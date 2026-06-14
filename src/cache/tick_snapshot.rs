@@ -1,10 +1,10 @@
 //! Persisted snapshots of UniswapV3-style tick state.
 //!
 //! Loading every initialized tick of a concentrated-liquidity pool over RPC is
-//! expensive, so this module defines serializable per-tick state
-//! ([`SerializableTickInfo`]) and the snapshot containers used to persist a
-//! pool's tick data to disk and reload it on a later run, avoiding repeated
-//! tick scans.
+//! expensive, so this module defines the public per-tick state ([`TickInfo`]),
+//! its serializable on-disk counterpart ([`SerializableTickInfo`]), and the
+//! snapshot containers used to persist a pool's tick data to disk and reload it
+//! on a later run, avoiding repeated tick scans.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -13,6 +13,23 @@ use alloy_primitives::{Address, U256};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
+
+/// Per-tick liquidity state for a UniswapV3-style concentrated-liquidity pool.
+///
+/// This is the public, dependency-free representation of a single tick's
+/// `Tick.Info` used by [`crate::cache::EvmCache::inject_v3_ticks`] and returned by
+/// [`V3PoolTickSnapshot::to_ticks`]. It mirrors the three fields of the
+/// on-chain struct that matter for swap simulation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TickInfo {
+    /// Total liquidity that references this tick (`liquidityGross`).
+    pub liquidity_gross: u128,
+    /// Net liquidity added/removed when the tick is crossed (`liquidityNet`).
+    pub liquidity_net: i128,
+    /// Whether the tick is initialized; controls whether it is processed
+    /// during swap execution.
+    pub initialized: bool,
+}
 
 /// Serializable tick info for V3 pools.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -45,7 +62,7 @@ impl V3PoolTickSnapshot {
     /// Create a new tick snapshot from pool data.
     pub fn from_pool_data(
         tick_bitmap: &std::collections::HashMap<i16, U256>,
-        ticks: &std::collections::HashMap<i32, amms::amms::uniswap_v3::Info>,
+        ticks: &std::collections::HashMap<i32, TickInfo>,
         liquidity: u128,
         tick: i32,
     ) -> Self {
@@ -80,15 +97,15 @@ impl V3PoolTickSnapshot {
             .collect()
     }
 
-    /// Convert ticks back to HashMap<i32, Info>.
-    pub fn to_ticks(&self) -> std::collections::HashMap<i32, amms::amms::uniswap_v3::Info> {
+    /// Convert ticks back to `HashMap<i32, TickInfo>`.
+    pub fn to_ticks(&self) -> std::collections::HashMap<i32, TickInfo> {
         self.ticks
             .iter()
             .filter_map(|(k, v)| {
                 k.parse::<i32>().ok().map(|key| {
                     (
                         key,
-                        amms::amms::uniswap_v3::Info {
+                        TickInfo {
                             liquidity_gross: v.liquidity_gross,
                             liquidity_net: v.liquidity_net,
                             initialized: v.initialized,

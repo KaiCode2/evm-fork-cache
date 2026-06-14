@@ -22,7 +22,7 @@ pub use storage_keys::{
     v3_tick_bitmap_storage_key_with_base, v3_tick_info_storage_keys,
     v3_tick_info_storage_keys_with_base,
 };
-pub use tick_snapshot::{SerializableTickInfo, V3PoolTickSnapshot, V3TickSnapshotCache};
+pub use tick_snapshot::{SerializableTickInfo, TickInfo, V3PoolTickSnapshot, V3TickSnapshotCache};
 
 use std::{
     cell::RefCell,
@@ -83,6 +83,33 @@ pub type RpcCallFn = Arc<dyn Fn(Address, Bytes) -> Result<Bytes> + Send + Sync>;
 pub type StorageBatchFetchFn =
     Arc<dyn Fn(Vec<(Address, U256)>) -> Vec<(Address, U256, Result<U256>)> + Send + Sync>;
 
+/// Return a tokio runtime [`Handle`] suitable for `block_in_place` + `block_on`,
+/// or an error describing why one is unavailable.
+///
+/// The RPC-backed callbacks ([`RpcCallFn`], [`StorageBatchFetchFn`]) drive async
+/// work synchronously via `tokio::task::block_in_place`. That helper panics on a
+/// current-thread runtime, and `Handle::current()` panics when no runtime is
+/// present. To avoid panicking deep inside a callback, callers use this guard to
+/// degrade to a typed error instead.
+///
+/// Requires a **multi-thread** tokio runtime.
+fn block_in_place_handle() -> Result<tokio::runtime::Handle> {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => match handle.runtime_flavor() {
+            tokio::runtime::RuntimeFlavor::CurrentThread => Err(anyhow!(
+                "evm-fork-cache RPC operations require a multi-thread tokio runtime; \
+                 found a current-thread runtime (block_in_place is not supported there). \
+                 Build the runtime with `tokio::runtime::Builder::new_multi_thread()` \
+                 or annotate with `#[tokio::main(flavor = \"multi_thread\")]`"
+            )),
+            _ => Ok(handle),
+        },
+        Err(e) => Err(anyhow!(
+            "evm-fork-cache RPC operations require a running multi-thread tokio runtime: {e}"
+        )),
+    }
+}
+
 static CACHE_SPEED_MODE: AtomicU8 = AtomicU8::new(CacheSpeedMode::Slow as u8);
 
 /// Runtime tuning profile for cache-side batch storage fetches.
@@ -126,23 +153,6 @@ pub enum MissingTargetBehavior {
     Create,
 }
 
-/// Minimal execution payload that can be queued alongside cache simulations.
-///
-/// The cache does not interpret the payload. It keeps the execution kind and
-/// ABI-encoded data as opaque bytes so downstream crates can avoid depending on
-/// generated Solidity bindings in this generic EVM layer.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct QueuedExecution {
-    pub kind: u8,
-    pub data: Bytes,
-}
-
-impl QueuedExecution {
-    pub fn new(kind: u8, data: Bytes) -> Self {
-        Self { kind, data }
-    }
-}
-
 type CacheEvm<'a> = revm::MainnetEvm<
     Context<BlockEnv, TxEnv, CfgEnv, &'a mut ForkCacheDB, Journal<&'a mut ForkCacheDB>, ()>,
 >;
@@ -165,7 +175,6 @@ pub struct EvmCache {
     backend: SharedBackend,
     blockchain_db: BlockchainDb,
     db: ForkCacheDB,
-    queued_executions: Vec<QueuedExecution>,
     token_decimals: HashMap<Address, u8>,
     block: Option<BlockId>,
     cache_config: Option<CacheConfig>,
@@ -250,6 +259,15 @@ impl EvmCache {
     ///
     /// The backend spawns a background handler task that manages RPC requests
     /// and deduplicates concurrent requests for the same data.
+    ///
+    /// # Runtime requirement
+    /// RPC-backed operation requires a **multi-thread** tokio runtime
+    /// (`#[tokio::main(flavor = "multi_thread")]` or
+    /// `tokio::runtime::Builder::new_multi_thread()`). The direct RPC callbacks
+    /// (`eth_call` and batch `eth_getStorageAt`) drive async work synchronously
+    /// via `tokio::task::block_in_place`, which is unsupported on a
+    /// current-thread runtime. On a current-thread runtime those callbacks
+    /// degrade to typed errors rather than panicking.
     pub async fn new<P>(provider: Arc<P>, block: Option<BlockId>) -> Self
     where
         P: Provider<AnyNetwork> + 'static,
@@ -264,6 +282,15 @@ impl EvmCache {
     /// 2. Bytecode caching: Contract bytecodes from `bytecodes.bin`
     /// 3. Tick snapshots: V3 pool tick data for validation
     /// 4. Immutable data: Token decimals, pool metadata
+    ///
+    /// # Runtime requirement
+    /// RPC-backed operation requires a **multi-thread** tokio runtime
+    /// (`#[tokio::main(flavor = "multi_thread")]` or
+    /// `tokio::runtime::Builder::new_multi_thread()`). The direct RPC callbacks
+    /// (`eth_call` and batch `eth_getStorageAt`) drive async work synchronously
+    /// via `tokio::task::block_in_place`, which is unsupported on a
+    /// current-thread runtime. On a current-thread runtime those callbacks
+    /// degrade to typed errors rather than panicking.
     pub async fn with_cache<P>(
         provider: Arc<P>,
         block: Option<BlockId>,
@@ -423,7 +450,9 @@ impl EvmCache {
         // This bypasses revm simulation for batch queries where lazy storage fetching is too slow.
         let provider_for_rpc = provider.clone();
         let rpc_caller: RpcCallFn = Arc::new(move |to: Address, calldata: Bytes| {
-            let handle = tokio::runtime::Handle::current();
+            // Guard against panicking inside `block_in_place` on a current-thread
+            // runtime (or when no runtime is present): degrade to a typed error.
+            let handle = block_in_place_handle()?;
             tokio::task::block_in_place(|| {
                 handle.block_on(async {
                     let tx = TransactionRequest::default()
@@ -464,7 +493,19 @@ impl EvmCache {
                     CacheSpeedMode::XSlow => 1,
                 };
 
-                let handle = tokio::runtime::Handle::current();
+                // Guard against panicking inside `block_in_place` on a
+                // current-thread runtime (or when no runtime is present): return
+                // an `Err` result for every requested slot instead.
+                let handle = match block_in_place_handle() {
+                    Ok(handle) => handle,
+                    Err(e) => {
+                        let msg = e.to_string();
+                        return requests
+                            .into_iter()
+                            .map(|(addr, slot)| (addr, slot, Err(anyhow!("{}", msg))))
+                            .collect();
+                    }
+                };
                 let current_block = *batch_block_ref.lock().unwrap();
                 tokio::task::block_in_place(|| {
                     handle.block_on(async {
@@ -535,9 +576,9 @@ impl EvmCache {
                             })
                             .collect();
 
-                        // Fire batches with bounded concurrency to avoid thundering herd.
-                        // 10 batches × 200 slots = 2000 concurrent storage reads, enough
-                        // throughput without overwhelming RPC providers.
+                        // Fire batches with bounded concurrency (`max_concurrent`) to avoid
+                        // a thundering herd; per-batch size is the speed-mode `batch_size`
+                        // chosen above, so throughput scales without overwhelming RPC providers.
                         let all_batch_results: Vec<Vec<_>> = stream::iter(batch_futs)
                             .buffer_unordered(max_concurrent)
                             .collect()
@@ -563,7 +604,6 @@ impl EvmCache {
             backend,
             blockchain_db,
             db,
-            queued_executions: Vec::new(),
             token_decimals,
             block,
             cache_config,
@@ -634,7 +674,6 @@ impl EvmCache {
             backend,
             blockchain_db,
             db,
-            queued_executions: Vec::new(),
             token_decimals: HashMap::new(),
             block,
             cache_config: None,
@@ -850,16 +889,37 @@ impl EvmCache {
         })
     }
 
-    /// Update the block context for RPC fetches.
+    /// Update the block that RPC fetches are pinned to.
     ///
-    /// This updates the pinned block on the SharedBackend, so subsequent
-    /// RPC fetches will use the new block.
+    /// This re-pins the SharedBackend and the batch storage fetcher to `block`,
+    /// so subsequent RPC fetches read state at the new block.
+    ///
+    /// # Block-context contract
+    /// To prevent the EVM block context from silently diverging from the pinned
+    /// block, when `block` is a concrete `BlockId::Number(Number(n))` this also
+    /// updates `block_number` (the `NUMBER` opcode) to `n`. For tag-based block
+    /// ids (`latest`, `pending`, hashes, etc.) the height is not statically known,
+    /// so `block_number` is left unchanged.
+    ///
+    /// `basefee` (the `BASEFEE` opcode) is **not** refreshed here because deriving
+    /// it requires fetching the block header, which this synchronous method cannot
+    /// do. Callers that change blocks should refresh it via
+    /// [`set_block_context`](Self::set_block_context) (e.g. after fetching the new
+    /// header). Prefer [`repin_to_block`](Self::repin_to_block) when re-pinning to
+    /// a concrete height, since it keeps `block_number` and the pinned block in
+    /// lockstep.
     pub fn set_block(&mut self, block: Option<BlockId>) {
         if self.block != block {
             self.block = block;
             if let Some(block_id) = block {
                 let _ = self.backend.set_pinned_block(block_id);
                 *self.batch_block_id.lock().unwrap() = block_id;
+                // Keep the EVM `NUMBER` opcode aligned with the pinned block so the
+                // two cannot silently diverge. Only a concrete height is meaningful;
+                // tags (latest/pending/hash) leave `block_number` untouched.
+                if let BlockId::Number(BlockNumberOrTag::Number(n)) = block_id {
+                    self.block_number = Some(n);
+                }
             }
         }
     }
@@ -909,11 +969,15 @@ impl EvmCache {
     /// Re-pin the cache to a specific block number.
     ///
     /// Updates the SharedBackend pinned block, the batch fetcher block, and the
-    /// EVM block context (NUMBER opcode). Returns the new block number.
-    /// Callers should fetch the latest block number from their provider and
-    /// optionally update basefee via `set_block_context()` afterwards.
+    /// EVM block context (`NUMBER` opcode) in lockstep. The current `basefee` is
+    /// preserved; callers should refresh it via
+    /// [`set_block_context`](Self::set_block_context) after fetching the new
+    /// block header if `BASEFEE` accuracy matters.
     pub fn repin_to_block(&mut self, block_number: u64) {
         let old_block = self.block;
+        // `set_block` already updates `block_number` for a concrete height; the
+        // explicit `set_block_context` below preserves `basefee` and keeps the
+        // re-pin atomic and self-documenting.
         self.set_block(Some(BlockId::Number(block_number.into())));
         self.set_block_context(Some(block_number), self.basefee);
 
@@ -928,25 +992,6 @@ impl EvmCache {
                 );
             }
         }
-    }
-
-    pub fn queue_execution(&mut self, execution: QueuedExecution) {
-        self.queued_executions.push(execution);
-    }
-
-    pub fn extend_executions<I>(&mut self, executions: I)
-    where
-        I: IntoIterator<Item = QueuedExecution>,
-    {
-        self.queued_executions.extend(executions);
-    }
-
-    pub fn queued_executions(&self) -> &[QueuedExecution] {
-        &self.queued_executions
-    }
-
-    pub fn take_queued_executions(&mut self) -> Vec<QueuedExecution> {
-        std::mem::take(&mut self.queued_executions)
     }
 
     /// Ensure an account is loaded into the cache.
@@ -1195,7 +1240,7 @@ impl EvmCache {
     pub fn inject_v3_ticks(
         &mut self,
         pool_address: Address,
-        ticks: &std::collections::HashMap<i32, amms::amms::uniswap_v3::Info>,
+        ticks: &std::collections::HashMap<i32, TickInfo>,
     ) -> Result<usize> {
         self.inject_v3_ticks_with_base(pool_address, ticks, V3_TICKS_BASE_SLOT)
     }
@@ -1206,7 +1251,7 @@ impl EvmCache {
     pub fn inject_v3_ticks_with_base(
         &mut self,
         pool_address: Address,
-        ticks: &std::collections::HashMap<i32, amms::amms::uniswap_v3::Info>,
+        ticks: &std::collections::HashMap<i32, TickInfo>,
         ticks_slot: U256,
     ) -> Result<usize> {
         let mut injected = 0;
@@ -1233,7 +1278,7 @@ impl EvmCache {
             // The `initialized` flag is in the highest byte (bit 248+).
             // We only set the initialized flag; the other fields in slot 3 are
             // not used by swap simulation, but without this injection the EVM
-            // would read stale values from Layer 2 (evm_state.json).
+            // would read stale values from Layer 2 (evm_state.bin).
             let slot3 = base_slot + U256::from(3);
             let initialized_value = if info.initialized {
                 // initialized is a bool packed at byte offset 31 (rightmost byte of the
@@ -1423,7 +1468,7 @@ impl EvmCache {
     /// Check if a pool has storage slots pre-loaded in the BlockchainDb.
     ///
     /// This is useful to determine if we loaded the EVM state from the unified
-    /// `evm_state.json` cache and the pool's tick data is already in storage.
+    /// `evm_state.bin` cache and the pool's tick data is already in storage.
     /// If true, we can skip expensive tick injection when liquidity hasn't changed.
     ///
     /// # Arguments
@@ -1518,7 +1563,7 @@ impl EvmCache {
     ///    this layer, subsequent EVM calls return stale values even after the backend
     ///    is purged.
     /// 2. **BlockchainDb backend** (`self.blockchain_db.storage()`) - the persistent
-    ///    layer that caches RPC responses and is loaded from `evm_state.json`.
+    ///    layer that caches RPC responses and is loaded from `evm_state.bin`.
     ///
     /// After purging both layers, the next EVM read for this pool's storage will
     /// go all the way to the RPC for fresh data.

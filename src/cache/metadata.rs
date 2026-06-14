@@ -115,7 +115,7 @@ pub struct BalancerPoolMetadata {
 /// - Pool metadata (token addresses, fees, tick spacing)
 ///
 /// By caching this data, we avoid redundant RPC calls across block changes
-/// and bot restarts.
+/// and process restarts.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ImmutableDataCache {
     /// Token address -> decimals

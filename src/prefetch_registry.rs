@@ -3,10 +3,12 @@
 //! Captures access lists from EVM interactions (multicall batches, simulations)
 //! and persists them across cycles. On the next cycle, batch-fetches the recorded
 //! slots into BlockchainDb before the EVM touches them, converting N individual
-//! `eth_getStorageAt` RPC calls into ⌈N/200⌉ batched HTTP requests.
+//! `eth_getStorageAt` RPC calls into a small number of batched HTTP requests
+//! (the batch size is governed by the cache's speed mode).
 //!
 //! Supports two storage shapes:
-//! - **Aggregated phases** (e.g., `cooldown_eval`): one access list per phase.
+//! - **Aggregated phases** (e.g., a `pool_refresh` phase): one access list per
+//!   phase.
 //! - **Keyed phases**: per-address access lists, enabling selective prefetch
 //!   for only the addresses that will be simulated.
 
@@ -23,11 +25,11 @@ use crate::cache::EvmCache;
 /// Registry of access lists keyed by phase, persisted across cycles via bincode.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct PrefetchRegistry {
-    /// Phases with a single aggregated access list (e.g., cooldown_eval).
+    /// Phases with a single aggregated access list (e.g., a `pool_refresh` phase).
     phases: HashMap<String, StorageAccessList>,
     /// Phases with per-address access lists.
     /// Stored by address so callers can selectively prefetch only ready targets.
-    strategy_phases: HashMap<String, HashMap<Address, StorageAccessList>>,
+    keyed_phases: HashMap<String, HashMap<Address, StorageAccessList>>,
 }
 
 impl PrefetchRegistry {
@@ -37,21 +39,21 @@ impl PrefetchRegistry {
             Ok(data) => match bincode::deserialize::<PrefetchRegistry>(&data) {
                 Ok(registry) => {
                     let phase_count = registry.phases.len();
-                    let strategy_phase_count = registry.strategy_phases.len();
+                    let keyed_phase_count = registry.keyed_phases.len();
                     let total_slots: usize = registry
                         .phases
                         .values()
                         .map(|al| al.slots.len())
                         .sum::<usize>()
                         + registry
-                            .strategy_phases
+                            .keyed_phases
                             .values()
                             .flat_map(|m| m.values())
                             .map(|al| al.slots.len())
                             .sum::<usize>();
                     info!(
                         phases = phase_count,
-                        strategy_phases = strategy_phase_count,
+                        keyed_phases = keyed_phase_count,
                         total_slots,
                         "Loaded prefetch registry"
                     );
@@ -63,29 +65,6 @@ impl PrefetchRegistry {
                 }
             },
             Err(_) => {
-                // Check for legacy harvest_access_lists.json and migrate.
-                // Try both the parent directory and the original hardcoded location.
-                let candidates = [
-                    path.parent().map(|p| p.join("harvest_access_lists.json")),
-                    Some(std::path::PathBuf::from("data/harvest_access_lists.json")),
-                ];
-                for candidate in candidates.into_iter().flatten() {
-                    if let Ok(json) = std::fs::read_to_string(&candidate)
-                        && let Ok(legacy) =
-                            serde_json::from_str::<HashMap<Address, StorageAccessList>>(&json)
-                    {
-                        info!(
-                            strategies = legacy.len(),
-                            path = %candidate.display(),
-                            "Migrated legacy harvest_access_lists.json to prefetch registry"
-                        );
-                        let mut registry = Self::default();
-                        registry
-                            .strategy_phases
-                            .insert("harvest_sim".to_string(), legacy);
-                        return registry;
-                    }
-                }
                 debug!("No prefetch registry file found, starting fresh");
                 Self::default()
             }
@@ -108,7 +87,7 @@ impl PrefetchRegistry {
                     let total_slots: usize =
                         self.phases.values().map(|al| al.slots.len()).sum::<usize>()
                             + self
-                                .strategy_phases
+                                .keyed_phases
                                 .values()
                                 .flat_map(|m| m.values())
                                 .map(|al| al.slots.len())
@@ -127,23 +106,10 @@ impl PrefetchRegistry {
 
     /// Record a keyed access list within a phase.
     pub fn record_keyed(&mut self, phase: &str, key: Address, access_list: StorageAccessList) {
-        self.strategy_phases
+        self.keyed_phases
             .entry(phase.to_string())
             .or_default()
             .insert(key, access_list);
-    }
-
-    /// Record a per-strategy access list within a phase.
-    ///
-    /// Kept for compatibility with the existing bot. New generic callers should
-    /// prefer [`record_keyed`](Self::record_keyed).
-    pub fn record_strategy(
-        &mut self,
-        phase: &str,
-        strategy: Address,
-        access_list: StorageAccessList,
-    ) {
-        self.record_keyed(phase, strategy, access_list);
     }
 
     /// Prefetch all slots for an aggregated phase.
@@ -162,25 +128,27 @@ impl PrefetchRegistry {
         batch_prefetch(cache, access_list.slots.iter().copied(), phase)
     }
 
-    /// Prefetch slots for specific strategies within a per-strategy phase,
-    /// excluding slots already warm from a previous prefetch stage.
+    /// Prefetch slots for specific keys within a keyed phase, excluding slots
+    /// already warm from a previous prefetch stage.
+    ///
+    /// Pairs with [`record_keyed`](Self::record_keyed).
     ///
     /// Returns `(fetched, errors)`.
-    pub fn prefetch_strategies(
+    pub fn prefetch_keyed(
         &self,
         phase: &str,
-        strategies: &[Address],
+        keys: &[Address],
         cache: &mut EvmCache,
         exclude: &HashSet<(Address, U256)>,
     ) -> (usize, usize) {
-        let Some(strategy_map) = self.strategy_phases.get(phase) else {
-            debug!(phase, "No per-strategy prefetch data for phase");
+        let Some(keyed_map) = self.keyed_phases.get(phase) else {
+            debug!(phase, "No keyed prefetch data for phase");
             return (0, 0);
         };
 
-        let slots: HashSet<(Address, U256)> = strategies
+        let slots: HashSet<(Address, U256)> = keys
             .iter()
-            .filter_map(|addr| strategy_map.get(addr))
+            .filter_map(|addr| keyed_map.get(addr))
             .flat_map(|al| al.slots.iter().copied())
             .filter(|slot| !exclude.contains(slot))
             .collect();
@@ -188,9 +156,9 @@ impl PrefetchRegistry {
         if slots.is_empty() {
             debug!(
                 phase,
-                strategies = strategies.len(),
+                keys = keys.len(),
                 excluded = exclude.len(),
-                "All strategy slots excluded or empty"
+                "All keyed slots excluded or empty"
             );
             return (0, 0);
         }
@@ -271,9 +239,9 @@ mod tests {
         al.slots.insert((addr, U256::from(1)));
         al.slots.insert((addr, U256::from(2)));
 
-        registry.record("cooldown_eval", al);
+        registry.record("pool_refresh", al);
 
-        let slots = registry.phase_slots("cooldown_eval");
+        let slots = registry.phase_slots("pool_refresh");
         assert_eq!(slots.len(), 2);
         assert!(slots.contains(&(addr, U256::from(1))));
         assert!(slots.contains(&(addr, U256::from(2))));
@@ -283,28 +251,28 @@ mod tests {
     }
 
     #[test]
-    fn test_registry_record_strategy() {
+    fn test_registry_record_keyed() {
         let mut registry = PrefetchRegistry::default();
-        let strategy1 = Address::repeat_byte(0x01);
-        let strategy2 = Address::repeat_byte(0x02);
+        let key_a = Address::repeat_byte(0x01);
+        let key_b = Address::repeat_byte(0x02);
 
         let mut al1 = StorageAccessList::default();
-        al1.slots.insert((strategy1, U256::from(10)));
+        al1.slots.insert((key_a, U256::from(10)));
 
         let mut al2 = StorageAccessList::default();
-        al2.slots.insert((strategy2, U256::from(20)));
+        al2.slots.insert((key_b, U256::from(20)));
 
-        registry.record_strategy("harvest_sim", strategy1, al1);
-        registry.record_strategy("harvest_sim", strategy2, al2);
+        registry.record_keyed("per_target", key_a, al1);
+        registry.record_keyed("per_target", key_b, al2);
 
-        // Verify strategy_phases has both
-        let map = registry.strategy_phases.get("harvest_sim").unwrap();
+        // Verify keyed_phases has both
+        let map = registry.keyed_phases.get("per_target").unwrap();
         assert_eq!(map.len(), 2);
         assert!(
-            map.get(&strategy1)
+            map.get(&key_a)
                 .unwrap()
                 .slots
-                .contains(&(strategy1, U256::from(10)))
+                .contains(&(key_a, U256::from(10)))
         );
     }
 
@@ -321,10 +289,10 @@ mod tests {
         al.accounts.insert(addr);
         registry.record("test_phase", al);
 
-        let strategy = Address::repeat_byte(0xBB);
+        let key = Address::repeat_byte(0xBB);
         let mut sal = StorageAccessList::default();
-        sal.slots.insert((strategy, U256::from(99)));
-        registry.record_strategy("harvest_sim", strategy, sal);
+        sal.slots.insert((key, U256::from(99)));
+        registry.record_keyed("per_target", key, sal);
 
         registry.save(&path);
 
@@ -335,13 +303,13 @@ mod tests {
                 .slots
                 .contains(&(addr, U256::from(42)))
         );
-        assert_eq!(loaded.strategy_phases.len(), 1);
+        assert_eq!(loaded.keyed_phases.len(), 1);
         assert!(
-            loaded.strategy_phases["harvest_sim"]
-                .get(&strategy)
+            loaded.keyed_phases["per_target"]
+                .get(&key)
                 .unwrap()
                 .slots
-                .contains(&(strategy, U256::from(99)))
+                .contains(&(key, U256::from(99)))
         );
 
         let _ = std::fs::remove_file(&path);
@@ -353,7 +321,7 @@ mod tests {
         let path = std::path::Path::new("/tmp/nonexistent_prefetch_registry.bin");
         let registry = PrefetchRegistry::load(path);
         assert!(registry.phases.is_empty());
-        assert!(registry.strategy_phases.is_empty());
+        assert!(registry.keyed_phases.is_empty());
     }
 
     #[test]

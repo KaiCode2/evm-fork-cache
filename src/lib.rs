@@ -16,12 +16,17 @@
 //! Other modules:
 //! - [`access_list`] / [`access_set`] — EIP-2930 access-list construction and
 //!   warm-slot tracking for gas estimation.
-//! - [`errors`] — structured simulation errors and revert-reason decoding.
+//! - [`errors`] — structured simulation errors and an extensible revert-reason
+//!   decoder you can teach your own custom Solidity error selectors.
 //! - [`inspector`] — an `Inspector` that captures ERC20 `Transfer` events to
 //!   reconstruct balance deltas from a simulation.
 //! - [`multicall`] — batched read-only calls.
 //! - [`deploy`] / [`create3`] — contract deployment and CREATE3 address math.
 //! - [`prefetch_registry`] — two-stage storage-slot pre-warming.
+//!
+//! The `examples/` directory has runnable, documented walkthroughs of each of
+//! these — offline ones that need no network, plus a few that fork real chain
+//! state over RPC. See the crate README for the full list.
 
 pub mod access_list;
 pub mod access_set;

@@ -36,3 +36,21 @@ jobs:
         run: cargo doc --no-deps
         env:
           RUSTDOCFLAGS: "-D warnings"
+
+  msrv:
+    name: msrv (1.88)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust 1.88 (declared MSRV)
+        uses: dtolnay/rust-toolchain@1.88.0
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      # The published library must build on the MSRV advertised in Cargo.toml.
+      # Scoped to --lib so the dev-only example/bench toolchain requirements
+      # (e.g. criterion) do not constrain the consumer-facing MSRV.
+      - name: Check library builds on MSRV
+        run: cargo check --lib --locked
