@@ -331,6 +331,19 @@ impl EvmOverlay {
         evm.journaled_state.checkpoint_revert(checkpoint);
         Ok((result, access_list))
     }
+
+    /// Write a storage value into this overlay's dirty layer.
+    ///
+    /// The dirty layer takes precedence over the snapshot on subsequent reads,
+    /// so this lets a caller (e.g. the freshness validator) inject a fresh slot
+    /// value into a snapshot-backed overlay before re-running a simulation,
+    /// without mutating the shared snapshot.
+    pub fn override_slot(&mut self, address: Address, slot: U256, value: U256) {
+        self.dirty_storage
+            .entry(address)
+            .or_default()
+            .insert(slot, value);
+    }
 }
 
 impl revm::database_interface::DatabaseCommit for EvmOverlay {

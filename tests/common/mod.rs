@@ -5,6 +5,7 @@
 //! ever reaches the network.
 #![allow(dead_code)]
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use alloy_primitives::{Address, Bytes, U256, hex};
@@ -14,7 +15,7 @@ use alloy_rpc_client::RpcClient;
 use alloy_sol_types::{SolCall, sol};
 use alloy_transport::mock::Asserter;
 use anyhow::{Result, anyhow};
-use evm_fork_cache::cache::EvmCache;
+use evm_fork_cache::cache::{EvmCache, StorageBatchFetchFn};
 use revm::context::result::ExecutionResult;
 use revm::state::{AccountInfo, Bytecode};
 
@@ -92,6 +93,36 @@ pub fn balance_of(cache: &mut EvmCache, token: Address, owner: Address) -> Resul
         ),
         other => Err(anyhow!("balanceOf call failed: {other:?}")),
     }
+}
+
+/// Build a stub [`StorageBatchFetchFn`] that returns chosen "current" values.
+///
+/// `values` maps `(address, slot)` to the value the fetcher reports. Any
+/// requested slot not present in the map is reported as `U256::ZERO` (matching
+/// how an unseen slot reads in a simulation). This is the offline stand-in for
+/// the real RPC batch fetcher.
+pub fn stub_fetcher(values: HashMap<(Address, U256), U256>) -> StorageBatchFetchFn {
+    Arc::new(move |requests: Vec<(Address, U256)>| {
+        requests
+            .into_iter()
+            .map(|(addr, slot)| {
+                let value = values.get(&(addr, slot)).copied().unwrap_or(U256::ZERO);
+                (addr, slot, Ok(value))
+            })
+            .collect()
+    })
+}
+
+/// Build a stub [`StorageBatchFetchFn`] that fails every request.
+///
+/// Used to exercise the `Unverified` / error paths offline.
+pub fn failing_fetcher() -> StorageBatchFetchFn {
+    Arc::new(|requests: Vec<(Address, U256)>| {
+        requests
+            .into_iter()
+            .map(|(addr, slot)| (addr, slot, Err(anyhow!("stub fetcher error"))))
+            .collect()
+    })
 }
 
 /// Submit a `transfer(to, amount)` to a `MockERC20`, committing the state change.

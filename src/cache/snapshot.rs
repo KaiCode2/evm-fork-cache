@@ -37,6 +37,19 @@ pub struct EvmSnapshot {
     pub(crate) spec_id: SpecId,
 }
 
+impl EvmSnapshot {
+    /// Return the snapshot's value for a storage slot, if present.
+    ///
+    /// Used by the freshness validator to compare a freshly-fetched value
+    /// against the value the snapshot was built from. A missing entry means the
+    /// snapshot never captured that slot (it would read as zero in a sim).
+    pub fn storage_value(&self, address: Address, slot: U256) -> Option<U256> {
+        self.storage
+            .get(&address)
+            .and_then(|s| s.get(&slot).copied())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

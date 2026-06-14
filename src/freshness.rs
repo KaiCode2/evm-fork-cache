@@ -404,6 +404,27 @@ impl FreshnessPolicy for ObservationDriven {
     }
 }
 
+// ---------------------------------------------------------------------------
+// 4. Results
+// ---------------------------------------------------------------------------
+
+/// A storage slot whose freshly-fetched value differs from the cached value.
+///
+/// Produced by [`EvmCache::verify_slots`](crate::cache::EvmCache::verify_slots)
+/// and by the background validator; `old` is the value the snapshot/cache held,
+/// `new` is the value the fetcher returned.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SlotChange {
+    /// Contract whose storage changed.
+    pub address: Address,
+    /// Storage slot key.
+    pub slot: U256,
+    /// Value previously held in the cache/snapshot.
+    pub old: U256,
+    /// Freshly-fetched value.
+    pub new: U256,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

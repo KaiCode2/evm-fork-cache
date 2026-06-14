@@ -62,6 +62,7 @@ use tracing::{debug, instrument, trace, warn};
 
 use crate::access_set::StorageAccessList;
 use crate::errors::{SimError, SimulationError, SimulationResult};
+use crate::freshness::SlotChange;
 use crate::inspector::TransferInspector;
 
 use bytecode::BytecodeCache;
@@ -941,6 +942,129 @@ impl EvmCache {
         let mut storage = self.blockchain_db.storage().write();
         for &(addr, slot, value) in results {
             storage.entry(addr).or_default().insert(slot, value);
+        }
+    }
+
+    /// Set (or replace) the batch storage fetcher.
+    ///
+    /// This is the seam the freshness controller and tests use to drive
+    /// re-verification without a live provider: a stubbed
+    /// [`StorageBatchFetchFn`] can be injected over a mocked-provider cache.
+    pub fn set_storage_batch_fetcher(&mut self, f: StorageBatchFetchFn) {
+        self.storage_batch_fetcher = Some(f);
+    }
+
+    /// Return the currently-cached value for a storage slot, if any.
+    ///
+    /// Checks the CacheDB overlay (layer 1) first, then the BlockchainDb backend
+    /// (layer 2). Returns `None` when neither layer has seen the slot. Unlike
+    /// [`read_storage_slot`](Self::read_storage_slot) this never touches RPC.
+    pub fn cached_storage_value(&self, address: Address, slot: U256) -> Option<U256> {
+        if let Some(db_account) = self.db.cache.accounts.get(&address)
+            && let Some(value) = db_account.storage.get(&slot)
+        {
+            return Some(*value);
+        }
+        let storage = self.blockchain_db.storage().read();
+        storage.get(&address).and_then(|s| s.get(&slot).copied())
+    }
+
+    /// Re-fetch the given slots via the batch fetcher, compare to the currently
+    /// cached values, and inject the ones that changed.
+    ///
+    /// For each slot whose freshly-fetched value differs from the cached value,
+    /// the fresh value is written into the cache via
+    /// [`inject_storage_batch`](Self::inject_storage_batch) and a [`SlotChange`]
+    /// is recorded. Slots that are unchanged, or that the fetcher fails to
+    /// return, are left as-is. Returns the set of changed slots.
+    ///
+    /// Requires a batch fetcher (set at construction or via
+    /// [`set_storage_batch_fetcher`](Self::set_storage_batch_fetcher)); errors if
+    /// none is available. This is the synchronous main-thread primitive; the
+    /// background validator performs the equivalent comparison against a snapshot.
+    pub fn verify_slots(&mut self, slots: &[(Address, U256)]) -> Result<Vec<SlotChange>> {
+        if slots.is_empty() {
+            return Ok(Vec::new());
+        }
+        let fetcher = self
+            .storage_batch_fetcher
+            .as_ref()
+            .ok_or_else(|| anyhow!("verify_slots requires a storage batch fetcher"))?
+            .clone();
+
+        // Snapshot the cached values before fetching so we compare against a
+        // stable baseline.
+        let cached: HashMap<(Address, U256), Option<U256>> = slots
+            .iter()
+            .map(|&(addr, slot)| ((addr, slot), self.cached_storage_value(addr, slot)))
+            .collect();
+
+        let results = (fetcher)(slots.to_vec());
+
+        let mut changed = Vec::new();
+        let mut to_inject = Vec::new();
+        for (addr, slot, fetched) in results {
+            let fresh = match fetched {
+                Ok(value) => value,
+                Err(e) => {
+                    debug!(%addr, %slot, error = %e, "verify_slots: fetch failed, skipping slot");
+                    continue;
+                }
+            };
+            // A slot the cache never saw is treated as old = ZERO (the value a
+            // sim would have read), so a non-zero fresh value counts as a change.
+            let old = cached
+                .get(&(addr, slot))
+                .copied()
+                .flatten()
+                .unwrap_or(U256::ZERO);
+            if fresh != old {
+                to_inject.push((addr, slot, fresh));
+                changed.push(SlotChange {
+                    address: addr,
+                    slot,
+                    old,
+                    new: fresh,
+                });
+            }
+        }
+
+        if !to_inject.is_empty() {
+            self.inject_storage_batch(&to_inject);
+        }
+        Ok(changed)
+    }
+
+    /// Purge an account fully from both cache layers: its `AccountInfo`
+    /// (balance/nonce/code hash) **and** all of its storage.
+    ///
+    /// Removes `addr` from the CacheDB overlay accounts map, the BlockchainDb
+    /// accounts map, and the BlockchainDb storage map, so the next access
+    /// re-fetches a clean account from RPC. This is the account-level
+    /// counterpart to the storage-only [`purge_pool_storage`](Self::purge_pool_storage):
+    /// use it when an address is fully volatile (no pinned slots) and even its
+    /// balance/nonce/code can no longer be trusted.
+    pub fn purge_account(&mut self, addr: Address) {
+        // Layer 1: CacheDB overlay (accounts + their storage live together).
+        let overlay_removed = self.db.cache.accounts.remove(&addr).is_some();
+
+        // Layer 2: BlockchainDb accounts + storage maps.
+        let backend_account_removed = self
+            .blockchain_db
+            .accounts()
+            .write()
+            .remove(&addr)
+            .is_some();
+        let backend_storage_removed = self.blockchain_db.storage().write().remove(&addr).is_some();
+
+        if overlay_removed || backend_account_removed || backend_storage_removed {
+            debug!(
+                account = %addr,
+                overlay_removed,
+                backend_account_removed,
+                backend_storage_removed,
+                "purged account from both cache layers"
+            );
         }
     }
 
