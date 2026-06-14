@@ -17,6 +17,7 @@ use common::{
     MOCK_ERC20_BALANCE_SLOT, balance_of, install_default_account, install_mock_erc20,
     mock_erc20_creation_code, mock_erc20_runtime, setup_cache, transfer,
 };
+use evm_fork_cache::cache::TxConfig;
 
 /// Deterministic CREATE address for `Address::ZERO` at nonce 0:
 /// `keccak256(rlp([ZERO, 0]))[12..]`.
@@ -53,6 +54,45 @@ async fn snapshot_restore_reverts_token_state() -> Result<()> {
 
     cache.restore(snapshot);
     assert_eq!(balance_of(&mut cache, token, owner)?, initial_balance);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn call_raw_with_carries_native_value() -> Result<()> {
+    let mut cache = setup_cache().await?;
+    let sender = Address::repeat_byte(0x11);
+    let recipient = Address::repeat_byte(0x22);
+
+    // Both accounts start empty (unfunded); balance checks are disabled in the
+    // simulator, so a value-bearing call still goes through.
+    install_default_account(&mut cache, Address::ZERO);
+    install_default_account(&mut cache, sender);
+    install_default_account(&mut cache, recipient);
+
+    let value = U256::from(1_000_000_000u64);
+    let tx = TxConfig {
+        value,
+        ..Default::default()
+    };
+    let result = cache.call_raw_with(sender, recipient, Bytes::new(), true, &tx)?;
+    assert!(
+        result.is_success(),
+        "value transfer should succeed: {result:?}"
+    );
+
+    // The recipient is credited the native value.
+    let recipient_balance = cache
+        .db_mut()
+        .cache
+        .accounts
+        .get(&recipient)
+        .map(|a| a.info.balance)
+        .unwrap_or_default();
+    assert_eq!(
+        recipient_balance, value,
+        "recipient should receive the value"
+    );
 
     Ok(())
 }

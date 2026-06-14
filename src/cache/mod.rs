@@ -57,7 +57,7 @@ use revm::{
 use tracing::{debug, instrument, trace, warn};
 
 use crate::access_set::StorageAccessList;
-use crate::errors::{SimulationError, SimulationErrorKind, SimulationResult};
+use crate::errors::{SimError, SimulationError, SimulationResult};
 use crate::inspector::TransferInspector;
 
 use bytecode::BytecodeCache;
@@ -153,6 +153,101 @@ pub enum MissingTargetBehavior {
     Create,
 }
 
+/// Per-call transaction-environment overrides for a simulation.
+///
+/// `Default` reproduces the read-only behavior of the plain `call_raw`
+/// (zero value, default gas/nonce). Use the `*_with` call variants to supply
+/// these — e.g. to simulate a payable function, a native-ETH transfer, or a
+/// gas-bounded call. Balance affordability checks are disabled in the
+/// simulator, so a non-zero `value` does not require the caller to be funded.
+#[derive(Debug, Clone, Default)]
+pub struct TxConfig {
+    /// Native value (wei) sent with the call.
+    pub value: U256,
+    /// Gas limit; `None` uses revm's default.
+    pub gas_limit: Option<u64>,
+    /// Gas price (wei); `None` uses revm's default.
+    pub gas_price: Option<u128>,
+    /// Sender nonce; `None` lets the simulator pick (nonce checks are disabled).
+    pub nonce: Option<u64>,
+    /// EIP-2930 access list to pre-warm slots for this call.
+    pub access_list: Option<AccessList>,
+}
+
+/// Fluent builder for [`EvmCache`].
+///
+/// A readable alternative to the positional [`EvmCache::with_cache`]
+/// constructor. Defaults: latest block, no disk cache, [`SpecId::CANCUN`].
+///
+/// ```no_run
+/// # use std::sync::Arc;
+/// # use alloy_provider::{ProviderBuilder, network::AnyNetwork};
+/// # use revm::primitives::hardfork::SpecId;
+/// # use evm_fork_cache::cache::EvmCache;
+/// # async fn example() -> anyhow::Result<()> {
+/// let provider = ProviderBuilder::new()
+///     .network::<AnyNetwork>()
+///     .connect_http("https://example-rpc.invalid".parse()?);
+/// let cache = EvmCache::builder(Arc::new(provider))
+///     .latest_block()
+///     .spec(SpecId::CANCUN)
+///     .build()
+///     .await;
+/// # let _ = cache;
+/// # Ok(())
+/// # }
+/// ```
+pub struct EvmCacheBuilder<P> {
+    provider: Arc<P>,
+    block: Option<BlockId>,
+    cache_config: Option<CacheConfig>,
+    spec_id: SpecId,
+}
+
+impl<P> EvmCacheBuilder<P>
+where
+    P: Provider<AnyNetwork> + 'static,
+{
+    /// Start a builder over the given provider.
+    pub fn new(provider: Arc<P>) -> Self {
+        Self {
+            provider,
+            block: None,
+            cache_config: None,
+            spec_id: SpecId::CANCUN,
+        }
+    }
+
+    /// Pin simulations and RPC fetches to a specific block.
+    pub fn block(mut self, block: BlockId) -> Self {
+        self.block = Some(block);
+        self
+    }
+
+    /// Pin to the latest block.
+    pub fn latest_block(mut self) -> Self {
+        self.block = Some(BlockId::latest());
+        self
+    }
+
+    /// Set the EVM hardfork spec (must match the chain's execution layer).
+    pub fn spec(mut self, spec_id: SpecId) -> Self {
+        self.spec_id = spec_id;
+        self
+    }
+
+    /// Enable disk-backed caching with the given configuration.
+    pub fn cache_config(mut self, cache_config: CacheConfig) -> Self {
+        self.cache_config = Some(cache_config);
+        self
+    }
+
+    /// Build the [`EvmCache`], fetching the pinned block's header for context.
+    pub async fn build(self) -> EvmCache {
+        EvmCache::with_cache(self.provider, self.block, self.cache_config, self.spec_id).await
+    }
+}
+
 type CacheEvm<'a> = revm::MainnetEvm<
     Context<BlockEnv, TxEnv, CfgEnv, &'a mut ForkCacheDB, Journal<&'a mut ForkCacheDB>, ()>,
 >;
@@ -194,6 +289,14 @@ pub struct EvmCache {
     /// Base fee per gas for EVM simulations (BASEFEE opcode).
     /// Fetched from block header during construction.
     basefee: Option<u64>,
+    /// Block beneficiary for EVM simulations (COINBASE opcode).
+    /// Fetched from the block header; commonly read by MEV/builder tip logic.
+    coinbase: Option<Address>,
+    /// `prevrandao` for EVM simulations (PREVRANDAO opcode), i.e. the header's
+    /// mix hash post-merge. Drives on-chain randomness.
+    prevrandao: Option<B256>,
+    /// Block gas limit for EVM simulations (GASLIMIT opcode).
+    block_gas_limit: Option<u64>,
     /// Shared memory buffer reused across EVM simulations.
     /// This avoids repeated allocations and allows measuring peak memory usage.
     shared_memory_buffer: Rc<RefCell<Vec<u8>>>,
@@ -255,6 +358,17 @@ pub fn parse_evm_spec(spec: &str) -> SpecId {
 }
 
 impl EvmCache {
+    /// Start a fluent [`EvmCacheBuilder`] over the given provider.
+    ///
+    /// Preferred over the positional [`with_cache`](Self::with_cache) /
+    /// [`new`](Self::new) constructors for readability.
+    pub fn builder<P>(provider: Arc<P>) -> EvmCacheBuilder<P>
+    where
+        P: Provider<AnyNetwork> + 'static,
+    {
+        EvmCacheBuilder::new(provider)
+    }
+
     /// Create a new EvmCache with a SharedBackend that lazily fetches from RPC.
     ///
     /// The backend spawns a background handler task that manages RPC requests
@@ -305,21 +419,30 @@ impl EvmCache {
         // Fetch block header for accurate block context (NUMBER, BASEFEE opcodes).
         // Without this, revm defaults to 0 for both, causing contracts that read
         // block.number or block.basefee to execute different code paths.
-        let (block_number, basefee) = match provider
+        let (block_number, basefee, coinbase, prevrandao, block_gas_limit) = match provider
             .get_block_by_number(match block_id {
                 BlockId::Number(n) => n,
                 _ => BlockNumberOrTag::Latest,
             })
             .await
         {
-            Ok(Some(blk)) => (Some(blk.header().number()), blk.header().base_fee_per_gas()),
+            Ok(Some(blk)) => {
+                let h = blk.header();
+                (
+                    Some(h.number()),
+                    h.base_fee_per_gas(),
+                    Some(h.beneficiary()),
+                    h.mix_hash(),
+                    Some(h.gas_limit()),
+                )
+            }
             Ok(None) => {
                 debug!("Block header not found for block context initialization");
-                (None, None)
+                (None, None, None, None, None)
             }
             Err(e) => {
                 debug!(error = %e, "Failed to fetch block header for block context");
-                (None, None)
+                (None, None, None, None, None)
             }
         };
 
@@ -613,6 +736,9 @@ impl EvmCache {
             chain_id,
             block_number,
             basefee,
+            coinbase,
+            prevrandao,
+            block_gas_limit,
             shared_memory_buffer: Rc::new(RefCell::new(Vec::with_capacity(
                 DEFAULT_SHARED_MEMORY_CAPACITY,
             ))),
@@ -683,6 +809,9 @@ impl EvmCache {
             chain_id,
             block_number,
             basefee,
+            coinbase: None,
+            prevrandao: None,
+            block_gas_limit: None,
             shared_memory_buffer: Rc::new(RefCell::new(Vec::with_capacity(
                 DEFAULT_SHARED_MEMORY_CAPACITY,
             ))),
@@ -883,6 +1012,9 @@ impl EvmCache {
             code_by_hash,
             block_number: self.block_number,
             basefee: self.basefee,
+            coinbase: self.coinbase,
+            prevrandao: self.prevrandao,
+            gas_limit: self.block_gas_limit,
             chain_id: self.chain_id,
             timestamp: self.timestamp_override,
             spec_id: self.spec_id,
@@ -964,6 +1096,21 @@ impl EvmCache {
     pub fn set_block_context(&mut self, block_number: Option<u64>, basefee: Option<u64>) {
         self.block_number = block_number;
         self.basefee = basefee;
+    }
+
+    /// Override the block beneficiary (COINBASE opcode) for subsequent simulations.
+    pub fn set_coinbase(&mut self, coinbase: Option<Address>) {
+        self.coinbase = coinbase;
+    }
+
+    /// Override `prevrandao` (PREVRANDAO opcode) for subsequent simulations.
+    pub fn set_prevrandao(&mut self, prevrandao: Option<B256>) {
+        self.prevrandao = prevrandao;
+    }
+
+    /// Override the block gas limit (GASLIMIT opcode) for subsequent simulations.
+    pub fn set_block_gas_limit(&mut self, gas_limit: Option<u64>) {
+        self.block_gas_limit = gas_limit;
     }
 
     /// Re-pin the cache to a specific block number.
@@ -1324,17 +1471,33 @@ impl EvmCache {
         calldata: Bytes,
         commit: bool,
     ) -> Result<ExecutionResult> {
-        let tx = Self::build_tx_env(from, to, calldata)?;
+        self.call_raw_with(from, to, calldata, commit, &TxConfig::default())
+    }
+
+    /// Execute a call with explicit transaction-environment overrides
+    /// ([`TxConfig`]): native `value`, gas limit/price, nonce, and an input
+    /// access list. This is the entry point for value-bearing and gas-bounded
+    /// simulation; [`call_raw`](Self::call_raw) is the zero-value shorthand.
+    #[instrument(level = "debug", skip(self, calldata, tx), fields(calldata_len = calldata.len()))]
+    pub fn call_raw_with(
+        &mut self,
+        from: Address,
+        to: Address,
+        calldata: Bytes,
+        commit: bool,
+        tx: &TxConfig,
+    ) -> Result<ExecutionResult> {
+        let tx_env = Self::build_tx_env_with(from, to, calldata, tx)?;
         let mut evm = self.build_evm();
 
         if commit {
             return evm
-                .transact_commit(tx)
+                .transact_commit(tx_env)
                 .map_err(|e| anyhow!("Failed to transact: {:?}", e));
         }
 
         let checkpoint = evm.journaled_state.checkpoint();
-        let result = evm.transact_one(tx);
+        let result = evm.transact_one(tx_env);
         evm.journaled_state.checkpoint_revert(checkpoint);
         result.map_err(|e| anyhow!("Failed to transact: {:?}", e))
     }
@@ -1847,8 +2010,8 @@ impl EvmCache {
     ///
     /// Returns:
     /// - `Ok(CallSimulationResult)` on successful execution
-    /// - `Err(SimulationErrorKind::Revert(_))` when the transaction reverts (graceful failure)
-    /// - `Err(SimulationErrorKind::Other(_))` for unexpected errors (should be propagated)
+    /// - `Err(SimError::Revert(_))` when the transaction reverts (graceful failure)
+    /// - `Err(SimError::Other(_))` for unexpected errors (should be propagated)
     #[instrument(level = "debug", skip(self, calldata, tokens), fields(calldata_len = calldata.len()))]
     pub fn simulate_with_transfer_tracking(
         &mut self,
@@ -1859,14 +2022,14 @@ impl EvmCache {
         tokens: Option<impl IntoIterator<Item = Address>>,
         commit: bool,
     ) -> SimulationResult<CallSimulationResult> {
-        let tx = Self::build_tx_env(from, to, calldata).map_err(SimulationErrorKind::Other)?;
+        let tx = Self::build_tx_env(from, to, calldata).map_err(SimError::Other)?;
         let inspector = TransferInspector::new();
         let mut evm = self.build_evm_with_inspector(inspector);
         let checkpoint = evm.journaled_state.checkpoint();
 
         let result = evm
             .inspect_one_tx(tx)
-            .map_err(|e| SimulationErrorKind::Other(anyhow!("Failed to transact: {:?}", e)));
+            .map_err(|e| SimError::Other(anyhow!("Failed to transact: {:?}", e)));
 
         match result {
             Ok(ExecutionResult::Success { logs, gas_used, .. }) => {
@@ -1908,11 +2071,10 @@ impl EvmCache {
             }
             Ok(ExecutionResult::Halt { reason, gas_used }) => {
                 evm.journaled_state.checkpoint_revert(checkpoint);
-                Err(SimulationErrorKind::Other(anyhow!(
-                    "Transaction halted: {:?} (gas_used: {})",
-                    reason,
-                    gas_used
-                )))
+                Err(SimError::Halt {
+                    reason: format!("{reason:?}"),
+                    gas_used,
+                })
             }
             Err(err) => {
                 evm.journaled_state.checkpoint_revert(checkpoint);
@@ -2120,6 +2282,7 @@ impl EvmCache {
                 cfg.disable_nonce_check = true;
                 cfg.disable_eip3607 = true;
                 cfg.disable_base_fee = true;
+                cfg.disable_balance_check = true;
                 cfg.chain_id = chain_id;
                 cfg.limit_contract_code_size = None;
                 cfg.tx_chain_id_check = false;
@@ -2140,6 +2303,15 @@ impl EvmCache {
         if let Some(basefee) = self.basefee {
             evm.block.basefee = basefee;
         }
+        if let Some(coinbase) = self.coinbase {
+            evm.block.beneficiary = coinbase;
+        }
+        if let Some(prevrandao) = self.prevrandao {
+            evm.block.prevrandao = Some(prevrandao);
+        }
+        if let Some(gas_limit) = self.block_gas_limit {
+            evm.block.gas_limit = gas_limit;
+        }
         evm
     }
 
@@ -2153,6 +2325,7 @@ impl EvmCache {
                 cfg.disable_nonce_check = true;
                 cfg.disable_eip3607 = true;
                 cfg.disable_base_fee = true;
+                cfg.disable_balance_check = true;
                 cfg.chain_id = chain_id;
                 cfg.limit_contract_code_size = None;
                 cfg.tx_chain_id_check = false;
@@ -2173,15 +2346,46 @@ impl EvmCache {
         if let Some(basefee) = self.basefee {
             evm.block.basefee = basefee;
         }
+        if let Some(coinbase) = self.coinbase {
+            evm.block.beneficiary = coinbase;
+        }
+        if let Some(prevrandao) = self.prevrandao {
+            evm.block.prevrandao = Some(prevrandao);
+        }
+        if let Some(gas_limit) = self.block_gas_limit {
+            evm.block.gas_limit = gas_limit;
+        }
         evm
     }
 
     fn build_tx_env(from: Address, to: Address, calldata: Bytes) -> Result<TxEnv> {
-        TxEnv::builder()
+        Self::build_tx_env_with(from, to, calldata, &TxConfig::default())
+    }
+
+    fn build_tx_env_with(
+        from: Address,
+        to: Address,
+        calldata: Bytes,
+        tx: &TxConfig,
+    ) -> Result<TxEnv> {
+        let mut builder = TxEnv::builder()
             .caller(from)
             .kind(TxKind::Call(to))
             .data(calldata)
-            .value(U256::ZERO)
+            .value(tx.value);
+        if let Some(gas_limit) = tx.gas_limit {
+            builder = builder.gas_limit(gas_limit);
+        }
+        if let Some(gas_price) = tx.gas_price {
+            builder = builder.gas_price(gas_price);
+        }
+        if let Some(nonce) = tx.nonce {
+            builder = builder.nonce(nonce);
+        }
+        if let Some(access_list) = &tx.access_list {
+            builder = builder.access_list(access_list.clone());
+        }
+        builder
             .build()
             .map_err(|e| anyhow!("Failed to build tx env: {:?}", e))
     }
@@ -2793,11 +2997,20 @@ mod tests {
 
         let block_num = 148_252_680u64;
         let basefee_val = 50u64;
+        let coinbase = Address::repeat_byte(0xC0);
+        let prevrandao = B256::repeat_byte(0x77);
+        let gas_limit = 30_000_000u64;
         cache.set_block_context(Some(block_num), Some(basefee_val));
+        cache.set_coinbase(Some(coinbase));
+        cache.set_prevrandao(Some(prevrandao));
+        cache.set_block_gas_limit(Some(gas_limit));
 
         let evm = cache.build_evm();
         assert_eq!(evm.block.number, U256::from(block_num));
         assert_eq!(evm.block.basefee, basefee_val);
+        assert_eq!(evm.block.beneficiary, coinbase);
+        assert_eq!(evm.block.prevrandao, Some(prevrandao));
+        assert_eq!(evm.block.gas_limit, gas_limit);
     }
 
     #[test]

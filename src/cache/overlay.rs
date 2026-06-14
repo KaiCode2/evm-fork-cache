@@ -18,7 +18,7 @@ use revm::{
 use super::CallSimulationResult;
 use super::snapshot::EvmSnapshot;
 use crate::access_set::StorageAccessList;
-use crate::errors::{SimulationError, SimulationErrorKind, SimulationResult};
+use crate::errors::{SimError, SimulationError, SimulationResult};
 use crate::inspector::TransferInspector;
 
 /// Default initial capacity for shared memory buffer (64KB).
@@ -103,6 +103,9 @@ impl EvmOverlay {
         });
         let block_number = self.snapshot.block_number;
         let basefee = self.snapshot.basefee;
+        let coinbase = self.snapshot.coinbase;
+        let prevrandao = self.snapshot.prevrandao;
+        let gas_limit = self.snapshot.gas_limit;
 
         let mut evm = Context::mainnet()
             .with_db(&mut *self)
@@ -111,6 +114,7 @@ impl EvmOverlay {
                 cfg.disable_nonce_check = true;
                 cfg.disable_eip3607 = true;
                 cfg.disable_base_fee = true;
+                cfg.disable_balance_check = true;
                 cfg.chain_id = chain_id;
                 cfg.limit_contract_code_size = None;
                 cfg.tx_chain_id_check = false;
@@ -124,6 +128,15 @@ impl EvmOverlay {
         }
         if let Some(basefee) = basefee {
             evm.block.basefee = basefee;
+        }
+        if let Some(coinbase) = coinbase {
+            evm.block.beneficiary = coinbase;
+        }
+        if let Some(prevrandao) = prevrandao {
+            evm.block.prevrandao = Some(prevrandao);
+        }
+        if let Some(gas_limit) = gas_limit {
+            evm.block.gas_limit = gas_limit;
         }
         evm
     }
@@ -171,6 +184,9 @@ impl EvmOverlay {
         });
         let block_number = self.snapshot.block_number;
         let basefee = self.snapshot.basefee;
+        let coinbase = self.snapshot.coinbase;
+        let prevrandao = self.snapshot.prevrandao;
+        let gas_limit = self.snapshot.gas_limit;
 
         let mut evm = Context::mainnet()
             .with_db(&mut *self)
@@ -179,6 +195,7 @@ impl EvmOverlay {
                 cfg.disable_nonce_check = true;
                 cfg.disable_eip3607 = true;
                 cfg.disable_base_fee = true;
+                cfg.disable_balance_check = true;
                 cfg.chain_id = chain_id;
                 cfg.limit_contract_code_size = None;
                 cfg.tx_chain_id_check = false;
@@ -192,6 +209,15 @@ impl EvmOverlay {
         }
         if let Some(basefee) = basefee {
             evm.block.basefee = basefee;
+        }
+        if let Some(coinbase) = coinbase {
+            evm.block.beneficiary = coinbase;
+        }
+        if let Some(prevrandao) = prevrandao {
+            evm.block.prevrandao = Some(prevrandao);
+        }
+        if let Some(gas_limit) = gas_limit {
+            evm.block.gas_limit = gas_limit;
         }
         evm
     }
@@ -216,7 +242,7 @@ impl EvmOverlay {
             .data(calldata)
             .value(U256::ZERO)
             .build()
-            .map_err(|e| SimulationErrorKind::Other(anyhow!("Failed to build tx env: {:?}", e)))?;
+            .map_err(|e| SimError::Other(anyhow!("Failed to build tx env: {:?}", e)))?;
 
         let inspector = TransferInspector::new();
         let mut evm = self.build_evm_with_inspector(inspector);
@@ -226,7 +252,7 @@ impl EvmOverlay {
 
         let result = evm
             .inspect_one_tx(tx)
-            .map_err(|e| SimulationErrorKind::Other(anyhow!("Failed to transact: {:?}", e)));
+            .map_err(|e| SimError::Other(anyhow!("Failed to transact: {:?}", e)));
 
         match result {
             Ok(ExecutionResult::Success { logs, gas_used, .. }) => {
@@ -258,11 +284,10 @@ impl EvmOverlay {
             }
             Ok(ExecutionResult::Halt { reason, gas_used }) => {
                 evm.journaled_state.checkpoint_revert(checkpoint);
-                Err(SimulationErrorKind::Other(anyhow!(
-                    "Transaction halted: {:?} (gas_used: {})",
-                    reason,
-                    gas_used
-                )))
+                Err(SimError::Halt {
+                    reason: format!("{reason:?}"),
+                    gas_used,
+                })
             }
             Err(err) => {
                 evm.journaled_state.checkpoint_revert(checkpoint);
@@ -446,6 +471,9 @@ mod tests {
             code_by_hash: HashMap::new(),
             block_number: None,
             basefee: None,
+            coinbase: None,
+            prevrandao: None,
+            gas_limit: None,
             chain_id: 42161,
             timestamp: None,
             spec_id: SpecId::CANCUN,
@@ -475,6 +503,9 @@ mod tests {
             code_by_hash: HashMap::new(),
             block_number: None,
             basefee: None,
+            coinbase: None,
+            prevrandao: None,
+            gas_limit: None,
             chain_id: 42161,
             timestamp: None,
             spec_id: SpecId::CANCUN,
@@ -502,6 +533,9 @@ mod tests {
             code_by_hash: HashMap::new(),
             block_number: None,
             basefee: None,
+            coinbase: None,
+            prevrandao: None,
+            gas_limit: None,
             chain_id: 42161,
             timestamp: None,
             spec_id: SpecId::CANCUN,
@@ -530,6 +564,9 @@ mod tests {
             code_by_hash: HashMap::new(),
             block_number: None,
             basefee: None,
+            coinbase: None,
+            prevrandao: None,
+            gas_limit: None,
             chain_id: 42161,
             timestamp: None,
             spec_id: SpecId::CANCUN,
@@ -559,6 +596,9 @@ mod tests {
             code_by_hash,
             block_number: None,
             basefee: None,
+            coinbase: None,
+            prevrandao: None,
+            gas_limit: None,
             chain_id: 42161,
             timestamp: None,
             spec_id: SpecId::CANCUN,
@@ -582,6 +622,9 @@ mod tests {
             code_by_hash: HashMap::new(),
             block_number: None,
             basefee: None,
+            coinbase: None,
+            prevrandao: None,
+            gas_limit: None,
             chain_id: 42161,
             timestamp: None,
             spec_id: SpecId::CANCUN,

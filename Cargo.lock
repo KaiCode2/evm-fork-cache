@@ -1865,6 +1865,7 @@ dependencies = [
  "revm",
  "serde",
  "serde_json",
+ "thiserror",
  "tokio",
  "tracing",
 ]

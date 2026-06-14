@@ -390,46 +390,71 @@ impl fmt::Display for SimulationError {
 impl std::error::Error for SimulationError {}
 
 /// Result type for simulations that distinguish EVM reverts from host errors.
-pub type SimulationResult<T> = Result<T, SimulationErrorKind>;
+pub type SimulationResult<T> = Result<T, SimError>;
 
-/// Error kind for simulation failures.
-#[derive(Debug)]
-pub enum SimulationErrorKind {
-    /// The transaction reverted.
-    Revert(Box<SimulationError>),
-    /// An unexpected host-side error occurred.
+/// Error returned by simulation entry points.
+///
+/// Distinguishes the three outcomes a caller must branch on: a transaction-level
+/// [`Revert`](SimError::Revert) (with a decoded reason), an EVM
+/// [`Halt`](SimError::Halt) (e.g. out of gas), and a host-side
+/// [`Other`](SimError::Other) failure (RPC, database, ABI encoding).
+#[derive(Debug, thiserror::Error)]
+pub enum SimError {
+    /// The transaction reverted; carries the decoded revert.
+    #[error("transaction reverted: {0}")]
+    Revert(#[source] Box<SimulationError>),
+    /// The EVM halted without returning revert data (e.g. out of gas, stack
+    /// overflow). `reason` is the debug rendering of revm's halt reason.
+    #[error("transaction halted: {reason} (gas used {gas_used})")]
+    Halt {
+        /// Debug rendering of the EVM halt reason.
+        reason: String,
+        /// Gas consumed before the halt.
+        gas_used: u64,
+    },
+    /// An unexpected host-side error (RPC, database, ABI encoding).
+    #[error("{0}")]
     Other(anyhow::Error),
 }
 
-impl fmt::Display for SimulationErrorKind {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl SimError {
+    /// `true` if this is a transaction-level revert.
+    pub fn is_revert(&self) -> bool {
+        matches!(self, SimError::Revert(_))
+    }
+
+    /// `true` if the EVM halted (e.g. out of gas).
+    pub fn is_halt(&self) -> bool {
+        matches!(self, SimError::Halt { .. })
+    }
+
+    /// The decoded revert, if this error is a revert.
+    pub fn as_revert(&self) -> Option<&SimulationError> {
         match self {
-            SimulationErrorKind::Revert(e) => write!(f, "Revert: {e}"),
-            SimulationErrorKind::Other(e) => write!(f, "Error: {e}"),
+            SimError::Revert(e) => Some(e),
+            _ => None,
         }
     }
 }
 
-impl std::error::Error for SimulationErrorKind {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            SimulationErrorKind::Revert(e) => Some(e.as_ref()),
-            SimulationErrorKind::Other(e) => e.source(),
-        }
-    }
-}
-
-impl From<anyhow::Error> for SimulationErrorKind {
+impl From<anyhow::Error> for SimError {
     fn from(e: anyhow::Error) -> Self {
-        SimulationErrorKind::Other(e)
+        SimError::Other(e)
     }
 }
 
-impl From<SimulationError> for SimulationErrorKind {
+impl From<SimulationError> for SimError {
     fn from(e: SimulationError) -> Self {
-        SimulationErrorKind::Revert(Box::new(e))
+        SimError::Revert(Box::new(e))
     }
 }
+
+/// Deprecated alias for [`SimError`].
+#[deprecated(
+    since = "0.2.0",
+    note = "renamed to `SimError`; `Halt` is now a distinct variant"
+)]
+pub type SimulationErrorKind = SimError;
 
 #[cfg(test)]
 mod tests {
