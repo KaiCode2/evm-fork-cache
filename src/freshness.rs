@@ -51,14 +51,20 @@
 //! assert!(NeverVerify.select(&candidates, &obs, now).is_empty());
 //! ```
 
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use alloy_primitives::{Address, U256};
+use alloy_eips::eip2930::AccessList;
+use alloy_primitives::{Address, Bytes, U256};
+use revm::context::result::ExecutionResult;
+use tokio::task::JoinHandle;
 
-use crate::cache::SlotObservationTracker;
+use crate::cache::{
+    CallSimulationResult, EvmCache, EvmOverlay, EvmSnapshot, SlotObservationTracker,
+    StorageBatchFetchFn, TxConfig,
+};
 
 /// Default minimum observations before the change-frequency data is trusted.
 pub const DEFAULT_MIN_OBSERVATIONS: u32 = 10;
@@ -423,6 +429,452 @@ pub struct SlotChange {
     pub old: U256,
     /// Freshly-fetched value.
     pub new: U256,
+}
+
+/// The deferred verdict on a [`SpeculativeSim`]'s optimistic results.
+pub enum Validation {
+    /// Nothing the sims read had changed; the optimistic results are correct.
+    Confirmed,
+    /// At least one read slot changed. `results` is the optimistic set with the
+    /// affected sims re-run against the fresh values; `changed` lists the slots
+    /// that differed (also queued for flow-back into the cache).
+    Corrected {
+        /// Optimistic results with the affected sims replaced by re-runs.
+        results: Vec<CallSimulationResult>,
+        /// Slots whose fresh value differed from the snapshot.
+        changed: Vec<SlotChange>,
+    },
+    /// The fetcher failed, so the results could not be validated. The optimistic
+    /// results are *not* trusted.
+    Unverified {
+        /// Human-readable description of why validation could not complete.
+        reason: String,
+    },
+}
+
+impl std::fmt::Debug for Validation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Validation::Confirmed => write!(f, "Confirmed"),
+            Validation::Corrected { changed, .. } => f
+                .debug_struct("Corrected")
+                .field("changed", changed)
+                .finish_non_exhaustive(),
+            Validation::Unverified { reason } => f
+                .debug_struct("Unverified")
+                .field("reason", reason)
+                .finish(),
+        }
+    }
+}
+
+/// A single non-committing simulation request for the optimistic loop.
+///
+/// `tx.access_list` is the *predicted* read set (a performance hint that seeds
+/// the verify candidates); correctness does not depend on it because the
+/// background validator re-checks each sim's actual volatile read set.
+#[derive(Clone, Debug)]
+pub struct SimRequest {
+    /// Transaction sender.
+    pub from: Address,
+    /// Call target.
+    pub to: Address,
+    /// Calldata.
+    pub calldata: Bytes,
+    /// Per-call tx environment; `tx.access_list` is the predicted read set.
+    pub tx: TxConfig,
+}
+
+impl SimRequest {
+    /// A zero-value request with default tx environment.
+    pub fn new(from: Address, to: Address, calldata: Bytes) -> Self {
+        Self {
+            from,
+            to,
+            calldata,
+            tx: TxConfig::default(),
+        }
+    }
+
+    /// Set the predicted read set (EIP-2930 access list hint).
+    pub fn with_access_list(mut self, access_list: AccessList) -> Self {
+        self.tx.access_list = Some(access_list);
+        self
+    }
+}
+
+/// Optimistic simulation results plus a handle to their deferred validation.
+///
+/// Returned by [`FreshnessController::run`] as soon as the optimistic sims
+/// finish (without awaiting RPC). Read [`optimistic`](Self::optimistic)
+/// immediately, then `await` [`validate`](Self::validate) for the verdict.
+/// Dropping the handle aborts the background validation task.
+pub struct SpeculativeSim {
+    optimistic: Vec<CallSimulationResult>,
+    /// `Option` so `validate`/`into_optimistic` can take the handle and skip the
+    /// abort-on-drop; `Drop` only aborts a handle still left in place.
+    validation: Option<JoinHandle<Validation>>,
+}
+
+impl SpeculativeSim {
+    /// The optimistic results, readable before validation completes.
+    pub fn optimistic(&self) -> &[CallSimulationResult] {
+        &self.optimistic
+    }
+
+    /// Consume the handle and return the optimistic results, aborting the
+    /// background validation task.
+    pub fn into_optimistic(mut self) -> Vec<CallSimulationResult> {
+        if let Some(handle) = self.validation.take() {
+            handle.abort();
+        }
+        std::mem::take(&mut self.optimistic)
+    }
+
+    /// Await the deferred validation verdict.
+    ///
+    /// If the background task panicked or was cancelled, returns
+    /// [`Validation::Unverified`].
+    pub async fn validate(mut self) -> Validation {
+        let handle = self
+            .validation
+            .take()
+            .expect("validation handle taken twice");
+        match handle.await {
+            Ok(v) => v,
+            Err(e) => Validation::Unverified {
+                reason: format!("validation task failed: {e}"),
+            },
+        }
+    }
+}
+
+impl Drop for SpeculativeSim {
+    fn drop(&mut self) {
+        if let Some(handle) = self.validation.take() {
+            handle.abort();
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Controller
+// ---------------------------------------------------------------------------
+
+/// Drives the optimistic verify-and-rerun loop over an [`EvmCache`].
+///
+/// Holds the freshness [`FreshnessRegistry`], the shared
+/// [`SlotObservationTracker`], a [`FreshnessPolicy`], a [`FreshnessClock`], the
+/// [`FreshnessParams`], and the pending-corrections queue. The tracker and the
+/// pending queue are `Arc<Mutex<…>>` so the background validator can update them
+/// without touching the `!Send` cache.
+///
+/// # Runtime requirement
+/// [`run`](Self::run) spawns a background task and the (synchronous) fetcher uses
+/// `block_in_place` internally, so a **multi-thread** tokio runtime is required
+/// (`#[tokio::main(flavor = "multi_thread")]` or
+/// `Builder::new_multi_thread()`), mirroring the [`EvmCache`] constructor note.
+pub struct FreshnessController<P: FreshnessPolicy, C: FreshnessClock> {
+    registry: FreshnessRegistry,
+    tracker: Arc<Mutex<SlotObservationTracker>>,
+    policy: P,
+    clock: C,
+    params: FreshnessParams,
+    pending: Arc<Mutex<Vec<SlotChange>>>,
+}
+
+impl<P: FreshnessPolicy> FreshnessController<P, BlockClock> {
+    /// Build a controller with the default [`BlockClock`].
+    pub fn new(registry: FreshnessRegistry, policy: P) -> Self {
+        Self::with_clock(registry, policy, BlockClock::new())
+    }
+}
+
+impl<P: FreshnessPolicy, C: FreshnessClock> FreshnessController<P, C> {
+    /// Build a controller with an explicit clock.
+    pub fn with_clock(registry: FreshnessRegistry, policy: P, clock: C) -> Self {
+        Self {
+            registry,
+            tracker: Arc::new(Mutex::new(SlotObservationTracker::new())),
+            policy,
+            clock,
+            params: FreshnessParams::default(),
+            pending: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    /// Replace the [`FreshnessParams`] used by the observation tracker.
+    pub fn with_params(mut self, params: FreshnessParams) -> Self {
+        self.params = params;
+        self
+    }
+
+    /// Use an existing shared observation tracker (e.g. a persisted one).
+    pub fn with_tracker(mut self, tracker: Arc<Mutex<SlotObservationTracker>>) -> Self {
+        self.tracker = tracker;
+        self
+    }
+
+    /// The shared observation tracker.
+    pub fn tracker(&self) -> &Arc<Mutex<SlotObservationTracker>> {
+        &self.tracker
+    }
+
+    /// The freshness registry.
+    pub fn registry(&self) -> &FreshnessRegistry {
+        &self.registry
+    }
+
+    /// Mutable access to the freshness registry.
+    pub fn registry_mut(&mut self) -> &mut FreshnessRegistry {
+        &mut self.registry
+    }
+
+    /// Number of corrections waiting to be drained into the cache on the next
+    /// [`run`](Self::run).
+    pub fn pending_len(&self) -> usize {
+        self.pending.lock().unwrap().len()
+    }
+
+    /// Advance to a new block: bump a [`BlockClock`] is the caller's job (the
+    /// clock is shared); this notifies the policy.
+    pub fn on_new_block(&mut self, block: u64) {
+        self.policy.on_new_block(block);
+    }
+
+    /// Run the optimistic loop for a batch of requests.
+    ///
+    /// 1. Drain queued corrections from prior cycles into the cache.
+    /// 2. Snapshot the cache and grab the batch fetcher.
+    /// 3. Run each request optimistically against the snapshot, capturing its
+    ///    actual volatile read set.
+    /// 4. Compute the predicted volatile candidates and ask the policy which to
+    ///    verify.
+    /// 5. Spawn the background validator (Send data only) and return a
+    ///    [`SpeculativeSim`] immediately.
+    pub fn run(
+        &mut self,
+        cache: &mut EvmCache,
+        requests: Vec<SimRequest>,
+    ) -> anyhow::Result<SpeculativeSim> {
+        let now = self.clock.now();
+
+        // 1. Drain pending corrections into the cache before snapshotting.
+        {
+            let mut pending = self.pending.lock().unwrap();
+            if !pending.is_empty() {
+                let injects: Vec<(Address, U256, U256)> =
+                    pending.iter().map(|c| (c.address, c.slot, c.new)).collect();
+                cache.inject_storage_batch(&injects);
+                pending.clear();
+            }
+        }
+
+        // 2. Snapshot + fetcher (Arc clones, both Send).
+        let snapshot = cache.create_snapshot();
+        let fetcher = cache.storage_batch_fetcher().cloned();
+
+        // 3. Optimistic sims + per-sim actual volatile read sets.
+        let mut optimistic = Vec::with_capacity(requests.len());
+        let mut read_sets: Vec<Vec<(Address, U256)>> = Vec::with_capacity(requests.len());
+        for req in &requests {
+            let mut overlay = EvmOverlay::new(Arc::clone(&snapshot), None);
+            let (result, access) =
+                overlay.call_raw_with_access_list(req.from, req.to, req.calldata.clone())?;
+            optimistic.push(result_to_sim(result, &access.to_eip2930()));
+
+            let volatile: Vec<(Address, U256)> = access
+                .slots
+                .iter()
+                .copied()
+                .filter(|(addr, slot)| self.registry.is_volatile(*addr, *slot, now))
+                .collect();
+            read_sets.push(volatile);
+        }
+
+        // 4. Predicted candidates (union of request access lists, volatile only).
+        let mut candidate_set: HashSet<(Address, U256)> = HashSet::new();
+        for req in &requests {
+            if let Some(al) = &req.tx.access_list {
+                for item in &al.0 {
+                    for key in &item.storage_keys {
+                        let slot = U256::from_be_bytes(key.0);
+                        if self.registry.is_volatile(item.address, slot, now) {
+                            candidate_set.insert((item.address, slot));
+                        }
+                    }
+                }
+            }
+        }
+        let candidates: Vec<(Address, U256)> = candidate_set.into_iter().collect();
+        let verify_set = {
+            let tracker = self.tracker.lock().unwrap();
+            self.policy.select(&candidates, &tracker, now)
+        };
+
+        // 5. Spawn the validator with Send-only data.
+        let registry = self.registry.clone();
+        let tracker = Arc::clone(&self.tracker);
+        let pending = Arc::clone(&self.pending);
+        let optimistic_for_task = optimistic.clone();
+        let validation = tokio::spawn(async move {
+            run_validator(ValidatorInput {
+                snapshot,
+                fetcher,
+                requests,
+                read_sets,
+                registry,
+                tracker,
+                pending,
+                now,
+                verify_set,
+                optimistic: optimistic_for_task,
+            })
+        });
+
+        Ok(SpeculativeSim {
+            optimistic,
+            validation: Some(validation),
+        })
+    }
+}
+
+/// Owned inputs handed to the background validator (all `Send`).
+struct ValidatorInput {
+    snapshot: Arc<EvmSnapshot>,
+    fetcher: Option<StorageBatchFetchFn>,
+    requests: Vec<SimRequest>,
+    read_sets: Vec<Vec<(Address, U256)>>,
+    registry: FreshnessRegistry,
+    tracker: Arc<Mutex<SlotObservationTracker>>,
+    pending: Arc<Mutex<Vec<SlotChange>>>,
+    now: u64,
+    verify_set: Vec<(Address, U256)>,
+    optimistic: Vec<CallSimulationResult>,
+}
+
+/// The background validation routine. Touches only `Send` data — never the cache.
+fn run_validator(input: ValidatorInput) -> Validation {
+    let ValidatorInput {
+        snapshot,
+        fetcher,
+        requests,
+        read_sets,
+        registry,
+        tracker,
+        pending,
+        now,
+        verify_set,
+        optimistic,
+    } = input;
+
+    let Some(fetcher) = fetcher else {
+        return Validation::Unverified {
+            reason: "no storage batch fetcher available".to_string(),
+        };
+    };
+
+    // verify = policy-selected set ∪ each sim's actual volatile read set,
+    // re-filtered through the registry clone so only currently-volatile slots
+    // are checked (defensive: read sets and the policy selection are already
+    // volatile-filtered on the main thread).
+    let mut verify: HashSet<(Address, U256)> = verify_set.into_iter().collect();
+    for set in &read_sets {
+        verify.extend(set.iter().copied());
+    }
+    verify.retain(|(addr, slot)| registry.is_volatile(*addr, *slot, now));
+    if verify.is_empty() {
+        return Validation::Confirmed;
+    }
+    let verify: Vec<(Address, U256)> = verify.into_iter().collect();
+
+    // Fetch fresh values. Any error → Unverified (never trust silently).
+    let results = (fetcher)(verify.clone());
+    let mut fresh: HashMap<(Address, U256), U256> = HashMap::new();
+    for (addr, slot, value) in results {
+        match value {
+            Ok(v) => {
+                fresh.insert((addr, slot), v);
+            }
+            Err(e) => {
+                return Validation::Unverified {
+                    reason: format!("fetch failed for {addr}:{slot}: {e}"),
+                };
+            }
+        }
+    }
+
+    // Compare against the snapshot, observe each checked slot, collect changes.
+    let mut changed = Vec::new();
+    {
+        let mut tracker = tracker.lock().unwrap();
+        for &(addr, slot) in &verify {
+            let new = fresh.get(&(addr, slot)).copied().unwrap_or(U256::ZERO);
+            let old = snapshot.storage_value(addr, slot).unwrap_or(U256::ZERO);
+            tracker.observe(addr, slot, new, now);
+            if new != old {
+                changed.push(SlotChange {
+                    address: addr,
+                    slot,
+                    old,
+                    new,
+                });
+            }
+        }
+    }
+
+    if changed.is_empty() {
+        return Validation::Confirmed;
+    }
+
+    // Queue corrections for flow-back into the cache on the next run.
+    {
+        let mut pending = pending.lock().unwrap();
+        pending.extend(changed.iter().cloned());
+    }
+
+    // Re-run only the sims whose read set intersects the changed slots.
+    let changed_keys: HashSet<(Address, U256)> =
+        changed.iter().map(|c| (c.address, c.slot)).collect();
+    let overrides: Vec<(Address, U256, U256)> =
+        changed.iter().map(|c| (c.address, c.slot, c.new)).collect();
+
+    let mut results = optimistic;
+    for (i, req) in requests.iter().enumerate() {
+        let read_set = &read_sets[i];
+        let intersects = read_set.iter().any(|k| changed_keys.contains(k));
+        if !intersects {
+            continue;
+        }
+        let mut overlay = EvmOverlay::new(Arc::clone(&snapshot), None);
+        for &(addr, slot, value) in &overrides {
+            overlay.override_slot(addr, slot, value);
+        }
+        if let Ok((result, access)) =
+            overlay.call_raw_with_access_list(req.from, req.to, req.calldata.clone())
+        {
+            results[i] = result_to_sim(result, &access.to_eip2930());
+        }
+    }
+
+    Validation::Corrected { results, changed }
+}
+
+/// Build a [`CallSimulationResult`] from a non-committing execution result and
+/// its captured access list. `token_deltas` is empty (the optimistic path does
+/// not run transfer tracking); gas and logs come from the execution result.
+fn result_to_sim(result: ExecutionResult, access_list: &AccessList) -> CallSimulationResult {
+    let (gas_used, logs) = match &result {
+        ExecutionResult::Success { gas_used, logs, .. } => (*gas_used, logs.clone()),
+        ExecutionResult::Revert { gas_used, .. } => (*gas_used, Vec::new()),
+        ExecutionResult::Halt { gas_used, .. } => (*gas_used, Vec::new()),
+    };
+    CallSimulationResult {
+        gas_used,
+        token_deltas: HashMap::new(),
+        logs,
+        access_list: access_list.clone(),
+    }
 }
 
 #[cfg(test)]
