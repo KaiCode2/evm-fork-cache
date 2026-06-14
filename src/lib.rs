@@ -34,6 +34,7 @@ pub mod cache;
 pub mod create3;
 pub mod deploy;
 pub mod errors;
+pub mod freshness;
 pub mod inspector;
 pub mod multicall;
 pub mod prefetch_registry;
