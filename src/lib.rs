@@ -18,6 +18,9 @@
 //!   warm-slot tracking for gas estimation.
 //! - [`errors`] — structured simulation errors and an extensible revert-reason
 //!   decoder you can teach your own custom Solidity error selectors.
+//! - [`freshness`] — the four-layer freshness model (classification, observation,
+//!   policy, mechanism) and the optimistic verify-and-rerun execution loop with
+//!   deferred validation.
 //! - [`inspector`] — an `Inspector` that captures ERC20 `Transfer` events to
 //!   reconstruct balance deltas from a simulation.
 //! - [`multicall`] — batched read-only calls.
@@ -40,3 +43,8 @@ pub mod multicall;
 pub mod prefetch_registry;
 
 pub use access_set::StorageAccessList;
+pub use freshness::{
+    AlwaysVerify, BlockClock, FreshnessClock, FreshnessController, FreshnessParams,
+    FreshnessPolicy, FreshnessRegistry, NeverVerify, ObservationDriven, SimRequest, SlotChange,
+    SpeculativeSim, Validation, Validity, WallClock,
+};

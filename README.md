@@ -112,6 +112,7 @@ and inject all state directly:
 | `transfer_inspector` | Report per-token balance deltas from a simulation. |
 | `deploy_and_override` | Deploy from creation code and etch it over another address. |
 | `prefetch_registry` | Record and persist storage touch sets for cross-cycle prefetch. |
+| `freshness_optimistic` | Optimistic verify-and-rerun loop: a `Corrected` validation via a stub fetcher. |
 
 RPC-gated examples fork real mainnet state. Set `RPC_URL` to an Ethereum RPC
 endpoint (they print instructions and exit if it is unset):

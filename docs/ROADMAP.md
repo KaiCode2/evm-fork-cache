@@ -71,7 +71,7 @@ RPC node                     Event-driven sync  ← WS logs · new block
 | --- | --- | --- |
 | **0** | API hygiene + correctness: drop `amms`, fix `set_block` divergence + `block_in_place` panic, commit the tree. | **Done** (`p0-oss-prep`) |
 | **1** | Engine seam: typed errors, configurable tx/block env, hot-path benches, builder, `protocols` feature. | **Done** (`phase-1-engine-seam`) |
-| **2** | Freshness core (Pillar C): `Validity` + `FreshnessRegistry`; `on_new_block` purge; pin immutables. | Planned |
+| **2** | Freshness core (Pillar C): `Validity` + `FreshnessRegistry`; observation tracker; policies; optimistic verify-and-rerun loop. | **Done** (`phase-2-freshness`) |
 | **3** | State-update primitives (Pillar B.1): `StateUpdate` + targeted writers; refold `inject_*`; surface state-diff output. | Planned |
 | **4** | Event pipeline + adapters (Pillar B.2): `EventDecoder` trait, V3 adapter, WS ingestion loop, reorg handling. | Planned |
 | **5** | COW snapshots (Pillar A): structural sharing; overlay buffer reuse. | Planned |
@@ -287,10 +287,19 @@ against a **stubbed** `StorageBatchFetchFn` returning chosen "current" values
 (refresh + selective re-run of only affected sims); `purge_account` drops account +
 storage on both layers; `ValidThrough` boundary; `WallClock` vs `BlockClock`.
 
-### Acceptance
+### Acceptance — met
 
 `cargo fmt --check`, `clippy --all-targets -- -D warnings` (default +
 `--lib --no-default-features`), `cargo test`, `RUSTDOCFLAGS=-D warnings cargo doc`.
+
+Landed on `phase-2-freshness`: `src/freshness.rs` (the generic core — `Validity`
+/ `FreshnessRegistry`, `FreshnessClock` + `BlockClock`/`WallClock`,
+`FreshnessParams`, `FreshnessPolicy` + `AlwaysVerify`/`NeverVerify`/
+`ObservationDriven`, `SlotChange`/`Validation`/`SpeculativeSim`/`SimRequest`,
+`FreshnessController`); a clock-agnostic `SlotObservationTracker`;
+`EvmCache::verify_slots`/`purge_account`/`set_storage_batch_fetcher`;
+`EvmSnapshot::storage_value` + `EvmOverlay::override_slot` validator seams; the
+offline `examples/freshness_optimistic.rs`; and `tests/freshness.rs`.
 
 ---
 
