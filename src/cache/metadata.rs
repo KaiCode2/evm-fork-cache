@@ -61,6 +61,7 @@ impl CacheConfig {
     }
 
     /// Get the path for the V3 tick snapshot cache file (binary format).
+    #[cfg(feature = "protocols")]
     pub(crate) fn tick_snapshot_cache_path(&self) -> PathBuf {
         self.chain_dir().join("v3_tick_snapshots.bin")
     }

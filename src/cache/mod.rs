@@ -4,7 +4,9 @@ mod metadata;
 pub mod overlay;
 pub mod slot_observations;
 pub mod snapshot;
+#[cfg(feature = "protocols")]
 mod storage_keys;
+#[cfg(feature = "protocols")]
 mod tick_snapshot;
 
 pub use binary_state::{load_binary_state, save_binary_state};
@@ -14,6 +16,7 @@ pub use metadata::{
 pub use overlay::EvmOverlay;
 pub use slot_observations::SlotObservationTracker;
 pub use snapshot::EvmSnapshot;
+#[cfg(feature = "protocols")]
 pub use storage_keys::{
     PANCAKE_V3_LIQUIDITY_SLOT, PANCAKE_V3_TICK_BITMAP_BASE_SLOT, PANCAKE_V3_TICKS_BASE_SLOT,
     SLIPSTREAM_LIQUIDITY_SLOT, SLIPSTREAM_SLOT0_SLOT, SLIPSTREAM_TICK_BITMAP_BASE_SLOT,
@@ -22,6 +25,7 @@ pub use storage_keys::{
     v3_tick_bitmap_storage_key_with_base, v3_tick_info_storage_keys,
     v3_tick_info_storage_keys_with_base,
 };
+#[cfg(feature = "protocols")]
 pub use tick_snapshot::{SerializableTickInfo, TickInfo, V3PoolTickSnapshot, V3TickSnapshotCache};
 
 use std::{
@@ -61,6 +65,7 @@ use crate::errors::{SimError, SimulationError, SimulationResult};
 use crate::inspector::TransferInspector;
 
 use bytecode::BytecodeCache;
+#[cfg(feature = "protocols")]
 use storage_keys::{i128_to_u256, i256_from_i16, i256_from_i24};
 
 /// Re-export AnyNetwork for callers that need to construct providers.
@@ -276,6 +281,7 @@ pub struct EvmCache {
     /// Cache for immutable on-chain data (token decimals, pool metadata).
     immutable_cache: ImmutableDataCache,
     /// Cache for V3 pool tick snapshots (tick_bitmap, ticks, liquidity).
+    #[cfg(feature = "protocols")]
     tick_snapshot_cache: V3TickSnapshotCache,
     /// Optional timestamp override for simulating future blocks.
     /// When set, EVM simulations use this timestamp instead of the current system time.
@@ -555,6 +561,7 @@ impl EvmCache {
         let token_decimals = immutable_cache.token_decimals.clone();
 
         // Load V3 tick snapshot cache (for liquidity validation)
+        #[cfg(feature = "protocols")]
         let tick_snapshot_cache = cache_config
             .as_ref()
             .and_then(|cfg| {
@@ -731,6 +738,7 @@ impl EvmCache {
             block,
             cache_config,
             immutable_cache,
+            #[cfg(feature = "protocols")]
             tick_snapshot_cache,
             timestamp_override: None,
             chain_id,
@@ -804,6 +812,7 @@ impl EvmCache {
             block,
             cache_config: None,
             immutable_cache: ImmutableDataCache::default(),
+            #[cfg(feature = "protocols")]
             tick_snapshot_cache: V3TickSnapshotCache::default(),
             timestamp_override: None,
             chain_id,
@@ -869,15 +878,18 @@ impl EvmCache {
             }
 
             // Save the V3 tick snapshot cache (needed for liquidity validation)
-            let tick_snapshot_path = cfg.tick_snapshot_cache_path();
-            if let Err(e) = self.tick_snapshot_cache.save(&tick_snapshot_path) {
-                warn!(error = %e, "Failed to save V3 tick snapshot cache");
-            } else {
-                debug!(
-                    snapshots = self.tick_snapshot_cache.len(),
-                    path = ?tick_snapshot_path,
-                    "Updated V3 tick snapshot cache"
-                );
+            #[cfg(feature = "protocols")]
+            {
+                let tick_snapshot_path = cfg.tick_snapshot_cache_path();
+                if let Err(e) = self.tick_snapshot_cache.save(&tick_snapshot_path) {
+                    warn!(error = %e, "Failed to save V3 tick snapshot cache");
+                } else {
+                    debug!(
+                        snapshots = self.tick_snapshot_cache.len(),
+                        path = ?tick_snapshot_path,
+                        "Updated V3 tick snapshot cache"
+                    );
+                }
             }
         }
     }
@@ -1297,6 +1309,7 @@ impl EvmCache {
     /// # Arguments
     /// * `pool_address` - The UniswapV2 pair contract address
     /// * `metadata` - The cached pool metadata containing token0 and token1
+    #[cfg(feature = "protocols")]
     pub fn inject_v2_pool_metadata(
         &mut self,
         pool_address: Address,
@@ -1329,6 +1342,7 @@ impl EvmCache {
     /// # Arguments
     /// * `pool_address` - The UniswapV3 pool contract address
     /// * `tick_bitmap` - Map of word position (int16) to bitmap value (uint256)
+    #[cfg(feature = "protocols")]
     pub fn inject_v3_tick_bitmap(
         &mut self,
         pool_address: Address,
@@ -1340,6 +1354,7 @@ impl EvmCache {
     /// Inject V3-style tick bitmap data with a custom base slot.
     ///
     /// PancakeSwap V3 uses base slot 7 instead of Uniswap V3's slot 6.
+    #[cfg(feature = "protocols")]
     pub fn inject_v3_tick_bitmap_with_base(
         &mut self,
         pool_address: Address,
@@ -1384,6 +1399,7 @@ impl EvmCache {
     /// # Arguments
     /// * `pool_address` - The UniswapV3 pool contract address
     /// * `ticks` - Map of tick index (int24) to tick info
+    #[cfg(feature = "protocols")]
     pub fn inject_v3_ticks(
         &mut self,
         pool_address: Address,
@@ -1395,6 +1411,7 @@ impl EvmCache {
     /// Inject V3-style tick info data with a custom ticks mapping slot.
     ///
     /// PancakeSwap V3 uses ticks at slot 6 instead of Uniswap V3's slot 5.
+    #[cfg(feature = "protocols")]
     pub fn inject_v3_ticks_with_base(
         &mut self,
         pool_address: Address,
@@ -1619,11 +1636,13 @@ impl EvmCache {
     }
 
     /// Get a reference to the V3 tick snapshot cache.
+    #[cfg(feature = "protocols")]
     pub fn tick_snapshot_cache(&self) -> &V3TickSnapshotCache {
         &self.tick_snapshot_cache
     }
 
     /// Get a mutable reference to the V3 tick snapshot cache.
+    #[cfg(feature = "protocols")]
     pub fn tick_snapshot_cache_mut(&mut self) -> &mut V3TickSnapshotCache {
         &mut self.tick_snapshot_cache
     }

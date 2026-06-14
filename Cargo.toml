@@ -15,6 +15,14 @@ documentation = "https://docs.rs/evm-fork-cache"
 # ancestor-directory workspace and gives it its own Cargo.lock.
 [workspace]
 
+[features]
+# `protocols` gates DeFi protocol knowledge (Uniswap V2/V3-style storage layouts,
+# V3 tick snapshots, and the `inject_v3_*` / `inject_v2_pool_metadata` helpers).
+# On by default; build with `--no-default-features` for the generic engine alone.
+# This surface is slated to move into the `evm-amm-state` crate.
+default = ["protocols"]
+protocols = []
+
 [dependencies]
 alloy-consensus = "1.1.2"
 alloy-contract = "1.0.38"

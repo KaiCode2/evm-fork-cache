@@ -70,7 +70,7 @@ RPC node                     Event-driven sync  ← WS logs · new block
 | Phase | Scope | Status |
 | --- | --- | --- |
 | **0** | API hygiene + correctness: drop `amms`, fix `set_block` divergence + `block_in_place` panic, commit the tree. | **Done** (`p0-oss-prep`) |
-| **1** | Engine seam: typed errors, configurable tx/block env, hot-path benches, builder, `protocols` feature. | **In progress** (`phase-1-engine-seam`) |
+| **1** | Engine seam: typed errors, configurable tx/block env, hot-path benches, builder, `protocols` feature. | **Done** (`phase-1-engine-seam`) |
 | **2** | Freshness core (Pillar C): `Validity` + `FreshnessRegistry`; `on_new_block` purge; pin immutables. | Planned |
 | **3** | State-update primitives (Pillar B.1): `StateUpdate` + targeted writers; refold `inject_*`; surface state-diff output. | Planned |
 | **4** | Event pipeline + adapters (Pillar B.2): `EventDecoder` trait, V3 adapter, WS ingestion loop, reorg handling. | Planned |
@@ -147,17 +147,24 @@ the Pillar A rewrite. These are the breaking changes that must precede a 1.0.
   Generic machinery (errors, create3, access sets, multicall, ERC20 helpers,
   the cache core, `CacheConfig`, token-decimals cache) stays always-on.
 - **Files:** `Cargo.toml`, `src/lib.rs`, `src/cache/mod.rs`, `src/cache/storage_keys.rs`.
-- **Note:** full extraction of pool *metadata* (V2/V3/Balancer structs, currently
-  entangled with `ImmutableDataCache`) and the no-provider `default-features = false`
-  build are deferred — they complete when this surface moves to `evm-amm-state`.
-- **Done when:** `cargo build` (default) and `cargo build --no-default-features`
-  both succeed; clippy green for both.
+- **Done:** `mod storage_keys` / `mod tick_snapshot`, their re-exports, the
+  `tick_snapshot_cache` field + its construction/save, the `inject_v2_pool_metadata`
+  / `inject_v3_*` methods, and `CacheConfig::tick_snapshot_cache_path` are all
+  gated behind `protocols` (default on). The library builds and lints cleanly
+  with `--no-default-features` (CI enforces `cargo clippy --lib
+  --no-default-features -- -D warnings`).
+- **Deferred (next, with the `evm-amm-state` move):** the in-crate *unit tests*
+  that exercise the tick math still assume the default feature, so
+  `cargo test --no-default-features` is not yet supported (gate or relocate those
+  tests). Pool *metadata* structs (`V2/V3/BalancerPoolMetadata`, entangled with
+  `ImmutableDataCache`) stay always-on for now, as does the full no-provider build
+  (making revm/foundry-fork-db/alloy-provider optional behind an `rpc` feature).
 
-### Phase 1 acceptance
+### Phase 1 acceptance — met
 
-`cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` (default and
-`--no-default-features`), `cargo test`, `RUSTDOCFLAGS=-D warnings cargo doc`, and
-all examples/benches build.
+`cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` (default),
+`cargo clippy --lib --no-default-features -- -D warnings`, `cargo test`,
+`RUSTDOCFLAGS=-D warnings cargo doc`, and all examples/benches build.
 
 ---
 

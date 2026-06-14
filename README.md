@@ -136,6 +136,14 @@ decoding, storage-key derivation, CREATE3, and access-list bookkeeping):
 cargo bench
 ```
 
+## Cargo features
+
+- `protocols` *(default)* — DeFi protocol knowledge: Uniswap V2/V3-style storage
+  layouts, V3 tick snapshots, and the `inject_v3_*` / `inject_v2_pool_metadata`
+  helpers. Build with `--no-default-features` for the generic simulation engine
+  alone (the revert decoder, snapshots/overlays, ERC20 helpers, multicall, deploy,
+  CREATE3). This surface is slated to move into a separate `evm-amm-state` crate.
+
 ## License
 
 Licensed under either of
