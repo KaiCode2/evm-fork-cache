@@ -1,0 +1,388 @@
+//! Storage-slot change-frequency tracking and freshness heuristics.
+//!
+//! To decide which cached storage slots can be reused and which must be
+//! re-fetched, this module records how often each observed slot changes over
+//! time. Slots that change frequently are rechecked sooner; stable slots are
+//! trusted longer (subject to a maximum age). The observations are persisted to
+//! disk so the heuristics survive across runs.
+
+use std::{
+    collections::HashMap,
+    path::Path,
+    time::{SystemTime, UNIX_EPOCH},
+};
+
+use alloy_primitives::{Address, U256};
+use serde::{Deserialize, Serialize};
+use tracing::{debug, warn};
+
+/// Minimum observations before we trust the change frequency data.
+const MIN_OBSERVATIONS: u32 = 10;
+
+/// Maximum time (seconds) to reuse a cached slot value before rechecking.
+/// Even never-changed slots get rechecked after 1 week.
+const MAX_REUSE_SECS: u64 = 7 * 86400;
+
+/// Refetch threshold: if expected probability of change exceeds this, refetch.
+const STALENESS_THRESHOLD: f64 = 0.05;
+
+/// Slots that change more than 90% of the time are always refetched.
+const ALWAYS_REFETCH_RATE: f64 = 0.9;
+
+/// Estimated cycle interval in seconds (used for probabilistic model).
+const ESTIMATED_CYCLE_SECS: f64 = 60.0;
+
+/// Per-slot observation record, persisted to disk.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct SlotObservation {
+    pub last_value: U256,
+    pub observation_count: u32,
+    pub change_count: u32,
+    /// Unix timestamp of most recent observation.
+    pub last_checked: u64,
+    /// Unix timestamp of most recent value change.
+    pub last_changed: u64,
+}
+
+/// Serializable key type for bincode persistence.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Hash)]
+struct SlotKey {
+    address: Address,
+    slot: U256,
+}
+
+/// Tracks per-slot change frequency to drive intelligent purge decisions.
+///
+/// Before purging a slot, check `should_refetch()`. Slots that rarely change
+/// are kept in the EVM cache, avoiding unnecessary RPC calls. On simulation
+/// revert, `take_skipped()` returns all slots that were kept, allowing a
+/// full-refresh fallback.
+pub struct SlotObservationTracker {
+    observations: HashMap<SlotKey, SlotObservation>,
+    /// Slots skipped (not purged) this cycle — kept for revert fallback.
+    skipped_this_cycle: Vec<(Address, U256)>,
+    dirty: bool,
+}
+
+impl SlotObservationTracker {
+    pub fn new() -> Self {
+        Self {
+            observations: HashMap::new(),
+            skipped_this_cycle: Vec::new(),
+            dirty: false,
+        }
+    }
+
+    /// Load persisted observations from disk (bincode format).
+    /// Returns a fresh tracker if the file doesn't exist or can't be decoded.
+    pub fn load(path: &Path) -> Self {
+        match std::fs::read(path) {
+            Ok(data) => match bincode::deserialize::<HashMap<SlotKey, SlotObservation>>(&data) {
+                Ok(observations) => {
+                    debug!(
+                        entries = observations.len(),
+                        "Loaded slot observation tracker"
+                    );
+                    Self {
+                        observations,
+                        skipped_this_cycle: Vec::new(),
+                        dirty: false,
+                    }
+                }
+                Err(e) => {
+                    warn!(?e, "Failed to decode slot observations, starting fresh");
+                    Self::new()
+                }
+            },
+            Err(_) => {
+                debug!("No slot observations file found, starting fresh");
+                Self::new()
+            }
+        }
+    }
+
+    /// Persist observations to disk. Called at end of cycle or on shutdown.
+    pub fn save(&mut self, path: &Path) -> anyhow::Result<()> {
+        if !self.dirty {
+            return Ok(());
+        }
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let data = bincode::serialize(&self.observations)?;
+        std::fs::write(path, data)?;
+        self.dirty = false;
+        debug!(entries = self.observations.len(), "Saved slot observations");
+        Ok(())
+    }
+
+    /// Core decision: should we re-fetch this slot from RPC?
+    ///
+    /// Returns `true` if the slot should be purged and re-fetched.
+    /// Returns `false` if the cached value is likely still valid.
+    pub fn should_refetch(&self, addr: Address, slot: U256) -> bool {
+        let key = SlotKey {
+            address: addr,
+            slot,
+        };
+        let Some(obs) = self.observations.get(&key) else {
+            return true; // never observed → must fetch
+        };
+
+        let now = unix_now();
+
+        // Always refetch if insufficient data to make predictions
+        if obs.observation_count < MIN_OBSERVATIONS {
+            return true;
+        }
+
+        // Always refetch if last check was > 1 week ago
+        if now.saturating_sub(obs.last_checked) > MAX_REUSE_SECS {
+            return true;
+        }
+
+        // Never-changed slots: reuse up to the 1-week max
+        if obs.change_count == 0 {
+            return false;
+        }
+
+        let change_rate = obs.change_count as f64 / obs.observation_count as f64;
+
+        // Always-changing slots: always refetch
+        if change_rate > ALWAYS_REFETCH_RATE {
+            return true;
+        }
+
+        // Probabilistic: estimate expected changes since last check
+        let secs_elapsed = now.saturating_sub(obs.last_checked) as f64;
+        let cycles_elapsed = (secs_elapsed / ESTIMATED_CYCLE_SECS).max(1.0);
+        let expected_changes = change_rate * cycles_elapsed;
+        expected_changes > STALENESS_THRESHOLD
+    }
+
+    /// Record a fresh observation after re-fetch or injection.
+    ///
+    /// Returns `true` if the value changed from the last observation.
+    pub fn observe(&mut self, addr: Address, slot: U256, value: U256) -> bool {
+        let key = SlotKey {
+            address: addr,
+            slot,
+        };
+        let now = unix_now();
+        self.dirty = true;
+
+        match self.observations.get_mut(&key) {
+            Some(obs) => {
+                let changed = obs.last_value != value;
+                obs.observation_count += 1;
+                if changed {
+                    obs.change_count += 1;
+                    obs.last_changed = now;
+                    obs.last_value = value;
+                }
+                obs.last_checked = now;
+                changed
+            }
+            None => {
+                self.observations.insert(
+                    key,
+                    SlotObservation {
+                        last_value: value,
+                        observation_count: 1,
+                        change_count: 0, // first observation = baseline, not a "change"
+                        last_checked: now,
+                        last_changed: 0,
+                    },
+                );
+                false
+            }
+        }
+    }
+
+    /// Record that a slot was skipped (not purged) this cycle.
+    /// Used for revert fallback: if simulation fails, these slots need re-fetching.
+    pub fn record_skip(&mut self, addr: Address, slot: U256) {
+        self.skipped_this_cycle.push((addr, slot));
+    }
+
+    /// Take all slots skipped this cycle (for revert recovery).
+    /// Clears the internal list.
+    pub fn take_skipped(&mut self) -> Vec<(Address, U256)> {
+        std::mem::take(&mut self.skipped_this_cycle)
+    }
+
+    /// Reset all observations for a contract address.
+    /// Called after a simulation revert to force full refresh next cycle.
+    pub fn reset_contract(&mut self, addr: Address) {
+        self.observations.retain(|k, _| k.address != addr);
+        self.dirty = true;
+    }
+
+    /// Clear cycle-specific state. Call at the start of each cycle.
+    pub fn begin_cycle(&mut self) {
+        self.skipped_this_cycle.clear();
+    }
+
+    /// Number of tracked slot observations.
+    pub fn len(&self) -> usize {
+        self.observations.len()
+    }
+
+    /// Returns true if no slots are being tracked.
+    pub fn is_empty(&self) -> bool {
+        self.observations.is_empty()
+    }
+
+    /// Returns the last observed value for a slot, if any.
+    pub fn last_value(&self, addr: Address, slot: U256) -> Option<U256> {
+        let key = SlotKey {
+            address: addr,
+            slot,
+        };
+        self.observations.get(&key).map(|o| o.last_value)
+    }
+}
+
+impl Default for SlotObservationTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn addr(n: u8) -> Address {
+        Address::new([n; 20])
+    }
+
+    #[test]
+    fn test_unknown_slot_always_refetches() {
+        let tracker = SlotObservationTracker::new();
+        assert!(tracker.should_refetch(addr(1), U256::from(0)));
+    }
+
+    #[test]
+    fn test_insufficient_observations_refetches() {
+        let mut tracker = SlotObservationTracker::new();
+        let a = addr(1);
+        let slot = U256::from(4);
+        // Record fewer than MIN_OBSERVATIONS observations
+        for _ in 0..(MIN_OBSERVATIONS - 1) {
+            tracker.observe(a, slot, U256::from(42));
+        }
+        assert!(tracker.should_refetch(a, slot));
+    }
+
+    #[test]
+    fn test_never_changed_slot_skips_refetch() {
+        let mut tracker = SlotObservationTracker::new();
+        let a = addr(1);
+        let slot = U256::from(4);
+        let value = U256::from(42);
+        // Build up enough observations with the same value
+        for _ in 0..MIN_OBSERVATIONS {
+            tracker.observe(a, slot, value);
+        }
+        assert!(!tracker.should_refetch(a, slot));
+    }
+
+    #[test]
+    fn test_always_changing_slot_refetches() {
+        let mut tracker = SlotObservationTracker::new();
+        let a = addr(1);
+        let slot = U256::from(4);
+        // Record MIN_OBSERVATIONS observations, each with a different value
+        for i in 0..(MIN_OBSERVATIONS + 1) {
+            tracker.observe(a, slot, U256::from(i));
+        }
+        assert!(tracker.should_refetch(a, slot));
+    }
+
+    #[test]
+    fn test_observe_returns_changed() {
+        let mut tracker = SlotObservationTracker::new();
+        let a = addr(1);
+        let slot = U256::from(0);
+        assert!(!tracker.observe(a, slot, U256::from(1))); // first = baseline
+        assert!(!tracker.observe(a, slot, U256::from(1))); // same
+        assert!(tracker.observe(a, slot, U256::from(2))); // changed
+        assert!(!tracker.observe(a, slot, U256::from(2))); // same again
+    }
+
+    #[test]
+    fn test_reset_contract_clears_observations() {
+        let mut tracker = SlotObservationTracker::new();
+        let a = addr(1);
+        for i in 0..MIN_OBSERVATIONS {
+            tracker.observe(a, U256::from(i), U256::from(42));
+        }
+        assert!(!tracker.is_empty());
+        tracker.reset_contract(a);
+        assert_eq!(tracker.len(), 0);
+        // After reset, should_refetch returns true
+        assert!(tracker.should_refetch(a, U256::from(0)));
+    }
+
+    #[test]
+    fn test_skipped_slots_tracking() {
+        let mut tracker = SlotObservationTracker::new();
+        tracker.begin_cycle();
+        tracker.record_skip(addr(1), U256::from(0));
+        tracker.record_skip(addr(1), U256::from(4));
+        tracker.record_skip(addr(2), U256::from(8));
+
+        let skipped = tracker.take_skipped();
+        assert_eq!(skipped.len(), 3);
+        // After take, list is empty
+        assert!(tracker.take_skipped().is_empty());
+    }
+
+    #[test]
+    fn test_begin_cycle_clears_skipped() {
+        let mut tracker = SlotObservationTracker::new();
+        tracker.record_skip(addr(1), U256::from(0));
+        tracker.begin_cycle();
+        assert!(tracker.take_skipped().is_empty());
+    }
+
+    #[test]
+    fn test_save_load_round_trip() {
+        let dir = std::env::temp_dir().join("evm_fork_cache_test_slot_obs");
+        let path = dir.join("test_observations.bin");
+        let _ = std::fs::remove_file(&path);
+
+        let mut tracker = SlotObservationTracker::new();
+        let a = addr(1);
+        tracker.observe(a, U256::from(0), U256::from(100));
+        tracker.observe(a, U256::from(4), U256::from(200));
+        tracker.save(&path).unwrap();
+
+        let loaded = SlotObservationTracker::load(&path);
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded.last_value(a, U256::from(0)), Some(U256::from(100)));
+        assert_eq!(loaded.last_value(a, U256::from(4)), Some(U256::from(200)));
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn test_last_value() {
+        let mut tracker = SlotObservationTracker::new();
+        let a = addr(1);
+        assert_eq!(tracker.last_value(a, U256::from(0)), None);
+        tracker.observe(a, U256::from(0), U256::from(42));
+        assert_eq!(tracker.last_value(a, U256::from(0)), Some(U256::from(42)));
+        tracker.observe(a, U256::from(0), U256::from(99));
+        assert_eq!(tracker.last_value(a, U256::from(0)), Some(U256::from(99)));
+    }
+}

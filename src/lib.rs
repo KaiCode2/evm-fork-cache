@@ -1,0 +1,36 @@
+//! Forked EVM state cache and simulation utilities for DeFi search.
+//!
+//! `evm-fork-cache` is a support layer for simulating EVM transactions against
+//! recent on-chain state without re-deriving it on every call. It builds on
+//! `revm` and `foundry-fork-db` to provide a lazy-loading state cache,
+//! immutable snapshots that can be shared across threads, per-simulation
+//! overlays, and a set of helpers for the kinds of state manipulation a search
+//! loop needs (overriding ERC20 balances by scanning for the balance slot,
+//! batched `eth_call` multicalls, Foundry-style bytecode etching, and CREATE3
+//! address derivation).
+//!
+//! The entry point is [`cache::EvmCache`]: construct one over an RPC backend,
+//! then snapshot it with [`cache::EvmCache::create_snapshot`] to fan out
+//! parallel simulations, each driving its own [`cache::EvmOverlay`].
+//!
+//! Other modules:
+//! - [`access_list`] / [`access_set`] — EIP-2930 access-list construction and
+//!   warm-slot tracking for gas estimation.
+//! - [`errors`] — structured simulation errors and revert-reason decoding.
+//! - [`inspector`] — an `Inspector` that captures ERC20 `Transfer` events to
+//!   reconstruct balance deltas from a simulation.
+//! - [`multicall`] — batched read-only calls.
+//! - [`deploy`] / [`create3`] — contract deployment and CREATE3 address math.
+//! - [`prefetch_registry`] — two-stage storage-slot pre-warming.
+
+pub mod access_list;
+pub mod access_set;
+pub mod cache;
+pub mod create3;
+pub mod deploy;
+pub mod errors;
+pub mod inspector;
+pub mod multicall;
+pub mod prefetch_registry;
+
+pub use access_set::StorageAccessList;
