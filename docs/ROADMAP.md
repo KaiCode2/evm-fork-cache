@@ -168,6 +168,132 @@ the Pillar A rewrite. These are the breaking changes that must precede a 1.0.
 
 ---
 
+## Phase 2 — freshness core (detailed, decisions locked)
+
+Builds the freshness/invalidation control plane **and** the optimistic
+verify-and-rerun execution loop on top of it. Out of scope: event-derived
+*writes* (Phase 3), the WS ingestion loop and reorg handling (Phase 4).
+
+### Locked decisions
+
+1. **`Validity` has three variants** (`EventDriven` dropped — folded into
+   `Pinned`): `Pinned` (caller-owned: immutable or kept fresh via event writes;
+   the freshness system never touches it), `Volatile` (governed by the active
+   policy), `ValidThrough(block)` (pinned until block N, then volatile). Default
+   is `Volatile`, configurable.
+2. **Optimistic verify-and-rerun is in scope.** Don't block on a purge: snapshot,
+   run sims, and concurrently re-fetch the volatile slots they read (scoped by the
+   `TxConfig.access_list`); on a value mismatch, refresh and re-run only the
+   affected sims. Correctness is independent of access-list completeness (the
+   post-sim actual read-set is re-verified before results are trusted).
+3. **Adaptive freshness via the (revived) `SlotObservationTracker`.** Per-slot
+   `last_value`/`observation_count`/`change_count`/`last_checked`/`last_changed`
+   drive `should_refetch`. Frequently-changing slots are verified often; stable
+   ones rarely.
+4. **Configurable clock, block-based by default.** `SlotObservationTracker` is made
+   clock-agnostic (takes `now: u64`); a `FreshnessClock` supplies it —
+   `BlockClock` (default) or `WallClock` (today's behavior).
+5. **Account-level purge.** A fully-volatile address drops account
+   (balance/nonce/code) + storage via a new `purge_account` primitive; an address
+   with any pinned slot keeps its account and only its volatile slots are purged.
+
+### Four-layer model
+
+| Layer | What | Type |
+| --- | --- | --- |
+| Classification | `Pinned` / `Volatile` / `ValidThrough` per address/slot | `FreshnessRegistry` |
+| Observation | per-slot change-frequency stats (clock-agnostic) | `SlotObservationTracker` (revived) |
+| Policy | which volatile slots to verify this cycle, and how | `FreshnessPolicy` trait |
+| Mechanism | re-fetch+compare, purge, re-run | `EvmCache` + `FreshnessController` |
+
+```rust
+pub enum Validity { Pinned, Volatile, ValidThrough(u64) }   // resolution: slot ▸ account ▸ default
+
+pub trait FreshnessClock { fn now(&self) -> u64; }          // BlockClock (default) | WallClock
+
+pub trait FreshnessPolicy {
+    fn select(&mut self, candidates: &[(Address, U256)],
+              obs: &SlotObservationTracker, now: u64) -> Vec<(Address, U256)>;
+    fn on_new_block(&mut self, block: u64) {}
+}
+// built-ins: AlwaysVerify, ObservationDriven (wraps should_refetch), NeverVerify.
+// tunable heuristics (min-observations, max-reuse, staleness threshold, …) move
+// into a `FreshnessParams` config so users can tune the adaptive model.
+
+pub struct FreshnessController<P: FreshnessPolicy, C: FreshnessClock> { /* registry, tracker, policy, clock, fetcher */ }
+```
+
+### Primitives (on `EvmCache`)
+
+- `verify_slots(&mut self, slots) -> Vec<SlotChange>` — re-fetch current values via
+  the existing batched `StorageBatchFetchFn`, compare to cached values, inject the
+  changed ones, and `observe` each (updating the tracker). Returns the changed set.
+- `purge_account(&mut self, addr)` — remove `addr` from the CacheDB overlay, the
+  BlockchainDb accounts map, and its storage, so the next access re-fetches a clean
+  `AccountInfo`. Distinct from storage-only `purge_pool_storage`.
+
+### Optimistic execution loop with deferred validation (`FreshnessController::run`)
+
+`run` returns a `SpeculativeSim { optimistic, validation }` **as soon as the
+optimistic sims finish** — it does *not* await RPC. The caller computes against
+`optimistic()` immediately and `validate().await`s the verdict when ready.
+
+```rust
+pub struct SpeculativeSim { /* optimistic results + JoinHandle<Validation> */ }
+impl SpeculativeSim {
+    pub fn optimistic(&self) -> &[SimOutcome];
+    pub async fn validate(self) -> Validation;
+}
+pub enum Validation {
+    Confirmed,
+    Corrected { results: Vec<SimOutcome>, changed: Vec<SlotChange> },
+    Unverified { reason: String },
+}
+```
+
+Main thread (`run`): drain pending corrections into the cache → `create_snapshot()`
+→ run optimistic sims (capturing read-sets) → **spawn** the validator with `Send`
+data only (`Arc<EvmSnapshot>`, the `Arc` `StorageBatchFetchFn`, requests, read-sets)
+→ return `SpeculativeSim`.
+
+Background validator (spawned task — never touches the `!Send` cache): `verify_slots`
+the predicted volatile set; reconcile by verifying any volatile slot in the actual
+read-set not yet checked; if nothing changed → `Confirmed`; else build *corrected*
+overlays from the snapshot with the fresh values in their dirty layers, re-run only
+the affected sims → `Corrected { results, changed }`. RPC failure → `Unverified`.
+
+Freshness flow-back: the validator can't mutate the live cache, so `changed` is
+returned **and** queued; the next `run` drains the queue and applies it before
+snapshotting (eventually-fresh, no cross-thread cache mutation). Dropping a
+`SpeculativeSim` aborts the background task.
+
+Correctness rests on the reconcile step (verify the actual read-set); the access
+list only buys the overlap. This `FreshnessController` is the seed of the eventual
+`SimulationEngine`.
+
+### Placement
+
+`src/cache/freshness.rs` (child of `cache` → reads private layers for enumeration);
+`slot_observations.rs` revived + made clock-agnostic; `verify_slots`/`purge_account`
+on `EvmCache`. The whole freshness surface lives under the always-on (non-`protocols`)
+core.
+
+### Tests (offline)
+
+Classification resolution (slot ▸ account ▸ default); observation tracker with an
+injected clock (block-based); each built-in policy's `select`; `verify_slots`
+against a **stubbed** `StorageBatchFetchFn` returning chosen "current" values
+(changed vs unchanged); the full loop — match path (no re-run) and mismatch path
+(refresh + selective re-run of only affected sims); `purge_account` drops account +
+storage on both layers; `ValidThrough` boundary; `WallClock` vs `BlockClock`.
+
+### Acceptance
+
+`cargo fmt --check`, `clippy --all-targets -- -D warnings` (default +
+`--lib --no-default-features`), `cargo test`, `RUSTDOCFLAGS=-D warnings cargo doc`.
+
+---
+
 ## Key abstractions for later phases (sketches)
 
 ```rust
