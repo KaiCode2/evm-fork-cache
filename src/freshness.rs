@@ -279,6 +279,13 @@ impl FreshnessRegistry {
 pub trait FreshnessClock: Send + Sync {
     /// The current clock value (block number or unix seconds).
     fn now(&self) -> u64;
+
+    /// Advance the clock to `now`.
+    ///
+    /// Called by [`FreshnessController::on_new_block`] so the natural API drives
+    /// the clock forward. The default is a no-op (for clocks like [`WallClock`]
+    /// that advance on their own); [`BlockClock`] overrides it to set the block.
+    fn advance(&self, _now: u64) {}
 }
 
 /// Block-number clock (the default). Cloning shares the underlying counter, so a
@@ -307,6 +314,11 @@ impl BlockClock {
 impl FreshnessClock for BlockClock {
     fn now(&self) -> u64 {
         self.0.load(Ordering::Relaxed)
+    }
+
+    /// Set the current block to `now` (shared across clones).
+    fn advance(&self, now: u64) {
+        self.set_block(now);
     }
 }
 
@@ -564,10 +576,11 @@ impl Drop for SpeculativeSim {
 /// Drives the optimistic verify-and-rerun loop over an [`EvmCache`].
 ///
 /// Holds the freshness [`FreshnessRegistry`], the shared
-/// [`SlotObservationTracker`], a [`FreshnessPolicy`], a [`FreshnessClock`], the
-/// [`FreshnessParams`], and the pending-corrections queue. The tracker and the
-/// pending queue are `Arc<Mutex<…>>` so the background validator can update them
-/// without touching the `!Send` cache.
+/// [`SlotObservationTracker`], a [`FreshnessPolicy`], a [`FreshnessClock`], and
+/// the pending-corrections queue. The tracker and the pending queue are
+/// `Arc<Mutex<…>>` so the background validator can update them without touching
+/// the `!Send` cache. Adaptive thresholds ([`FreshnessParams`]) live on the
+/// policy that uses them ([`ObservationDriven`]), not on the controller.
 ///
 /// # Runtime requirement
 /// [`run`](Self::run) spawns a background task and the (synchronous) fetcher uses
@@ -579,7 +592,6 @@ pub struct FreshnessController<P: FreshnessPolicy, C: FreshnessClock> {
     tracker: Arc<Mutex<SlotObservationTracker>>,
     policy: P,
     clock: C,
-    params: FreshnessParams,
     pending: Arc<Mutex<Vec<SlotChange>>>,
 }
 
@@ -598,15 +610,8 @@ impl<P: FreshnessPolicy, C: FreshnessClock> FreshnessController<P, C> {
             tracker: Arc::new(Mutex::new(SlotObservationTracker::new())),
             policy,
             clock,
-            params: FreshnessParams::default(),
             pending: Arc::new(Mutex::new(Vec::new())),
         }
-    }
-
-    /// Replace the [`FreshnessParams`] used by the observation tracker.
-    pub fn with_params(mut self, params: FreshnessParams) -> Self {
-        self.params = params;
-        self
     }
 
     /// Use an existing shared observation tracker (e.g. a persisted one).
@@ -633,12 +638,17 @@ impl<P: FreshnessPolicy, C: FreshnessClock> FreshnessController<P, C> {
     /// Number of corrections waiting to be drained into the cache on the next
     /// [`run`](Self::run).
     pub fn pending_len(&self) -> usize {
-        self.pending.lock().unwrap().len()
+        self.pending.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 
-    /// Advance to a new block: bump a [`BlockClock`] is the caller's job (the
-    /// clock is shared); this notifies the policy.
+    /// Advance to a new block.
+    ///
+    /// Advances the clock to `block` (a no-op for [`WallClock`], a `set_block`
+    /// for [`BlockClock`]) and then notifies the policy. Advancing the clock is
+    /// what ages [`Validity::ValidThrough`] slots into [`Validity::Volatile`] and
+    /// progresses the observation-tracker reuse window through the natural API.
     pub fn on_new_block(&mut self, block: u64) {
+        self.clock.advance(block);
         self.policy.on_new_block(block);
     }
 
@@ -661,7 +671,7 @@ impl<P: FreshnessPolicy, C: FreshnessClock> FreshnessController<P, C> {
 
         // 1. Drain pending corrections into the cache before snapshotting.
         {
-            let mut pending = self.pending.lock().unwrap();
+            let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
             if !pending.is_empty() {
                 let injects: Vec<(Address, U256, U256)> =
                     pending.iter().map(|c| (c.address, c.slot, c.new)).collect();
@@ -708,7 +718,7 @@ impl<P: FreshnessPolicy, C: FreshnessClock> FreshnessController<P, C> {
         }
         let candidates: Vec<(Address, U256)> = candidate_set.into_iter().collect();
         let verify_set = {
-            let tracker = self.tracker.lock().unwrap();
+            let tracker = self.tracker.lock().unwrap_or_else(|e| e.into_inner());
             self.policy.select(&candidates, &tracker, now)
         };
 
@@ -807,7 +817,7 @@ fn run_validator(input: ValidatorInput) -> Validation {
     // Compare against the snapshot, observe each checked slot, collect changes.
     let mut changed = Vec::new();
     {
-        let mut tracker = tracker.lock().unwrap();
+        let mut tracker = tracker.lock().unwrap_or_else(|e| e.into_inner());
         for &(addr, slot) in &verify {
             let new = fresh.get(&(addr, slot)).copied().unwrap_or(U256::ZERO);
             let old = snapshot.storage_value(addr, slot).unwrap_or(U256::ZERO);
@@ -829,7 +839,7 @@ fn run_validator(input: ValidatorInput) -> Validation {
 
     // Queue corrections for flow-back into the cache on the next run.
     {
-        let mut pending = pending.lock().unwrap();
+        let mut pending = pending.lock().unwrap_or_else(|e| e.into_inner());
         pending.extend(changed.iter().cloned());
     }
 
@@ -862,18 +872,26 @@ fn run_validator(input: ValidatorInput) -> Validation {
 
 /// Build a [`CallSimulationResult`] from a non-committing execution result and
 /// its captured access list. `token_deltas` is empty (the optimistic path does
-/// not run transfer tracking); gas and logs come from the execution result.
+/// not run transfer tracking); gas, logs, and return data come from the
+/// execution result. `output` carries the `Success`/`Revert` payload (empty on
+/// `Halt`), so a corrected view-call's new return value is observable here.
 fn result_to_sim(result: ExecutionResult, access_list: &AccessList) -> CallSimulationResult {
-    let (gas_used, logs) = match &result {
-        ExecutionResult::Success { gas_used, logs, .. } => (*gas_used, logs.clone()),
-        ExecutionResult::Revert { gas_used, .. } => (*gas_used, Vec::new()),
-        ExecutionResult::Halt { gas_used, .. } => (*gas_used, Vec::new()),
+    let (gas_used, logs, output) = match result {
+        ExecutionResult::Success {
+            gas_used,
+            logs,
+            output,
+            ..
+        } => (gas_used, logs, output.into_data()),
+        ExecutionResult::Revert { gas_used, output } => (gas_used, Vec::new(), output),
+        ExecutionResult::Halt { gas_used, .. } => (gas_used, Vec::new(), Bytes::new()),
     };
     CallSimulationResult {
         gas_used,
         token_deltas: HashMap::new(),
         logs,
         access_list: access_list.clone(),
+        output,
     }
 }
 

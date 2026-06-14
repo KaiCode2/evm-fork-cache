@@ -336,6 +336,13 @@ pub struct CallSimulationResult {
     /// EIP-2930 access list of all accounts and storage slots touched during simulation.
     /// Extracted from the EVM journaled state after execution.
     pub access_list: AccessList,
+    /// Raw return data of the call.
+    ///
+    /// `Success` carries the returned bytes, `Revert` the revert payload, and
+    /// `Halt` an empty slice. This makes a corrected view-call result observable:
+    /// when a re-run reads a changed slot, the new return value differs here even
+    /// if both runs succeed.
+    pub output: Bytes,
 }
 
 sol!(
@@ -2110,8 +2117,13 @@ impl EvmCache {
             let result = evm
                 .transact_one(tx)
                 .map_err(|e| anyhow!("Failed to transact: {:?}", e))?;
-            let (logs, gas_used) = match result {
-                ExecutionResult::Success { logs, gas_used, .. } => (logs, gas_used),
+            let (logs, gas_used, output) = match result {
+                ExecutionResult::Success {
+                    logs,
+                    gas_used,
+                    output,
+                    ..
+                } => (logs, gas_used, output.into_data()),
                 _ => return Err(anyhow!("Failed to call: {:?}", result)),
             };
 
@@ -2122,11 +2134,11 @@ impl EvmCache {
                 token_deltas.insert(*token, I256::from_raw(post) - I256::from_raw(pre));
             }
 
-            Ok((gas_used, token_deltas, logs))
+            Ok((gas_used, token_deltas, logs, output))
         })();
 
         match result {
-            Ok((gas_used, token_deltas, logs)) => {
+            Ok((gas_used, token_deltas, logs, output)) => {
                 if commit {
                     evm.commit_inner();
                 } else {
@@ -2137,6 +2149,7 @@ impl EvmCache {
                     token_deltas,
                     logs,
                     access_list: AccessList::default(),
+                    output,
                 })
             }
             Err(err) => {
@@ -2175,7 +2188,12 @@ impl EvmCache {
             .map_err(|e| SimError::Other(anyhow!("Failed to transact: {:?}", e)));
 
         match result {
-            Ok(ExecutionResult::Success { logs, gas_used, .. }) => {
+            Ok(ExecutionResult::Success {
+                logs,
+                gas_used,
+                output,
+                ..
+            }) => {
                 // Compute balance deltas from captured transfers
                 let token_deltas = if let Some(token_list) = tokens {
                     evm.inspector.balance_deltas_for_tokens(owner, token_list)
@@ -2206,6 +2224,7 @@ impl EvmCache {
                     token_deltas,
                     logs,
                     access_list,
+                    output: output.into_data(),
                 })
             }
             Ok(ExecutionResult::Revert { gas_used, output }) => {

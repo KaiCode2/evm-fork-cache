@@ -171,7 +171,11 @@ impl SpeculativeSim {
 impl Drop for SpeculativeSim { /* abort the background task */ }
 ```
 `CallSimulationResult` must be `Clone` (verify it already is; add derive if needed)
-so optimistic + corrected copies can coexist and cross the task boundary.
+so optimistic + corrected copies can coexist and cross the task boundary. It also
+carries a `pub output: Bytes` field (the call's raw return data: the `Success`
+payload, the `Revert` payload, or empty on `Halt`), so a corrected **view-call**
+re-run that returns a new value is observable even when both runs succeed —
+`Corrected.results[i].output` differs from `optimistic[i].output`.
 
 ### 4.6 Request
 
@@ -212,10 +216,13 @@ pub struct FreshnessController<P: FreshnessPolicy, C: FreshnessClock> {
     tracker: Arc<Mutex<SlotObservationTracker>>,
     policy: P,
     clock: C,
-    params: FreshnessParams,
     pending: Arc<Mutex<Vec<SlotChange>>>,   // corrections flowing back from bg tasks
 }
 ```
+
+Adaptive thresholds (`FreshnessParams`) are **not** a controller field — they
+live on the policy that consumes them (`ObservationDriven { params }`), so the
+controller never carries an unused copy.
 
 `run(&mut self, cache: &mut EvmCache, requests: Vec<SimRequest>) -> Result<SpeculativeSim>`
 (main thread):
@@ -248,7 +255,11 @@ pub struct FreshnessController<P: FreshnessPolicy, C: FreshnessClock> {
    re-run ones replaced).
 5. On fetcher error → `Validation::Unverified { reason }` (do not trust silently).
 
-`on_new_block(&mut self, block: u64)`: `clock` advance (if `BlockClock`), `policy.on_new_block(block)`.
+`on_new_block(&mut self, block: u64)`: advance the clock via
+`FreshnessClock::advance(block)` (a no-op for `WallClock`, a `set_block` for
+`BlockClock`), then `policy.on_new_block(block)`. Advancing the clock ages
+`ValidThrough` slots into `Volatile` and progresses the reuse window through the
+natural API — callers do not bump a `BlockClock` separately.
 
 **Concurrency notes:** `tracker` and `pending` are `Arc<Mutex<…>>` so the background
 task updates them safely; the live `EvmCache` is never shared across threads.

@@ -226,8 +226,9 @@ pub struct FreshnessController<P: FreshnessPolicy, C: FreshnessClock> { /* regis
 ### Primitives (on `EvmCache`)
 
 - `verify_slots(&mut self, slots) -> Vec<SlotChange>` — re-fetch current values via
-  the existing batched `StorageBatchFetchFn`, compare to cached values, inject the
-  changed ones, and `observe` each (updating the tracker). Returns the changed set.
+  the existing batched `StorageBatchFetchFn`, compare to cached values, and inject the
+  changed ones. Returns the changed set. (It does **not** update the observation
+  tracker — only the background validator observes checked slots.)
 - `purge_account(&mut self, addr)` — remove `addr` from the CacheDB overlay, the
   BlockchainDb accounts map, and its storage, so the next access re-fetches a clean
   `AccountInfo`. Distinct from storage-only `purge_pool_storage`.

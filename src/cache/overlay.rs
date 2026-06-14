@@ -255,7 +255,12 @@ impl EvmOverlay {
             .map_err(|e| SimError::Other(anyhow!("Failed to transact: {:?}", e)));
 
         match result {
-            Ok(ExecutionResult::Success { logs, gas_used, .. }) => {
+            Ok(ExecutionResult::Success {
+                logs,
+                gas_used,
+                output,
+                ..
+            }) => {
                 let token_deltas = if let Some(token_list) = tokens {
                     evm.inspector.balance_deltas_for_tokens(owner, token_list)
                 } else {
@@ -276,6 +281,7 @@ impl EvmOverlay {
                     token_deltas,
                     logs,
                     access_list,
+                    output: output.into_data(),
                 })
             }
             Ok(ExecutionResult::Revert { gas_used, output }) => {
