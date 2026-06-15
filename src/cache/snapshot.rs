@@ -1,10 +1,32 @@
 //! Immutable, shareable EVM state snapshots.
 //!
+//! # Flattening model
+//!
 //! A snapshot flattens the live cache (CacheDB overlay plus the BlockchainDb
 //! backend) into a single immutable, `Send + Sync` view of accounts and
-//! storage. Because it is read-only it can be wrapped in an `Arc` and shared
+//! storage. The layered lookups of the live cache are collapsed into flat
+//! `HashMap`s at creation time, so every read against the snapshot is an O(1)
+//! lookup with no locks and no fallback chain.
+//!
+//! # `Arc` sharing
+//!
+//! Because the snapshot is read-only it can be wrapped in an `Arc` and shared
 //! across threads, letting many parallel simulations read from one consistent
-//! state while each layers its own writes through a separate overlay.
+//! state. Handing a new simulation task its state is a cheap `Arc::clone`
+//! rather than a deep copy of the accounts/storage maps.
+//!
+//! # Per-simulation dirty layer
+//!
+//! Each simulation does not mutate the shared snapshot. Instead it wraps the
+//! `Arc<EvmSnapshot>` in an [`EvmOverlay`], which adds a per-simulation
+//! *dirty layer* on top: writes (committed account/storage changes, RPC
+//! fallbacks, freshness overrides) land in the overlay's own maps and take
+//! precedence over the snapshot on subsequent reads. Two overlays built from
+//! the same `Arc<EvmSnapshot>` are fully isolated from one another, so
+//! simulations can run in parallel without contending for or corrupting the
+//! shared base state.
+//!
+//! [`EvmOverlay`]: super::EvmOverlay
 
 use std::collections::HashMap;
 

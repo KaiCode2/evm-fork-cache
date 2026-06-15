@@ -117,6 +117,44 @@ impl SlotObservationTracker {
     /// `now` is the current clock value (block number or unix seconds) and
     /// `params` carries the (clock-unit) thresholds — see
     /// [`crate::freshness::FreshnessParams`].
+    ///
+    /// The heuristic is fully deterministic (no randomness): a never-observed slot
+    /// always refetches, as does one with fewer than
+    /// [`min_observations`](crate::freshness::FreshnessParams::min_observations);
+    /// once enough observations accrue, a never-changed slot is reused until the
+    /// [`max_reuse`](crate::freshness::FreshnessParams::max_reuse) window elapses,
+    /// while changing slots refetch once the probabilistic expected-change estimate
+    /// crosses [`staleness_threshold`](crate::freshness::FreshnessParams::staleness_threshold).
+    ///
+    /// # Examples
+    /// The deterministic threshold edges around a stable (never-changed) slot:
+    ///
+    /// ```
+    /// use alloy_primitives::{Address, U256};
+    /// use evm_fork_cache::cache::SlotObservationTracker;
+    /// use evm_fork_cache::freshness::FreshnessParams;
+    ///
+    /// let params = FreshnessParams::default();
+    /// let mut tracker = SlotObservationTracker::new();
+    /// let addr = Address::repeat_byte(0x01);
+    /// let slot = U256::from(0);
+    ///
+    /// // An unobserved slot must always be fetched.
+    /// assert!(tracker.should_refetch(addr, slot, 0, &params));
+    ///
+    /// // Record fewer than `min_observations` of the same value: still refetches
+    /// // because there is not enough data to trust the change frequency.
+    /// for now in 0..(params.min_observations - 1) {
+    ///     tracker.observe(addr, slot, U256::from(42), now as u64);
+    /// }
+    /// assert!(tracker.should_refetch(addr, slot, params.min_observations as u64, &params));
+    ///
+    /// // One more identical observation reaches `min_observations`; the slot has
+    /// // never changed, so within the reuse window it is now reused (no refetch).
+    /// let last = params.min_observations as u64 - 1;
+    /// tracker.observe(addr, slot, U256::from(42), last);
+    /// assert!(!tracker.should_refetch(addr, slot, last, &params));
+    /// ```
     pub fn should_refetch(
         &self,
         addr: Address,

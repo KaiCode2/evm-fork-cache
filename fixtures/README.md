@@ -14,6 +14,10 @@ deployment helpers without touching a real network.
   token directly at an address via `db_mut().insert_account_info`.
 - `mock_erc20_creation.hex` — creation bytecode, for `deploy_contract`. The
   constructor takes `(string name, string symbol, uint8 decimals)`.
+- `MockERC20.foundry.json` — a minimal Foundry-shaped build artifact wrapping the
+  creation bytecode in `bytecode.object`, used by the `foundry_artifact_etching`
+  example to exercise `deploy::etch_foundry_artifact*` (which load from a JSON
+  artifact on disk). Regenerated from `mock_erc20_creation.hex`.
 
 ### Storage layout
 

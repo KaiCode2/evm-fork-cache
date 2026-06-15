@@ -1,3 +1,16 @@
+//! On-disk cache of contract bytecode, keyed by account address.
+//!
+//! Bytecode is large and immutable for a deployed contract, so it is persisted
+//! in its own file (`bytecodes.bin`) separately from the binary EVM state. On
+//! save we copy the bytecode of every account that has any, and on load these
+//! entries are used to re-seed the `code` of accounts that were restored
+//! without it.
+//!
+//! Each entry's bytes are hex-encoded for the serde representation, but the
+//! file is written as raw bincode with no version header, so a cache written by
+//! an incompatible build fails to decode (cache miss) rather than being
+//! migrated.
+
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -24,6 +37,11 @@ pub(crate) struct BytecodeCache {
 
 impl BytecodeCache {
     /// Load bytecode cache from disk (binary format).
+    ///
+    /// Returns `None` if `path` cannot be read or its contents fail to decode as
+    /// bincode for this type; a decode failure is logged at `warn` level. The
+    /// format carries no version header, so a file from an incompatible build is
+    /// reported as `None`.
     pub(crate) fn load(path: &Path) -> Option<Self> {
         let data = std::fs::read(path).ok()?;
         bincode::deserialize(&data)
@@ -32,6 +50,14 @@ impl BytecodeCache {
     }
 
     /// Save bytecode cache to disk (binary format).
+    ///
+    /// Creates the parent directory if needed, then writes the
+    /// bincode-serialized cache to `path`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the parent directory cannot be created, if bincode
+    /// serialization fails, or if writing the file fails.
     pub(crate) fn save(&self, path: &Path) -> Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -42,6 +68,10 @@ impl BytecodeCache {
     }
 
     /// Merge new bytecodes from a BlockchainDb.
+    ///
+    /// Inserts (or overwrites) an entry for every account that currently has
+    /// non-empty `code`; accounts without loaded code are skipped. Existing
+    /// entries for addresses not present in `db` are left untouched.
     pub(crate) fn merge_from_db(&mut self, db: &BlockchainDb) {
         let accounts = db.accounts().read();
         for (addr, info) in accounts.iter() {
@@ -57,6 +87,86 @@ impl BytecodeCache {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_primitives::{Bytes, U256};
+    use foundry_fork_db::cache::BlockchainDbMeta;
+    use revm::state::{AccountInfo, Bytecode};
+
+    fn temp_path(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("evm_fork_cache_bytecode_{tag}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir.join("bytecodes.bin")
+    }
+
+    #[test]
+    fn save_load_round_trip_through_hex_serde() {
+        let path = temp_path("roundtrip");
+        let addr = Address::repeat_byte(0x42);
+
+        let mut cache = BytecodeCache::default();
+        cache.contracts.insert(
+            addr,
+            BytecodeCacheEntry {
+                bytecode: vec![0x60, 0x00, 0x60, 0x00, 0xf3],
+            },
+        );
+        cache.save(&path).expect("save bytecode cache");
+
+        let loaded = BytecodeCache::load(&path).expect("load bytecode cache");
+        assert_eq!(
+            loaded.contracts.get(&addr).map(|e| e.bytecode.clone()),
+            Some(vec![0x60, 0x00, 0x60, 0x00, 0xf3]),
+            "bytecode survives the hex-encoded round trip"
+        );
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn load_missing_file_is_none() {
+        assert!(BytecodeCache::load(std::path::Path::new("/nonexistent/bytecodes.bin")).is_none());
+    }
+
+    #[test]
+    fn merge_from_db_caches_only_coded_accounts() {
+        let db = BlockchainDb::new(BlockchainDbMeta::default(), None);
+        let coded = Address::repeat_byte(0x01);
+        let eoa = Address::repeat_byte(0x02);
+
+        let code = Bytecode::new_raw(Bytes::from_static(&[0x60, 0x01, 0x60, 0x02, 0x01]));
+        let expected = code.original_byte_slice().to_vec();
+        let code_hash = code.hash_slow();
+        {
+            let mut accounts = db.accounts().write();
+            accounts.insert(
+                coded,
+                AccountInfo {
+                    balance: U256::ZERO,
+                    nonce: 1,
+                    code: Some(code),
+                    code_hash,
+                    account_id: None,
+                },
+            );
+            // An account with no loaded code must be skipped.
+            accounts.insert(eoa, AccountInfo::default());
+        }
+
+        let mut cache = BytecodeCache::default();
+        cache.merge_from_db(&db);
+
+        assert_eq!(cache.contracts.len(), 1, "only the coded account is cached");
+        assert_eq!(
+            cache.contracts.get(&coded).map(|e| e.bytecode.clone()),
+            Some(expected)
+        );
+        assert!(!cache.contracts.contains_key(&eoa));
     }
 }
 

@@ -8,6 +8,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use alloy_eips::BlockId;
 use alloy_primitives::{Address, Bytes, U256, hex};
 use alloy_provider::RootProvider;
 use alloy_provider::network::AnyNetwork;
@@ -102,22 +103,24 @@ pub fn balance_of(cache: &mut EvmCache, token: Address, owner: Address) -> Resul
 /// how an unseen slot reads in a simulation). This is the offline stand-in for
 /// the real RPC batch fetcher.
 pub fn stub_fetcher(values: HashMap<(Address, U256), U256>) -> StorageBatchFetchFn {
-    Arc::new(move |requests: Vec<(Address, U256)>| {
-        requests
-            .into_iter()
-            .map(|(addr, slot)| {
-                let value = values.get(&(addr, slot)).copied().unwrap_or(U256::ZERO);
-                (addr, slot, Ok(value))
-            })
-            .collect()
-    })
+    Arc::new(
+        move |requests: Vec<(Address, U256)>, _block: Option<BlockId>| {
+            requests
+                .into_iter()
+                .map(|(addr, slot)| {
+                    let value = values.get(&(addr, slot)).copied().unwrap_or(U256::ZERO);
+                    (addr, slot, Ok(value))
+                })
+                .collect()
+        },
+    )
 }
 
 /// Build a stub [`StorageBatchFetchFn`] that fails every request.
 ///
 /// Used to exercise the `Unverified` / error paths offline.
 pub fn failing_fetcher() -> StorageBatchFetchFn {
-    Arc::new(|requests: Vec<(Address, U256)>| {
+    Arc::new(|requests: Vec<(Address, U256)>, _block: Option<BlockId>| {
         requests
             .into_iter()
             .map(|(addr, slot)| (addr, slot, Err(anyhow!("stub fetcher error"))))
@@ -135,23 +138,27 @@ pub fn tracking_fetcher(
     values: HashMap<(Address, U256), U256>,
     called: Arc<std::sync::atomic::AtomicBool>,
 ) -> StorageBatchFetchFn {
-    Arc::new(move |requests: Vec<(Address, U256)>| {
-        called.store(true, std::sync::atomic::Ordering::SeqCst);
-        requests
-            .into_iter()
-            .map(|(addr, slot)| {
-                let value = values.get(&(addr, slot)).copied().unwrap_or(U256::ZERO);
-                (addr, slot, Ok(value))
-            })
-            .collect()
-    })
+    Arc::new(
+        move |requests: Vec<(Address, U256)>, _block: Option<BlockId>| {
+            called.store(true, std::sync::atomic::Ordering::SeqCst);
+            requests
+                .into_iter()
+                .map(|(addr, slot)| {
+                    let value = values.get(&(addr, slot)).copied().unwrap_or(U256::ZERO);
+                    (addr, slot, Ok(value))
+                })
+                .collect()
+        },
+    )
 }
 
 /// Build a stub [`StorageBatchFetchFn`] that panics, to exercise the validator's
 /// `JoinError` (`Unverified`) path.
 pub fn panicking_fetcher() -> StorageBatchFetchFn {
     Arc::new(
-        |_requests: Vec<(Address, U256)>| -> Vec<(Address, U256, Result<U256>)> {
+        |_requests: Vec<(Address, U256)>,
+         _block: Option<BlockId>|
+         -> Vec<(Address, U256, Result<U256>)> {
             panic!("panicking fetcher: deliberate failure for the Unverified test")
         },
     )

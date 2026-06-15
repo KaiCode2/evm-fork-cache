@@ -23,10 +23,11 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use alloy_eips::BlockId;
 use alloy_primitives::{Address, Bytes, U256, keccak256};
 use alloy_sol_types::{SolCall, SolValue};
 use anyhow::Result;
-use evm_fork_cache::cache::StorageBatchFetchFn;
+use evm_fork_cache::cache::{SimStatus, StorageBatchFetchFn};
 use evm_fork_cache::freshness::{
     AlwaysVerify, FreshnessController, FreshnessRegistry, SimRequest, Validation,
 };
@@ -60,15 +61,17 @@ async fn main() -> Result<()> {
     // (An unmapped slot reads as zero, matching how a sim reads an unseen slot.)
     let fresh: HashMap<(Address, U256), U256> =
         HashMap::from([((token, owner_slot), U256::from(50))]);
-    let fetcher: StorageBatchFetchFn = Arc::new(move |requests: Vec<(Address, U256)>| {
-        requests
-            .into_iter()
-            .map(|(addr, slot)| {
-                let value = fresh.get(&(addr, slot)).copied().unwrap_or(U256::ZERO);
-                (addr, slot, Ok(value))
-            })
-            .collect()
-    });
+    let fetcher: StorageBatchFetchFn = Arc::new(
+        move |requests: Vec<(Address, U256)>, _block: Option<BlockId>| {
+            requests
+                .into_iter()
+                .map(|(addr, slot)| {
+                    let value = fresh.get(&(addr, slot)).copied().unwrap_or(U256::ZERO);
+                    (addr, slot, Ok(value))
+                })
+                .collect()
+        },
+    );
     cache.set_storage_batch_fetcher(fetcher);
 
     // Classification: the balance slot is volatile (default), and slot 6 (a
@@ -92,7 +95,7 @@ async fn main() -> Result<()> {
     let sim = controller.run(&mut cache, vec![request])?;
 
     let optimistic = &sim.optimistic()[0];
-    let optimistic_succeeded = !optimistic.logs.is_empty();
+    let optimistic_succeeded = matches!(optimistic.status, SimStatus::Success);
     println!("optimistic result (computed immediately, against the snapshot):");
     println!("  gas_used = {}", optimistic.gas_used);
     println!(
@@ -116,7 +119,7 @@ async fn main() -> Result<()> {
                 println!("  {} slot {} : {} -> {}", c.address, c.slot, c.old, c.new);
             }
             let corrected = &results[0];
-            let corrected_succeeded = !corrected.logs.is_empty();
+            let corrected_succeeded = matches!(corrected.status, SimStatus::Success);
             println!(
                 "\ncorrected re-run: gas_used = {}, transfer {} (emitted {} log(s))",
                 corrected.gas_used,

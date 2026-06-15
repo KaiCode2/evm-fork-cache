@@ -4,6 +4,10 @@
 //! On save, we extract accounts (without bytecode) and storage from BlockchainDb
 //! and write a compact binary file. On load, we populate BlockchainDb directly,
 //! then seed bytecodes from the separate bytecodes.bin cache.
+//!
+//! The file format is raw bincode with no version header or magic bytes, so it
+//! is not migratable: a cache written by a build with a different struct layout
+//! decodes as a failure (cache miss) rather than being upgraded in place.
 
 use std::path::Path;
 use std::time::Instant;
@@ -34,7 +38,19 @@ struct BinaryAccountInfo {
 /// Save the current BlockchainDb state to a binary file.
 ///
 /// This extracts accounts (without code) and storage from the MemDb
-/// and serializes them with bincode for fast restoration.
+/// and serializes them with bincode for fast restoration. Bytecode is excluded
+/// and persisted separately to `bytecodes.bin`; the saved account info keeps
+/// only the `code_hash`.
+///
+/// Errors are logged at `warn` level and otherwise swallowed: serialization
+/// failures, parent-directory creation failures, and write failures all return
+/// without signalling to the caller, so a failed save is indistinguishable from
+/// a successful one at the call site.
+///
+/// The on-disk format is raw bincode with no version header, so it is not
+/// forward/backward compatible: a file written by a build with a different
+/// layout will fail to decode on load (treated as a cache miss) rather than
+/// being migrated.
 pub fn save_binary_state(blockchain_db: &BlockchainDb, path: &Path) {
     let start = Instant::now();
 
@@ -91,6 +107,11 @@ pub fn save_binary_state(blockchain_db: &BlockchainDb, path: &Path) {
 /// Returns `true` if the binary state was loaded successfully, `false` otherwise.
 /// When successful, accounts (without code) and storage are populated in the MemDb.
 /// Bytecodes should be seeded separately from bytecodes.bin.
+///
+/// Returns `false` (rather than erroring) when `path` cannot be read or its
+/// contents fail to decode as the expected bincode layout; a decode failure is
+/// logged at `warn` level. Because the format carries no version header, a file
+/// written by an incompatible build is reported as a decode failure here.
 pub fn load_binary_state(blockchain_db: &BlockchainDb, path: &Path) -> bool {
     let start = Instant::now();
 

@@ -18,8 +18,10 @@ use crate::cache::EvmCache;
 /// Multicall3 contract address (same on all EVM chains).
 pub const MULTICALL3_ADDRESS: Address = address!("cA11bde05977b3631167028862bE2a173976CA11");
 
-/// Maximum number of calls to batch in a single multicall.
-/// This prevents hitting gas limits or creating overly large calldata.
+/// Maximum number of calls to batch in a single `aggregate3` invocation.
+///
+/// Caps per-batch gas and calldata size. [`execute_batched`] splits larger call
+/// sets into chunks of at most this many calls.
 pub const MAX_BATCH_SIZE: usize = 200;
 
 sol! {
@@ -44,18 +46,31 @@ sol! {
     }
 }
 
-/// A batch of calls to execute via Multicall3.
+/// A batch of calls to execute in a single `aggregate3` invocation via Multicall3.
+///
+/// Build a batch with [`add`](Self::add) / [`add_call`](Self::add_call), then run
+/// it with [`execute`](Self::execute) or [`execute_tracked`](Self::execute_tracked).
+/// The batch should hold at most [`MAX_BATCH_SIZE`] calls; use [`execute_batched`]
+/// to chunk larger sets automatically.
 pub struct MulticallBatch {
     calls: Vec<IMulticall3::Call3>,
 }
 
 impl MulticallBatch {
     /// Create a new empty batch.
+    ///
+    /// ```
+    /// use evm_fork_cache::multicall::MulticallBatch;
+    ///
+    /// let batch = MulticallBatch::new();
+    /// assert!(batch.is_empty());
+    /// assert_eq!(batch.len(), 0);
+    /// ```
     pub fn new() -> Self {
         Self { calls: Vec::new() }
     }
 
-    /// Create a new batch with pre-allocated capacity.
+    /// Create a new empty batch with room for `capacity` calls before reallocating.
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
             calls: Vec::with_capacity(capacity),
@@ -76,7 +91,12 @@ impl MulticallBatch {
         self
     }
 
-    /// Add a typed call to the batch.
+    /// Add a typed [`SolCall`] to the batch, ABI-encoding its calldata.
+    ///
+    /// Convenience wrapper over [`add`](Self::add) for callers holding a generated
+    /// call type rather than raw bytes. As with `add`, `allow_failure` controls
+    /// whether a revert of this call fails the whole batch (`false`) or surfaces as
+    /// `success = false` in the result (`true`).
     pub fn add_call<C: SolCall>(
         &mut self,
         target: Address,
@@ -86,20 +106,37 @@ impl MulticallBatch {
         self.add(target, call.abi_encode().into(), allow_failure)
     }
 
-    /// Get the number of calls in the batch.
+    /// Number of calls currently in the batch.
     pub fn len(&self) -> usize {
         self.calls.len()
     }
 
-    /// Check if the batch is empty.
+    /// Returns `true` if the batch contains no calls.
     pub fn is_empty(&self) -> bool {
         self.calls.is_empty()
     }
 
-    /// Execute the batch using the provided EvmCache.
+    /// Execute the batch against `cache`, returning one [`IMulticall3::Result`]
+    /// per input call, in order. An empty batch returns an empty vector without
+    /// touching the EVM.
     ///
-    /// Returns a vector of results, one for each call in the batch.
-    /// Failed calls (when allow_failure was true) will have `success = false`.
+    /// Per-call failure is reported in the result's `success` field rather than as
+    /// an `Err`: a call added with `allow_failure = true` that reverts surfaces as
+    /// `success = false` with whatever revert data it returned. The batch as a whole
+    /// is all-or-nothing — a call added with `allow_failure = false` that reverts
+    /// makes the entire `aggregate3` call revert, which is returned here as an `Err`.
+    ///
+    /// Requires Multicall3 to be deployed at [`MULTICALL3_ADDRESS`] on the forked
+    /// chain (it is on virtually all EVM chains).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - the underlying `call_raw` execution does not return
+    ///   [`ExecutionResult::Success`](revm::context::result::ExecutionResult::Success)
+    ///   — e.g. the `aggregate3` call reverted because a call with
+    ///   `allow_failure = false` failed, or Multicall3 is not deployed; or
+    /// - the returned data cannot be ABI-decoded into the expected result list.
     #[instrument(skip(self, cache), fields(batch_size = self.calls.len()))]
     pub fn execute(&self, cache: &mut EvmCache) -> Result<Vec<IMulticall3::Result>> {
         if self.calls.is_empty() {
@@ -132,11 +169,21 @@ impl MulticallBatch {
         }
     }
 
-    /// Execute the batch and return both results and the access list of all
-    /// accounts/storage slots touched during execution.
+    /// Execute the batch and return both the results and the
+    /// [`StorageAccessList`] of all accounts/storage slots touched during
+    /// execution.
     ///
-    /// Same as [`Self::execute`] but uses `call_raw_with_access_list` to capture
-    /// the EVM state touched by the multicall, enabling prefetch on the next cycle.
+    /// Same all-or-nothing batch semantics and Multicall3 deployment requirement
+    /// as [`execute`](Self::execute), but uses `call_raw_with_access_list` to
+    /// capture the EVM state touched by the multicall, enabling prefetch on the
+    /// next cycle. An empty batch returns an empty result list and a default
+    /// (empty) access list.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error under the same conditions as [`execute`](Self::execute):
+    /// the `aggregate3` call did not succeed (revert, or Multicall3 not deployed),
+    /// or the returned data failed to ABI-decode.
     #[instrument(skip(self, cache), fields(batch_size = self.calls.len()))]
     pub fn execute_tracked(
         &self,
@@ -183,8 +230,15 @@ impl Default for MulticallBatch {
 
 /// Execute multiple calls in batches using Multicall3.
 ///
-/// This helper handles splitting large call sets into multiple batches
-/// that respect the MAX_BATCH_SIZE limit.
+/// Splits large call sets into consecutive batches of at most [`MAX_BATCH_SIZE`]
+/// calls, running each via [`MulticallBatch::execute`]. Results are concatenated
+/// in input order. Requires Multicall3 to be deployed at [`MULTICALL3_ADDRESS`]
+/// on the forked chain.
+///
+/// As with a single batch, the all-or-nothing semantics are per-batch: a call
+/// added with `allow_failure = true` that reverts surfaces as `success = false`
+/// in its result, whereas a call with `allow_failure = false` that reverts makes
+/// that batch's `aggregate3` revert (returned here as an `Err`).
 ///
 /// # Arguments
 /// * `cache` - The EvmCache to execute calls on
@@ -192,6 +246,13 @@ impl Default for MulticallBatch {
 ///
 /// # Returns
 /// A vector of results in the same order as the input calls.
+///
+/// # Errors
+///
+/// Returns an error as soon as any chunk's [`MulticallBatch::execute`] fails —
+/// i.e. that chunk's `aggregate3` reverted (a `allow_failure = false` call failed,
+/// or Multicall3 is not deployed) or its return data failed to decode. Results
+/// from earlier successful chunks are discarded.
 #[instrument(skip(cache, calls))]
 pub fn execute_batched<I>(cache: &mut EvmCache, calls: I) -> Result<Vec<IMulticall3::Result>>
 where
@@ -225,7 +286,12 @@ where
     Ok(all_results)
 }
 
-/// Decode a multicall result into the expected return type.
+/// Decode a single multicall [`IMulticall3::Result`] into the call's typed return.
+///
+/// # Errors
+///
+/// Returns an error if `result.success` is `false` (the call reverted), or if
+/// `result.returnData` cannot be ABI-decoded into `C::Return`.
 pub fn decode_result<C: SolCall>(result: &IMulticall3::Result) -> Result<C::Return> {
     if !result.success {
         return Err(anyhow!("Call failed"));
@@ -235,7 +301,8 @@ pub fn decode_result<C: SolCall>(result: &IMulticall3::Result) -> Result<C::Retu
         .map_err(|e| anyhow!("Failed to decode result: {:?}", e))
 }
 
-/// Decode a multicall result, returning None on failure instead of error.
+/// Like [`decode_result`], but returns `None` instead of an `Err` when the call
+/// did not succeed or its return data fails to decode.
 pub fn try_decode_result<C: SolCall>(result: &IMulticall3::Result) -> Option<C::Return> {
     if !result.success {
         return None;

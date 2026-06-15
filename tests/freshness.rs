@@ -10,6 +10,7 @@ mod common;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use alloy_eips::BlockId;
 use alloy_primitives::{Address, Bytes, U256};
 use alloy_sol_types::SolCall;
 use anyhow::Result;
@@ -18,7 +19,9 @@ use common::{
     MOCK_ERC20_BALANCE_SLOT, MockERC20, failing_fetcher, install_default_account,
     install_mock_erc20, panicking_fetcher, setup_cache, stub_fetcher, tracking_fetcher,
 };
-use evm_fork_cache::cache::{EvmCache, EvmOverlay, SlotObservationTracker};
+use evm_fork_cache::cache::{
+    EvmCache, EvmOverlay, SimStatus, SlotObservationTracker, StorageBatchFetchFn,
+};
 use evm_fork_cache::freshness::{
     AlwaysVerify, BlockClock, FreshnessController, FreshnessParams, FreshnessRegistry, NeverVerify,
     ObservationDriven, SimRequest, Validation, WallClock,
@@ -597,6 +600,506 @@ async fn run_drains_pending_on_next_run() -> Result<()> {
     assert!(
         matches!(validation, Validation::Confirmed),
         "{validation:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn run_converges_when_corrected_slot_is_overlay_resident() -> Result<()> {
+    // F1 regression: a correction must reach the layer that *wins* in the
+    // snapshot. When the verified slot lives in the CacheDB overlay (layer 1) —
+    // e.g. seeded via insert_account_storage or written by a committed call —
+    // draining the correction into BlockchainDb (layer 2) alone leaves the stale
+    // overlay value shadowing it, so the cache never converges and re-corrects
+    // forever. This test seeds the balance into the overlay and asserts the
+    // second run both heals the live cache and yields Confirmed.
+    let token = Address::repeat_byte(0x11);
+    let owner = Address::repeat_byte(0x22);
+    let recipient = Address::repeat_byte(0x33);
+
+    let mut cache = setup_cache().await?;
+    install_default_account(&mut cache, Address::ZERO);
+    install_default_account(&mut cache, owner);
+    install_mock_erc20(&mut cache, token);
+
+    let slot = balance_slot_for(owner);
+    // Seed the balance into the OVERLAY (layer 1), not layer 2.
+    cache
+        .db_mut()
+        .insert_account_storage(token, slot, U256::from(1000))?;
+    assert_eq!(
+        cache.cached_storage_value(token, slot),
+        Some(U256::from(1000)),
+        "precondition: overlay holds the seeded value"
+    );
+
+    // Live value is 2000 (changed).
+    cache.set_storage_batch_fetcher(stub_fetcher(HashMap::from([(
+        (token, slot),
+        U256::from(2000),
+    )])));
+
+    let mut controller = FreshnessController::new(FreshnessRegistry::new(), AlwaysVerify);
+
+    // First run: detects the change, queues a correction.
+    let sim = controller.run(
+        &mut cache,
+        vec![SimRequest::new(
+            owner,
+            token,
+            transfer_calldata(recipient, U256::from(100)),
+        )],
+    )?;
+    assert!(matches!(sim.validate().await, Validation::Corrected { .. }));
+    assert_eq!(controller.pending_len(), 1);
+
+    // Second run: drains the correction. It must overwrite the overlay-resident
+    // slot, not just layer 2, so the live cache now reads the fresh value.
+    let sim = controller.run(
+        &mut cache,
+        vec![SimRequest::new(
+            owner,
+            token,
+            transfer_calldata(recipient, U256::from(100)),
+        )],
+    )?;
+    assert_eq!(controller.pending_len(), 0, "pending drained");
+    assert_eq!(
+        cache.cached_storage_value(token, slot),
+        Some(U256::from(2000)),
+        "correction must overwrite the overlay-resident slot, not just layer 2"
+    );
+
+    // The snapshot now matches the fetcher → Confirmed, proving convergence.
+    let validation = sim.validate().await;
+    assert!(
+        matches!(validation, Validation::Confirmed),
+        "must converge, got {validation:?}"
+    );
+    // No background re-run happened on the converged second cycle.
+    assert_eq!(controller.rerun_count(), 1, "only the first cycle re-ran");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn verify_slots_heals_overlay_resident_slot() -> Result<()> {
+    // F1 regression on the synchronous primitive: verify_slots must heal a slot
+    // that lives in the CacheDB overlay, so both cached_storage_value and the
+    // EVM SLOAD path (here, a balanceOf call against a StorageCleared account)
+    // reflect the fresh value, and a re-verify is idempotent.
+    let token = Address::repeat_byte(0x11);
+    let owner = Address::repeat_byte(0x22);
+
+    let mut cache = setup_cache().await?;
+    install_default_account(&mut cache, Address::ZERO); // coinbase, for call_raw
+    install_default_account(&mut cache, owner);
+    install_mock_erc20(&mut cache, token);
+
+    let slot = balance_slot_for(owner);
+    cache
+        .db_mut()
+        .insert_account_storage(token, slot, U256::from(100))?;
+
+    cache.set_storage_batch_fetcher(stub_fetcher(HashMap::from([(
+        (token, slot),
+        U256::from(999),
+    )])));
+
+    let changed = cache.verify_slots(&[(token, slot)])?;
+    assert_eq!(changed.len(), 1, "stale overlay slot detected as changed");
+    assert_eq!(
+        cache.cached_storage_value(token, slot),
+        Some(U256::from(999)),
+        "verify_slots heals the overlay-resident slot"
+    );
+
+    // The synchronous EVM SLOAD path sees the fresh value too: the
+    // StorageCleared overlay account must read the written slot (a value the
+    // delete-the-slot alternative would have turned into a zero read).
+    let balance = common::balance_of(&mut cache, token, owner)?;
+    assert_eq!(
+        balance,
+        U256::from(999),
+        "EVM SLOAD reflects the healed overlay slot"
+    );
+
+    // Converged: a re-verify reports nothing (no perpetual re-change).
+    assert!(
+        cache.verify_slots(&[(token, slot)])?.is_empty(),
+        "overlay slot healed; re-verify is idempotent"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn optimistic_result_reports_status_per_outcome() -> Result<()> {
+    // F6 regression: CallSimulationResult must distinguish Success from Revert
+    // via an explicit status. The old example inferred success from
+    // `!logs.is_empty()`, which misclassifies a zero-log success (a view call)
+    // as a revert.
+    let token = Address::repeat_byte(0x11);
+    let owner = Address::repeat_byte(0x22);
+    let recipient = Address::repeat_byte(0x33);
+
+    let mut cache = setup_cache().await?;
+    install_default_account(&mut cache, Address::ZERO);
+    install_default_account(&mut cache, owner);
+    install_mock_erc20(&mut cache, token);
+    let slot = balance_slot_for(owner);
+    cache.inject_storage_batch(&[(token, slot, U256::from(1000))]);
+    cache.set_storage_batch_fetcher(stub_fetcher(HashMap::from([(
+        (token, slot),
+        U256::from(1000),
+    )])));
+
+    let mut controller = FreshnessController::new(FreshnessRegistry::new(), AlwaysVerify);
+
+    // A balanceOf view call SUCCEEDS but emits NO logs — status must be Success,
+    // not the revert the old logs heuristic would have inferred.
+    let sim = controller.run(
+        &mut cache,
+        vec![SimRequest::new(owner, token, balance_of_calldata(owner))],
+    )?;
+    assert_eq!(sim.optimistic()[0].status, SimStatus::Success);
+    assert!(
+        sim.optimistic()[0].logs.is_empty(),
+        "the view call emits no logs"
+    );
+    assert_eq!(
+        decode_balance(&sim.optimistic()[0].output),
+        U256::from(1000)
+    );
+    sim.into_optimistic();
+
+    // Transferring more than the balance REVERTS — status must be Revert.
+    let sim = controller.run(
+        &mut cache,
+        vec![SimRequest::new(
+            owner,
+            token,
+            transfer_calldata(recipient, U256::from(5000)),
+        )],
+    )?;
+    assert_eq!(sim.optimistic()[0].status, SimStatus::Revert);
+    sim.into_optimistic();
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dropping_after_fetch_started_suppresses_correction() -> Result<()> {
+    // F4: cancellation is best-effort, but once observed at a checkpoint it must
+    // prevent side effects. The fetcher is held inside a barrier so the validator
+    // is provably past `yield_now` and blocked mid-fetch; we drop the sim while it
+    // is blocked, then release it. The post-fetch checkpoint must see the cancel
+    // and NOT queue a correction, even though the balance slot changed.
+    let token = Address::repeat_byte(0x11);
+    let owner = Address::repeat_byte(0x22);
+    let recipient = Address::repeat_byte(0x33);
+
+    let mut cache = setup_cache().await?;
+    install_default_account(&mut cache, Address::ZERO);
+    install_default_account(&mut cache, owner);
+    install_mock_erc20(&mut cache, token);
+    let slot = balance_slot_for(owner);
+    cache.inject_storage_batch(&[(token, slot, U256::from(1000))]);
+
+    // Two rendezvous: R1 = "fetch started", R2 = "released by the test". After R2
+    // the fetcher reports a CHANGED balance, so absent the cancel the validator
+    // would queue a correction.
+    let barrier = Arc::new(std::sync::Barrier::new(2));
+    let fb = Arc::clone(&barrier);
+    let fetcher: StorageBatchFetchFn =
+        Arc::new(move |reqs: Vec<(Address, U256)>, _block: Option<BlockId>| {
+            fb.wait(); // R1
+            fb.wait(); // R2
+            reqs.into_iter()
+                .map(|(a, s)| (a, s, Ok(U256::from(2000))))
+                .collect()
+        });
+    cache.set_storage_batch_fetcher(fetcher);
+
+    let mut controller = FreshnessController::new(FreshnessRegistry::new(), AlwaysVerify);
+    let sim = controller.run(
+        &mut cache,
+        vec![SimRequest::new(
+            owner,
+            token,
+            transfer_calldata(recipient, U256::from(100)),
+        )],
+    )?;
+
+    barrier.wait(); // R1: the validator is now blocked inside the fetcher.
+    drop(sim); // Sets the cancel flag (abort cannot preempt the sync validator).
+    barrier.wait(); // R2: release the fetcher; the validator resumes past the fetch.
+
+    settle().await;
+    assert_eq!(
+        controller.pending_len(),
+        0,
+        "a cancel observed after the fetch must suppress the queued correction"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn run_corrected_rerun_verifies_newly_read_volatile_slot() -> Result<()> {
+    // F2 regression: a correction can flip control flow so the re-run reads a
+    // NEW volatile slot the optimistic run never touched. That slot must itself
+    // be fetched and diffed (fixed-point), or the "corrected" result would still
+    // rest on stale snapshot state.
+    use revm::state::{AccountInfo, Bytecode};
+
+    let mut cache = setup_cache().await?;
+    install_default_account(&mut cache, Address::ZERO);
+    let caller = Address::repeat_byte(0x66);
+    install_default_account(&mut cache, caller);
+
+    // Branchy runtime: load slot 0 (A); if A != 0 return A (reads only slot 0);
+    // else read slot 1 (B) and return it. A correction A: nonzero -> 0 flips the
+    // branch onto slot B, which the optimistic run never read.
+    let contract = Address::repeat_byte(0x55);
+    let code = Bytecode::new_raw(Bytes::from(
+        alloy_primitives::hex::decode("600054806013575060015460005260206000f35b60005260206000f3")
+            .expect("valid runtime hex"),
+    ));
+    let code_hash = code.hash_slow();
+    cache.db_mut().insert_account_info(
+        contract,
+        AccountInfo {
+            balance: U256::ZERO,
+            nonce: 0,
+            code: Some(code),
+            code_hash,
+            account_id: None,
+        },
+    );
+    cache
+        .db_mut()
+        .replace_account_storage(contract, Default::default())
+        .unwrap();
+
+    let slot_a = U256::from(0);
+    let slot_b = U256::from(1);
+    // Snapshot: A = 5 (nonzero) → optimistic takes "return A" and never reads B.
+    cache.inject_storage_batch(&[(contract, slot_a, U256::from(5))]);
+    // Fresh chain: A dropped to 0 (flips the branch) and B is 777.
+    cache.set_storage_batch_fetcher(stub_fetcher(HashMap::from([
+        ((contract, slot_a), U256::from(0)),
+        ((contract, slot_b), U256::from(777)),
+    ])));
+
+    let mut controller = FreshnessController::new(FreshnessRegistry::new(), AlwaysVerify);
+    let sim = controller.run(
+        &mut cache,
+        vec![SimRequest::new(caller, contract, Bytes::new())],
+    )?;
+
+    // Optimistic: A != 0 branch returns 5.
+    assert_eq!(
+        U256::from_be_slice(&sim.optimistic()[0].output),
+        U256::from(5)
+    );
+
+    match sim.validate().await {
+        Validation::Corrected { results, changed } => {
+            let keys: std::collections::HashSet<(Address, U256)> =
+                changed.iter().map(|c| (c.address, c.slot)).collect();
+            assert!(keys.contains(&(contract, slot_a)), "A reported as changed");
+            assert!(
+                keys.contains(&(contract, slot_b)),
+                "B (read only on the corrected branch) must be verified and reported"
+            );
+            assert_eq!(
+                U256::from_be_slice(&results[0].output),
+                U256::from(777),
+                "corrected result must use the FRESH value of the newly-read slot, not stale 0"
+            );
+        }
+        other => panic!("expected Corrected, got {other:?}"),
+    }
+    // The one affected sim, re-run across multiple rounds, is counted once.
+    assert_eq!(controller.rerun_count(), 1);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn overlay_call_with_tx_config_threads_value() -> Result<()> {
+    // F3 regression: the overlay must honor TxConfig.value, not hardcode zero.
+    use evm_fork_cache::cache::TxConfig;
+    use revm::context::result::ExecutionResult;
+    use revm::state::{AccountInfo, Bytecode};
+
+    let mut cache = setup_cache().await?;
+    install_default_account(&mut cache, Address::ZERO);
+    let caller = Address::repeat_byte(0x66);
+    install_default_account(&mut cache, caller);
+
+    // Runtime bytecode that returns msg.value:
+    // CALLVALUE; PUSH1 0; MSTORE; PUSH1 32; PUSH1 0; RETURN.
+    let callee = Address::repeat_byte(0x55);
+    let code = Bytecode::new_raw(Bytes::from(
+        alloy_primitives::hex::decode("3460005260206000f3").expect("valid runtime hex"),
+    ));
+    let code_hash = code.hash_slow();
+    cache.db_mut().insert_account_info(
+        callee,
+        AccountInfo {
+            balance: U256::ZERO,
+            nonce: 0,
+            code: Some(code),
+            code_hash,
+            account_id: None,
+        },
+    );
+    cache
+        .db_mut()
+        .replace_account_storage(callee, Default::default())
+        .unwrap();
+
+    let snapshot = cache.create_snapshot();
+    let mut overlay = EvmOverlay::new(snapshot, None);
+
+    fn returned_value(res: ExecutionResult) -> U256 {
+        match res {
+            ExecutionResult::Success { output, .. } => U256::from_be_slice(&output.into_data()),
+            other => panic!("expected success, got {other:?}"),
+        }
+    }
+
+    // The zero-value shorthand observes value 0.
+    let (res, _) = overlay.call_raw_with_access_list(caller, callee, Bytes::new())?;
+    assert_eq!(returned_value(res), U256::ZERO);
+
+    // The TxConfig variant threads the native value through to CALLVALUE.
+    let tx = TxConfig {
+        value: U256::from(12_345u64),
+        ..Default::default()
+    };
+    let (res, _) = overlay.call_raw_with_access_list_with(caller, callee, Bytes::new(), &tx)?;
+    assert_eq!(returned_value(res), U256::from(12_345u64));
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn run_honors_tx_gas_limit() -> Result<()> {
+    // F3 regression: SimRequest.tx.gas_limit must reach the optimistic call. A
+    // limit well below the ~51k an ERC20 transfer needs (but above intrinsic gas)
+    // halts out-of-gas; ignoring it would run at the default limit → Success.
+    let token = Address::repeat_byte(0x11);
+    let owner = Address::repeat_byte(0x22);
+    let recipient = Address::repeat_byte(0x33);
+
+    let mut cache = setup_cache().await?;
+    install_default_account(&mut cache, Address::ZERO);
+    install_default_account(&mut cache, owner);
+    install_mock_erc20(&mut cache, token);
+    let slot = balance_slot_for(owner);
+    cache.inject_storage_batch(&[(token, slot, U256::from(1000))]);
+    cache.set_storage_batch_fetcher(stub_fetcher(HashMap::from([(
+        (token, slot),
+        U256::from(1000),
+    )])));
+
+    let mut controller = FreshnessController::new(FreshnessRegistry::new(), AlwaysVerify);
+
+    let req = SimRequest::new(owner, token, transfer_calldata(recipient, U256::from(100)))
+        .with_gas_limit(30_000);
+    let sim = controller.run(&mut cache, vec![req])?;
+    assert!(
+        matches!(sim.optimistic()[0].status, SimStatus::Halt { .. }),
+        "gas-bounded transfer must halt, got {:?}",
+        sim.optimistic()[0].status
+    );
+    sim.into_optimistic();
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn validator_fetches_at_snapshot_block_despite_repin() -> Result<()> {
+    // F5 regression: the deferred validator must fetch at the block its snapshot
+    // was built from, even if the cache is re-pinned while validation is pending.
+    // Otherwise it would compare snapshot(N) values against fresh(N+1) values and
+    // emit a spurious Corrected.
+    use alloy_eips::BlockNumberOrTag;
+
+    let token = Address::repeat_byte(0x11);
+    let owner = Address::repeat_byte(0x22);
+    let recipient = Address::repeat_byte(0x33);
+    let slot = balance_slot_for(owner);
+    let n = 100u64;
+    let block_n = BlockId::Number(BlockNumberOrTag::Number(n));
+
+    let mut cache = setup_cache().await?;
+    install_default_account(&mut cache, Address::ZERO);
+    install_default_account(&mut cache, owner);
+    install_mock_erc20(&mut cache, token);
+    cache.set_block(Some(block_n));
+    cache.inject_storage_batch(&[(token, slot, U256::from(1000))]);
+    assert_eq!(
+        cache.cached_storage_value(token, slot),
+        Some(U256::from(1000)),
+        "PRECONDITION: seeded balance present after set_block + inject"
+    );
+
+    // Block-aware fetcher: the snapshot value (1000) at block N, a CHANGED value
+    // (2000) at any other block. Records the block it was asked for, and blocks on
+    // a barrier so the test can repin before the fetch resolves.
+    let barrier = Arc::new(std::sync::Barrier::new(2));
+    let fb = Arc::clone(&barrier);
+    let seen_block: Arc<Mutex<Option<Option<BlockId>>>> = Arc::new(Mutex::new(None));
+    let seen = Arc::clone(&seen_block);
+    let fetcher: StorageBatchFetchFn =
+        Arc::new(move |reqs: Vec<(Address, U256)>, block: Option<BlockId>| {
+            *seen.lock().unwrap() = Some(block);
+            fb.wait(); // R1: fetch entered
+            fb.wait(); // R2: released after the test repins
+            let at_n = block == Some(block_n);
+            reqs.into_iter()
+                .map(|(a, s)| {
+                    // At block N every slot matches the snapshot (sender = 1000,
+                    // everything else = 0) → Confirmed. At any other block the
+                    // sender balance reads as changed (2000) → would be Corrected.
+                    let v = if s == slot {
+                        if at_n {
+                            U256::from(1000)
+                        } else {
+                            U256::from(2000)
+                        }
+                    } else {
+                        U256::ZERO
+                    };
+                    (a, s, Ok(v))
+                })
+                .collect()
+        });
+    cache.set_storage_batch_fetcher(fetcher);
+
+    let mut controller = FreshnessController::new(FreshnessRegistry::new(), AlwaysVerify);
+    let sim = controller.run(
+        &mut cache,
+        vec![SimRequest::new(
+            owner,
+            token,
+            transfer_calldata(recipient, U256::from(100)),
+        )],
+    )?;
+
+    barrier.wait(); // R1: the validator is inside the fetcher.
+    // Re-pin the cache to N+1 while validation is still outstanding.
+    cache.set_block(Some(BlockId::Number(BlockNumberOrTag::Number(n + 1))));
+    barrier.wait(); // R2: release the fetcher.
+
+    let verdict = sim.validate().await;
+    assert!(
+        matches!(verdict, Validation::Confirmed),
+        "validator must fetch at the snapshot's block N, not the re-pinned N+1; got {verdict:?}"
+    );
+    assert_eq!(
+        *seen_block.lock().unwrap(),
+        Some(Some(block_n)),
+        "the fetch must be pinned to the snapshot block N"
     );
     Ok(())
 }

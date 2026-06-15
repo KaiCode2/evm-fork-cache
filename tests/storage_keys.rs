@@ -1,5 +1,10 @@
 //! Tests for the Uniswap V3-style storage-key derivation helpers, exercised
 //! through their public re-export path so the coverage travels with the crate.
+//!
+//! Gated on the `protocols` feature: the helpers under test are only compiled
+//! (and re-exported) when that feature is on, so without it this whole file is
+//! cfg'd out rather than failing to build under `--no-default-features`.
+#![cfg(feature = "protocols")]
 
 use alloy_primitives::U256;
 use evm_fork_cache::cache::{v3_tick_bitmap_storage_key, v3_tick_info_storage_keys};

@@ -26,6 +26,10 @@ use crate::cache::EvmCache;
 const ARB_GAS_INFO: Address = address!("000000000000000000000000000000000000006C");
 
 /// Optimism GasPriceOracle predeploy (Bedrock+).
+///
+/// Fixed predeploy address on every OP Stack chain. Queried for the L1 base fee
+/// ([`query_l1_base_fee_for_chain`]) and the full Ecotone L1 data fee
+/// ([`compute_op_l1_fee`]).
 pub const OP_GAS_PRICE_ORACLE: Address = address!("420000000000000000000000000000000000000F");
 
 /// Chain fee model used when deciding whether an access list is worth posting.
@@ -70,11 +74,20 @@ pub struct SmartAccessList {
 
 impl SmartAccessList {
     /// Create an empty smart access-list builder.
+    ///
+    /// Populate it with [`SmartAccessList::add_address`] and
+    /// [`SmartAccessList::add_storage_key`], then finalize with one of the
+    /// `into_access_list_*` methods.
     pub fn new() -> Self {
         Self { items: Vec::new() }
     }
 
     /// Create a builder from precomputed EIP-2930 items.
+    ///
+    /// The items are taken as-is; this constructor does not deduplicate
+    /// addresses or storage keys (unlike [`SmartAccessList::add_address`] and
+    /// [`SmartAccessList::add_storage_key`]). Pass items that are already
+    /// distinct, or rely on downstream encoders to fold duplicates.
     pub fn from_items(items: Vec<AccessListItem>) -> Self {
         Self { items }
     }
@@ -121,11 +134,43 @@ impl SmartAccessList {
     /// Evaluate profitability against current L1/L2 gas prices and return
     /// the access list only if it saves money.
     ///
-    /// Queries the ArbGasInfo precompile for pricing, then compares the
-    /// L2 execution savings (100 gas per entry) against the L1 data cost
-    /// of serializing each entry.
+    /// Queries the Arbitrum `ArbGasInfo` precompile for pricing, then compares
+    /// the L2 execution savings against the estimated L1 data cost of posting
+    /// the serialized list:
     ///
-    /// Returns `Ok(None)` if unprofitable or on pricing query failure.
+    /// - **L2 savings**: `100 gas * entry_count * perArbGas`, where each address
+    ///   and each storage key counts as one entry (the EIP-2929 warm-vs-cold
+    ///   access discount).
+    /// - **L1 cost**: `l1_data_gas * l1_base_fee`, where `l1_data_gas` sums the
+    ///   per-byte calldata gas ([`l1_data_gas_for_bytes`]) of every address and
+    ///   key plus a fixed RLP-framing surcharge.
+    ///
+    /// # Cost model is approximate
+    ///
+    /// The RLP-overhead constants — roughly `4 * 16` gas per address entry,
+    /// `16` gas per storage key, and `3 * 16` gas for the top-level list headers
+    /// — are a deliberate **approximation**, not the exact EIP-2930 RLP
+    /// serialization cost. They assume worst-case non-zero framing bytes and do
+    /// not account for the real RLP length-prefix sizing, address/key sharing,
+    /// or rollup-specific compression. Treat this as a rough profitability gate,
+    /// not a precise gas accounting: a list near the break-even point may be
+    /// classified either way.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` only if the call wrapper itself surfaces a non-recoverable
+    /// error; in practice provider/pricing failures do **not** error.
+    ///
+    /// Returns `Ok(None)` when:
+    /// - the list is empty,
+    /// - the `ArbGasInfo` pricing or L1-base-fee query fails (the error is logged
+    ///   at `debug` and swallowed — see below),
+    /// - either the L2 or L1 gas price reads as zero, or
+    /// - the estimated L1 cost meets or exceeds the L2 savings (not profitable).
+    ///
+    /// A `None` returned because a provider query failed is **indistinguishable**
+    /// from a `None` returned because the list was genuinely unprofitable: both
+    /// surface as a skipped access list, not as an error.
     pub async fn into_access_list_if_profitable<P: Provider>(
         self,
         provider: &P,
@@ -212,7 +257,35 @@ impl SmartAccessList {
 /// but costs L1 data posting gas for its serialized bytes. This function
 /// computes the net and returns the access list only if profitable.
 ///
-/// Returns `Ok(None)` if the list is empty, unprofitable, or pricing queries fail.
+/// This is the free-function counterpart to
+/// [`SmartAccessList::into_access_list_if_profitable`] for a pre-built
+/// [`AccessList`]; the two share the same cost model and break-even comparison.
+///
+/// # Cost model is approximate
+///
+/// As with [`SmartAccessList::into_access_list_if_profitable`], the L1 cost is
+/// estimated from per-byte calldata gas ([`l1_data_gas_for_bytes`]) plus fixed
+/// RLP-framing surcharges (`4 * 16` gas per address, `16` gas per key, `3 * 16`
+/// gas for the top-level headers). Those framing constants are an
+/// **approximation**, not the exact EIP-2930 RLP serialization cost: they assume
+/// worst-case non-zero bytes and ignore real length-prefix sizing and
+/// rollup-specific compression. Treat the result as a rough profitability gate.
+///
+/// # Errors
+///
+/// Returns `Err` only if the call wrapper itself surfaces a non-recoverable
+/// error; in practice provider/pricing failures do **not** error.
+///
+/// Returns `Ok(None)` when:
+/// - the list is empty,
+/// - the `ArbGasInfo` pricing or L1-base-fee query fails (the error is logged at
+///   `debug` and swallowed),
+/// - either the L2 or L1 gas price reads as zero, or
+/// - the estimated L1 cost meets or exceeds the L2 savings (not profitable).
+///
+/// A `None` returned because a provider query failed is **indistinguishable**
+/// from a `None` returned because the list was genuinely unprofitable: both
+/// surface as a skipped access list, not as an error.
 pub async fn access_list_if_profitable<P: Provider>(
     access_list: AccessList,
     provider: &P,
@@ -387,6 +460,23 @@ fn push_unique(vec: &mut Vec<B256>, val: B256) {
 }
 
 /// L1 calldata gas for a byte slice: zero bytes = 4 gas, non-zero = 16 gas.
+///
+/// This is the post-EIP-2028 calldata pricing used to approximate the L1 data
+/// cost of serialized access-list entries. It counts the raw bytes only and
+/// does not add any RLP framing overhead.
+///
+/// # Examples
+///
+/// ```
+/// use evm_fork_cache::access_list::l1_data_gas_for_bytes;
+///
+/// // All-zero 32-byte slot: 32 * 4 = 128 gas.
+/// assert_eq!(l1_data_gas_for_bytes(&[0u8; 32]), 128);
+/// // All-non-zero 20-byte address: 20 * 16 = 320 gas.
+/// assert_eq!(l1_data_gas_for_bytes(&[0xFFu8; 20]), 320);
+/// // Empty slice costs nothing.
+/// assert_eq!(l1_data_gas_for_bytes(&[]), 0);
+/// ```
 pub fn l1_data_gas_for_bytes(data: &[u8]) -> u64 {
     data.iter()
         .map(|&b| if b == 0 { 4u64 } else { 16u64 })

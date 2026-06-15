@@ -26,6 +26,7 @@ use std::hint::black_box;
 use std::sync::Arc;
 use std::time::Duration;
 
+use alloy_eips::BlockId;
 use alloy_primitives::{Address, Bytes, U256, hex, keccak256};
 use alloy_provider::RootProvider;
 use alloy_provider::network::AnyNetwork;
@@ -113,7 +114,7 @@ fn stub_fetcher(
     values: HashMap<(Address, U256), U256>,
     delay: Option<Duration>,
 ) -> StorageBatchFetchFn {
-    Arc::new(move |reqs: Vec<(Address, U256)>| {
+    Arc::new(move |reqs: Vec<(Address, U256)>, _block: Option<BlockId>| {
         if let Some(d) = delay {
             std::thread::sleep(d);
         }
@@ -308,5 +309,91 @@ fn bench_phase2_latency(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_phase2_cpu, bench_phase2_latency);
+/// Scaling of the `verify_slots` primitive — the background validator's core
+/// work — as the volatile set grows (1 → 1000 slots). The (zero-latency) stub
+/// reports every slot unchanged, so this isolates the fetch + compare cost from
+/// any injection churn.
+fn bench_verify_slots(c: &mut Criterion) {
+    let rt = current_thread_rt();
+    let contract = Address::repeat_byte(0xDD);
+
+    let mut group = c.benchmark_group("verify_slots");
+    for &n in &[1usize, 10, 100, 1_000] {
+        let slots: Vec<(Address, U256)> =
+            (0..n).map(|i| (contract, U256::from(i as u64))).collect();
+        let values: HashMap<(Address, U256), U256> =
+            slots.iter().map(|&key| (key, U256::from(1u64))).collect();
+
+        let provider = RootProvider::<AnyNetwork>::new(RpcClient::mocked(Asserter::new()));
+        let mut cache = rt.block_on(EvmCache::new(Arc::new(provider), None));
+        // Seed the cached values so the fetched (stub) values match → no change.
+        let seed: Vec<(Address, U256, U256)> = slots
+            .iter()
+            .map(|&(a, s)| (a, s, U256::from(1u64)))
+            .collect();
+        cache.inject_storage_batch(&seed);
+        cache.set_storage_batch_fetcher(stub_fetcher(values, None));
+
+        group.throughput(criterion::Throughput::Elements(n as u64));
+        group.bench_with_input(
+            criterion::BenchmarkId::from_parameter(n),
+            &slots,
+            |b, slots| {
+                b.iter(|| {
+                    black_box(cache.verify_slots(slots).unwrap());
+                })
+            },
+        );
+    }
+    group.finish();
+}
+
+/// Fan-out of the optimistic loop across a batch of K independent sims that all
+/// validate as `Confirmed` (stub reports the read slot unchanged). Shows how the
+/// per-cycle cost scales with the number of candidate transactions — one frozen
+/// snapshot shared across K overlays plus K read-set captures and the unioned
+/// verification.
+fn bench_multi_sim(c: &mut Criterion) {
+    let rt = current_thread_rt();
+    let calldata = transfer_calldata(1);
+
+    let mut group = c.benchmark_group("multi_sim_confirmed");
+    for &k in &[1usize, 4, 16] {
+        group.throughput(criterion::Throughput::Elements(k as u64));
+        group.bench_with_input(
+            criterion::BenchmarkId::from_parameter(format!("{k}sims")),
+            &k,
+            |b, &k| {
+                b.iter_batched(
+                    || {
+                        let mut cache = swap_cache(&rt, 1_000_000);
+                        cache.set_storage_batch_fetcher(fetcher_for(1_000_000, None));
+                        let reqs: Vec<SimRequest> = (0..k)
+                            .map(|_| SimRequest::new(SENDER, TOKEN, calldata.clone()))
+                            .collect();
+                        (cache, controller(), reqs)
+                    },
+                    |(mut cache, mut ctrl, reqs)| {
+                        rt.block_on(async {
+                            let sim = ctrl.run(&mut cache, reqs).unwrap();
+                            let v = sim.validate().await;
+                            debug_assert!(matches!(v, Validation::Confirmed));
+                            black_box(v);
+                        });
+                    },
+                    BatchSize::SmallInput,
+                )
+            },
+        );
+    }
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_phase2_cpu,
+    bench_phase2_latency,
+    bench_verify_slots,
+    bench_multi_sim
+);
 criterion_main!(benches);

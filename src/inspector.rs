@@ -5,6 +5,18 @@
 //! signature, and records each transfer. The captured transfers let callers
 //! compute net balance changes per token and account without re-reading storage
 //! after the call.
+//!
+//! # Parsing assumptions
+//!
+//! Transfers are decoded assuming the standard ERC20 event layout:
+//! `from` and `to` come from the indexed topics (via [`Address::from_word`], i.e.
+//! the low 20 bytes of each 32-byte topic) and `value` is read from the first 32
+//! data bytes. A non-standard or packed `Transfer` event (e.g. one that does not
+//! index `from`/`to`, or packs additional fields into the data) may parse
+//! incorrectly or be silently skipped.
+//!
+//! Balance deltas are computed symmetrically: a self-transfer where `from == to`
+//! is both subtracted and added, netting to zero for that owner.
 
 use std::collections::HashMap;
 
@@ -12,31 +24,56 @@ use alloy_primitives::{Address, B256, I256, Log, U256};
 use revm::Inspector;
 use revm::interpreter::InterpreterTypes;
 
-/// ERC20 Transfer event signature: keccak256("Transfer(address,address,uint256)")
+/// ERC20 `Transfer` event signature: `keccak256("Transfer(address,address,uint256)")`.
+///
+/// A log's first topic must equal this value to be treated as a transfer.
 const TRANSFER_EVENT_SIGNATURE: B256 = B256::new([
     0xdd, 0xf2, 0x52, 0xad, 0x1b, 0xe2, 0xc8, 0x9b, 0x69, 0xc2, 0xb0, 0x68, 0xfc, 0x37, 0x8d, 0xaa,
     0x95, 0x2b, 0xa7, 0xf1, 0x63, 0xc4, 0xa1, 0x16, 0x28, 0xf5, 0x5a, 0x4d, 0xf5, 0x23, 0xb3, 0xef,
 ]);
 
-/// Represents a single ERC20 token transfer
+/// A single ERC20 token transfer decoded from a `Transfer` log.
+///
+/// Fields are populated from the standard ERC20 event layout (see the
+/// [module docs](crate::inspector) for caveats on non-standard events).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TokenTransfer {
+    /// Address of the token contract that emitted the event (the log's address).
     pub token: Address,
+    /// Sender, decoded from the first indexed topic.
     pub from: Address,
+    /// Recipient, decoded from the second indexed topic.
     pub to: Address,
+    /// Amount transferred, decoded from the first 32 data bytes.
     pub value: U256,
 }
 
-/// Inspector that captures ERC20 Transfer events during EVM execution
+/// Inspector that captures ERC20 `Transfer` events during EVM execution.
+///
+/// Attach to a simulation and the [`Inspector::log`] hook records every emitted
+/// log; logs matching the ERC20 `Transfer` layout are additionally decoded into
+/// [`TokenTransfer`]s. Reconstruct net balance changes afterward with
+/// [`balance_deltas`](Self::balance_deltas) or
+/// [`balance_deltas_for_tokens`](Self::balance_deltas_for_tokens), and reuse the
+/// inspector across calls via [`clear`](Self::clear).
 #[derive(Clone, Debug, Default)]
 pub struct TransferInspector {
-    /// All captured token transfers
+    /// Token transfers decoded from captured logs.
     pub transfers: Vec<TokenTransfer>,
-    /// All logs emitted during execution
+    /// Every log emitted during execution, retained for debugging/analysis.
     pub logs: Vec<Log>,
 }
 
 impl TransferInspector {
+    /// Create an empty inspector with no captured transfers or logs.
+    ///
+    /// ```
+    /// use evm_fork_cache::inspector::TransferInspector;
+    ///
+    /// let inspector = TransferInspector::new();
+    /// assert!(inspector.transfers.is_empty());
+    /// assert!(inspector.logs.is_empty());
+    /// ```
     pub fn new() -> Self {
         Self {
             transfers: Vec::new(),
@@ -67,7 +104,29 @@ impl TransferInspector {
         deltas
     }
 
-    /// Filter balance deltas to only include specified tokens
+    /// Like [`balance_deltas`](Self::balance_deltas), but restricted to the
+    /// given set of token addresses.
+    ///
+    /// Tokens in `tokens` with no transfers touching `owner` are simply absent
+    /// from the result; tokens not in `tokens` are excluded even if `owner`
+    /// transacted in them.
+    ///
+    /// ```
+    /// # use evm_fork_cache::inspector::{TransferInspector, TokenTransfer};
+    /// # use alloy_primitives::{Address, I256, U256};
+    /// let mut inspector = TransferInspector::new();
+    /// let token_a = Address::repeat_byte(0xAA);
+    /// let token_b = Address::repeat_byte(0xBB);
+    /// let owner = Address::repeat_byte(0x11);
+    /// let other = Address::repeat_byte(0x22);
+    /// inspector.transfers.push(TokenTransfer { token: token_a, from: owner, to: other, value: U256::from(100u64) });
+    /// inspector.transfers.push(TokenTransfer { token: token_b, from: other, to: owner, value: U256::from(50u64) });
+    ///
+    /// let deltas = inspector.balance_deltas_for_tokens(owner, [token_a]);
+    /// assert_eq!(deltas.len(), 1);
+    /// assert_eq!(deltas.get(&token_a), Some(&(-I256::from_raw(U256::from(100u64)))));
+    /// assert!(!deltas.contains_key(&token_b));
+    /// ```
     pub fn balance_deltas_for_tokens(
         &self,
         owner: Address,
@@ -82,7 +141,8 @@ impl TransferInspector {
             .collect()
     }
 
-    /// Clear all captured data for reuse
+    /// Drop all captured transfers and logs so the inspector can be reused
+    /// across simulations.
     pub fn clear(&mut self) {
         self.transfers.clear();
         self.logs.clear();
@@ -126,10 +186,18 @@ impl TransferInspector {
     }
 }
 
+/// Captures every emitted log via the [`Inspector::log`] hook.
+///
+/// Each log is pushed to [`logs`](TransferInspector::logs); logs whose first
+/// topic matches the ERC20 `Transfer` signature and that carry the standard ERC20
+/// layout are additionally decoded into [`transfers`](TransferInspector::transfers).
+/// Logs that do not match (wrong signature, fewer than three topics, or fewer
+/// than 32 data bytes) are retained in `logs` but produce no transfer.
 impl<CTX, INTR> Inspector<CTX, INTR> for TransferInspector
 where
     INTR: InterpreterTypes,
 {
+    /// Records `log` and, if it parses as an ERC20 `Transfer`, the decoded transfer.
     fn log(&mut self, _context: &mut CTX, log: Log) {
         // Try to parse as ERC20 Transfer event
         if let Some(transfer) = Self::parse_transfer(&log) {

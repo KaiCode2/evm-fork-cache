@@ -15,8 +15,8 @@ use revm::{
     state::{AccountInfo, Bytecode},
 };
 
-use super::CallSimulationResult;
 use super::snapshot::EvmSnapshot;
+use super::{CallSimulationResult, SimStatus, TxConfig};
 use crate::access_set::StorageAccessList;
 use crate::errors::{SimError, SimulationError, SimulationResult};
 use crate::inspector::TransferInspector;
@@ -61,22 +61,36 @@ impl EvmOverlay {
         }
     }
 
-    /// Get the chain ID from the underlying snapshot.
+    /// Chain ID of the block context captured by the underlying snapshot.
+    ///
+    /// This is the value installed into `cfg.chain_id` by [`Self::build_evm`].
     pub fn chain_id(&self) -> u64 {
         self.snapshot.chain_id
     }
 
-    /// Get the block number from the underlying snapshot.
+    /// Block number of the snapshot's block context, or `None` if it was not
+    /// captured.
+    ///
+    /// When present this is the `block.number` simulations run against; when
+    /// `None`, [`Self::build_evm`] leaves revm's default block number in place.
     pub fn block_number(&self) -> Option<u64> {
         self.snapshot.block_number
     }
 
-    /// Get the base fee from the underlying snapshot.
+    /// Base fee of the snapshot's block context, or `None` if it was not
+    /// captured.
+    ///
+    /// Note that base-fee checks are disabled in the simulation EVM, so this is
+    /// informational rather than enforced against the transaction.
     pub fn basefee(&self) -> Option<u64> {
         self.snapshot.basefee
     }
 
-    /// Get the timestamp from the underlying snapshot.
+    /// Timestamp of the snapshot's block context, or `None` if it was not
+    /// captured.
+    ///
+    /// When `None`, [`Self::build_evm`] substitutes the current wall-clock time
+    /// for `block.timestamp`.
     pub fn timestamp(&self) -> Option<u64> {
         self.snapshot.timestamp
     }
@@ -141,7 +155,38 @@ impl EvmOverlay {
         evm
     }
 
-    /// Execute a non-committing call and return the result.
+    /// Execute a non-committing call and return the raw [`ExecutionResult`].
+    ///
+    /// The EVM state is reverted to a checkpoint after execution on *both*
+    /// success and failure, so the call never mutates this overlay's dirty
+    /// layer. Each overlay simulation is therefore isolated: repeated calls all
+    /// observe the same base state.
+    ///
+    /// A revert or halt is *not* an error here — it is reported through the
+    /// returned [`ExecutionResult`] variant. Only failure to build or transact
+    /// the call yields `Err`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the [`TxEnv`] cannot be built from the given inputs,
+    /// or if revm fails to transact the call (for example a database error
+    /// while loading state from the RPC fallback).
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use std::sync::Arc;
+    /// # use alloy_primitives::{Address, Bytes};
+    /// # use evm_fork_cache::cache::{EvmOverlay, EvmSnapshot};
+    /// # fn run(snapshot: Arc<EvmSnapshot>) -> anyhow::Result<()> {
+    /// let mut overlay = EvmOverlay::new(snapshot, None);
+    /// let result = overlay.call_raw(Address::ZERO, Address::ZERO, Bytes::new())?;
+    /// // State is reverted; a second call sees the same base state.
+    /// let _again = overlay.call_raw(Address::ZERO, Address::ZERO, Bytes::new())?;
+    /// # let _ = result;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn call_raw(
         &mut self,
         from: Address,
@@ -224,9 +269,45 @@ impl EvmOverlay {
 
     /// Simulate a call with transfer tracking via the `TransferInspector`.
     ///
-    /// This is the overlay-compatible equivalent of `EvmCache::simulate_with_transfer_tracking`.
-    /// It captures ERC20 Transfer events during execution to compute balance deltas
-    /// without relying on pre/post balance queries.
+    /// This is the overlay-compatible equivalent of
+    /// [`super::EvmCache::simulate_with_transfer_tracking`]. It captures ERC20
+    /// Transfer events during execution to compute balance deltas for `owner`
+    /// (restricted to `tokens` when provided) without relying on pre/post
+    /// balance queries.
+    ///
+    /// On a reverting or halting call the EVM state is reverted to a checkpoint
+    /// before returning, so a failed simulation never mutates this overlay. On
+    /// success the call either commits the journaled changes into the overlay's
+    /// dirty layer (`commit == true`) or reverts them (`commit == false`); a
+    /// non-committing run leaves each overlay simulation isolated from the next.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the [`TxEnv`] cannot be built, if revm fails to
+    /// transact the call, if the call reverts (mapped from the revert payload),
+    /// or if the call halts. In every error case the EVM state is reverted
+    /// first, regardless of `commit`.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use std::sync::Arc;
+    /// # use alloy_primitives::{Address, Bytes};
+    /// # use evm_fork_cache::cache::{EvmOverlay, EvmSnapshot};
+    /// # fn run(snapshot: Arc<EvmSnapshot>, token: Address, owner: Address) -> anyhow::Result<()> {
+    /// let mut overlay = EvmOverlay::new(snapshot, None);
+    /// let sim = overlay.simulate_with_transfer_tracking(
+    ///     owner,
+    ///     token,
+    ///     Bytes::new(),
+    ///     owner,
+    ///     Some([token]),
+    ///     false, // non-committing: state is reverted afterwards
+    /// )?;
+    /// let _delta = sim.token_deltas.get(&token);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn simulate_with_transfer_tracking(
         &mut self,
         from: Address,
@@ -277,6 +358,7 @@ impl EvmOverlay {
                 }
 
                 Ok(CallSimulationResult {
+                    status: SimStatus::Success,
                     gas_used,
                     token_deltas,
                     logs,
@@ -302,18 +384,83 @@ impl EvmOverlay {
         }
     }
 
-    /// Execute a non-committing call and return the result + access list.
+    /// Execute a non-committing call and return the result plus the touched
+    /// [`StorageAccessList`].
+    ///
+    /// The access list is collected from every account marked touched in the
+    /// journaled state after execution, recording both the touched accounts and
+    /// the storage slots accessed under each.
+    ///
+    /// The EVM state is reverted to a checkpoint after a successful transact on
+    /// both success and revert/halt outcomes, so the call never mutates this
+    /// overlay's dirty layer and each overlay simulation stays isolated. As with
+    /// [`Self::call_raw`], a revert or halt is reported through the returned
+    /// [`ExecutionResult`] rather than as an error.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the [`TxEnv`] cannot be built, or if revm fails to
+    /// transact the call (for example a database error while loading state).
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use std::sync::Arc;
+    /// # use alloy_primitives::{Address, Bytes};
+    /// # use evm_fork_cache::cache::{EvmOverlay, EvmSnapshot};
+    /// # fn run(snapshot: Arc<EvmSnapshot>) -> anyhow::Result<()> {
+    /// let mut overlay = EvmOverlay::new(snapshot, None);
+    /// let (result, access_list) =
+    ///     overlay.call_raw_with_access_list(Address::ZERO, Address::ZERO, Bytes::new())?;
+    /// # let _ = (result, access_list);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn call_raw_with_access_list(
         &mut self,
         from: Address,
         to: Address,
         calldata: Bytes,
     ) -> Result<(ExecutionResult, StorageAccessList)> {
-        let tx = TxEnv::builder()
+        self.call_raw_with_access_list_with(from, to, calldata, &TxConfig::default())
+    }
+
+    /// Like [`call_raw_with_access_list`](Self::call_raw_with_access_list) but
+    /// honors a full [`TxConfig`]: native `value`, `gas_limit`, `gas_price`,
+    /// `nonce`, and a pre-warming EIP-2930 `access_list`.
+    ///
+    /// This is what the freshness optimistic loop uses so a [`SimRequest`]'s tx
+    /// environment — e.g. a payable call carrying `value`, or a gas-bounded call
+    /// — is reproduced faithfully instead of silently running as a zero-value,
+    /// default-gas call. Like the shorthand it is non-committing (the checkpoint
+    /// is reverted) and returns the captured storage access list.
+    ///
+    /// [`SimRequest`]: crate::freshness::SimRequest
+    pub fn call_raw_with_access_list_with(
+        &mut self,
+        from: Address,
+        to: Address,
+        calldata: Bytes,
+        tx: &TxConfig,
+    ) -> Result<(ExecutionResult, StorageAccessList)> {
+        let mut builder = TxEnv::builder()
             .caller(from)
             .kind(TxKind::Call(to))
             .data(calldata)
-            .value(U256::ZERO)
+            .value(tx.value);
+        if let Some(gas_limit) = tx.gas_limit {
+            builder = builder.gas_limit(gas_limit);
+        }
+        if let Some(gas_price) = tx.gas_price {
+            builder = builder.gas_price(gas_price);
+        }
+        if let Some(nonce) = tx.nonce {
+            builder = builder.nonce(nonce);
+        }
+        if let Some(access_list) = &tx.access_list {
+            builder = builder.access_list(access_list.clone());
+        }
+        let tx_env = builder
             .build()
             .map_err(|e| anyhow!("Failed to build tx env: {:?}", e))?;
 
@@ -321,7 +468,7 @@ impl EvmOverlay {
         use revm::context_interface::JournalTr;
         let checkpoint = evm.journaled_state.checkpoint();
         let result = evm
-            .transact_one(tx)
+            .transact_one(tx_env)
             .map_err(|e| anyhow!("Failed to transact: {:?}", e))?;
 
         let mut access_list = StorageAccessList::default();
@@ -340,10 +487,35 @@ impl EvmOverlay {
 
     /// Write a storage value into this overlay's dirty layer.
     ///
-    /// The dirty layer takes precedence over the snapshot on subsequent reads,
-    /// so this lets a caller (e.g. the freshness validator) inject a fresh slot
-    /// value into a snapshot-backed overlay before re-running a simulation,
-    /// without mutating the shared snapshot.
+    /// The dirty layer takes precedence over the snapshot on subsequent reads
+    /// (see the lookup order on [`EvmOverlay`]), so this injects a value into a
+    /// snapshot-backed overlay without mutating the shared snapshot.
+    ///
+    /// # Freshness validation
+    ///
+    /// This is the freshness validator's correction step. When a slot the
+    /// snapshot captured is found to be stale, the validator writes the
+    /// freshly-fetched value here and then re-runs the simulation (e.g. via
+    /// [`Self::call_raw`]): the re-run reads the corrected slot out of the dirty
+    /// layer instead of the stale snapshot value, so the corrected result
+    /// becomes observable. Because the override lives only in this overlay,
+    /// other overlays sharing the same `Arc<EvmSnapshot>` are unaffected.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use std::sync::Arc;
+    /// # use alloy_primitives::{Address, Bytes, U256};
+    /// # use evm_fork_cache::cache::{EvmOverlay, EvmSnapshot};
+    /// # fn run(snapshot: Arc<EvmSnapshot>, token: Address, slot: U256) -> anyhow::Result<()> {
+    /// let mut overlay = EvmOverlay::new(snapshot, None);
+    /// // Inject the fresh value, then re-run to observe the corrected result.
+    /// overlay.override_slot(token, slot, U256::from(42u64));
+    /// let corrected = overlay.call_raw(Address::ZERO, token, Bytes::new())?;
+    /// # let _ = corrected;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn override_slot(&mut self, address: Address, slot: U256, value: U256) {
         self.dirty_storage
             .entry(address)

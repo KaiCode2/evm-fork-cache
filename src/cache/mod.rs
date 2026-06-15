@@ -17,6 +17,7 @@ pub use overlay::EvmOverlay;
 pub use slot_observations::SlotObservationTracker;
 pub use snapshot::EvmSnapshot;
 #[cfg(feature = "protocols")]
+#[cfg_attr(docsrs, doc(cfg(feature = "protocols")))]
 pub use storage_keys::{
     PANCAKE_V3_LIQUIDITY_SLOT, PANCAKE_V3_TICK_BITMAP_BASE_SLOT, PANCAKE_V3_TICKS_BASE_SLOT,
     SLIPSTREAM_LIQUIDITY_SLOT, SLIPSTREAM_SLOT0_SLOT, SLIPSTREAM_TICK_BITMAP_BASE_SLOT,
@@ -26,6 +27,7 @@ pub use storage_keys::{
     v3_tick_info_storage_keys_with_base,
 };
 #[cfg(feature = "protocols")]
+#[cfg_attr(docsrs, doc(cfg(feature = "protocols")))]
 pub use tick_snapshot::{SerializableTickInfo, TickInfo, V3PoolTickSnapshot, V3TickSnapshotCache};
 
 use std::{
@@ -86,8 +88,18 @@ pub type RpcCallFn = Arc<dyn Fn(Address, Bytes) -> Result<Bytes> + Send + Sync>;
 /// Used by V3 tick prefetch to avoid 16K+ individual channel round-trips through
 /// SharedBackend. Fires concurrent `eth_getStorageAt` calls directly via the provider
 /// and returns results for bulk injection into BlockchainDb.
-pub type StorageBatchFetchFn =
-    Arc<dyn Fn(Vec<(Address, U256)>) -> Vec<(Address, U256, Result<U256>)> + Send + Sync>;
+///
+/// The second argument pins the fetch to a specific block: `Some(block)` fetches
+/// at exactly that block, while `None` uses the fetcher's configured block (the
+/// cache's currently-pinned block). The freshness validator passes the block its
+/// snapshot was built from, so a concurrent [`EvmCache::set_block`] cannot make
+/// the deferred fetch read a *different* block than the snapshot it is compared
+/// against.
+pub type StorageBatchFetchFn = Arc<
+    dyn Fn(Vec<(Address, U256)>, Option<BlockId>) -> Vec<(Address, U256, Result<U256>)>
+        + Send
+        + Sync,
+>;
 
 /// Return a tokio runtime [`Handle`] suitable for `block_in_place` + `block_on`,
 /// or an error describing why one is unavailable.
@@ -119,12 +131,22 @@ fn block_in_place_handle() -> Result<tokio::runtime::Handle> {
 static CACHE_SPEED_MODE: AtomicU8 = AtomicU8::new(CacheSpeedMode::Slow as u8);
 
 /// Runtime tuning profile for cache-side batch storage fetches.
+///
+/// Selects the per-batch size and concurrency used by [`StorageBatchFetchFn`]:
+/// faster modes send larger batches with more in-flight HTTP requests, slower
+/// modes throttle to avoid RPC rate-limiting (e.g. HTTP 429 on Base). The
+/// selected mode is **process-global** state, set via [`set_cache_speed_mode`]
+/// and read via [`cache_speed_mode`]; it affects every cache in the process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum CacheSpeedMode {
+    /// Largest batches, highest concurrency — fastest, most likely to trip rate limits.
     Fast = 0,
+    /// Moderate batch size and concurrency.
     Normal = 1,
+    /// Conservative batch size and concurrency. The default.
     Slow = 2,
+    /// Smallest batches, single in-flight request — slowest, gentlest on the RPC provider.
     XSlow = 3,
 }
 
@@ -140,12 +162,20 @@ impl CacheSpeedMode {
     }
 }
 
-/// Set the global cache batch-fetch speed profile.
+/// Set the process-global cache batch-fetch speed profile.
+///
+/// This mutates a single static shared by every cache in the process, so it
+/// affects all in-flight and future batch fetches, not just one [`EvmCache`].
+/// Read the current value with [`cache_speed_mode`].
 pub fn set_cache_speed_mode(mode: CacheSpeedMode) {
     CACHE_SPEED_MODE.store(mode as u8, Ordering::Relaxed);
 }
 
-/// Return the current global cache batch-fetch speed profile.
+/// Return the current process-global cache batch-fetch speed profile.
+///
+/// Defaults to [`CacheSpeedMode::Slow`] until changed via
+/// [`set_cache_speed_mode`]. The value is shared across all caches in the
+/// process.
 pub fn cache_speed_mode() -> CacheSpeedMode {
     CacheSpeedMode::from_u8(CACHE_SPEED_MODE.load(Ordering::Relaxed))
 }
@@ -168,15 +198,22 @@ pub enum MissingTargetBehavior {
 /// simulator, so a non-zero `value` does not require the caller to be funded.
 #[derive(Debug, Clone, Default)]
 pub struct TxConfig {
-    /// Native value (wei) sent with the call.
+    /// Native value (wei) sent with the call. Set this to simulate a payable
+    /// function or a native-ETH transfer. Balance checks are disabled in the
+    /// simulator, so the caller need not be funded for a non-zero value.
     pub value: U256,
-    /// Gas limit; `None` uses revm's default.
+    /// Gas limit for the call. `None` uses revm's default. Set this to model a
+    /// gas-bounded call (e.g. to observe out-of-gas behavior).
     pub gas_limit: Option<u64>,
-    /// Gas price (wei); `None` uses revm's default.
+    /// Gas price (wei) for the call. `None` uses revm's default. Rarely needed
+    /// because base-fee checks are disabled in the simulator.
     pub gas_price: Option<u128>,
-    /// Sender nonce; `None` lets the simulator pick (nonce checks are disabled).
+    /// Sender nonce. `None` lets the simulator pick; nonce checks are disabled,
+    /// so this is only worth setting when a contract reads the nonce explicitly.
     pub nonce: Option<u64>,
-    /// EIP-2930 access list to pre-warm slots for this call.
+    /// EIP-2930 access list to pre-warm accounts and storage slots for this
+    /// call. Pre-warming changes EIP-2929 gas accounting; supply it when
+    /// reproducing the gas cost of a transaction that carried an access list.
     pub access_list: Option<AccessList>,
 }
 
@@ -225,12 +262,20 @@ where
     }
 
     /// Pin simulations and RPC fetches to a specific block.
+    ///
+    /// Use this to fork at a fixed height for reproducible simulation. Without
+    /// a call to [`block`](Self::block) or [`latest_block`](Self::latest_block)
+    /// the builder defaults to the latest block at [`build`](Self::build) time.
     pub fn block(mut self, block: BlockId) -> Self {
         self.block = Some(block);
         self
     }
 
     /// Pin to the latest block.
+    ///
+    /// The height is resolved when [`build`](Self::build) fetches the block
+    /// header, so the cache forks at whatever was latest at construction. Use
+    /// [`block`](Self::block) instead to pin a fixed, reproducible height.
     pub fn latest_block(mut self) -> Self {
         self.block = Some(BlockId::latest());
         self
@@ -243,6 +288,12 @@ where
     }
 
     /// Enable disk-backed caching with the given configuration.
+    ///
+    /// Supplying a [`CacheConfig`] turns on persistence of EVM state,
+    /// bytecodes, immutable data, and (with the `protocols` feature) V3 tick
+    /// snapshots under the configured chain directory; the cache is loaded on
+    /// [`build`](Self::build) and flushed on drop. Omit it for a purely
+    /// in-memory cache backed solely by RPC.
     pub fn cache_config(mut self, cache_config: CacheConfig) -> Self {
         self.cache_config = Some(cache_config);
         self
@@ -328,10 +379,45 @@ pub struct EvmCache {
     spec_id: SpecId,
 }
 
+/// Outcome of a balance-delta-tracking simulation.
+///
+/// Produced by [`EvmCache::simulate_call_with_balance_deltas`] and
+/// [`EvmCache::simulate_with_transfer_tracking`]: a successful call together
+/// with the per-token balance changes it caused, its emitted logs, the touched
+/// access list, and its raw return data.
+/// Execution outcome of a simulated call.
+///
+/// Lets a caller distinguish a successful call — even one that emitted no logs,
+/// such as a view call — from a revert or a halt, without guessing from `logs`
+/// or `output`. Revert payloads live in [`CallSimulationResult::output`] and can
+/// be decoded with [`RevertDecoder`](crate::errors::RevertDecoder); only `Halt`
+/// carries extra data here, since its reason has nowhere else to live.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SimStatus {
+    /// The call returned successfully.
+    Success,
+    /// The call reverted; the revert payload (if any) is in `output`.
+    Revert,
+    /// The call halted (e.g. out of gas, invalid opcode).
+    Halt {
+        /// Debug-formatted halt reason.
+        reason: String,
+    },
+}
+
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct CallSimulationResult {
+    /// Whether the call succeeded, reverted, or halted.
+    pub status: SimStatus,
+    /// Gas consumed by the (successful) call.
     pub gas_used: u64,
+    /// Net change in `owner`'s balance per tracked token, as a **signed**
+    /// [`I256`] (`post - pre`): positive means the call increased the balance,
+    /// negative means it decreased it. Tokens not seen by the call may be
+    /// absent or zero.
     pub token_deltas: HashMap<Address, I256>,
+    /// Logs emitted by the call (in emission order).
     pub logs: Vec<Log>,
     /// EIP-2930 access list of all accounts and storage slots touched during simulation.
     /// Extracted from the EVM journaled state after execution.
@@ -610,8 +696,8 @@ impl EvmCache {
         let provider_for_batch = provider.clone();
         let batch_block_id = Arc::new(Mutex::new(block_id));
         let batch_block_ref = batch_block_id.clone();
-        let storage_batch_fetcher: StorageBatchFetchFn =
-            Arc::new(move |requests: Vec<(Address, U256)>| {
+        let storage_batch_fetcher: StorageBatchFetchFn = Arc::new(
+            move |requests: Vec<(Address, U256)>, block: Option<BlockId>| {
                 use futures::stream::{self, StreamExt};
                 // Max items per JSON-RPC batch. RPC providers typically limit batch
                 // size to ~1000 items. Reduced from 200 to avoid 429s on Base.
@@ -644,7 +730,11 @@ impl EvmCache {
                             .collect();
                     }
                 };
-                let current_block = *batch_block_ref.lock().unwrap();
+                // Pin to the explicitly-requested block when given, else the
+                // cache's currently-pinned block. Capturing the block at the call
+                // site is what lets the deferred freshness validator fetch at the
+                // snapshot's block despite a later `set_block`.
+                let current_block = block.unwrap_or_else(|| *batch_block_ref.lock().unwrap());
                 tokio::task::block_in_place(|| {
                     handle.block_on(async {
                         let mut results = Vec::with_capacity(requests.len());
@@ -727,7 +817,8 @@ impl EvmCache {
                         results
                     })
                 })
-            });
+            },
+        );
 
         // Spawn the backend handler on a background task
         let backend =
@@ -903,21 +994,42 @@ impl EvmCache {
     }
 
     /// Get the cache configuration, if any.
+    ///
+    /// Returns `None` when the cache is purely in-memory (no disk persistence),
+    /// i.e. constructed without a [`CacheConfig`] or via
+    /// [`from_backend`](Self::from_backend).
     pub fn cache_config(&self) -> Option<&CacheConfig> {
         self.cache_config.as_ref()
     }
 
-    /// Get a reference to the underlying BlockchainDb.
+    /// Get a reference to the underlying [`BlockchainDb`] (the layer-2 backend
+    /// store of accounts, storage, and bytecodes).
+    ///
+    /// This exposes an internal store and bypasses the cache's two-layer
+    /// consistency model: reads here see only the backend layer, not the
+    /// CacheDB overlay, and any writes performed through it skip the overlay.
+    /// Prefer the higher-level accessors; use with care.
     pub fn blockchain_db(&self) -> &BlockchainDb {
         &self.blockchain_db
     }
 
-    /// Get a reference to the underlying SharedBackend.
+    /// Get a reference to the underlying [`SharedBackend`] (the lazy RPC-backed
+    /// fetcher shared across clones).
+    ///
+    /// This exposes an internal and bypasses the cache's two-layer consistency
+    /// model: it reads/fetches directly without consulting the CacheDB overlay.
+    /// Prefer the higher-level accessors; use with care.
     pub fn backend(&self) -> &SharedBackend {
         &self.backend
     }
 
-    /// Get a mutable reference to the database.
+    /// Get a mutable reference to the underlying [`ForkCacheDB`] (the layer-1
+    /// CacheDB overlay).
+    ///
+    /// This exposes an internal and bypasses the cache's two-layer consistency
+    /// model: writes made here land only in the overlay and are not mirrored
+    /// into the BlockchainDb backend, so parallel tasks sharing the backend
+    /// will not see them. Prefer the higher-level mutators; use with care.
     pub fn db_mut(&mut self) -> &mut ForkCacheDB {
         &mut self.db
     }
@@ -927,6 +1039,14 @@ impl EvmCache {
     /// This is much faster than `call_raw` for batch operations because the RPC
     /// node has all state in memory and doesn't need lazy storage fetching.
     /// Returns `None` if no RPC caller is available (e.g. `from_backend` constructor).
+    ///
+    /// # Panics
+    /// Must be called from within a **multi-thread** tokio runtime: the callback
+    /// drives the async `eth_call` to completion via
+    /// `tokio::task::block_in_place`. On a current-thread runtime (or with no
+    /// runtime), the callback degrades to an `Err` rather than panicking, but
+    /// `block_in_place` itself will panic if invoked from a non-worker thread of
+    /// a multi-thread runtime.
     pub fn rpc_call(&self, to: Address, calldata: Bytes) -> Option<Result<Bytes>> {
         self.rpc_caller
             .as_ref()
@@ -936,6 +1056,15 @@ impl EvmCache {
     /// Get the batch storage fetcher, if available.
     ///
     /// Returns `None` when constructed via `from_backend` (no provider available).
+    ///
+    /// # Panics
+    /// The returned [`StorageBatchFetchFn`] must be invoked from within a
+    /// **multi-thread** tokio runtime: it drives concurrent `eth_getStorageAt`
+    /// calls to completion via `tokio::task::block_in_place`. On a
+    /// current-thread runtime (or with no runtime) it degrades to an `Err`
+    /// result for every requested slot rather than panicking, but
+    /// `block_in_place` itself will panic if invoked from a non-worker thread of
+    /// a multi-thread runtime.
     pub fn storage_batch_fetcher(&self) -> Option<&StorageBatchFetchFn> {
         self.storage_batch_fetcher.as_ref()
     }
@@ -949,6 +1078,40 @@ impl EvmCache {
         let mut storage = self.blockchain_db.storage().write();
         for &(addr, slot, value) in results {
             storage.entry(addr).or_default().insert(slot, value);
+        }
+    }
+
+    /// Inject freshly-fetched storage values, healing **both** cache layers.
+    ///
+    /// Like [`inject_storage_batch`](Self::inject_storage_batch) this writes each
+    /// value into the BlockchainDb backend (layer 2). Additionally, for any
+    /// address that *already* has a CacheDB overlay entry (layer 1), it writes
+    /// the slot into that overlay too.
+    ///
+    /// This matters because both [`create_snapshot`](Self::create_snapshot) and
+    /// the synchronous EVM SLOAD path let the overlay win over the backend. A
+    /// correction written only to layer 2 would be shadowed by a stale layer-1
+    /// slot, so the cache could never converge — the freshness validator would
+    /// re-detect the same change and re-correct it every cycle. Writing through
+    /// the overlay keeps the layer that wins authoritative.
+    ///
+    /// It deliberately does **not** create a new overlay account for an address
+    /// that has none: such a slot is layer-2-only (e.g. cold prefetch), where
+    /// the backend write is already authoritative and materializing an overlay
+    /// entry would pollute layer 1 and could shadow later RPC reads.
+    pub fn inject_storage_batch_fresh(&mut self, results: &[(Address, U256, U256)]) {
+        {
+            let mut storage = self.blockchain_db.storage().write();
+            for &(addr, slot, value) in results {
+                storage.entry(addr).or_default().insert(slot, value);
+            }
+        }
+        // Write through to the overlay only for accounts already materialized
+        // there, so the winning layer reflects the fresh value.
+        for &(addr, slot, value) in results {
+            if let Some(db_account) = self.db.cache.accounts.get_mut(&addr) {
+                db_account.storage.insert(slot, value);
+            }
         }
     }
 
@@ -1006,7 +1169,7 @@ impl EvmCache {
             .map(|&(addr, slot)| ((addr, slot), self.cached_storage_value(addr, slot)))
             .collect();
 
-        let results = (fetcher)(slots.to_vec());
+        let results = (fetcher)(slots.to_vec(), self.block);
 
         let mut changed = Vec::new();
         let mut to_inject = Vec::new();
@@ -1037,7 +1200,7 @@ impl EvmCache {
         }
 
         if !to_inject.is_empty() {
-            self.inject_storage_batch(&to_inject);
+            self.inject_storage_batch_fresh(&to_inject);
         }
         Ok(changed)
     }
@@ -1075,20 +1238,35 @@ impl EvmCache {
         }
     }
 
-    /// Get the chain ID used for EVM simulations.
+    /// Get the chain ID used for EVM simulations (the `CHAINID` opcode).
     pub fn chain_id(&self) -> u64 {
         self.chain_id
     }
 
-    /// Create a snapshot of the current cache state for later restoration.
+    /// Take a low-level, same-thread snapshot of the CacheDB overlay for
+    /// in-place restore.
     ///
-    /// Note: This creates a copy of the inner cache only (accounts and storage),
-    /// not the underlying database wrapper.
+    /// Clones the inner [`revm::database::Cache`] (the layer-1 overlay's
+    /// accounts and storage) only — not the underlying database wrapper or the
+    /// BlockchainDb backend. Pair with [`restore`](Self::restore) to roll the
+    /// overlay back on the same `EvmCache` after speculative mutations (this is
+    /// how the balance-slot scan probes and rewinds).
+    ///
+    /// For cross-thread fan-out use [`create_snapshot`](Self::create_snapshot)
+    /// instead: it merges both layers into an `Arc<`[`EvmSnapshot`]`>` that is
+    /// `Send + Sync` and can be shared with parallel simulators via
+    /// [`EvmOverlay`].
     pub fn snapshot(&self) -> revm::database::Cache {
         self.db.cache.clone()
     }
 
-    /// Restore the cache state from a previous snapshot.
+    /// Restore the CacheDB overlay from a snapshot taken with
+    /// [`snapshot`](Self::snapshot).
+    ///
+    /// Overwrites the layer-1 overlay wholesale with `snapshot`, discarding any
+    /// overlay mutations made since it was taken. The BlockchainDb backend is
+    /// untouched. This is the in-place counterpart to the cross-thread
+    /// [`create_snapshot`](Self::create_snapshot) / [`EvmOverlay`] path.
     pub fn restore(&mut self, snapshot: revm::database::Cache) {
         self.db.cache = snapshot;
     }
@@ -1104,7 +1282,8 @@ impl EvmCache {
         }
     }
 
-    /// Create an immutable snapshot of the current EVM state.
+    /// Create an immutable snapshot of the current EVM state for cross-thread
+    /// fan-out.
     ///
     /// Merges both layers (CacheDB overlay + BlockchainDb backend) into a
     /// single flat HashMap. The snapshot is `Send + Sync` and can be shared
@@ -1112,6 +1291,9 @@ impl EvmCache {
     ///
     /// CacheDB overlay values take precedence over BlockchainDb values.
     /// Use with [`EvmOverlay`] for parallel simulation.
+    ///
+    /// For cheap same-thread save/restore of just the overlay, prefer
+    /// [`snapshot`](Self::snapshot) / [`restore`](Self::restore) instead.
     pub fn create_snapshot(&self) -> Arc<snapshot::EvmSnapshot> {
         let mut accounts = HashMap::new();
         let mut storage = HashMap::new();
@@ -1199,7 +1381,11 @@ impl EvmCache {
         }
     }
 
-    /// Get the current block.
+    /// Get the block that RPC fetches are currently pinned to.
+    ///
+    /// `None` means no explicit pin was set, so the backend reads the latest
+    /// block. Set it with [`set_block`](Self::set_block) or
+    /// [`repin_to_block`](Self::repin_to_block).
     pub fn block(&self) -> Option<BlockId> {
         self.block
     }
@@ -1222,12 +1408,25 @@ impl EvmCache {
         self.timestamp_override
     }
 
-    /// Get the block number used for EVM simulations (NUMBER opcode).
+    /// Get the block number used for EVM simulations (the `NUMBER` opcode).
+    ///
+    /// Fetched from the pinned block's header at construction and kept in
+    /// lockstep with the pin by [`set_block`](Self::set_block) /
+    /// [`repin_to_block`](Self::repin_to_block). `None` means revm falls back
+    /// to `0`, which can steer contracts that branch on `block.number` down a
+    /// different code path. Override directly via
+    /// [`set_block_context`](Self::set_block_context).
     pub fn block_number(&self) -> Option<u64> {
         self.block_number
     }
 
-    /// Get the base fee used for EVM simulations (BASEFEE opcode).
+    /// Get the base fee per gas used for EVM simulations (the `BASEFEE` opcode).
+    ///
+    /// Fetched from the pinned block's header at construction. `None` means
+    /// revm falls back to `0`. Unlike `block_number` this is **not** refreshed
+    /// by [`set_block`](Self::set_block); refresh it with
+    /// [`set_block_context`](Self::set_block_context) after fetching a new
+    /// header if `BASEFEE` accuracy matters.
     pub fn basefee(&self) -> Option<u64> {
         self.basefee
     }
@@ -1241,17 +1440,29 @@ impl EvmCache {
         self.basefee = basefee;
     }
 
-    /// Override the block beneficiary (COINBASE opcode) for subsequent simulations.
+    /// Override the block beneficiary (the `COINBASE` opcode) for subsequent
+    /// simulations.
+    ///
+    /// Set this when simulating logic that reads `block.coinbase` (e.g.
+    /// MEV/builder tip accounting). `None` lets revm use its default beneficiary.
     pub fn set_coinbase(&mut self, coinbase: Option<Address>) {
         self.coinbase = coinbase;
     }
 
-    /// Override `prevrandao` (PREVRANDAO opcode) for subsequent simulations.
+    /// Override `prevrandao` (the `PREVRANDAO` opcode, the post-merge header mix
+    /// hash) for subsequent simulations.
+    ///
+    /// Set this when reproducing contracts that source on-chain randomness from
+    /// `block.prevrandao`. `None` leaves revm's default in place.
     pub fn set_prevrandao(&mut self, prevrandao: Option<B256>) {
         self.prevrandao = prevrandao;
     }
 
-    /// Override the block gas limit (GASLIMIT opcode) for subsequent simulations.
+    /// Override the block gas limit (the `GASLIMIT` opcode) for subsequent
+    /// simulations.
+    ///
+    /// Set this when simulating logic that reads `block.gaslimit`. `None` lets
+    /// revm use its default.
     pub fn set_block_gas_limit(&mut self, gas_limit: Option<u64>) {
         self.block_gas_limit = gas_limit;
     }
@@ -1333,14 +1544,32 @@ impl EvmCache {
         Ok(())
     }
 
-    /// Pre-seed known ERC20 balance mapping slots so that `set_erc20_balance_with_slot_scan`
-    /// can skip the scanning step for these tokens.
+    /// Pre-seed known ERC20 `balanceOf` mapping base slots, keyed by token.
+    ///
+    /// Each `(token, slot)` records the storage slot of the token's
+    /// `mapping(address => uint256) balances`, letting
+    /// [`set_erc20_balance_with_slot_scan`](Self::set_erc20_balance_with_slot_scan)
+    /// skip its `0..=max_slot` probing pass for that token and write the balance
+    /// directly. Seeding a wrong slot is self-correcting: the scan verifies the
+    /// write and falls back to a fresh probe (evicting the bad seed) if it
+    /// fails. Later entries overwrite earlier ones for the same token.
     pub fn seed_erc20_balance_slots(&mut self, slots: impl IntoIterator<Item = (Address, U256)>) {
         for (token, slot) in slots {
             self.erc20_balance_slots.insert(token, slot);
         }
     }
 
+    /// Write a value into a Solidity `mapping(address => ...)` entry on
+    /// `contract`, at the mapping declared at base slot `slot`.
+    ///
+    /// Computes the entry's storage key as
+    /// `keccak256(abi.encode(slot_address, slot))` — Solidity's layout for an
+    /// address-keyed mapping — and writes `value` there in the CacheDB overlay.
+    /// Used to forge ERC20 balances and allowances without an on-chain transfer.
+    ///
+    /// # Errors
+    /// Returns an error if the underlying CacheDB storage insert fails (e.g. the
+    /// account cannot be loaded from the backend).
     pub fn insert_mapping_storage_slot(
         &mut self,
         contract: Address,
@@ -1441,6 +1670,7 @@ impl EvmCache {
     /// * `pool_address` - The UniswapV2 pair contract address
     /// * `metadata` - The cached pool metadata containing token0 and token1
     #[cfg(feature = "protocols")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "protocols")))]
     pub fn inject_v2_pool_metadata(
         &mut self,
         pool_address: Address,
@@ -1474,6 +1704,7 @@ impl EvmCache {
     /// * `pool_address` - The UniswapV3 pool contract address
     /// * `tick_bitmap` - Map of word position (int16) to bitmap value (uint256)
     #[cfg(feature = "protocols")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "protocols")))]
     pub fn inject_v3_tick_bitmap(
         &mut self,
         pool_address: Address,
@@ -1486,6 +1717,7 @@ impl EvmCache {
     ///
     /// PancakeSwap V3 uses base slot 7 instead of Uniswap V3's slot 6.
     #[cfg(feature = "protocols")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "protocols")))]
     pub fn inject_v3_tick_bitmap_with_base(
         &mut self,
         pool_address: Address,
@@ -1531,6 +1763,7 @@ impl EvmCache {
     /// * `pool_address` - The UniswapV3 pool contract address
     /// * `ticks` - Map of tick index (int24) to tick info
     #[cfg(feature = "protocols")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "protocols")))]
     pub fn inject_v3_ticks(
         &mut self,
         pool_address: Address,
@@ -1543,6 +1776,7 @@ impl EvmCache {
     ///
     /// PancakeSwap V3 uses ticks at slot 6 instead of Uniswap V3's slot 5.
     #[cfg(feature = "protocols")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "protocols")))]
     pub fn inject_v3_ticks_with_base(
         &mut self,
         pool_address: Address,
@@ -1684,6 +1918,15 @@ impl EvmCache {
         Ok((result, access_list))
     }
 
+    /// Execute a call and return its emitted logs and gas used.
+    ///
+    /// A thin wrapper over [`call`](Self::call) that requires success and
+    /// discards the return data. When `commit` is true the call's state changes
+    /// are persisted to the CacheDB overlay; otherwise they are reverted.
+    ///
+    /// # Errors
+    /// Returns an error if the underlying transact fails, or if the call did not
+    /// `Success` (i.e. it reverted or halted).
     pub fn call_logs(
         &mut self,
         from: Address,
@@ -1699,6 +1942,14 @@ impl EvmCache {
         }
     }
 
+    /// Read an ERC20 token balance by simulating a `balanceOf(owner)` call.
+    ///
+    /// Non-committing: the read is reverted, so it never mutates cache state.
+    ///
+    /// # Errors
+    /// Returns an error if the simulated call fails or does not `Success` (e.g.
+    /// `token` is not a contract or reverts), or if the returned data cannot be
+    /// ABI-decoded as a `uint256`.
     pub fn erc20_balance_of(&mut self, token: Address, owner: Address) -> Result<U256> {
         let call = IERC20::balanceOfCall { target: owner };
         let result = self.call_raw(Address::ZERO, token, Bytes::from(call.abi_encode()), false)?;
@@ -1714,6 +1965,14 @@ impl EvmCache {
         }
     }
 
+    /// Read an ERC20 allowance by simulating an `allowance(owner, spender)` call.
+    ///
+    /// Non-committing: the read is reverted, so it never mutates cache state.
+    ///
+    /// # Errors
+    /// Returns an error if the simulated call fails or does not `Success` (e.g.
+    /// `token` is not a contract or reverts), or if the returned data cannot be
+    /// ABI-decoded as a `uint256`.
     pub fn erc20_allowance(
         &mut self,
         token: Address,
@@ -1734,6 +1993,21 @@ impl EvmCache {
         }
     }
 
+    /// Read an ERC20 token's decimals by simulating a `decimals()` call.
+    ///
+    /// Memoized: a hit in the in-memory token-decimals map returns immediately
+    /// without simulating. On a miss the value is resolved by a non-committing
+    /// `decimals()` call.
+    ///
+    /// # Side effects
+    /// On a miss the resolved value is cached in **both** the in-memory
+    /// token-decimals map (process lifetime) **and** the immutable data cache
+    /// (so it is persisted to disk on the next [`flush`](Self::flush)).
+    ///
+    /// # Errors
+    /// Returns an error if the simulated call fails or does not `Success` (e.g.
+    /// `token` is not a contract or reverts), or if the returned data cannot be
+    /// ABI-decoded as a `uint8`.
     pub fn erc20_decimals(&mut self, token: Address) -> Result<u8> {
         if let Some(decimals) = self.token_decimals.get(&token) {
             return Ok(*decimals);
@@ -1756,24 +2030,36 @@ impl EvmCache {
         }
     }
 
-    /// Get a reference to the immutable data cache.
+    /// Get a reference to the immutable data cache (token decimals and pool
+    /// metadata that never change for a given contract).
     pub fn immutable_cache(&self) -> &ImmutableDataCache {
         &self.immutable_cache
     }
 
     /// Get a mutable reference to the immutable data cache.
+    ///
+    /// Use this to pre-populate token decimals or pool metadata that would
+    /// otherwise be discovered lazily. Entries are persisted on the next
+    /// [`flush`](Self::flush) (and on drop) when a [`CacheConfig`] is set.
     pub fn immutable_cache_mut(&mut self) -> &mut ImmutableDataCache {
         &mut self.immutable_cache
     }
 
-    /// Get a reference to the V3 tick snapshot cache.
+    /// Get a reference to the V3 pool tick snapshot cache (per-pool
+    /// `tick_bitmap`, `ticks`, and liquidity used for liquidity validation).
     #[cfg(feature = "protocols")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "protocols")))]
     pub fn tick_snapshot_cache(&self) -> &V3TickSnapshotCache {
         &self.tick_snapshot_cache
     }
 
-    /// Get a mutable reference to the V3 tick snapshot cache.
+    /// Get a mutable reference to the V3 pool tick snapshot cache.
+    ///
+    /// Use this to insert or update tick snapshots. Entries are persisted on
+    /// the next [`flush`](Self::flush) (and on drop) when a [`CacheConfig`] is
+    /// set.
     #[cfg(feature = "protocols")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "protocols")))]
     pub fn tick_snapshot_cache_mut(&mut self) -> &mut V3TickSnapshotCache {
         &mut self.tick_snapshot_cache
     }
@@ -2092,6 +2378,22 @@ impl EvmCache {
             .unwrap_or(0)
     }
 
+    /// Simulate a call and compute `owner`'s net balance change for each token
+    /// in `tokens` by reading `balanceOf(owner)` immediately before and after.
+    ///
+    /// Each delta is the signed `post - pre` difference (see
+    /// [`CallSimulationResult::token_deltas`]). When `commit` is true the call's
+    /// state changes are persisted to the CacheDB overlay; otherwise they are
+    /// reverted. Unlike
+    /// [`simulate_with_transfer_tracking`](Self::simulate_with_transfer_tracking),
+    /// this measures deltas via pre/post balance reads (not transfer-event
+    /// inspection) and the returned
+    /// [`access_list`](CallSimulationResult::access_list) is always empty.
+    ///
+    /// # Errors
+    /// Returns an error if building the tx env fails, if a pre/post
+    /// `balanceOf` read fails, or if the call does not `Success` (i.e. it
+    /// reverted or halted). On error the simulation is reverted.
     pub fn simulate_call_with_balance_deltas(
         &mut self,
         from: Address,
@@ -2145,6 +2447,7 @@ impl EvmCache {
                     evm.journaled_state.checkpoint_revert(checkpoint);
                 }
                 Ok(CallSimulationResult {
+                    status: SimStatus::Success,
                     gas_used,
                     token_deltas,
                     logs,
@@ -2220,6 +2523,7 @@ impl EvmCache {
                 }
 
                 Ok(CallSimulationResult {
+                    status: SimStatus::Success,
                     gas_used,
                     token_deltas,
                     logs,
@@ -2268,6 +2572,11 @@ impl EvmCache {
     ///
     /// Note: This commits the deployment to the CacheDB. Use a throw-away deployer
     /// address (e.g., `Address::ZERO`) to avoid side effects on real accounts.
+    ///
+    /// # Errors
+    /// Returns an error if the CREATE tx env cannot be built, if the deployment
+    /// reverts or halts, or if it succeeds but the EVM returns no contract
+    /// address.
     pub fn deploy_contract(&mut self, from: Address, creation_code: Bytes) -> Result<Address> {
         let tx = TxEnv::builder()
             .caller(from)
@@ -2306,6 +2615,13 @@ impl EvmCache {
     /// at `target` remain unchanged. `target` must already have non-empty runtime
     /// bytecode. Both the CacheDB overlay and BlockchainDb backend are updated,
     /// ensuring the override is visible to parallel EVM tasks sharing the same backend.
+    ///
+    /// # Errors
+    /// Returns an error if `source` has no cached bytecode or its code is empty,
+    /// if `target` cannot be loaded (it must already exist on the backend), or
+    /// if `target` has no existing runtime bytecode to override. For synthetic
+    /// `target` addresses that may not exist, use
+    /// [`override_or_create_account_code`](Self::override_or_create_account_code).
     pub fn override_account_code(&mut self, source: Address, target: Address) -> Result<()> {
         self.override_account_code_with_missing_target(source, target, MissingTargetBehavior::Error)
     }
@@ -2624,6 +2940,12 @@ impl<'a> EvmSession<'a> {
     }
 
     /// Get access to the underlying EVM for advanced operations.
+    ///
+    /// This exposes revm internals and bypasses the cache's two-layer
+    /// consistency model: state mutated directly through the journaled EVM
+    /// lands in the session's journal, not the BlockchainDb backend, and is
+    /// only flushed to the CacheDB overlay on [`commit`](Self::commit). Use
+    /// with care.
     pub fn evm(&mut self) -> &mut CacheEvm<'a> {
         &mut self.evm
     }
@@ -2660,7 +2982,7 @@ fn extract_access_list(state: &revm::state::EvmState) -> AccessList {
     AccessList(items)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "protocols"))]
 mod tests {
     use super::*;
     use storage_keys::{i128_to_u256, i256_from_i16, i256_from_i24};
@@ -2965,65 +3287,6 @@ mod tests {
         assert_ne!(slot_60, slot_neg60);
     }
 
-    // ==================== V2 pool metadata injection tests ====================
-
-    #[test]
-    fn test_v2_pool_metadata_storage_slots() {
-        // Verify the storage slot constants match UniswapV2Pair layout
-        const TOKEN0_SLOT: U256 = U256::from_limbs([6, 0, 0, 0]);
-        const TOKEN1_SLOT: U256 = U256::from_limbs([7, 0, 0, 0]);
-
-        // Slots should be sequential starting at 6
-        assert_eq!(TOKEN0_SLOT, U256::from(6));
-        assert_eq!(TOKEN1_SLOT, U256::from(7));
-    }
-
-    #[test]
-    fn test_address_to_u256_conversion() {
-        // Test that address conversion preserves the address bytes correctly
-        let addr = Address::repeat_byte(0xAB);
-        let value = U256::from_be_slice(addr.as_slice());
-
-        // Address is 20 bytes, should be right-aligned in U256 (32 bytes)
-        let bytes = value.to_be_bytes::<32>();
-
-        // First 12 bytes should be zero (padding)
-        assert_eq!(&bytes[..12], &[0u8; 12]);
-
-        // Last 20 bytes should be the address
-        assert_eq!(&bytes[12..], addr.as_slice());
-    }
-
-    #[test]
-    fn test_v2_metadata_address_values() {
-        // Test specific address encoding
-        let token0 = Address::repeat_byte(0x11);
-        let token1 = Address::repeat_byte(0x22);
-
-        let metadata = V2PoolMetadata {
-            token0,
-            token1,
-            last_block_timestamp: 0,
-        };
-
-        let token0_value = U256::from_be_slice(metadata.token0.as_slice());
-        let token1_value = U256::from_be_slice(metadata.token1.as_slice());
-
-        // Values should be different
-        assert_ne!(token0_value, token1_value);
-
-        // Each should be non-zero
-        assert_ne!(token0_value, U256::ZERO);
-        assert_ne!(token1_value, U256::ZERO);
-
-        // Verify round-trip: extract address bytes back
-        let token0_bytes = token0_value.to_be_bytes::<32>();
-        let token1_bytes = token1_value.to_be_bytes::<32>();
-
-        assert_eq!(&token0_bytes[12..], token0.as_slice());
-        assert_eq!(&token1_bytes[12..], token1.as_slice());
-    }
-
     // -- PancakeSwap V3 storage slot tests --
 
     #[test]
@@ -3104,6 +3367,73 @@ mod tests {
         assert_eq!(keys[1], keys[0] + U256::from(1));
         assert_eq!(keys[2], keys[0] + U256::from(2));
         assert_eq!(keys[3], keys[0] + U256::from(3));
+    }
+}
+
+/// Tests that exercise only the generic (protocol-independent) engine, so they
+/// run under `--no-default-features` too. The protocol-gated unit tests live in
+/// the `tests` module above, which is `#[cfg(feature = "protocols")]`.
+#[cfg(test)]
+mod core_tests {
+    use super::*;
+
+    // ==================== V2 pool metadata injection tests ====================
+
+    #[test]
+    fn test_v2_pool_metadata_storage_slots() {
+        // Verify the storage slot constants match UniswapV2Pair layout
+        const TOKEN0_SLOT: U256 = U256::from_limbs([6, 0, 0, 0]);
+        const TOKEN1_SLOT: U256 = U256::from_limbs([7, 0, 0, 0]);
+
+        // Slots should be sequential starting at 6
+        assert_eq!(TOKEN0_SLOT, U256::from(6));
+        assert_eq!(TOKEN1_SLOT, U256::from(7));
+    }
+
+    #[test]
+    fn test_address_to_u256_conversion() {
+        // Test that address conversion preserves the address bytes correctly
+        let addr = Address::repeat_byte(0xAB);
+        let value = U256::from_be_slice(addr.as_slice());
+
+        // Address is 20 bytes, should be right-aligned in U256 (32 bytes)
+        let bytes = value.to_be_bytes::<32>();
+
+        // First 12 bytes should be zero (padding)
+        assert_eq!(&bytes[..12], &[0u8; 12]);
+
+        // Last 20 bytes should be the address
+        assert_eq!(&bytes[12..], addr.as_slice());
+    }
+
+    #[test]
+    fn test_v2_metadata_address_values() {
+        // Test specific address encoding
+        let token0 = Address::repeat_byte(0x11);
+        let token1 = Address::repeat_byte(0x22);
+
+        let metadata = V2PoolMetadata {
+            token0,
+            token1,
+            last_block_timestamp: 0,
+        };
+
+        let token0_value = U256::from_be_slice(metadata.token0.as_slice());
+        let token1_value = U256::from_be_slice(metadata.token1.as_slice());
+
+        // Values should be different
+        assert_ne!(token0_value, token1_value);
+
+        // Each should be non-zero
+        assert_ne!(token0_value, U256::ZERO);
+        assert_ne!(token1_value, U256::ZERO);
+
+        // Verify round-trip: extract address bytes back
+        let token0_bytes = token0_value.to_be_bytes::<32>();
+        let token1_bytes = token1_value.to_be_bytes::<32>();
+
+        assert_eq!(&token0_bytes[12..], token0.as_slice());
+        assert_eq!(&token1_bytes[12..], token1.as_slice());
     }
 
     // ==================== block context tests ====================
