@@ -8,7 +8,7 @@
 mod common;
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use alloy_primitives::{Address, Bytes, U256};
 use alloy_sol_types::SolCall;
@@ -16,12 +16,12 @@ use anyhow::Result;
 
 use common::{
     MOCK_ERC20_BALANCE_SLOT, MockERC20, failing_fetcher, install_default_account,
-    install_mock_erc20, setup_cache, stub_fetcher,
+    install_mock_erc20, panicking_fetcher, setup_cache, stub_fetcher, tracking_fetcher,
 };
-use evm_fork_cache::cache::{EvmCache, EvmOverlay};
+use evm_fork_cache::cache::{EvmCache, EvmOverlay, SlotObservationTracker};
 use evm_fork_cache::freshness::{
-    AlwaysVerify, FreshnessController, FreshnessRegistry, NeverVerify, SimRequest, Validation,
-    WallClock,
+    AlwaysVerify, BlockClock, FreshnessController, FreshnessParams, FreshnessRegistry, NeverVerify,
+    ObservationDriven, SimRequest, Validation, WallClock,
 };
 
 /// Hashed storage slot of `balanceOf[owner]` for the MockERC20 fixture.
@@ -35,6 +35,27 @@ fn balance_slot_for(owner: Address) -> U256 {
 /// Encode a `transfer(to, amount)` call.
 fn transfer_calldata(to: Address, amount: U256) -> Bytes {
     Bytes::from(MockERC20::transferCall { to, amount }.abi_encode())
+}
+
+/// Encode a `balanceOf(account)` view call.
+fn balance_of_calldata(account: Address) -> Bytes {
+    Bytes::from(MockERC20::balanceOfCall { account }.abi_encode())
+}
+
+/// Decode a `balanceOf` return value from a [`CallSimulationResult`] `output`.
+fn decode_balance(output: &Bytes) -> U256 {
+    MockERC20::balanceOfCall::abi_decode_returns(output).expect("decode balanceOf return")
+}
+
+/// Yield and briefly sleep so that any background validation task that survived
+/// (i.e. was *not* aborted) would get a chance to run and mutate shared state.
+/// Used by the abort tests: if the task were alive it would queue a correction
+/// within this window, so a subsequent `pending_len() == 0` assertion is
+/// meaningful rather than merely racing the spawn.
+async fn settle() {
+    tokio::task::yield_now().await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    tokio::task::yield_now().await;
 }
 
 // ---------------------------------------------------------------------------
@@ -386,6 +407,16 @@ async fn run_mismatch_path_corrected_only_affected_rerun() -> Result<()> {
         !opt[1].logs.is_empty(),
         "req2 optimistic should succeed (a log)"
     );
+    // T9: the optimistic path does not run transfer tracking, so token_deltas is
+    // always empty — pin that documented stub behavior on both results.
+    assert!(
+        opt[0].token_deltas.is_empty(),
+        "optimistic token_deltas are empty (no transfer tracking)"
+    );
+    assert!(
+        opt[1].token_deltas.is_empty(),
+        "optimistic token_deltas empty"
+    );
 
     let validation = sim.validate().await;
     match validation {
@@ -415,6 +446,86 @@ async fn run_mismatch_path_corrected_only_affected_rerun() -> Result<()> {
             // req2's slot did not change → its result is untouched (== optimistic).
             assert_eq!(results[1].gas_used, opt[1].gas_used, "req2 not re-run");
             assert_eq!(results[1].logs.len(), opt[1].logs.len(), "req2 unchanged");
+
+            // T9: the corrected re-run also skips transfer tracking → empty deltas.
+            assert!(
+                results[0].token_deltas.is_empty(),
+                "corrected result token_deltas are empty (no transfer tracking)"
+            );
+        }
+        other => panic!("expected Corrected, got {other:?}"),
+    }
+
+    // The discriminating assertion: exactly ONE sim (req1) was re-run. If the
+    // `intersects` filter were removed, the validator would re-run BOTH req1 and
+    // req2, and this would be 2 — so this test fails on that regression. The
+    // value-equality checks above alone cannot tell a skip from an identical
+    // re-run; the counter can.
+    assert_eq!(
+        controller.rerun_count(),
+        1,
+        "only the affected sim (req1) should be re-run, not req2"
+    );
+    Ok(())
+}
+
+// T1: a VIEW call corrected from one success to a *different* success. The
+// observable return data (not logs) carries the change.
+#[tokio::test(flavor = "multi_thread")]
+async fn run_view_call_corrected_success_to_different_success() -> Result<()> {
+    let token = Address::repeat_byte(0x44);
+    let owner = Address::repeat_byte(0x55);
+
+    // Cache holds balanceOf(owner) == 1000.
+    let mut cache = cache_with_balance(token, owner, U256::from(1000)).await?;
+    // Fetcher reports the balance slot changed to 250 (still a success on re-run,
+    // but a different return value).
+    cache.set_storage_batch_fetcher(stub_fetcher(HashMap::from([(
+        (token, balance_slot_for(owner)),
+        U256::from(250),
+    )])));
+
+    let mut controller = FreshnessController::new(FreshnessRegistry::new(), AlwaysVerify);
+    // A pure view call: balanceOf(owner). Its return value depends on the slot.
+    let req = SimRequest::new(owner, token, balance_of_calldata(owner));
+    let sim = controller.run(&mut cache, vec![req])?;
+
+    // Optimistic view call succeeds and returns the OLD balance (1000).
+    let opt = sim.optimistic().to_vec();
+    assert_eq!(opt.len(), 1);
+    assert!(!opt[0].output.is_empty(), "view call returns data");
+    assert_eq!(
+        decode_balance(&opt[0].output),
+        U256::from(1000),
+        "optimistic returns the old balance"
+    );
+
+    let validation = sim.validate().await;
+    match validation {
+        Validation::Corrected { results, changed } => {
+            assert_eq!(changed.len(), 1, "exactly the balance slot changed");
+            assert_eq!(changed[0].address, token);
+            assert_eq!(changed[0].slot, balance_slot_for(owner));
+            assert_eq!(changed[0].old, U256::from(1000));
+            assert_eq!(changed[0].new, U256::from(250));
+
+            // The corrected re-run STILL succeeds (a balanceOf view never reverts)
+            // but its return data reflects the NEW balance.
+            assert_eq!(
+                decode_balance(&results[0].output),
+                U256::from(250),
+                "corrected re-run returns the new balance"
+            );
+            // Both runs succeed (non-empty return data) yet the outputs differ —
+            // this is the success→different-success contract, not keyed off logs.
+            assert!(
+                !results[0].output.is_empty(),
+                "corrected run still succeeds"
+            );
+            assert_ne!(
+                results[0].output, opt[0].output,
+                "corrected output differs from optimistic output"
+            );
         }
         other => panic!("expected Corrected, got {other:?}"),
     }
@@ -516,6 +627,9 @@ async fn run_unverified_on_fetcher_error() -> Result<()> {
     Ok(())
 }
 
+// T3 (part 2): into_optimistic aborts the validation task. The fetcher WOULD
+// queue a correction (it reports a changed value), so if the abort failed we
+// would observe a non-zero pending queue. We assert it stays 0.
 #[tokio::test(flavor = "multi_thread")]
 async fn run_into_optimistic_aborts_validation() -> Result<()> {
     let token = Address::repeat_byte(0x44);
@@ -523,9 +637,10 @@ async fn run_into_optimistic_aborts_validation() -> Result<()> {
     let recipient = Address::repeat_byte(0x66);
 
     let mut cache = cache_with_balance(token, owner, U256::from(1000)).await?;
+    // A CHANGED value: if the validator ran, it would queue a correction.
     cache.set_storage_batch_fetcher(stub_fetcher(HashMap::from([(
         (token, balance_slot_for(owner)),
-        U256::from(1000),
+        U256::from(50),
     )])));
 
     let mut controller = FreshnessController::new(FreshnessRegistry::new(), AlwaysVerify);
@@ -537,8 +652,64 @@ async fn run_into_optimistic_aborts_validation() -> Result<()> {
             transfer_calldata(recipient, U256::from(100)),
         )],
     )?;
-    let results = sim.into_optimistic();
+    let results = sim.into_optimistic(); // aborts the background validation
     assert_eq!(results.len(), 1);
+
+    // Give any (incorrectly) surviving task a chance to run, then assert no
+    // correction was queued and no re-run happened.
+    settle().await;
+    assert_eq!(
+        controller.pending_len(),
+        0,
+        "into_optimistic must abort validation before it queues a correction"
+    );
+    assert_eq!(controller.rerun_count(), 0, "no re-run after abort");
+    Ok(())
+}
+
+// T3 (part 1): dropping the SpeculativeSim (no validate/into_optimistic) aborts
+// the validation task before it can push a correction. The fetcher reports a
+// CHANGED value and flips a "called" flag; after the drop + settle we assert the
+// pending queue is empty (and, robustly, that the fetcher was never even
+// reached) — proving the abort beat the push.
+#[tokio::test(flavor = "multi_thread")]
+async fn dropping_speculative_sim_aborts_before_queueing_correction() -> Result<()> {
+    let token = Address::repeat_byte(0x44);
+    let owner = Address::repeat_byte(0x55);
+    let recipient = Address::repeat_byte(0x66);
+
+    let mut cache = cache_with_balance(token, owner, U256::from(1000)).await?;
+    let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    cache.set_storage_batch_fetcher(tracking_fetcher(
+        HashMap::from([((token, balance_slot_for(owner)), U256::from(50))]),
+        Arc::clone(&called),
+    ));
+
+    let mut controller = FreshnessController::new(FreshnessRegistry::new(), AlwaysVerify);
+    let sim = controller.run(
+        &mut cache,
+        vec![SimRequest::new(
+            owner,
+            token,
+            transfer_calldata(recipient, U256::from(100)),
+        )],
+    )?;
+    // Drop immediately, with NO intervening await, so the abort flag is set
+    // before the spawned task is ever polled.
+    drop(sim);
+
+    settle().await;
+
+    assert_eq!(
+        controller.pending_len(),
+        0,
+        "dropping the sim must abort validation before it queues a correction"
+    );
+    assert!(
+        !called.load(std::sync::atomic::Ordering::SeqCst),
+        "the aborted validator should never have reached the fetcher"
+    );
+    assert_eq!(controller.rerun_count(), 0, "no re-run after abort");
     Ok(())
 }
 
@@ -641,8 +812,6 @@ async fn wall_clock_controller_runs() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn valid_through_becomes_volatile_after_boundary() -> Result<()> {
-    use evm_fork_cache::freshness::BlockClock;
-
     let token = Address::repeat_byte(0x44);
     let owner = Address::repeat_byte(0x55);
     let recipient = Address::repeat_byte(0x66);
@@ -684,6 +853,311 @@ async fn valid_through_becomes_volatile_after_boundary() -> Result<()> {
     assert!(
         matches!(sim.validate().await, Validation::Corrected { .. }),
         "past ValidThrough boundary the slot is volatile and the change is caught"
+    );
+    Ok(())
+}
+
+// T4: a sim reads a slot absent from both the snapshot and the cache; the
+// fetcher returns a NONZERO value. The validator must treat the missing slot as
+// zero and report a SlotChange { old: ZERO, new: nonzero } through the
+// controller.
+#[tokio::test(flavor = "multi_thread")]
+async fn run_missing_slot_treated_as_zero_is_corrected() -> Result<()> {
+    let token = Address::repeat_byte(0x44);
+    let owner = Address::repeat_byte(0x55);
+
+    // Owner's balance slot is NEVER injected → snapshot/cache have no entry, so
+    // the optimistic balanceOf reads it as zero.
+    let mut cache = setup_cache().await?;
+    install_default_account(&mut cache, Address::ZERO);
+    install_default_account(&mut cache, owner);
+    install_mock_erc20(&mut cache, token);
+
+    let slot = balance_slot_for(owner);
+    // Fetcher reports a NONZERO current value for the unseen slot.
+    cache.set_storage_batch_fetcher(stub_fetcher(HashMap::from([(
+        (token, slot),
+        U256::from(777),
+    )])));
+
+    let mut controller = FreshnessController::new(FreshnessRegistry::new(), AlwaysVerify);
+    let req = SimRequest::new(owner, token, balance_of_calldata(owner));
+    let sim = controller.run(&mut cache, vec![req])?;
+
+    // Optimistic reads the unseen slot as zero.
+    let opt = sim.optimistic().to_vec();
+    assert_eq!(
+        decode_balance(&opt[0].output),
+        U256::ZERO,
+        "unseen slot reads as zero optimistically"
+    );
+
+    match sim.validate().await {
+        Validation::Corrected { results, changed } => {
+            let change = changed
+                .iter()
+                .find(|c| c.address == token && c.slot == slot)
+                .expect("the missing balance slot should be reported as changed");
+            assert_eq!(change.old, U256::ZERO, "missing slot treated as old = zero");
+            assert_eq!(change.new, U256::from(777), "fetcher's nonzero value");
+            // The corrected re-run now sees the fresh balance.
+            assert_eq!(
+                decode_balance(&results[0].output),
+                U256::from(777),
+                "corrected re-run returns the fresh balance"
+            );
+        }
+        other => panic!("expected Corrected, got {other:?}"),
+    }
+    Ok(())
+}
+
+// T5: a queued correction, once drained on the SECOND run, changes the second
+// run's *result* (not merely the cached value / verdict). First run queues a
+// drop to balance 50; the second run's transfer of 100 then reverts after the
+// drain.
+#[tokio::test(flavor = "multi_thread")]
+async fn pending_drain_alters_subsequent_result() -> Result<()> {
+    let token = Address::repeat_byte(0x44);
+    let owner = Address::repeat_byte(0x55);
+    let recipient = Address::repeat_byte(0x66);
+
+    // Cache holds balance 1000.
+    let mut cache = cache_with_balance(token, owner, U256::from(1000)).await?;
+    // Fetcher reports the balance DROPPED to 50 (a change → queued correction).
+    cache.set_storage_batch_fetcher(stub_fetcher(HashMap::from([(
+        (token, balance_slot_for(owner)),
+        U256::from(50),
+    )])));
+
+    let mut controller = FreshnessController::new(FreshnessRegistry::new(), AlwaysVerify);
+
+    // First run: optimistic transfer of 100 SUCCEEDS against the cached 1000.
+    let sim = controller.run(
+        &mut cache,
+        vec![SimRequest::new(
+            owner,
+            token,
+            transfer_calldata(recipient, U256::from(100)),
+        )],
+    )?;
+    assert!(
+        !sim.optimistic()[0].logs.is_empty(),
+        "first-run optimistic transfer succeeds against cached 1000"
+    );
+    assert!(matches!(sim.validate().await, Validation::Corrected { .. }));
+    assert_eq!(controller.pending_len(), 1, "a correction (→50) is queued");
+
+    // Second run drains the correction (balance := 50) BEFORE snapshotting, so
+    // the optimistic transfer of 100 now REVERTS against the drained 50.
+    let sim = controller.run(
+        &mut cache,
+        vec![SimRequest::new(
+            owner,
+            token,
+            transfer_calldata(recipient, U256::from(100)),
+        )],
+    )?;
+    assert_eq!(controller.pending_len(), 0, "pending drained");
+    assert!(
+        sim.optimistic()[0].logs.is_empty(),
+        "second-run optimistic transfer REVERTS — the drained value (50 < 100) \
+         changed the *result*, not just the cached value"
+    );
+    Ok(())
+}
+
+// T6a: a panicking fetcher → the validator task panics → JoinError → Unverified.
+#[tokio::test(flavor = "multi_thread")]
+async fn run_unverified_on_fetcher_panic() -> Result<()> {
+    let token = Address::repeat_byte(0x44);
+    let owner = Address::repeat_byte(0x55);
+    let recipient = Address::repeat_byte(0x66);
+
+    let mut cache = cache_with_balance(token, owner, U256::from(1000)).await?;
+    cache.set_storage_batch_fetcher(panicking_fetcher());
+
+    let mut controller = FreshnessController::new(FreshnessRegistry::new(), AlwaysVerify);
+    let sim = controller.run(
+        &mut cache,
+        vec![SimRequest::new(
+            owner,
+            token,
+            transfer_calldata(recipient, U256::from(100)),
+        )],
+    )?;
+    let validation = sim.validate().await;
+    assert!(
+        matches!(validation, Validation::Unverified { .. }),
+        "a panicking fetcher (JoinError) should yield Unverified: {validation:?}"
+    );
+    Ok(())
+}
+
+// T6b: a cache with NO storage batch fetcher → Unverified with the specific
+// "no storage batch fetcher available" reason.
+#[tokio::test(flavor = "multi_thread")]
+async fn run_unverified_without_fetcher() -> Result<()> {
+    use revm::primitives::hardfork::SpecId;
+
+    let token = Address::repeat_byte(0x44);
+    let owner = Address::repeat_byte(0x55);
+    let recipient = Address::repeat_byte(0x66);
+
+    // A `from_backend` cache exposes no fetcher (no provider captured).
+    let base = cache_with_balance(token, owner, U256::from(1000)).await?;
+    let mut cache = EvmCache::from_backend(
+        base.backend().clone(),
+        base.blockchain_db().clone(),
+        None,
+        base.chain_id(),
+        None,
+        None,
+        SpecId::CANCUN,
+    );
+    // Seed the same state the simulation needs into the no-fetcher cache.
+    install_default_account(&mut cache, Address::ZERO);
+    install_default_account(&mut cache, owner);
+    install_mock_erc20(&mut cache, token);
+    cache.inject_storage_batch(&[(token, balance_slot_for(owner), U256::from(1000))]);
+    assert!(
+        cache.storage_batch_fetcher().is_none(),
+        "from_backend cache has no fetcher"
+    );
+
+    let mut controller = FreshnessController::new(FreshnessRegistry::new(), AlwaysVerify);
+    let sim = controller.run(
+        &mut cache,
+        vec![SimRequest::new(
+            owner,
+            token,
+            transfer_calldata(recipient, U256::from(100)),
+        )],
+    )?;
+    match sim.validate().await {
+        Validation::Unverified { reason } => {
+            assert_eq!(reason, "no storage batch fetcher available", "{reason}");
+        }
+        other => panic!("expected Unverified, got {other:?}"),
+    }
+    Ok(())
+}
+
+// T7 (controller-level): drive ObservationDriven end-to-end. Seed the tracker so
+// the owner's balance slot is a well-observed, never-changed slot; with the
+// adaptive policy it is NOT selected for verification this cycle, yet the
+// validator's actual-read-set reconcile still catches the real change. This
+// exercises the controller → policy → should_refetch path.
+#[tokio::test(flavor = "multi_thread")]
+async fn observation_driven_controller_end_to_end() -> Result<()> {
+    let token = Address::repeat_byte(0x44);
+    let owner = Address::repeat_byte(0x55);
+    let recipient = Address::repeat_byte(0x66);
+
+    let mut cache = cache_with_balance(token, owner, U256::from(1000)).await?;
+    cache.set_storage_batch_fetcher(stub_fetcher(HashMap::from([(
+        (token, balance_slot_for(owner)),
+        U256::from(50), // a real change
+    )])));
+
+    // Seed a shared tracker so the balance slot is "stable, well-observed":
+    // enough never-changed observations that should_refetch() returns false.
+    let params = FreshnessParams::default();
+    let slot = balance_slot_for(owner);
+    let tracker = {
+        let mut t = SlotObservationTracker::new();
+        for now in 0..params.min_observations {
+            t.observe(token, slot, U256::from(1000), now as u64);
+        }
+        // At a now within the reuse window, a stable slot is not refetched.
+        assert!(!t.should_refetch(token, slot, params.min_observations as u64, &params));
+        Arc::new(Mutex::new(t))
+    };
+
+    // Use a predicted access list so the policy actually receives the slot as a
+    // candidate (the predicted set drives policy.select).
+    use alloy_eips::eip2930::{AccessList, AccessListItem};
+    let predicted = AccessList(vec![AccessListItem {
+        address: token,
+        storage_keys: vec![alloy_primitives::B256::from(slot)],
+    }]);
+
+    let clock = BlockClock::at(params.min_observations as u64);
+    let mut controller = FreshnessController::with_clock(
+        FreshnessRegistry::new(),
+        ObservationDriven::new(params),
+        clock,
+    )
+    .with_tracker(Arc::clone(&tracker));
+
+    let req = SimRequest::new(owner, token, transfer_calldata(recipient, U256::from(100)))
+        .with_access_list(predicted);
+    let sim = controller.run(&mut cache, vec![req])?;
+
+    // Even though the policy declined to *predictively* verify the stable slot,
+    // the validator's actual-read-set reconcile catches the real change.
+    match sim.validate().await {
+        Validation::Corrected { changed, .. } => {
+            assert!(
+                changed.iter().any(|c| c.address == token && c.slot == slot),
+                "the actual-read-set reconcile catches the balance change"
+            );
+        }
+        other => panic!("expected Corrected, got {other:?}"),
+    }
+    Ok(())
+}
+
+// T8: on_new_block advances the BlockClock so a ValidThrough(100) slot becomes
+// volatile, driven entirely through the controller's natural API (no separate
+// clock bump).
+#[tokio::test(flavor = "multi_thread")]
+async fn on_new_block_ages_valid_through() -> Result<()> {
+    let token = Address::repeat_byte(0x44);
+    let owner = Address::repeat_byte(0x55);
+    let recipient = Address::repeat_byte(0x66);
+
+    let mut cache = cache_with_balance(token, owner, U256::from(1000)).await?;
+    cache.set_storage_batch_fetcher(stub_fetcher(HashMap::from([(
+        (token, balance_slot_for(owner)),
+        U256::from(2000), // a change, if the slot is verified
+    )])));
+
+    let mut registry = FreshnessRegistry::new();
+    registry.valid_through_slot(token, balance_slot_for(owner), 100);
+
+    // Start at block 100 (still valid). Advance via on_new_block(101) — NOT a
+    // direct set_block — so the natural API ages the slot into volatile.
+    let mut controller =
+        FreshnessController::with_clock(registry, AlwaysVerify, BlockClock::at(100));
+
+    let sim = controller.run(
+        &mut cache,
+        vec![SimRequest::new(
+            owner,
+            token,
+            transfer_calldata(recipient, U256::from(100)),
+        )],
+    )?;
+    assert!(
+        matches!(sim.validate().await, Validation::Confirmed),
+        "at block 100 the ValidThrough slot is still pinned"
+    );
+
+    // Advance the clock through the controller API.
+    controller.on_new_block(101);
+
+    let sim = controller.run(
+        &mut cache,
+        vec![SimRequest::new(
+            owner,
+            token,
+            transfer_calldata(recipient, U256::from(100)),
+        )],
+    )?;
+    assert!(
+        matches!(sim.validate().await, Validation::Corrected { .. }),
+        "after on_new_block(101) the slot is volatile and the change is caught"
     );
     Ok(())
 }

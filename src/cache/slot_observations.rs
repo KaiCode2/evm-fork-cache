@@ -420,4 +420,89 @@ mod tests {
         tracker.observe(a, U256::from(0), U256::from(99), 1);
         assert_eq!(tracker.last_value(a, U256::from(0)), Some(U256::from(99)));
     }
+
+    // --- T7: probabilistic should_refetch coverage -------------------------
+
+    /// Insert a fully-specified observation so the probabilistic branch can be
+    /// tested with an exact `change_rate = change_count / observation_count` and
+    /// a known `last_checked`, without replaying an `observe` sequence.
+    fn seed_obs(
+        tracker: &mut SlotObservationTracker,
+        a: Address,
+        slot: U256,
+        observation_count: u32,
+        change_count: u32,
+        last_checked: u64,
+    ) {
+        tracker.observations.insert(
+            SlotKey { address: a, slot },
+            SlotObservation {
+                last_value: U256::from(1),
+                observation_count,
+                change_count,
+                last_checked,
+                last_changed: last_checked,
+            },
+        );
+    }
+
+    #[test]
+    fn test_probabilistic_refetches_at_now_equals_last_checked() {
+        // change_rate = 3/20 = 0.15. At now == last_checked, units_elapsed = 0 so
+        // cycles_elapsed clamps to 1.0; expected = 0.15 > 0.05 → refetch.
+        let mut tracker = SlotObservationTracker::new();
+        let p = params();
+        let a = addr(1);
+        let slot = U256::from(7);
+        seed_obs(&mut tracker, a, slot, 20, 3, 100);
+        // Sanity: this is the probabilistic branch (between never and always).
+        assert!((3.0_f64 / 20.0) < p.always_refetch_rate);
+        assert!(tracker.should_refetch(a, slot, 100, &p));
+    }
+
+    #[test]
+    fn test_probabilistic_reuses_then_refetches_after_elapsed() {
+        // change_rate = 1/100 = 0.01. At now == last_checked, expected = 0.01 <
+        // 0.05 → reuse. After 10 cycles elapsed (cycle_interval = 1), expected =
+        // 0.01 * 10 = 0.10 > 0.05 → refetch. Stays within max_reuse (300).
+        let mut tracker = SlotObservationTracker::new();
+        let p = params();
+        let a = addr(1);
+        let slot = U256::from(7);
+        seed_obs(&mut tracker, a, slot, 100, 1, 100);
+
+        // Immediately: reused.
+        assert!(!tracker.should_refetch(a, slot, 100, &p));
+        // After a few units: still under threshold (0.01 * 4 = 0.04 < 0.05).
+        assert!(!tracker.should_refetch(a, slot, 104, &p));
+        // After enough units: over threshold (0.01 * 10 = 0.10 > 0.05).
+        assert!(tracker.should_refetch(a, slot, 110, &p));
+    }
+
+    #[test]
+    fn test_probabilistic_cycle_interval_scaling() {
+        // change_rate = 1/100 = 0.01, cycle_interval = 10. cycles_elapsed =
+        // units_elapsed / 10, so it takes 10x more elapsed units than a unit
+        // cycle to cross the 0.05 threshold.
+        let mut tracker = SlotObservationTracker::new();
+        let p = FreshnessParams {
+            cycle_interval: 10,
+            ..FreshnessParams::default()
+        };
+        let a = addr(1);
+        let slot = U256::from(7);
+        seed_obs(&mut tracker, a, slot, 100, 1, 100);
+
+        // 60 units elapsed → 6 cycles → expected = 0.06 > 0.05 → refetch.
+        assert!(tracker.should_refetch(a, slot, 160, &p));
+        // 40 units elapsed → 4 cycles → expected = 0.04 < 0.05 → reuse. (Under a
+        // unit cycle_interval this same 40-unit gap would be 40 cycles and would
+        // refetch — proving the cycle_interval scaling is applied.)
+        assert!(!tracker.should_refetch(a, slot, 140, &p));
+        let unit = FreshnessParams::default();
+        assert!(
+            tracker.should_refetch(a, slot, 140, &unit),
+            "with cycle_interval = 1 the same elapsed gap refetches"
+        );
+    }
 }

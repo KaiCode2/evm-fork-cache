@@ -125,6 +125,38 @@ pub fn failing_fetcher() -> StorageBatchFetchFn {
     })
 }
 
+/// Build a stub [`StorageBatchFetchFn`] that reports chosen values *and* flips a
+/// shared flag the first time it is called.
+///
+/// Used by the Drop-abort test to prove the background validator was cancelled
+/// before it ever fetched (so it could not have queued a correction). The
+/// returned values otherwise behave exactly like [`stub_fetcher`].
+pub fn tracking_fetcher(
+    values: HashMap<(Address, U256), U256>,
+    called: Arc<std::sync::atomic::AtomicBool>,
+) -> StorageBatchFetchFn {
+    Arc::new(move |requests: Vec<(Address, U256)>| {
+        called.store(true, std::sync::atomic::Ordering::SeqCst);
+        requests
+            .into_iter()
+            .map(|(addr, slot)| {
+                let value = values.get(&(addr, slot)).copied().unwrap_or(U256::ZERO);
+                (addr, slot, Ok(value))
+            })
+            .collect()
+    })
+}
+
+/// Build a stub [`StorageBatchFetchFn`] that panics, to exercise the validator's
+/// `JoinError` (`Unverified`) path.
+pub fn panicking_fetcher() -> StorageBatchFetchFn {
+    Arc::new(
+        |_requests: Vec<(Address, U256)>| -> Vec<(Address, U256, Result<U256>)> {
+            panic!("panicking fetcher: deliberate failure for the Unverified test")
+        },
+    )
+}
+
 /// Submit a `transfer(to, amount)` to a `MockERC20`, committing the state change.
 pub fn transfer(
     cache: &mut EvmCache,

@@ -52,7 +52,7 @@
 //! ```
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -593,6 +593,11 @@ pub struct FreshnessController<P: FreshnessPolicy, C: FreshnessClock> {
     policy: P,
     clock: C,
     pending: Arc<Mutex<Vec<SlotChange>>>,
+    /// Cumulative count of background re-runs performed by the validator across
+    /// all `run` calls. Shared with the spawned task; incremented once per
+    /// re-executed sim. Lets callers observe that selective re-run actually
+    /// skipped the unaffected sims rather than re-running every one.
+    rerun_count: Arc<AtomicUsize>,
 }
 
 impl<P: FreshnessPolicy> FreshnessController<P, BlockClock> {
@@ -611,6 +616,7 @@ impl<P: FreshnessPolicy, C: FreshnessClock> FreshnessController<P, C> {
             policy,
             clock,
             pending: Arc::new(Mutex::new(Vec::new())),
+            rerun_count: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -639,6 +645,18 @@ impl<P: FreshnessPolicy, C: FreshnessClock> FreshnessController<P, C> {
     /// [`run`](Self::run).
     pub fn pending_len(&self) -> usize {
         self.pending.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
+
+    /// Cumulative number of background re-runs performed by the validator across
+    /// all [`run`](Self::run) calls so far.
+    ///
+    /// Incremented once per sim that the reconcile step actually re-executes
+    /// (i.e. whose read set intersected a changed slot). A `Corrected` verdict
+    /// over `n` requests where only one slot changed advances this by the number
+    /// of *affected* sims, not by `n` — making the selective-re-run behavior
+    /// directly observable.
+    pub fn rerun_count(&self) -> usize {
+        self.rerun_count.load(Ordering::Relaxed)
     }
 
     /// Advance to a new block.
@@ -726,8 +744,15 @@ impl<P: FreshnessPolicy, C: FreshnessClock> FreshnessController<P, C> {
         let registry = self.registry.clone();
         let tracker = Arc::clone(&self.tracker);
         let pending = Arc::clone(&self.pending);
+        let rerun_count = Arc::clone(&self.rerun_count);
         let optimistic_for_task = optimistic.clone();
         let validation = tokio::spawn(async move {
+            // Yield once before doing any work. `run_validator` is fully
+            // synchronous (no `.await` inside), so without an early await point
+            // an abort-on-drop could not preempt it once polled. Yielding gives
+            // `into_optimistic`/`Drop` a deterministic chance to cancel the task
+            // before it touches the tracker or queues a correction.
+            tokio::task::yield_now().await;
             run_validator(ValidatorInput {
                 snapshot,
                 fetcher,
@@ -736,6 +761,7 @@ impl<P: FreshnessPolicy, C: FreshnessClock> FreshnessController<P, C> {
                 registry,
                 tracker,
                 pending,
+                rerun_count,
                 now,
                 verify_set,
                 optimistic: optimistic_for_task,
@@ -758,6 +784,7 @@ struct ValidatorInput {
     registry: FreshnessRegistry,
     tracker: Arc<Mutex<SlotObservationTracker>>,
     pending: Arc<Mutex<Vec<SlotChange>>>,
+    rerun_count: Arc<AtomicUsize>,
     now: u64,
     verify_set: Vec<(Address, U256)>,
     optimistic: Vec<CallSimulationResult>,
@@ -773,6 +800,7 @@ fn run_validator(input: ValidatorInput) -> Validation {
         registry,
         tracker,
         pending,
+        rerun_count,
         now,
         verify_set,
         optimistic,
@@ -856,6 +884,7 @@ fn run_validator(input: ValidatorInput) -> Validation {
         if !intersects {
             continue;
         }
+        rerun_count.fetch_add(1, Ordering::Relaxed);
         let mut overlay = EvmOverlay::new(Arc::clone(&snapshot), None);
         for &(addr, slot, value) in &overrides {
             overlay.override_slot(addr, slot, value);
