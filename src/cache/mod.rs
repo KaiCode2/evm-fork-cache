@@ -68,7 +68,7 @@ use crate::freshness::SlotChange;
 use crate::inspector::TransferInspector;
 use crate::state_update::{
     AccountChange, AccountPatch, PurgeRecord, PurgeScope, SkippedBalanceDelta, SkippedDelta,
-    SlotDelta, StateDiff, StateUpdate,
+    SkippedMask, SlotDelta, StateDiff, StateUpdate,
 };
 
 use bytecode::BytecodeCache;
@@ -1262,6 +1262,36 @@ impl EvmCache {
                     address: *address,
                     slot: *slot,
                     delta: *delta,
+                }),
+            },
+            StateUpdate::SlotMasked {
+                address,
+                slot,
+                mask,
+                value,
+            } => match self.cached_storage_value(*address, *slot) {
+                // Hot slot: overwrite only the masked bits, preserving the rest.
+                // Build the change from the value we already read (mirroring the
+                // `SlotDelta` arm; do not re-read through `apply_slot`).
+                Some(old) => {
+                    let new = (old & !*mask) | (*value & *mask);
+                    self.write_slot_through(*address, *slot, new);
+                    if old != new {
+                        diff.slots.push(SlotChange {
+                            address: *address,
+                            slot: *slot,
+                            old,
+                            new,
+                        });
+                    }
+                }
+                // Cold slot: the un-masked bits are unknown, so the result cannot
+                // be computed; write nothing and surface the skip for re-seeding.
+                None => diff.skipped_masks.push(SkippedMask {
+                    address: *address,
+                    slot: *slot,
+                    mask: *mask,
+                    value: *value,
                 }),
             },
             StateUpdate::BalanceDelta { address, delta } => {

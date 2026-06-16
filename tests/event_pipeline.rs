@@ -21,10 +21,10 @@ use anyhow::Result;
 
 use common::{install_mock_erc20, setup_cache, stub_fetcher};
 use evm_fork_cache::cache::EvmCache;
+use evm_fork_cache::events::erc20::Erc20TransferDecoder;
 use evm_fork_cache::events::{
     DecoderRegistry, EventDecoder, EventPipeline, ReorgConfig, StateView,
 };
-use evm_fork_cache::events::erc20::Erc20TransferDecoder;
 use evm_fork_cache::{PurgeScope, SlotDelta, StateUpdate};
 
 // ---------------------------------------------------------------------------
@@ -153,12 +153,12 @@ fn decoder_returns_empty_for_unrecognized_log() {
 /// Build an ERC-20 `Transfer(from, to, value)` log.
 fn transfer_log(token: Address, from: Address, to: Address, value: U256) -> Log {
     let sig = keccak256(b"Transfer(address,address,uint256)");
-    let topics = vec![
-        sig,
-        from.into_word(),
-        to.into_word(),
-    ];
-    Log::new_unchecked(token, topics, Bytes::copy_from_slice(&value.to_be_bytes::<32>()))
+    let topics = vec![sig, from.into_word(), to.into_word()];
+    Log::new_unchecked(
+        token,
+        topics,
+        Bytes::copy_from_slice(&value.to_be_bytes::<32>()),
+    )
 }
 
 #[test]
@@ -174,7 +174,11 @@ fn erc20_transfer_decodes_to_sub_and_add_deltas() {
     assert_eq!(
         updates,
         vec![
-            StateUpdate::slot_delta(token, mapping_slot(from, 3), SlotDelta::Sub(U256::from(100))),
+            StateUpdate::slot_delta(
+                token,
+                mapping_slot(from, 3),
+                SlotDelta::Sub(U256::from(100))
+            ),
             StateUpdate::slot_delta(token, mapping_slot(to, 3), SlotDelta::Add(U256::from(100))),
         ]
     );
@@ -229,13 +233,27 @@ fn erc20_uses_per_token_slot_override_else_default() {
         &transfer_log(token_default, Address::ZERO, holder, U256::from(1)),
         &view,
     );
-    assert_eq!(d[0], StateUpdate::slot_delta(token_default, mapping_slot(holder, 3), SlotDelta::Add(U256::from(1))));
+    assert_eq!(
+        d[0],
+        StateUpdate::slot_delta(
+            token_default,
+            mapping_slot(holder, 3),
+            SlotDelta::Add(U256::from(1))
+        )
+    );
 
     let c = decoder.decode(
         &transfer_log(token_custom, Address::ZERO, holder, U256::from(1)),
         &view,
     );
-    assert_eq!(c[0], StateUpdate::slot_delta(token_custom, mapping_slot(holder, 9), SlotDelta::Add(U256::from(1))));
+    assert_eq!(
+        c[0],
+        StateUpdate::slot_delta(
+            token_custom,
+            mapping_slot(holder, 9),
+            SlotDelta::Add(U256::from(1))
+        )
+    );
 }
 
 #[test]
@@ -243,7 +261,10 @@ fn erc20_non_transfer_log_decodes_to_empty() {
     let decoder = Erc20TransferDecoder::new(U256::from(3));
     let view = empty_view();
     // Wrong topic0.
-    let log = bare_log(Address::repeat_byte(0x28), vec![keccak256(b"Approval(address,address,uint256)")]);
+    let log = bare_log(
+        Address::repeat_byte(0x28),
+        vec![keccak256(b"Approval(address,address,uint256)")],
+    );
     assert!(decoder.decode(&log, &view).is_empty());
 }
 
@@ -344,7 +365,10 @@ async fn ingest_records_touched_slots() -> Result<()> {
 
     let digest = pipeline.ingest_logs(&mut cache, 10, &[bare_log(token, vec![])]);
     assert!(digest.touched_slots.contains(&(token, U256::from(5))));
-    assert_eq!(cache.cached_storage_value(token, U256::from(5)), Some(U256::from(42)));
+    assert_eq!(
+        cache.cached_storage_value(token, U256::from(5)),
+        Some(U256::from(42))
+    );
     Ok(())
 }
 
@@ -379,9 +403,21 @@ async fn reorg_to_purges_addresses_touched_after_head() -> Result<()> {
     // Reorg back to block 10: purge B and C (touched after 10), keep A.
     let diff = pipeline.reorg_to(&mut cache, 10);
 
-    assert_eq!(backend_slot(&cache, token_a, slot), Some(U256::from(77)), "A untouched");
-    assert_eq!(backend_slot(&cache, token_b, slot), None, "B storage purged");
-    assert_eq!(backend_slot(&cache, token_c, slot), None, "C storage purged");
+    assert_eq!(
+        backend_slot(&cache, token_a, slot),
+        Some(U256::from(77)),
+        "A untouched"
+    );
+    assert_eq!(
+        backend_slot(&cache, token_b, slot),
+        None,
+        "B storage purged"
+    );
+    assert_eq!(
+        backend_slot(&cache, token_c, slot),
+        None,
+        "C storage purged"
+    );
 
     // The returned diff records the purges (B and C only).
     let purged: Vec<Address> = diff.purged.iter().map(|r| r.address).collect();
@@ -410,7 +446,11 @@ async fn reorg_config_account_scope_fully_drops_account() -> Result<()> {
     pipeline.ingest_logs(&mut cache, 20, &[bare_log(token, vec![])]);
     let diff = pipeline.reorg_to(&mut cache, 19);
 
-    assert!(diff.purged.iter().any(|r| r.address == token && r.account_removed));
+    assert!(
+        diff.purged
+            .iter()
+            .any(|r| r.address == token && r.account_removed)
+    );
     Ok(())
 }
 
@@ -430,10 +470,16 @@ async fn reconcile_reports_mismatch_and_corrects() -> Result<()> {
     }));
     let mut pipeline = EventPipeline::new(registry);
     pipeline.ingest_logs(&mut cache, 1, &[bare_log(token, vec![])]);
-    assert_eq!(cache.cached_storage_value(token, slot), Some(U256::from(50)));
+    assert_eq!(
+        cache.cached_storage_value(token, slot),
+        Some(U256::from(50))
+    );
 
     // Chain truth is 100. Reconcile must surface the drift AND correct the cache.
-    cache.set_storage_batch_fetcher(stub_fetcher(HashMap::from([((token, slot), U256::from(100))])));
+    cache.set_storage_batch_fetcher(stub_fetcher(HashMap::from([(
+        (token, slot),
+        U256::from(100),
+    )])));
     let report = pipeline.reconcile(&mut cache, &[(token, slot)])?;
 
     assert_eq!(report.checked, 1);
@@ -441,7 +487,10 @@ async fn reconcile_reports_mismatch_and_corrects() -> Result<()> {
     assert_eq!(report.mismatched[0].old, U256::from(50));
     assert_eq!(report.mismatched[0].new, U256::from(100));
     // Cache corrected to chain truth.
-    assert_eq!(cache.cached_storage_value(token, slot), Some(U256::from(100)));
+    assert_eq!(
+        cache.cached_storage_value(token, slot),
+        Some(U256::from(100))
+    );
     Ok(())
 }
 
@@ -461,7 +510,10 @@ async fn reconcile_empty_when_event_state_matches_chain() -> Result<()> {
     pipeline.ingest_logs(&mut cache, 1, &[bare_log(token, vec![])]);
 
     // Chain agrees (100).
-    cache.set_storage_batch_fetcher(stub_fetcher(HashMap::from([((token, slot), U256::from(100))])));
+    cache.set_storage_batch_fetcher(stub_fetcher(HashMap::from([(
+        (token, slot),
+        U256::from(100),
+    )])));
     let report = pipeline.reconcile(&mut cache, &[(token, slot)])?;
     assert!(report.mismatched.is_empty());
     Ok(())
@@ -473,7 +525,11 @@ async fn reconcile_errors_without_fetcher() -> Result<()> {
     let registry = DecoderRegistry::new();
     let mut pipeline = EventPipeline::new(registry);
     let token = Address::repeat_byte(0x37);
-    assert!(pipeline.reconcile(&mut cache, &[(token, U256::from(0))]).is_err());
+    assert!(
+        pipeline
+            .reconcile(&mut cache, &[(token, U256::from(0))])
+            .is_err()
+    );
     Ok(())
 }
 
@@ -484,11 +540,11 @@ async fn reconcile_errors_without_fetcher() -> Result<()> {
 #[cfg(feature = "protocols")]
 mod uniswap_v3 {
     use super::*;
-    use alloy_primitives::aliases::{I24, U160};
     use alloy_primitives::I256;
+    use alloy_primitives::aliases::{I24, U160};
     use alloy_sol_types::{SolEvent, sol};
     use evm_fork_cache::cache::{
-        V3_LIQUIDITY_SLOT, V3_SLOT0_SLOT, V3_TICKS_BASE_SLOT, V3_TICK_BITMAP_BASE_SLOT,
+        V3_LIQUIDITY_SLOT, V3_SLOT0_SLOT, V3_TICK_BITMAP_BASE_SLOT, V3_TICKS_BASE_SLOT,
         v3_tick_bitmap_storage_key_with_base, v3_tick_info_storage_keys_with_base,
     };
     use evm_fork_cache::events::uniswap_v3::{UniswapV3Decoder, UniswapV3Layout};
@@ -564,7 +620,8 @@ mod uniswap_v3 {
 
     fn pool_with_decoder(tick_spacing: i32) -> (Address, UniswapV3Decoder) {
         let pool = Address::repeat_byte(0x40);
-        let decoder = UniswapV3Decoder::new().with_pool(pool, UniswapV3Layout::uniswap(tick_spacing));
+        let decoder =
+            UniswapV3Decoder::new().with_pool(pool, UniswapV3Layout::uniswap(tick_spacing));
         (pool, decoder)
     }
 
@@ -578,7 +635,9 @@ mod uniswap_v3 {
         // observation index (bits 184+). high = unlocked(bit 56 of high) | obs(=7).
         let high = (U256::from(1) << 56) | U256::from(7);
         let seeded = pack_slot0(1_000_000, 50, high);
-        cache.db_mut().insert_account_storage(pool, V3_SLOT0_SLOT, seeded)?;
+        cache
+            .db_mut()
+            .insert_account_storage(pool, V3_SLOT0_SLOT, seeded)?;
 
         let mut registry = DecoderRegistry::new();
         registry.register(Arc::new(decoder));
@@ -601,9 +660,11 @@ mod uniswap_v3 {
         let (pool, decoder) = pool_with_decoder(1);
         let mut cache = setup_cache().await?;
         install_mock_erc20(&mut cache, pool);
-        cache
-            .db_mut()
-            .insert_account_storage(pool, V3_SLOT0_SLOT, pack_slot0(1, 0, U256::from(1) << 56))?;
+        cache.db_mut().insert_account_storage(
+            pool,
+            V3_SLOT0_SLOT,
+            pack_slot0(1, 0, U256::from(1) << 56),
+        )?;
 
         let mut registry = DecoderRegistry::new();
         registry.register(Arc::new(decoder));
@@ -650,8 +711,10 @@ mod uniswap_v3 {
 
         let lo_key = v3_tick_info_storage_keys_with_base(lo, V3_TICKS_BASE_SLOT)[0];
         let hi_key = v3_tick_info_storage_keys_with_base(hi, V3_TICKS_BASE_SLOT)[0];
-        let (lo_gross, lo_net) = unpack_tick_word(cache.cached_storage_value(pool, lo_key).unwrap());
-        let (hi_gross, hi_net) = unpack_tick_word(cache.cached_storage_value(pool, hi_key).unwrap());
+        let (lo_gross, lo_net) =
+            unpack_tick_word(cache.cached_storage_value(pool, lo_key).unwrap());
+        let (hi_gross, hi_net) =
+            unpack_tick_word(cache.cached_storage_value(pool, hi_key).unwrap());
 
         assert_eq!(lo_gross, 500);
         assert_eq!(lo_net, 500, "lower tick: net += amount");
@@ -677,8 +740,14 @@ mod uniswap_v3 {
         let lo3 = v3_tick_info_storage_keys_with_base(lo, V3_TICKS_BASE_SLOT)[3];
         let hi3 = v3_tick_info_storage_keys_with_base(hi, V3_TICKS_BASE_SLOT)[3];
         let init_bit = U256::from(1) << 248;
-        assert_eq!(cache.cached_storage_value(pool, lo3).unwrap() & init_bit, init_bit);
-        assert_eq!(cache.cached_storage_value(pool, hi3).unwrap() & init_bit, init_bit);
+        assert_eq!(
+            cache.cached_storage_value(pool, lo3).unwrap() & init_bit,
+            init_bit
+        );
+        assert_eq!(
+            cache.cached_storage_value(pool, hi3).unwrap() & init_bit,
+            init_bit
+        );
 
         // bitmap word 0 (ticks 10 & 20 with tick_spacing 1 → word 0, bits 10 & 20).
         let word_key = v3_tick_bitmap_storage_key_with_base(0, V3_TICK_BITMAP_BASE_SLOT);
@@ -708,17 +777,24 @@ mod uniswap_v3 {
         );
 
         let lo_key = v3_tick_info_storage_keys_with_base(lo, V3_TICKS_BASE_SLOT)[0];
-        let (lo_gross, lo_net) = unpack_tick_word(cache.cached_storage_value(pool, lo_key).unwrap());
+        let (lo_gross, lo_net) =
+            unpack_tick_word(cache.cached_storage_value(pool, lo_key).unwrap());
         assert_eq!(lo_gross, 0, "gross back to zero");
         assert_eq!(lo_net, 0, "net back to zero");
 
         // initialized flag cleared and bitmap bit cleared.
         let lo3 = v3_tick_info_storage_keys_with_base(lo, V3_TICKS_BASE_SLOT)[3];
         let init_bit = U256::from(1) << 248;
-        assert_eq!(cache.cached_storage_value(pool, lo3).unwrap_or(U256::ZERO) & init_bit, U256::ZERO);
+        assert_eq!(
+            cache.cached_storage_value(pool, lo3).unwrap_or(U256::ZERO) & init_bit,
+            U256::ZERO
+        );
         let word_key = v3_tick_bitmap_storage_key_with_base(0, V3_TICK_BITMAP_BASE_SLOT);
         assert_eq!(
-            cache.cached_storage_value(pool, word_key).unwrap_or(U256::ZERO) & (U256::from(1) << 10),
+            cache
+                .cached_storage_value(pool, word_key)
+                .unwrap_or(U256::ZERO)
+                & (U256::from(1) << 10),
             U256::ZERO
         );
         Ok(())
@@ -795,9 +871,16 @@ mod uniswap_v3 {
         let mut pipeline = EventPipeline::new(registry);
 
         let digest = pipeline.ingest_logs(&mut cache, 1, &[mint_log(pool, 10, 20, 500)]);
-        assert!(digest.applied.has_skipped(), "cold tick words surfaced as skips");
+        assert!(
+            digest.applied.has_skipped(),
+            "cold tick words surfaced as skips"
+        );
         let lo_key = v3_tick_info_storage_keys_with_base(10, V3_TICKS_BASE_SLOT)[0];
-        assert_eq!(cache.cached_storage_value(pool, lo_key), None, "nothing written");
+        assert_eq!(
+            cache.cached_storage_value(pool, lo_key),
+            None,
+            "nothing written"
+        );
         Ok(())
     }
 

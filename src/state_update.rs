@@ -58,6 +58,20 @@
 //! true value (the next read otherwise lazily fetches it). `modify_slot` hands its
 //! closure an `Option<U256>` (`None` when cold) and lets the caller decide.
 //!
+//! # Masked writes to packed words
+//!
+//! A storage slot often packs several fields (a UniswapV3 `slot0` holds
+//! `sqrtPriceX96`, `tick`, an observation index, and the `unlocked` flag in one
+//! word). A decoder that learns only some of those fields must update *just* its
+//! bits without clobbering the rest. [`StateUpdate::SlotMasked`] is the
+//! cold-aware masked read-modify-write for exactly this: it computes
+//! `new = (old & !mask) | (value & mask)`, touching only the `mask` bits. Like
+//! [`SlotDelta`](StateUpdate::SlotDelta) it is cold-aware — the un-masked bits of
+//! a slot absent from both layers are unknown, so a masked write to a cold slot
+//! is **not** applied; it is surfaced in [`StateDiff::skipped_masks`] as a
+//! [`SkippedMask`]. (A full-mask `SlotMasked` matches an absolute
+//! [`Slot`](StateUpdate::Slot) write on a hot slot but still skips on a cold one.)
+//!
 //! The same relative, cold-aware rule extends to an account's **native balance**:
 //! [`StateUpdate::BalanceDelta`] (and the closure form
 //! [`EvmCache::modify_account_balance`](crate::cache::EvmCache::modify_account_balance))
@@ -206,6 +220,32 @@ pub enum StateUpdate {
         /// The relative, saturating mutation to apply to the current balance.
         delta: SlotDelta,
     },
+    /// Set only the `mask` bits of a storage slot to the corresponding bits of
+    /// `value`, preserving the rest: `new = (old & !mask) | (value & mask)`.
+    ///
+    /// A *masked* read-modify-write: it lets a pure decoder express a partial
+    /// update to a **packed** storage word (e.g. a UniswapV3 `slot0`, which packs
+    /// `sqrtPriceX96`, `tick`, the observation index, and the `unlocked` flag into
+    /// one slot) without knowing or clobbering the bits it does not own.
+    ///
+    /// **Cold-aware** — a masked write to a slot absent from *both* cache layers is
+    /// **not** applied (the un-masked bits are unknown, so the result cannot be
+    /// computed); it is surfaced in [`StateDiff::skipped_masks`] as a
+    /// [`SkippedMask`] instead. A masked write with `mask == U256::MAX` equals an
+    /// absolute [`Slot`](Self::Slot) write on a *hot* slot, but **still skips** on a
+    /// cold one (unlike [`Slot`](Self::Slot), which writes unconditionally). Use
+    /// [`Slot`](Self::Slot) for an unconditional absolute write; use `SlotMasked`
+    /// when neighbouring bits must be preserved.
+    SlotMasked {
+        /// Contract whose storage is written.
+        address: Address,
+        /// Storage slot key.
+        slot: U256,
+        /// Which bits of the slot to overwrite (1 = take from `value`).
+        mask: U256,
+        /// The bits to write (only the bits selected by `mask` are applied).
+        value: U256,
+    },
     /// Patch an account's balance/nonce/code (partial — see [`AccountPatch`]).
     ///
     /// # Warning
@@ -247,6 +287,17 @@ impl StateUpdate {
             address,
             slot,
             delta,
+        }
+    }
+
+    /// Construct a [`StateUpdate::SlotMasked`] that sets only the `mask` bits of
+    /// `(address, slot)` to the corresponding bits of `value`.
+    pub fn slot_masked(address: Address, slot: U256, mask: U256, value: U256) -> Self {
+        Self::SlotMasked {
+            address,
+            slot,
+            mask,
+            value,
         }
     }
 
@@ -428,6 +479,11 @@ pub struct StateDiff {
     /// was unknown). Like [`skipped`](Self::skipped) this is informational
     /// metadata, not a change.
     pub skipped_balances: Vec<SkippedBalanceDelta>,
+    /// Masked slot updates ([`StateUpdate::SlotMasked`]) that were **not** applied
+    /// because the target slot's current value was unknown (cold) — the un-masked
+    /// bits could not be preserved. Like [`skipped`](Self::skipped) this is
+    /// informational metadata, not a change.
+    pub skipped_masks: Vec<SkippedMask>,
 }
 
 impl StateDiff {
@@ -456,12 +512,15 @@ impl StateDiff {
     /// [`is_empty`](Self::is_empty) — callers applying relative updates should
     /// check this to avoid silently dropping a balance update.
     pub fn has_skipped(&self) -> bool {
-        !self.skipped.is_empty() || !self.skipped_balances.is_empty()
+        !self.skipped.is_empty()
+            || !self.skipped_balances.is_empty()
+            || !self.skipped_masks.is_empty()
     }
 
-    /// Total number of skipped relative updates (`skipped` + `skipped_balances`).
+    /// Total number of skipped relative/masked updates (`skipped` +
+    /// `skipped_balances` + `skipped_masks`).
     pub fn skipped_len(&self) -> usize {
-        self.skipped.len() + self.skipped_balances.len()
+        self.skipped.len() + self.skipped_balances.len() + self.skipped_masks.len()
     }
 
     /// Whether every relative update in the apply was applied (none skipped).
@@ -475,14 +534,15 @@ impl StateDiff {
     ///
     /// Used by [`apply_updates`](crate::cache::EvmCache::apply_updates) to merge
     /// per-update diffs; the concatenation preserves order, so two writes to the
-    /// same slot record their `old → new` history in sequence. The `skipped` and
-    /// `skipped_balances` metadata are concatenated too.
+    /// same slot record their `old → new` history in sequence. The `skipped`,
+    /// `skipped_balances`, and `skipped_masks` metadata are concatenated too.
     pub fn merge(&mut self, other: StateDiff) {
         self.slots.extend(other.slots);
         self.accounts.extend(other.accounts);
         self.purged.extend(other.purged);
         self.skipped.extend(other.skipped);
         self.skipped_balances.extend(other.skipped_balances);
+        self.skipped_masks.extend(other.skipped_masks);
     }
 }
 
@@ -547,6 +607,39 @@ pub struct SkippedBalanceDelta {
     pub address: Address,
     /// The delta that was not applied.
     pub delta: SlotDelta,
+}
+
+/// A masked write ([`StateUpdate::SlotMasked`]) that could not be applied because
+/// the target slot's current value is unknown (not cached in either layer).
+///
+/// A masked write needs the slot's current value to preserve the un-masked bits
+/// (`new = (old & !mask) | (value & mask)`); without it the result cannot be
+/// computed, so the write is skipped rather than applied against an assumed value.
+/// It is surfaced here so the caller can fetch+seed the slot and retry; otherwise
+/// the next read lazily fetches the true value.
+///
+/// # The `mask == U256::MAX, value == U256::ZERO` cold-tick convention
+///
+/// The UniswapV3 adapter (`events::uniswap_v3`) reuses this record as a
+/// "could-not-compute" marker for the *absolute* tick-word / global-liquidity
+/// writes it must skip when a needed word is cold: it pushes a `SkippedMask` with
+/// `mask == U256::MAX` and `value == U256::ZERO`. This avoids adding a fourth skip
+/// vector for stateful protocol updates; the count flows through
+/// [`StateDiff::skipped_len`] all the same, and the caller re-seeds the pool.
+///
+/// Deliberately **not** `#[non_exhaustive]`: it is a stable, fully-determined leaf
+/// record routinely constructed as a struct literal in equality assertions by the
+/// test suite and downstream users testing against a returned diff.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SkippedMask {
+    /// Contract whose storage slot the masked write targeted.
+    pub address: Address,
+    /// Storage slot key that was cold.
+    pub slot: U256,
+    /// The mask that was not applied.
+    pub mask: U256,
+    /// The value bits that were not applied.
+    pub value: U256,
 }
 
 #[cfg(test)]
@@ -703,5 +796,61 @@ mod tests {
         // A skip is metadata, not a change.
         assert!(left.is_empty());
         assert_eq!(left.len(), 0);
+    }
+
+    #[test]
+    fn slot_masked_constructor_produces_variant() {
+        let a = addr(0xee);
+        assert_eq!(
+            StateUpdate::slot_masked(a, U256::from(1), U256::from(0xFF), U256::from(0x42)),
+            StateUpdate::SlotMasked {
+                address: a,
+                slot: U256::from(1),
+                mask: U256::from(0xFF),
+                value: U256::from(0x42),
+            }
+        );
+    }
+
+    #[test]
+    fn state_diff_merge_extends_skipped_masks_without_counting_it() {
+        let a = addr(0xef);
+        let mut left = StateDiff::default();
+        let mut right = StateDiff::default();
+        right.skipped_masks.push(SkippedMask {
+            address: a,
+            slot: U256::from(1),
+            mask: U256::from(0xFF),
+            value: U256::from(0x42),
+        });
+
+        left.merge(right);
+        assert_eq!(left.skipped_masks.len(), 1);
+        // A masked skip is metadata, not a change.
+        assert!(left.is_empty());
+        assert_eq!(left.len(), 0);
+        // But it is discoverable through the skip accessors.
+        assert!(left.has_skipped());
+        assert_eq!(left.skipped_len(), 1);
+        assert!(!left.is_fully_applied());
+    }
+
+    #[test]
+    fn slot_masked_serde_round_trips() {
+        let a = addr(0xf0);
+        let update = StateUpdate::slot_masked(a, U256::from(5), U256::from(0xFF), U256::from(3));
+        let json = serde_json::to_string(&update).expect("serialize");
+        let back: StateUpdate = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(update, back);
+
+        let mask = SkippedMask {
+            address: a,
+            slot: U256::from(1),
+            mask: U256::from(0xFF),
+            value: U256::from(2),
+        };
+        let json = serde_json::to_string(&mask).expect("serialize");
+        let back: SkippedMask = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(mask, back);
     }
 }

@@ -116,5 +116,5 @@ pub use freshness::{
 };
 pub use state_update::{
     AccountChange, AccountPatch, PurgeRecord, PurgeScope, SkippedBalanceDelta, SkippedDelta,
-    SlotDelta, StateDiff, StateUpdate,
+    SkippedMask, SlotDelta, StateDiff, StateUpdate,
 };

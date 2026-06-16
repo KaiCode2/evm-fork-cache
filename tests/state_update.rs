@@ -22,8 +22,8 @@ use common::{
 };
 use evm_fork_cache::cache::EvmCache;
 use evm_fork_cache::{
-    AccountPatch, PurgeScope, SkippedBalanceDelta, SkippedDelta, SkippedMask, SlotChange, SlotDelta,
-    StateDiff, StateUpdate,
+    AccountPatch, PurgeScope, SkippedBalanceDelta, SkippedDelta, SkippedMask, SlotChange,
+    SlotDelta, StateDiff, StateUpdate,
 };
 use revm::state::{AccountInfo, Bytecode};
 
@@ -1666,7 +1666,10 @@ async fn slot_masked_noop_when_masked_bits_already_equal() -> Result<()> {
         U256::from(0x42),
     ));
 
-    assert!(diff.is_empty(), "masked write that changes nothing is a no-op");
+    assert!(
+        diff.is_empty(),
+        "masked write that changes nothing is a no-op"
+    );
     assert!(diff.skipped_masks.is_empty());
     Ok(())
 }
@@ -1749,8 +1752,12 @@ async fn slot_masked_full_mask_equals_absolute_on_hot_but_skips_cold() -> Result
         .db_mut()
         .insert_account_storage(token, hot, U256::from(7))?;
 
-    let hot_diff =
-        cache.apply_update(&StateUpdate::slot_masked(token, hot, U256::MAX, U256::from(99)));
+    let hot_diff = cache.apply_update(&StateUpdate::slot_masked(
+        token,
+        hot,
+        U256::MAX,
+        U256::from(99),
+    ));
     assert_eq!(cache.cached_storage_value(token, hot), Some(U256::from(99)));
     assert_eq!(hot_diff.slots.len(), 1);
     assert!(hot_diff.skipped_masks.is_empty());
@@ -1769,8 +1776,12 @@ async fn slot_masked_full_mask_equals_absolute_on_hot_but_skips_cold() -> Result
 
 #[tokio::test]
 async fn slot_masked_serde_round_trips() -> Result<()> {
-    let update =
-        StateUpdate::slot_masked(Address::repeat_byte(0x17), U256::from(5), U256::from(0xFF), U256::from(3));
+    let update = StateUpdate::slot_masked(
+        Address::repeat_byte(0x17),
+        U256::from(5),
+        U256::from(0xFF),
+        U256::from(3),
+    );
     let json = serde_json::to_string(&update)?;
     let back: StateUpdate = serde_json::from_str(&json)?;
     assert_eq!(update, back);
