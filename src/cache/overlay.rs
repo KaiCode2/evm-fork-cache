@@ -21,9 +21,6 @@ use crate::access_set::StorageAccessList;
 use crate::errors::{SimError, SimulationError, SimulationResult};
 use crate::inspector::TransferInspector;
 
-/// Default initial capacity for shared memory buffer (64KB).
-const OVERLAY_SHARED_MEMORY_CAPACITY: usize = 64 * 1024;
-
 type OverlayEvm<'a> = revm::MainnetEvm<
     Context<BlockEnv, TxEnv, CfgEnv, &'a mut EvmOverlay, Journal<&'a mut EvmOverlay>, ()>,
 >;
@@ -63,17 +60,28 @@ pub struct EvmOverlay {
     /// for revm's [`LocalContext`], runs, then reclaims and clears it after the
     /// EVM is dropped (see [`Self::build_evm_with_local`]).
     reusable_buffer: Vec<u8>,
+    /// Target pre-allocation (bytes) for [`Self::reusable_buffer`] and each
+    /// per-call buffer, taken from the snapshot's configured
+    /// [`SharedMemoryCapacity`](super::SharedMemoryCapacity) so overlays honor the
+    /// capacity set on the originating [`EvmCache`].
+    buffer_capacity: usize,
 }
 
 impl EvmOverlay {
     /// Create a new overlay on the given snapshot.
+    ///
+    /// The reusable shared-memory buffer is pre-allocated to the snapshot's
+    /// configured shared-memory capacity (see
+    /// [`SharedMemoryCapacity`](super::SharedMemoryCapacity)).
     pub fn new(snapshot: Arc<EvmSnapshot>, ext_db: Option<SharedBackend>) -> Self {
+        let buffer_capacity = snapshot.shared_memory_capacity;
         Self {
             snapshot,
             dirty_accounts: HashMap::new(),
             dirty_storage: HashMap::new(),
             ext_db,
-            reusable_buffer: Vec::with_capacity(OVERLAY_SHARED_MEMORY_CAPACITY),
+            reusable_buffer: Vec::with_capacity(buffer_capacity),
+            buffer_capacity,
         }
     }
 
@@ -133,11 +141,9 @@ impl EvmOverlay {
     /// Used by the public [`Self::build_evm`], which hands out the EVM and cannot
     /// reclaim its buffer afterwards. The internal call methods instead recycle
     /// [`Self::reusable_buffer`] via [`Self::build_evm_with_local`].
-    fn fresh_local() -> LocalContext {
+    fn fresh_local(&self) -> LocalContext {
         LocalContext {
-            shared_memory_buffer: Rc::new(RefCell::new(Vec::with_capacity(
-                OVERLAY_SHARED_MEMORY_CAPACITY,
-            ))),
+            shared_memory_buffer: Rc::new(RefCell::new(Vec::with_capacity(self.buffer_capacity))),
             precompile_error_message: None,
         }
     }
@@ -212,7 +218,7 @@ impl EvmOverlay {
     /// Note: The returned EVM is `!Send` (due to `LocalContext`'s `Rc<RefCell>`),
     /// but this is fine because it's created and used within a single task.
     pub fn build_evm(&mut self) -> OverlayEvm<'_> {
-        let local = Self::fresh_local();
+        let local = self.fresh_local();
         self.build_evm_with_local(local)
     }
 
@@ -300,7 +306,7 @@ impl EvmOverlay {
             buf.clear();
             self.reusable_buffer = buf;
         } else {
-            self.reusable_buffer = Vec::with_capacity(OVERLAY_SHARED_MEMORY_CAPACITY);
+            self.reusable_buffer = Vec::with_capacity(self.buffer_capacity);
         }
     }
 
@@ -805,6 +811,7 @@ mod tests {
             chain_id: 42161,
             timestamp: None,
             spec_id: SpecId::CANCUN,
+            shared_memory_capacity: 64_000,
         })
     }
 

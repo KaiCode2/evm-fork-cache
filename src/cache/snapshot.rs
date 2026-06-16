@@ -112,6 +112,12 @@ pub struct EvmSnapshot {
     pub(crate) chain_id: u64,
     pub(crate) timestamp: Option<u64>,
     pub(crate) spec_id: SpecId,
+    /// Per-context EVM shared-memory pre-allocation (bytes) copied from the
+    /// [`EvmCache`](super::EvmCache) at snapshot time, so an [`EvmOverlay`] built
+    /// from this snapshot pre-allocates the same working-memory size the live cache
+    /// was configured with (see
+    /// [`SharedMemoryCapacity`](super::SharedMemoryCapacity)).
+    pub(crate) shared_memory_capacity: usize,
 }
 
 impl EvmSnapshot {
@@ -202,6 +208,7 @@ mod tests {
             chain_id: 42161,
             timestamp: None,
             spec_id: SpecId::CANCUN,
+            shared_memory_capacity: 64_000,
         };
         assert_eq!(snap.chain_id, 42161);
         assert_eq!(snap.block_number, Some(100));

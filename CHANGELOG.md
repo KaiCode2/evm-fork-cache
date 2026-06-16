@@ -161,6 +161,16 @@ pre-release development phases (see [`docs/ROADMAP.md`](docs/ROADMAP.md)).
   exactly like a freshly-built overlay. The 64 KB shared-memory buffer is also
   recycled across the build→transact→revert call methods (stored as a plain
   `Vec<u8>`, so the overlay stays `Send`).
+- **Configurable EVM shared-memory pre-allocation** — `SharedMemoryCapacity`
+  (`Fixed(usize)` / `Auto`, default `Fixed(64_000)`) set via
+  `EvmCacheBuilder::shared_memory_capacity`. `Fixed` pins the per-context working-
+  memory buffer (general users running wide fan-outs of small simulations can lower
+  it to cut per-overlay memory; the previous behavior is the default); `Auto` sizes
+  it from the chain state loaded at build time (e.g. a bincode state file), clamped
+  to a 64 kB floor / 4 MiB ceiling. The resolved size is readable via
+  `EvmCache::shared_memory_capacity()` and is propagated to every snapshot so
+  snapshot-backed overlays pre-allocate the same amount. `with_cache_capacity` is
+  the lower-level constructor behind the builder setter.
 
 ### Changed
 
