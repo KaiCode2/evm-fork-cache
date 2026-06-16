@@ -71,6 +71,21 @@ Confidence legend: **[V]** verified against the source during review;
     override is set, which panics if the system clock is before the Unix epoch.
     Setting an explicit timestamp avoids it; consider a saturating fallback.
 
+18. **[V] Cold absolute `Account` patch masks the real on-chain account.** A
+    *partial* absolute [`StateUpdate::Account`] patch (e.g. balance-only) applied
+    to an address absent from **both** cache layers writes default values for the
+    un-patched fields (nonce `0`, empty code) through the shared BlockchainDb
+    backend as authoritative — pre-empting a later RPC fetch of the real account
+    (`apply_account_patch` materializes the backend account on any real change, by
+    design / spec §5.2). This is a live-fork footgun for callers reconstructing an
+    account from one event field. Mitigations: fetch+seed the account first, or use
+    the relative `StateUpdate::BalanceDelta` / `EvmCache::modify_account_balance`
+    (Phase 3 §16.5), which are cold-aware (a cold target is skipped and surfaced in
+    `StateDiff.skipped_balances`, never materialized). A no-op patch (no field
+    actually changes) does **not** materialize anything (Phase 3 §16.1 fix). The
+    rustdoc on `apply_update` / `StateUpdate::Account` / `AccountPatch` carries a
+    `# Warning` to this effect.
+
 ## Code-quality nits
 
 11. **[V] Dead branch in `i128_to_u256`** (`cache/storage_keys.rs`): both the
@@ -124,7 +139,20 @@ Confidence legend: **[V]** verified against the source during review;
   planned (roadmap), blocked partly by `ImmutableDataCache` coupling generic
   token-decimals with V2/V3/Balancer pool metadata.
 - **Event-driven sync (roadmap Pillar B) is not implemented.** Targeted
-  inject/purge exist; decoding logs into state updates and the WS ingestion loop
-  with reorg handling are future phases.
+  inject/purge exist; the Phase 3 **writer half** (the `StateUpdate` vocabulary +
+  `apply_update`/`apply_updates`) lands the apply mechanism, but decoding logs
+  into state updates and the WS ingestion loop with reorg handling are future
+  phases (Pillar B.2).
+- **`inject_v2/v3_*` layer behavior changed in Phase 3 (Decision 2).** The
+  `protocols`-gated `inject_v2_pool_metadata` / `inject_v3_tick_bitmap*` /
+  `inject_v3_ticks*` helpers were refolded onto the write-through
+  `StateUpdate::Slot` primitive, so they now write **both** cache layers (backend
+  + overlay-if-present) instead of the previous overlay-only write. This is a
+  deliberate normalization (one consistent write path), not a bug: signatures and
+  return values are unchanged and the visible reads are identical; only the slot
+  *placement* across layers moved. `tests/state_update.rs`
+  (`inject_v3_tick_bitmap_writes_through_to_backend`) pins the new behavior, and
+  it is recorded in `CHANGELOG.md` (`### Changed`). The cold-backfill
+  `inject_storage_batch` deliberately remains layer-2-only.
 - **Recent toolchain.** MSRV 1.88 and edition 2024 are intentional and
   CI-enforced; consumers on older toolchains are not supported.

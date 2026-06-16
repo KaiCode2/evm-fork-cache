@@ -72,7 +72,7 @@ RPC node                     Event-driven sync  ← WS logs · new block
 | **0** | API hygiene + correctness: drop `amms`, fix `set_block` divergence + `block_in_place` panic, commit the tree. | **Done** (`p0-oss-prep`) |
 | **1** | Engine seam: typed errors, configurable tx/block env, hot-path benches, builder, `protocols` feature. | **Done** (`phase-1-engine-seam`) |
 | **2** | Freshness core (Pillar C): `Validity` + `FreshnessRegistry`; observation tracker; policies; optimistic verify-and-rerun loop. | **Done** (`phase-2-freshness`) |
-| **3** | State-update primitives (Pillar B.1): `StateUpdate` + targeted writers; refold `inject_*`; surface state-diff output. | Planned |
+| **3** | State-update primitives (Pillar B.1): `StateUpdate` + targeted writers; refold `inject_*`; surface state-diff output. | **Done** (`phase-3-state-updates`) |
 | **4** | Event pipeline + adapters (Pillar B.2): `EventDecoder` trait, V3 adapter, WS ingestion loop, reorg handling. | Planned |
 | **5** | COW snapshots (Pillar A): structural sharing; overlay buffer reuse. | Planned |
 
@@ -301,6 +301,58 @@ Landed on `phase-2-freshness`: `src/freshness.rs` (the generic core — `Validit
 `EvmCache::verify_slots`/`purge_account`/`set_storage_batch_fetcher`;
 `EvmSnapshot::storage_value` + `EvmOverlay::override_slot` validator seams; the
 offline `examples/freshness_optimistic.rs`; and `tests/freshness.rs`.
+
+---
+
+## Phase 3 — state-update primitives (detailed, decisions locked)
+
+Builds **Pillar B.1 — the writer half** of the event → state pipeline: the
+generic state-mutation vocabulary and the single apply primitive that writes it
+consistently across both cache layers, returning a structured diff. Out of
+scope (Phase 4): event decoding (`EventDecoder`, `Log` → `StateUpdate`), the WS
+ingestion loop, reorg handling, and overlay-side apply.
+
+### Locked decisions
+
+1. **`Account` variant is a partial `AccountPatch`** (`balance`/`nonce`/`code`,
+   each `Option`), not a full `AccountInfo`: best fit for event-derived writes
+   (one field at a time) and keeps revm's type out of the public vocabulary.
+2. **`inject_v2/v3_*` (`protocols`) normalized to write-through.** Refolded onto
+   the write-through `StateUpdate::Slot` primitive (backend + overlay-if-present)
+   instead of the old overlay-only write — a deliberate behavior change recorded
+   in `CHANGELOG.md` (`### Changed`) and `KNOWN_ISSUES.md`, with a test pinning
+   the new placement. The cold-backfill `inject_storage_batch` stays layer-2-only.
+
+### Acceptance — met
+
+`cargo fmt --check`, `clippy --all-targets -- -D warnings` (default +
+`--lib --no-default-features`), `cargo test`, `RUSTDOCFLAGS=-D warnings cargo doc`.
+
+Landed on `phase-3-state-updates`: `src/state_update.rs` (the generic vocabulary
+— `StateUpdate` / `AccountPatch` / `PurgeScope`, the `StateDiff` / `AccountChange`
+/ `PurgeRecord` output, reusing `freshness::SlotChange`); `EvmCache::apply_update`
+/ `apply_updates` with the dual-layer write-through `Slot`/`Account` and dispatch
+`Purge` semantics; the refold of `inject_storage_batch_fresh` / `purge_account` /
+`purge_pool_storage` / `purge_pool_slots` / `inject_v2_pool_metadata` /
+`inject_v3_*` onto the primitive and the freshness correction-drain routed
+through `apply_updates`; the offline `examples/state_update_apply.rs`;
+`benches/state_update.rs`; and `tests/state_update.rs`. The §15 addendum adds the
+relative / read-modify-write surface — a saturating `SlotDelta`, the
+`StateUpdate::SlotDelta` variant, `EvmCache::modify_slot`, and the cold-aware
+skip-and-surface contract via the new `StateDiff.skipped` field — to keep
+event-derived balances (e.g. ERC-20 `Transfer` deltas) hot without knowing the
+resulting absolute value. The §16 post-audit remediation then fixed a
+HIGH-severity silent-corruption bug — `cached_storage_value` now mirrors the EVM
+`SLOAD` for `StorageCleared`/`NotExisting` overlay accounts instead of returning a
+shadowed backend value — and hardened the surface: a no-op `Account` patch no
+longer materializes a backend account; the vocabulary and diff gained `serde`;
+`StateDiff`/`AccountPatch` became `#[non_exhaustive]`; relative native-balance
+tracking landed (`StateUpdate::BalanceDelta`, `EvmCache::modify_account_balance`,
+`StateDiff.skipped_balances`, `SkippedBalanceDelta`) with discoverable skip
+accessors (`has_skipped`/`skipped_len`/`is_fully_applied`) and the
+`StateUpdate::nonce`/`code`/`account` constructors; and `apply_updates` gained a
+batched single-lock fast-path (byte-identical to the sequential fold, pinned by an
+equivalence test).
 
 ---
 

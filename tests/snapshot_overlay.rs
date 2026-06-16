@@ -101,7 +101,15 @@ async fn overlays_from_one_snapshot_are_isolated() -> Result<()> {
 
     let slot = U256::from(7);
     let original = U256::from(1u64);
-    cache.inject_storage_batch(&[(contract, slot, original)]);
+    // Overlay-resident seed so the value is EVM-visible on the StorageCleared
+    // MockERC20: after the §16.0 fix, a backend-only `inject_storage_batch` seed on
+    // a StorageCleared account reads as ZERO via `cached_storage_value` (mirroring
+    // the EVM SLOAD), so the live-cache assertion below would observe 0. Seeding
+    // the overlay (the winning layer) is what the test means by "the cache holds
+    // `original`" and is captured by `create_snapshot`.
+    cache
+        .db_mut()
+        .insert_account_storage(contract, slot, original)?;
 
     let snapshot = cache.create_snapshot();
     let mut overlay_a = EvmOverlay::new(Arc::clone(&snapshot), None);

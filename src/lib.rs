@@ -45,6 +45,10 @@
 //! - [`freshness`] — the four-layer freshness model (classification, observation,
 //!   policy, mechanism) and the optimistic verify-and-rerun execution loop with
 //!   deferred validation.
+//! - [`state_update`] — the generic state-mutation vocabulary (`StateUpdate` /
+//!   `AccountPatch` / `PurgeScope`, plus relative `SlotDelta` read-modify-write)
+//!   applied by `EvmCache::apply_update` / `apply_updates` / `modify_slot`, with a
+//!   structured `StateDiff` output (Pillar B.1).
 //! - [`inspector`] — an [`Inspector`](revm::Inspector) that captures ERC20
 //!   `Transfer` events to reconstruct balance deltas from a simulation.
 //! - [`multicall`] — batched read-only calls through Multicall3.
@@ -102,10 +106,15 @@ pub mod freshness;
 pub mod inspector;
 pub mod multicall;
 pub mod prefetch_registry;
+pub mod state_update;
 
 pub use access_set::StorageAccessList;
 pub use freshness::{
     AlwaysVerify, BlockClock, FreshnessClock, FreshnessController, FreshnessParams,
     FreshnessPolicy, FreshnessRegistry, NeverVerify, ObservationDriven, SimRequest, SlotChange,
     SpeculativeSim, Validation, Validity, WallClock,
+};
+pub use state_update::{
+    AccountChange, AccountPatch, PurgeRecord, PurgeScope, SkippedBalanceDelta, SkippedDelta,
+    SlotDelta, StateDiff, StateUpdate,
 };

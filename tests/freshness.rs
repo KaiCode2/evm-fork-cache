@@ -73,11 +73,18 @@ async fn verify_slots_detects_and_injects_changes() -> Result<()> {
 
     let slot_a = U256::from(10);
     let slot_b = U256::from(20);
-    // Cache holds these values.
-    cache.inject_storage_batch(&[
-        (contract, slot_a, U256::from(100)),
-        (contract, slot_b, U256::from(200)),
-    ]);
+    // Cache holds these values, seeded OVERLAY-resident so they are EVM-visible:
+    // `contract` is a StorageCleared MockERC20, and after the §16.0 fix a
+    // backend-only `inject_storage_batch` seed on a StorageCleared account is
+    // shadowed to ZERO by `cached_storage_value` (it mirrors the EVM SLOAD). The
+    // test's intent is that the cache *holds* these values, so seed the layer that
+    // actually wins (mirrors `state_update::balance_tracking_scenario`).
+    cache
+        .db_mut()
+        .insert_account_storage(contract, slot_a, U256::from(100))?;
+    cache
+        .db_mut()
+        .insert_account_storage(contract, slot_b, U256::from(200))?;
 
     // Stub reports slot_a changed, slot_b unchanged.
     let values = HashMap::from([
@@ -115,7 +122,13 @@ async fn verify_slots_unchanged_returns_empty() -> Result<()> {
     install_mock_erc20(&mut cache, contract);
 
     let slot = U256::from(7);
-    cache.inject_storage_batch(&[(contract, slot, U256::from(42))]);
+    // Overlay-resident seed so the value is EVM-visible (see the note in
+    // `verify_slots_detects_and_injects_changes`): a backend-only seed on this
+    // StorageCleared MockERC20 would read as ZERO under the §16.0 fix, so the
+    // fetcher's matching 42 would (incorrectly) look like a 0 -> 42 change.
+    cache
+        .db_mut()
+        .insert_account_storage(contract, slot, U256::from(42))?;
     cache.set_storage_batch_fetcher(stub_fetcher(HashMap::from([(
         (contract, slot),
         U256::from(42),
@@ -547,7 +560,15 @@ async fn run_drains_pending_on_next_run() -> Result<()> {
     install_default_account(&mut cache, Address::ZERO);
     install_default_account(&mut cache, owner);
     install_mock_erc20(&mut cache, token);
-    cache.inject_storage_batch(&[(token, balance_slot_for(owner), U256::from(1000))]);
+    // Overlay-resident seed so the balance is EVM-visible on the StorageCleared
+    // token account (see the note in `verify_slots_detects_and_injects_changes`):
+    // after the §16.0 fix, a backend-only `inject_storage_batch` seed here reads as
+    // ZERO via `cached_storage_value` (mirroring the SLOAD), so the live-cache
+    // assertions below would observe 0 instead of the seeded value. This mirrors
+    // `state_update::balance_tracking_scenario`.
+    cache
+        .db_mut()
+        .insert_account_storage(token, balance_slot_for(owner), U256::from(1000))?;
     cache.set_storage_batch_fetcher(stub_fetcher(HashMap::from([(
         (token, balance_slot_for(owner)),
         U256::from(2000),
@@ -1036,11 +1057,17 @@ async fn validator_fetches_at_snapshot_block_despite_repin() -> Result<()> {
     install_default_account(&mut cache, owner);
     install_mock_erc20(&mut cache, token);
     cache.set_block(Some(block_n));
-    cache.inject_storage_batch(&[(token, slot, U256::from(1000))]);
+    // Overlay-resident seed so the balance is EVM-visible on the StorageCleared
+    // token account (see the note in `verify_slots_detects_and_injects_changes`):
+    // a backend-only seed would read as ZERO under the §16.0 `cached_storage_value`
+    // fix, failing the precondition below.
+    cache
+        .db_mut()
+        .insert_account_storage(token, slot, U256::from(1000))?;
     assert_eq!(
         cache.cached_storage_value(token, slot),
         Some(U256::from(1000)),
-        "PRECONDITION: seeded balance present after set_block + inject"
+        "PRECONDITION: seeded balance present after set_block + insert"
     );
 
     // Block-aware fetcher: the snapshot value (1000) at block N, a CHANGED value

@@ -168,6 +168,7 @@ and inject all state directly:
 | `prefetch_registry` | Advanced | Record and persist storage touch sets for cross-cycle prefetch. |
 | `freshness_optimistic` | Advanced | Optimistic verify-and-rerun loop: a `Corrected` validation via a stub fetcher. |
 | `freshness_multi_sim` | Advanced | Many sims with selective re-run, plus classification and `ValidThrough` aging. |
+| `state_update_apply` | Advanced | Apply a mixed `StateUpdate` batch (`Slot`/`Account`/`Purge`) and inspect the returned `StateDiff`. |
 
 **RPC examples** fork real mainnet state. Set `RPC_URL` to an Ethereum RPC
 endpoint (they print instructions and exit if it is unset):
@@ -224,6 +225,7 @@ cache sizes:
 | --- | --- |
 | `simulation` | `create_snapshot` across cache sizes (100 → 10k accounts), overlay fan-out, `call_raw` throughput, sequential bundle execution, batched storage injection. |
 | `freshness` | The optimistic loop end-to-end (CPU and latency-hiding), `verify_slots` at scale (1 → 1000 slots), and multi-sim fan-out. |
+| `state_update` | `apply_updates` throughput across batch sizes (1 → 1000 `Slot`s) and per-variant apply cost (`Slot` vs `Account` vs `Purge`). |
 | `access_list` | Touch-set merge and EIP-2930 list construction. |
 | `revert_decoding` | Built-in and custom revert decoding, including decoder dispatch with many registered errors. |
 | `storage_keys` | Mapping/array storage-key derivation. |

@@ -56,7 +56,7 @@ use revm::{
     Context, ExecuteCommitEvm, ExecuteEvm, InspectEvm, MainBuilder, MainContext,
     context::{BlockEnv, CfgEnv, Journal, LocalContext, TxEnv, result::ExecutionResult},
     context_interface::JournalTr,
-    database::CacheDB,
+    database::{AccountState, CacheDB},
     primitives::hardfork::SpecId,
     state::{AccountInfo, Bytecode},
 };
@@ -66,6 +66,10 @@ use crate::access_set::StorageAccessList;
 use crate::errors::{SimError, SimulationError, SimulationResult};
 use crate::freshness::SlotChange;
 use crate::inspector::TransferInspector;
+use crate::state_update::{
+    AccountChange, AccountPatch, PurgeRecord, PurgeScope, SkippedBalanceDelta, SkippedDelta,
+    SlotDelta, StateDiff, StateUpdate,
+};
 
 use bytecode::BytecodeCache;
 #[cfg(feature = "protocols")]
@@ -125,6 +129,57 @@ fn block_in_place_handle() -> Result<tokio::runtime::Handle> {
         Err(e) => Err(anyhow!(
             "evm-fork-cache RPC operations require a running multi-thread tokio runtime: {e}"
         )),
+    }
+}
+
+/// Read a storage slot from already-borrowed layers (`account_state`-aware),
+/// mirroring [`EvmCache::cached_storage_value`] but operating on a held backend
+/// storage guard rather than re-locking. Shared by the batched slot-run fast-path
+/// ([`EvmCache::apply_slot_run`]) so the same EVM-SLOAD semantics hold inside the
+/// held guard: the overlay slot wins; a `StorageCleared`/`NotExisting` overlay
+/// account reads a missing slot as ZERO (the backend is **not** consulted);
+/// otherwise it falls through to the backend.
+fn read_slot_account_state_aware<S1, S2>(
+    overlay: &std::collections::HashMap<Address, revm::database::DbAccount, S1>,
+    storage: &std::collections::HashMap<Address, foundry_fork_db::cache::StorageInfo, S2>,
+    address: Address,
+    slot: U256,
+) -> Option<U256>
+where
+    S1: std::hash::BuildHasher,
+    S2: std::hash::BuildHasher,
+{
+    if let Some(db_account) = overlay.get(&address) {
+        if let Some(value) = db_account.storage.get(&slot) {
+            return Some(*value);
+        }
+        if matches!(
+            db_account.account_state,
+            AccountState::StorageCleared | AccountState::NotExisting
+        ) {
+            return Some(U256::ZERO);
+        }
+    }
+    storage.get(&address).and_then(|s| s.get(&slot).copied())
+}
+
+/// Write a storage slot into already-borrowed layers, mirroring
+/// [`EvmCache::write_slot_through`] but operating on a held backend storage guard.
+/// Backend (layer 2) is always written; the overlay (layer 1) is written only if
+/// an overlay account already exists (never materialize a new overlay account).
+fn write_slot_into<S1, S2>(
+    overlay: &mut std::collections::HashMap<Address, revm::database::DbAccount, S1>,
+    storage: &mut std::collections::HashMap<Address, foundry_fork_db::cache::StorageInfo, S2>,
+    address: Address,
+    slot: U256,
+    value: U256,
+) where
+    S1: std::hash::BuildHasher,
+    S2: std::hash::BuildHasher + Default,
+{
+    storage.entry(address).or_default().insert(slot, value);
+    if let Some(db_account) = overlay.get_mut(&address) {
+        db_account.storage.insert(slot, value);
     }
 }
 
@@ -1100,17 +1155,538 @@ impl EvmCache {
     /// the backend write is already authoritative and materializing an overlay
     /// entry would pollute layer 1 and could shadow later RPC reads.
     pub fn inject_storage_batch_fresh(&mut self, results: &[(Address, U256, U256)]) {
-        {
-            let mut storage = self.blockchain_db.storage().write();
-            for &(addr, slot, value) in results {
-                storage.entry(addr).or_default().insert(slot, value);
+        // Thin wrapper over the unified write primitive (the F1 fix now lives in
+        // `apply_slot`). Each tuple becomes a write-through `StateUpdate::Slot`;
+        // the returned diff is discarded to preserve this method's `-> ()` API.
+        let updates: Vec<StateUpdate> = results
+            .iter()
+            .map(|&(addr, slot, value)| StateUpdate::slot(addr, slot, value))
+            .collect();
+        let _ = self.apply_updates(&updates);
+    }
+
+    /// Apply a single targeted [`StateUpdate`], returning a [`StateDiff`] of what
+    /// actually changed.
+    ///
+    /// This is the single primitive that writes the state-update vocabulary
+    /// across both cache layers with one consistent, documented policy. It is
+    /// **synchronous and infallible** — a write, not a fetch, so it never touches
+    /// RPC and never errors. See the [`state_update`](crate::state_update) module
+    /// for the dual-layer write-through policy and the diff semantics.
+    ///
+    /// - [`StateUpdate::Slot`] — write `value` into the backend (layer 2) always,
+    ///   and into the overlay (layer 1) only if an overlay account already
+    ///   exists. Records a [`SlotChange`] only when the value actually changes
+    ///   (`old.unwrap_or(ZERO) != value`).
+    /// - [`StateUpdate::SlotDelta`] — *relative*, cold-aware. If the slot has a
+    ///   cached value, write the saturating delta through the same path and record
+    ///   a [`SlotChange`] iff it changed; if the slot is cold (absent from both
+    ///   layers), apply nothing and surface a `SkippedDelta` in `diff.skipped`.
+    /// - [`StateUpdate::BalanceDelta`] — *relative*, cold-aware native-balance
+    ///   update. If the account is present in either layer, apply the saturating
+    ///   delta to its balance (nonce/code preserved) write-through and record an
+    ///   [`AccountChange`] iff it changed; if the account is cold (absent from both
+    ///   layers), apply nothing and surface a [`SkippedBalanceDelta`] in
+    ///   `diff.skipped_balances` (no default account is materialized).
+    /// - [`StateUpdate::Account`] — load the current `AccountInfo` from the cached
+    ///   layers (no RPC), apply each `Some` patch field (recomputing the code hash
+    ///   when `code` is set), then write through with the same layer policy.
+    ///   Records an [`AccountChange`] with `Some((old, new))` only for fields
+    ///   that changed.
+    /// - [`StateUpdate::Purge`] — dispatch to the matching purge layer logic and
+    ///   record a [`PurgeRecord`].
+    ///
+    /// # Warning — relative updates can be skipped
+    ///
+    /// A relative [`SlotDelta`](StateUpdate::SlotDelta) /
+    /// [`BalanceDelta`](StateUpdate::BalanceDelta) targeting a **cold** address is
+    /// *dropped, not applied* (applying it against an unknown base would corrupt
+    /// state). Because a skip produces no change, it is invisible to the
+    /// changes-only [`StateDiff::is_empty`] / [`StateDiff::len`] success check, so
+    /// after applying relative updates the caller **must** inspect
+    /// [`StateDiff::has_skipped`] (or `diff.skipped` / `diff.skipped_balances`) and
+    /// fetch+seed the cold target — a silently-dropped balance update can break
+    /// conservation.
+    ///
+    /// # Warning — cold absolute `Account` patches
+    ///
+    /// A partial absolute [`StateUpdate::Account`] patch on an address absent from
+    /// both layers writes default nonce/code through the backend as authoritative,
+    /// masking a real RPC fetch. Fetch+seed the account first, or use
+    /// [`StateUpdate::BalanceDelta`] for relative native-balance tracking.
+    ///
+    /// ```no_run
+    /// # use alloy_primitives::{Address, U256};
+    /// # use evm_fork_cache::StateUpdate;
+    /// # fn example(cache: &mut evm_fork_cache::cache::EvmCache) {
+    /// let pool = Address::repeat_byte(0x01);
+    /// let diff = cache.apply_update(&StateUpdate::slot(pool, U256::from(0), U256::from(42)));
+    /// assert_eq!(diff.slots.len(), 1);
+    /// # }
+    /// ```
+    pub fn apply_update(&mut self, update: &StateUpdate) -> StateDiff {
+        let mut diff = StateDiff::default();
+        match update {
+            StateUpdate::Slot {
+                address,
+                slot,
+                value,
+            } => {
+                if let Some(change) = self.apply_slot(*address, *slot, *value) {
+                    diff.slots.push(change);
+                }
+            }
+            StateUpdate::SlotDelta {
+                address,
+                slot,
+                delta,
+            } => match self.cached_storage_value(*address, *slot) {
+                // Hot slot: apply the saturating delta write-through. Build the
+                // change from the value we already read (do not route through
+                // `apply_slot`, which would re-read the same slot — §16.9.1).
+                Some(current) => {
+                    let new = delta.apply(current);
+                    self.write_slot_through(*address, *slot, new);
+                    if current != new {
+                        diff.slots.push(SlotChange {
+                            address: *address,
+                            slot: *slot,
+                            old: current,
+                            new,
+                        });
+                    }
+                }
+                // Cold slot: applying `0 ± amount` would corrupt an unknown value,
+                // so write nothing and surface the skip for the caller to seed.
+                None => diff.skipped.push(SkippedDelta {
+                    address: *address,
+                    slot: *slot,
+                    delta: *delta,
+                }),
+            },
+            StateUpdate::BalanceDelta { address, delta } => {
+                match self.apply_balance_delta(*address, *delta) {
+                    // Hot account: the saturating delta was applied.
+                    Ok(Some(change)) => diff.accounts.push(change),
+                    // Hot account but no change (e.g. Sub from 0, Add of 0).
+                    Ok(None) => {}
+                    // Cold account: surface the skip; nothing was materialized.
+                    Err(skipped) => diff.skipped_balances.push(skipped),
+                }
+            }
+            StateUpdate::Account { address, patch } => {
+                if let Some(change) = self.apply_account_patch(*address, patch) {
+                    diff.accounts.push(change);
+                }
+            }
+            StateUpdate::Purge { address, scope } => {
+                diff.purged.push(self.apply_purge(*address, scope));
             }
         }
-        // Write through to the overlay only for accounts already materialized
-        // there, so the winning layer reflects the fresh value.
-        for &(addr, slot, value) in results {
-            if let Some(db_account) = self.db.cache.accounts.get_mut(&addr) {
-                db_account.storage.insert(slot, value);
+        diff
+    }
+
+    /// Apply a batch of [`StateUpdate`]s left-to-right, merging each per-update
+    /// [`StateDiff`].
+    ///
+    /// Later updates observe the effect of earlier ones: two `Slot` writes to the
+    /// same key record `old → a` then `a → b`. Like
+    /// [`apply_update`](Self::apply_update) this is synchronous and infallible.
+    ///
+    /// # Performance — batched single-lock fast-path
+    ///
+    /// Consecutive `Slot`/`SlotDelta` writes are processed holding the backend
+    /// storage write-guard **once** for the run (the overlay map is lock-free), so
+    /// a bulk slot seed pays one lock acquisition instead of one read + one write
+    /// lock per slot. Apply order is preserved: when an `Account`/`BalanceDelta`/
+    /// `Purge` update is reached the guard is dropped first (those take the
+    /// `accounts()` / `storage()` locks themselves — holding the storage
+    /// write-guard across them would deadlock the non-reentrant `RwLock`), the
+    /// update is processed via [`apply_update`](Self::apply_update), then the guard
+    /// is lazily re-acquired on the next slot run. The result is byte-identical to
+    /// folding [`apply_update`](Self::apply_update) over the batch.
+    ///
+    /// # Warning — relative updates can be skipped
+    ///
+    /// See [`apply_update`](Self::apply_update): a cold relative update is dropped,
+    /// not applied, and is invisible to [`StateDiff::is_empty`] /
+    /// [`StateDiff::len`]. After a batch with relative updates, check
+    /// [`StateDiff::has_skipped`].
+    pub fn apply_updates(&mut self, updates: &[StateUpdate]) -> StateDiff {
+        let mut diff = StateDiff::default();
+        let mut i = 0;
+        while i < updates.len() {
+            match &updates[i] {
+                // A run of consecutive slot writes: process them under a single
+                // held storage write-guard, then advance past the run.
+                StateUpdate::Slot { .. } | StateUpdate::SlotDelta { .. } => {
+                    let run_end = updates[i..]
+                        .iter()
+                        .position(|u| {
+                            !matches!(u, StateUpdate::Slot { .. } | StateUpdate::SlotDelta { .. })
+                        })
+                        .map(|off| i + off)
+                        .unwrap_or(updates.len());
+                    self.apply_slot_run(&updates[i..run_end], &mut diff);
+                    i = run_end;
+                }
+                // Account / BalanceDelta / Purge: no held guard (they take their
+                // own locks), so route through the single-update primitive.
+                _ => {
+                    diff.merge(self.apply_update(&updates[i]));
+                    i += 1;
+                }
+            }
+        }
+        diff
+    }
+
+    /// Apply a run of consecutive `Slot`/`SlotDelta` updates under one held backend
+    /// storage write-guard (§16.9.2), merging each change into `diff`.
+    ///
+    /// The backend storage guard is acquired once for the whole run; overlay access
+    /// is lock-free (`self.db.cache.accounts`). The old-value read stays
+    /// `account_state`-aware (matching [`cached_storage_value`](Self::cached_storage_value)):
+    /// for an overlay account whose slot is absent, a `StorageCleared`/`NotExisting`
+    /// state reads ZERO and the backend is **not** consulted. Behavior is identical
+    /// to applying each update via [`apply_update`](Self::apply_update); the
+    /// `apply_updates_batched_equals_sequential` test pins this.
+    fn apply_slot_run(&mut self, run: &[StateUpdate], diff: &mut StateDiff) {
+        // Borrow the two layers as disjoint fields: the backend storage guard
+        // (layer 2) held for the whole run, and the overlay accounts map (layer 1,
+        // lock-free).
+        let overlay = &mut self.db.cache.accounts;
+        let mut storage = self.blockchain_db.storage().write();
+
+        for update in run {
+            // Resolve `(address, slot, old, new)` for the write; a cold SlotDelta
+            // is skipped here (write nothing). `old` is the `account_state`-aware
+            // read (overlay ▸ cleared-as-ZERO ▸ backend), reused for both the write
+            // gate and the change record so each slot is read at most once.
+            let (address, slot, old, new) = match update {
+                StateUpdate::Slot {
+                    address,
+                    slot,
+                    value,
+                } => {
+                    let old = read_slot_account_state_aware(overlay, &storage, *address, *slot)
+                        .unwrap_or(U256::ZERO);
+                    (*address, *slot, old, *value)
+                }
+                StateUpdate::SlotDelta {
+                    address,
+                    slot,
+                    delta,
+                } => match read_slot_account_state_aware(overlay, &storage, *address, *slot) {
+                    // Hot: apply the saturating delta to the value already read.
+                    Some(current) => (*address, *slot, current, delta.apply(current)),
+                    // Cold: skip and surface (write nothing).
+                    None => {
+                        diff.skipped.push(SkippedDelta {
+                            address: *address,
+                            slot: *slot,
+                            delta: *delta,
+                        });
+                        continue;
+                    }
+                },
+                // The caller only ever hands this method slot updates.
+                _ => unreachable!("apply_slot_run only processes Slot/SlotDelta"),
+            };
+
+            write_slot_into(overlay, &mut storage, address, slot, new);
+            if old != new {
+                diff.slots.push(SlotChange {
+                    address,
+                    slot,
+                    old,
+                    new,
+                });
+            }
+        }
+    }
+
+    /// Write-through a single storage slot (§5.1). Returns a [`SlotChange`] iff
+    /// the slot's value actually changes.
+    fn apply_slot(&mut self, address: Address, slot: U256, value: U256) -> Option<SlotChange> {
+        // Old value: overlay ▸ backend ▸ None (treated as ZERO).
+        let old = self
+            .cached_storage_value(address, slot)
+            .unwrap_or(U256::ZERO);
+
+        self.write_slot_through(address, slot, value);
+
+        // Record only an actual change.
+        (old != value).then_some(SlotChange {
+            address,
+            slot,
+            old,
+            new: value,
+        })
+    }
+
+    /// The single dual-layer slot write path (§5.1), shared by [`apply_slot`],
+    /// the [`StateUpdate::SlotDelta`] handler, and [`modify_slot`](Self::modify_slot).
+    ///
+    /// Backend (layer 2) is always written; the overlay (layer 1) is written only
+    /// if an overlay account already exists. A new overlay account is never
+    /// materialized: that preserves the layer-2-only invariant (a fresh
+    /// `StorageCleared` overlay account would read missing slots as ZERO and could
+    /// shadow later RPC reads), and an absent overlay entry falls through to the
+    /// backend on reads so the backend write is authoritative.
+    fn write_slot_through(&mut self, address: Address, slot: U256, value: U256) {
+        // Backend (layer 2): always write.
+        {
+            let mut storage = self.blockchain_db.storage().write();
+            storage.entry(address).or_default().insert(slot, value);
+        }
+
+        // Overlay (layer 1): write only if an overlay account already exists.
+        if let Some(db_account) = self.db.cache.accounts.get_mut(&address) {
+            db_account.storage.insert(slot, value);
+        }
+    }
+
+    /// Read-modify-write one storage slot through a caller-supplied transform.
+    ///
+    /// The general closure escape hatch behind [`StateUpdate::SlotDelta`] (the
+    /// data-level form flows through [`apply_update`](Self::apply_update); this is
+    /// for arbitrary transforms). `f` is called with the current cached value
+    /// (overlay ▸ backend ▸ `None` when the slot is cold) and decides the new
+    /// value:
+    ///
+    /// - `Some(new)` writes `new` through both layers (the same write path as
+    ///   [`StateUpdate::Slot`]) and returns a [`SlotChange`] iff it changed
+    ///   (`old.unwrap_or(ZERO) != new`);
+    /// - `None` writes nothing and returns `None`.
+    ///
+    /// The caller owns the cold/overflow policy. To skip cold slots (the
+    /// cold-aware read-modify-write rule), map through the `Option`:
+    /// `|cur| cur.map(|v| v.saturating_add(amount))` leaves a cold slot untouched.
+    /// To write an absolute value regardless, ignore the argument: `|_| Some(v)`.
+    ///
+    /// ```no_run
+    /// # use alloy_primitives::{Address, U256};
+    /// # fn example(cache: &mut evm_fork_cache::cache::EvmCache) {
+    /// let token = Address::repeat_byte(0x01);
+    /// let slot = U256::from(0);
+    /// // Saturating +100, but only if the slot is already hot.
+    /// let change = cache.modify_slot(token, slot, |cur| cur.map(|v| v.saturating_add(U256::from(100))));
+    /// # let _ = change;
+    /// # }
+    /// ```
+    pub fn modify_slot(
+        &mut self,
+        address: Address,
+        slot: U256,
+        f: impl FnOnce(Option<U256>) -> Option<U256>,
+    ) -> Option<SlotChange> {
+        let current = self.cached_storage_value(address, slot);
+        let new = f(current)?;
+
+        self.write_slot_through(address, slot, new);
+
+        let old = current.unwrap_or(U256::ZERO);
+        (old != new).then_some(SlotChange {
+            address,
+            slot,
+            old,
+            new,
+        })
+    }
+
+    /// Read-modify-write an account's native balance through a caller-supplied
+    /// transform.
+    ///
+    /// The closure analog of [`StateUpdate::BalanceDelta`] (the data-level form
+    /// flows through [`apply_update`](Self::apply_update); this is for arbitrary
+    /// transforms). `f` is called with the account's current native balance
+    /// (overlay ▸ backend ▸ `None` when the account is absent from **both**
+    /// layers) and decides the new balance:
+    ///
+    /// - `Some(new)` writes `new` through both layers — backend always, overlay
+    ///   only if an overlay account already exists — preserving the account's
+    ///   nonce and code, and returns an [`AccountChange`] (balance only) iff the
+    ///   balance changed;
+    /// - `None` writes nothing (no account is materialized) and returns `None`.
+    ///
+    /// "Cold" for a balance is the account being absent from both layers; the
+    /// revm `account_state` does **not** matter here (it governs storage, not the
+    /// basic `AccountInfo`). To skip cold accounts, map through the `Option`:
+    /// `|cur| cur.map(|v| v.saturating_add(amount))`.
+    ///
+    /// ```no_run
+    /// # use alloy_primitives::{Address, U256};
+    /// # fn example(cache: &mut evm_fork_cache::cache::EvmCache) {
+    /// let acct = Address::repeat_byte(0x01);
+    /// // Saturating +100, but only if the account's balance is already known.
+    /// let change = cache.modify_account_balance(acct, |cur| cur.map(|v| v.saturating_add(U256::from(100))));
+    /// # let _ = change;
+    /// # }
+    /// ```
+    pub fn modify_account_balance(
+        &mut self,
+        address: Address,
+        f: impl FnOnce(Option<U256>) -> Option<U256>,
+    ) -> Option<AccountChange> {
+        // Load the full info from the cached layers only (overlay ▸ backend); the
+        // account is "cold" when absent from both.
+        let base = self.loaded_account_info(address);
+        let current_balance = base.as_ref().map(|info| info.balance);
+        let new_balance = f(current_balance)?;
+
+        // The closure asked to write `new_balance`. Materialize from the loaded
+        // base (or a default if the caller chose to write a cold account).
+        let mut info = base.unwrap_or_default();
+        let old_balance = info.balance;
+        info.balance = new_balance;
+        self.write_account_info_through(address, info);
+
+        (old_balance != new_balance).then_some(AccountChange {
+            address,
+            balance: Some((old_balance, new_balance)),
+            nonce: None,
+            code_hash: None,
+        })
+    }
+
+    /// Apply a relative (saturating) [`SlotDelta`] to an account's native balance
+    /// (§16.5). Cold-aware:
+    ///
+    /// - `Ok(Some(change))` — present account, balance changed;
+    /// - `Ok(None)` — present account, balance unchanged (e.g. `Sub` from 0);
+    /// - `Err(skipped)` — cold account (absent from both layers): nothing applied,
+    ///   nothing materialized.
+    fn apply_balance_delta(
+        &mut self,
+        address: Address,
+        delta: SlotDelta,
+    ) -> std::result::Result<Option<AccountChange>, SkippedBalanceDelta> {
+        let Some(mut info) = self.loaded_account_info(address) else {
+            // Cold: applying a delta against an unknown balance would corrupt it,
+            // and materializing a default account would mask the real on-chain one.
+            return Err(SkippedBalanceDelta { address, delta });
+        };
+
+        let old_balance = info.balance;
+        let new_balance = delta.apply(old_balance);
+        info.balance = new_balance;
+        self.write_account_info_through(address, info);
+
+        Ok((old_balance != new_balance).then_some(AccountChange {
+            address,
+            balance: Some((old_balance, new_balance)),
+            nonce: None,
+            code_hash: None,
+        }))
+    }
+
+    /// Load an account's `AccountInfo` from the cached layers only (overlay ▸
+    /// backend), without touching RPC. `None` when the account is absent from
+    /// both layers.
+    fn loaded_account_info(&self, address: Address) -> Option<AccountInfo> {
+        self.db
+            .cache
+            .accounts
+            .get(&address)
+            .map(|a| a.info.clone())
+            .or_else(|| self.blockchain_db.accounts().read().get(&address).cloned())
+    }
+
+    /// Write an `AccountInfo` through both layers, mirroring the slot policy:
+    /// backend (layer 2) always; overlay (layer 1) only if an overlay account
+    /// already exists (never materialize a new overlay account).
+    fn write_account_info_through(&mut self, address: Address, info: AccountInfo) {
+        let overlay_present = self.db.cache.accounts.contains_key(&address);
+        {
+            let mut accounts = self.blockchain_db.accounts().write();
+            accounts.insert(address, info.clone());
+        }
+        if overlay_present {
+            self.db.insert_account_info(address, info);
+        }
+    }
+
+    /// Apply a partial [`AccountPatch`] write-through (§5.2). Returns an
+    /// [`AccountChange`] iff any field actually changes.
+    fn apply_account_patch(
+        &mut self,
+        address: Address,
+        patch: &AccountPatch,
+    ) -> Option<AccountChange> {
+        // 1. Current info from the cached layers only (overlay ▸ backend ▸
+        //    default). No RPC: apply is a write, not a fetch.
+        let mut info = self.loaded_account_info(address).unwrap_or_default();
+
+        let old_balance = info.balance;
+        let old_nonce = info.nonce;
+        let old_code_hash = info.code_hash;
+
+        // 2. Apply each `Some` field.
+        if let Some(balance) = patch.balance {
+            info.balance = balance;
+        }
+        if let Some(nonce) = patch.nonce {
+            info.nonce = nonce;
+        }
+        if let Some(code) = &patch.code {
+            let bytecode = Bytecode::new_raw(code.clone());
+            info.code_hash = bytecode.hash_slow();
+            info.code = Some(bytecode);
+        }
+
+        // 3. Compute the change first. A no-op patch (every field equals the
+        //    loaded base) must NOT write either layer — otherwise an all-`None`
+        //    patch on an absent address would insert `AccountInfo::default()` into
+        //    the shared backend (masking a future RPC fetch) while returning an
+        //    empty diff. Only a real field change materializes anything.
+        let change = AccountChange {
+            address,
+            balance: (old_balance != info.balance).then_some((old_balance, info.balance)),
+            nonce: (old_nonce != info.nonce).then_some((old_nonce, info.nonce)),
+            code_hash: (old_code_hash != info.code_hash).then_some((old_code_hash, info.code_hash)),
+        };
+        if change.balance.is_none() && change.nonce.is_none() && change.code_hash.is_none() {
+            return None;
+        }
+
+        // 4. Write-through, mirroring the slot policy: backend always; overlay
+        //    only if an overlay account already exists (do not materialize one).
+        self.write_account_info_through(address, info);
+
+        Some(change)
+    }
+
+    /// Dispatch a [`PurgeScope`] to the matching layer logic (§5.3), returning a
+    /// [`PurgeRecord`] of what was removed from each layer.
+    fn apply_purge(&mut self, address: Address, scope: &PurgeScope) -> PurgeRecord {
+        match scope {
+            PurgeScope::Account => {
+                let (slots_removed, account_removed) = self.purge_account_inner(address);
+                PurgeRecord {
+                    address,
+                    scope: PurgeScope::Account,
+                    slots_removed,
+                    account_removed,
+                }
+            }
+            PurgeScope::AllStorage => {
+                let slots_removed = self.purge_pool_storage_inner(address);
+                PurgeRecord {
+                    address,
+                    scope: PurgeScope::AllStorage,
+                    slots_removed,
+                    account_removed: false,
+                }
+            }
+            PurgeScope::Slots(slots) => {
+                let slots_removed = self.purge_pool_slots_inner(address, slots);
+                PurgeRecord {
+                    address,
+                    scope: PurgeScope::Slots(slots.clone()),
+                    slots_removed,
+                    account_removed: false,
+                }
             }
         }
     }
@@ -1126,14 +1702,33 @@ impl EvmCache {
 
     /// Return the currently-cached value for a storage slot, if any.
     ///
-    /// Checks the CacheDB overlay (layer 1) first, then the BlockchainDb backend
-    /// (layer 2). Returns `None` when neither layer has seen the slot. Unlike
-    /// [`read_storage_slot`](Self::read_storage_slot) this never touches RPC.
+    /// Mirrors what the EVM would `SLOAD` from the cached layers (it never touches
+    /// RPC, unlike [`read_storage_slot`](Self::read_storage_slot)):
+    ///
+    /// 1. The CacheDB overlay (layer 1) wins: if the overlay account holds the
+    ///    slot, return it.
+    /// 2. Match revm's `CacheDB::storage_ref`: if the overlay account exists but
+    ///    does **not** hold the slot, and its `account_state` is `StorageCleared`
+    ///    or `NotExisting`, the live EVM reads the slot as ZERO and never consults
+    ///    the backend — so return `Some(U256::ZERO)`, **not** the (shadowed)
+    ///    backend value. Returning the backend value here would let a
+    ///    `SlotDelta`/`modify_slot` compute a delta against a base the EVM never
+    ///    sees (silent corruption) and would mis-record `apply_slot`'s `old`.
+    /// 3. Otherwise fall through to the BlockchainDb backend (layer 2); `None` when
+    ///    neither layer has seen the slot.
     pub fn cached_storage_value(&self, address: Address, slot: U256) -> Option<U256> {
-        if let Some(db_account) = self.db.cache.accounts.get(&address)
-            && let Some(value) = db_account.storage.get(&slot)
-        {
-            return Some(*value);
+        if let Some(db_account) = self.db.cache.accounts.get(&address) {
+            if let Some(value) = db_account.storage.get(&slot) {
+                return Some(*value);
+            }
+            // A StorageCleared / NotExisting overlay account reads a missing slot
+            // as ZERO and never consults the backend (matching the EVM SLOAD).
+            if matches!(
+                db_account.account_state,
+                AccountState::StorageCleared | AccountState::NotExisting
+            ) {
+                return Some(U256::ZERO);
+            }
         }
         let storage = self.blockchain_db.storage().read();
         storage.get(&address).and_then(|s| s.get(&slot).copied())
@@ -1215,6 +1810,16 @@ impl EvmCache {
     /// use it when an address is fully volatile (no pinned slots) and even its
     /// balance/nonce/code can no longer be trusted.
     pub fn purge_account(&mut self, addr: Address) {
+        // Thin wrapper over the unified purge primitive; the layer logic lives in
+        // `purge_account_inner` (shared with `apply_update(Purge { Account })`).
+        let _ = self.apply_update(&StateUpdate::purge(addr, PurgeScope::Account));
+    }
+
+    /// Account-scope purge layer logic. Removes `addr` from the overlay accounts
+    /// map, the backend accounts map, and the backend storage map. Returns
+    /// `(backend_slots_removed, account_removed)` where `account_removed` is true
+    /// if an account entry was removed from either account layer.
+    fn purge_account_inner(&mut self, addr: Address) -> (usize, bool) {
         // Layer 1: CacheDB overlay (accounts + their storage live together).
         let overlay_removed = self.db.cache.accounts.remove(&addr).is_some();
 
@@ -1225,17 +1830,22 @@ impl EvmCache {
             .write()
             .remove(&addr)
             .is_some();
-        let backend_storage_removed = self.blockchain_db.storage().write().remove(&addr).is_some();
+        let backend_storage_removed = self.blockchain_db.storage().write().remove(&addr);
+        let slots_removed = backend_storage_removed
+            .map(|slots| slots.len())
+            .unwrap_or(0);
 
-        if overlay_removed || backend_account_removed || backend_storage_removed {
+        let account_removed = overlay_removed || backend_account_removed;
+        if account_removed || slots_removed > 0 {
             debug!(
                 account = %addr,
                 overlay_removed,
                 backend_account_removed,
-                backend_storage_removed,
+                backend_storage_slots = slots_removed,
                 "purged account from both cache layers"
             );
         }
+        (slots_removed, account_removed)
     }
 
     /// Get the chain ID used for EVM simulations (the `CHAINID` opcode).
@@ -1669,6 +2279,13 @@ impl EvmCache {
     /// # Arguments
     /// * `pool_address` - The UniswapV2 pair contract address
     /// * `metadata` - The cached pool metadata containing token0 and token1
+    ///
+    /// # Layering (Phase 3 change)
+    /// As of Phase 3 this writes **through** the dual-layer policy via
+    /// [`apply_updates`](Self::apply_updates) (backend always, overlay-if-present)
+    /// rather than the old overlay-only write. The slot *placement* is normalized;
+    /// the visible `token0()` / `token1()` reads are unchanged. The slot writes are
+    /// now infallible; the `Result` is retained for signature compatibility.
     #[cfg(feature = "protocols")]
     #[cfg_attr(docsrs, doc(cfg(feature = "protocols")))]
     pub fn inject_v2_pool_metadata(
@@ -1683,10 +2300,10 @@ impl EvmCache {
         let token0_value = U256::from_be_slice(metadata.token0.as_slice());
         let token1_value = U256::from_be_slice(metadata.token1.as_slice());
 
-        self.db
-            .insert_account_storage(pool_address, TOKEN0_SLOT, token0_value)?;
-        self.db
-            .insert_account_storage(pool_address, TOKEN1_SLOT, token1_value)?;
+        self.apply_updates(&[
+            StateUpdate::slot(pool_address, TOKEN0_SLOT, token0_value),
+            StateUpdate::slot(pool_address, TOKEN1_SLOT, token1_value),
+        ]);
 
         Ok(())
     }
@@ -1703,6 +2320,14 @@ impl EvmCache {
     /// # Arguments
     /// * `pool_address` - The UniswapV3 pool contract address
     /// * `tick_bitmap` - Map of word position (int16) to bitmap value (uint256)
+    ///
+    /// # Layering (Phase 3 change)
+    /// As of Phase 3 this writes **through** the dual-layer policy via
+    /// [`apply_updates`](Self::apply_updates) (backend always, overlay-if-present)
+    /// rather than the old overlay-only write — so the slots now land in the
+    /// BlockchainDb backend (layer 2) too. See `CHANGELOG.md` / `KNOWN_ISSUES.md`.
+    /// The slot writes are now infallible; the `Result` is retained for signature
+    /// compatibility.
     #[cfg(feature = "protocols")]
     #[cfg_attr(docsrs, doc(cfg(feature = "protocols")))]
     pub fn inject_v3_tick_bitmap(
@@ -1724,17 +2349,17 @@ impl EvmCache {
         tick_bitmap: &std::collections::HashMap<i16, U256>,
         base_slot: U256,
     ) -> Result<usize> {
-        let mut injected = 0;
+        let mut updates = Vec::with_capacity(tick_bitmap.len());
         for (&word_position, &bitmap_value) in tick_bitmap {
             let word_position_i256 = i256_from_i16(word_position);
             let mut slot_preimage = [0u8; 64];
             slot_preimage[..32].copy_from_slice(&word_position_i256);
             slot_preimage[32..64].copy_from_slice(&base_slot.to_be_bytes::<32>());
             let storage_slot: U256 = keccak256(slot_preimage).into();
-            self.db
-                .insert_account_storage(pool_address, storage_slot, bitmap_value)?;
-            injected += 1;
+            updates.push(StateUpdate::slot(pool_address, storage_slot, bitmap_value));
         }
+        let injected = updates.len();
+        self.apply_updates(&updates);
         Ok(injected)
     }
 
@@ -1762,6 +2387,13 @@ impl EvmCache {
     /// # Arguments
     /// * `pool_address` - The UniswapV3 pool contract address
     /// * `ticks` - Map of tick index (int24) to tick info
+    ///
+    /// # Layering (Phase 3 change)
+    /// As of Phase 3 this writes **through** the dual-layer policy via
+    /// [`apply_updates`](Self::apply_updates) (backend always, overlay-if-present)
+    /// rather than the old overlay-only write. See `CHANGELOG.md` /
+    /// `KNOWN_ISSUES.md`. The slot writes are now infallible; the `Result` is
+    /// retained for signature compatibility.
     #[cfg(feature = "protocols")]
     #[cfg_attr(docsrs, doc(cfg(feature = "protocols")))]
     pub fn inject_v3_ticks(
@@ -1783,7 +2415,7 @@ impl EvmCache {
         ticks: &std::collections::HashMap<i32, TickInfo>,
         ticks_slot: U256,
     ) -> Result<usize> {
-        let mut injected = 0;
+        let mut updates = Vec::with_capacity(ticks.len() * 2);
         for (&tick, info) in ticks {
             let tick_i256 = i256_from_i24(tick);
             let mut slot_preimage = [0u8; 64];
@@ -1798,8 +2430,7 @@ impl EvmCache {
             let liquidity_net_u256 = i128_to_u256(info.liquidity_net);
             let packed_slot0 = liquidity_gross_u256 | (liquidity_net_u256 << 128);
 
-            self.db
-                .insert_account_storage(pool_address, base_slot, packed_slot0)?;
+            updates.push(StateUpdate::slot(pool_address, base_slot, packed_slot0));
 
             // Also inject slot 3 with the `initialized` flag.
             // Slot 3 layout: packed (tickCumulativeOutside, secondsPerLiquidityOutsideX128,
@@ -1818,12 +2449,11 @@ impl EvmCache {
             } else {
                 U256::ZERO
             };
-            self.db
-                .insert_account_storage(pool_address, slot3, initialized_value)?;
-
-            injected += 1;
+            updates.push(StateUpdate::slot(pool_address, slot3, initialized_value));
         }
 
+        let injected = ticks.len();
+        self.apply_updates(&updates);
         Ok(injected)
     }
 
@@ -2167,6 +2797,19 @@ impl EvmCache {
     /// After purging both layers, the next EVM read for this pool's storage will
     /// go all the way to the RPC for fresh data.
     pub fn purge_pool_storage(&mut self, address: Address) -> usize {
+        // Thin wrapper over the unified purge primitive; returns the backend slot
+        // count the `AllStorage` scope removed.
+        self.apply_update(&StateUpdate::purge(address, PurgeScope::AllStorage))
+            .purged
+            .first()
+            .map(|rec| rec.slots_removed)
+            .unwrap_or(0)
+    }
+
+    /// `AllStorage`-scope purge layer logic. Clears the overlay storage for
+    /// `address` and removes its backend storage map. Returns the number of
+    /// backend slots removed.
+    fn purge_pool_storage_inner(&mut self, address: Address) -> usize {
         // Layer 1: Clear CacheDB overlay
         let cache_db_cleared = if let Some(db_account) = self.db.cache.accounts.get_mut(&address) {
             let count = db_account.storage.len();
@@ -2206,6 +2849,21 @@ impl EvmCache {
     ///
     /// Returns the number of slots removed from the BlockchainDb backend.
     pub fn purge_pool_slots(&mut self, address: Address, slots: &[U256]) -> usize {
+        // Thin wrapper over the unified purge primitive; returns the backend slot
+        // count the `Slots` scope removed.
+        self.apply_update(&StateUpdate::purge(
+            address,
+            PurgeScope::Slots(slots.to_vec()),
+        ))
+        .purged
+        .first()
+        .map(|rec| rec.slots_removed)
+        .unwrap_or(0)
+    }
+
+    /// `Slots`-scope purge layer logic. Removes the listed slots from the overlay
+    /// and the backend storage map. Returns the number of backend slots removed.
+    fn purge_pool_slots_inner(&mut self, address: Address, slots: &[U256]) -> usize {
         let mut cache_db_removed = 0usize;
         let mut backend_removed = 0usize;
 
@@ -2644,6 +3302,17 @@ impl EvmCache {
     }
 
     /// Override code at `target`, with explicit behavior for missing target accounts.
+    ///
+    /// This is intentionally **not** folded onto
+    /// [`apply_update`](Self::apply_update)'s `Account` code patch: it copies code
+    /// from a `source` account, preserves the target's existing balance/nonce/
+    /// storage, and **unconditionally materializes** the target in the CacheDB
+    /// overlay (the primary read path for EVM execution, required for the
+    /// `Create` synthetic-target case). The generic primitive writes the overlay
+    /// only when an account is already present, so the two are not
+    /// behavior-equivalent. For a plain code overwrite that follows the
+    /// dual-layer write-through policy, use
+    /// `apply_update(StateUpdate::Account { patch: AccountPatch::default().code(..) })`.
     pub fn override_account_code_with_missing_target(
         &mut self,
         source: Address,

@@ -66,6 +66,7 @@ use crate::cache::{
     CallSimulationResult, EvmCache, EvmOverlay, EvmSnapshot, SimStatus, SlotObservationTracker,
     StorageBatchFetchFn, TxConfig,
 };
+use crate::state_update::StateUpdate;
 
 /// Default minimum observations before the change-frequency data is trusted.
 pub const DEFAULT_MIN_OBSERVATIONS: u32 = 10;
@@ -434,12 +435,17 @@ impl FreshnessPolicy for ObservationDriven {
 // 4. Results
 // ---------------------------------------------------------------------------
 
-/// A storage slot whose freshly-fetched value differs from the cached value.
+/// A storage slot whose value changed: `old` is the prior cached/snapshot value
+/// (`ZERO` if previously uncached), `new` is the resulting value.
 ///
-/// Produced by [`EvmCache::verify_slots`](crate::cache::EvmCache::verify_slots)
-/// and by the background validator; `old` is the value the snapshot/cache held,
-/// `new` is the value the fetcher returned.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Produced by two paths: the freshness verifier
+/// ([`EvmCache::verify_slots`](crate::cache::EvmCache::verify_slots) and the
+/// background validator), where `new` is a freshly-fetched value that differed
+/// from the cache; and the state-update writer
+/// ([`EvmCache::apply_update`](crate::cache::EvmCache::apply_update) /
+/// [`apply_updates`](crate::cache::EvmCache::apply_updates)), where `new` is the
+/// value just written.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SlotChange {
     /// Contract whose storage changed.
     pub address: Address,
@@ -777,12 +783,17 @@ impl<P: FreshnessPolicy, C: FreshnessClock> FreshnessController<P, C> {
         let now = self.clock.now();
 
         // 1. Drain pending corrections into the cache before snapshotting.
+        //    Routed through the unified write primitive (`apply_updates` of
+        //    write-through `Slot`s); behavior-identical to the old
+        //    `inject_storage_batch_fresh`, demonstrating the one write path.
         {
             let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
             if !pending.is_empty() {
-                let injects: Vec<(Address, U256, U256)> =
-                    pending.iter().map(|c| (c.address, c.slot, c.new)).collect();
-                cache.inject_storage_batch_fresh(&injects);
+                let injects: Vec<StateUpdate> = pending
+                    .iter()
+                    .map(|c| StateUpdate::slot(c.address, c.slot, c.new))
+                    .collect();
+                cache.apply_updates(&injects);
                 pending.clear();
             }
         }
