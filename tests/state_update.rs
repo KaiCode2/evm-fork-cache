@@ -1526,3 +1526,83 @@ async fn inject_v3_ticks_writes_through_to_backend() -> Result<()> {
     );
     Ok(())
 }
+
+// ===========================================================================
+// §16 fix-review regressions — account_state-awareness on the account axis.
+// ===========================================================================
+
+#[tokio::test]
+async fn balance_delta_on_notexisting_overlay_account_is_skipped() -> Result<()> {
+    // A NotExisting overlay account is absent to the EVM (revm DbAccount::info()
+    // returns None), even if it carries a stale info.balance. loaded_account_info
+    // must treat it as cold so a BalanceDelta skips rather than applying to 1000.
+    use revm::database::AccountState;
+    let acct = Address::repeat_byte(0x7e);
+    let mut cache = setup_cache().await?;
+    cache.db_mut().insert_account_info(
+        acct,
+        AccountInfo {
+            balance: U256::from(1000),
+            ..Default::default()
+        },
+    );
+    cache
+        .db_mut()
+        .cache
+        .accounts
+        .get_mut(&acct)
+        .expect("overlay account present")
+        .account_state = AccountState::NotExisting;
+
+    let diff = cache.apply_update(&StateUpdate::balance_delta(
+        acct,
+        SlotDelta::Add(U256::from(500)),
+    ));
+
+    assert!(
+        diff.accounts.is_empty(),
+        "NotExisting account is EVM-absent: the delta must skip, not apply to the stale 1000"
+    );
+    assert_eq!(
+        diff.skipped_balances,
+        vec![SkippedBalanceDelta {
+            address: acct,
+            delta: SlotDelta::Add(U256::from(500)),
+        }]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn account_patch_normalizes_zero_code_hash_across_layers() -> Result<()> {
+    // write_account_info_through normalizes a ZERO code_hash to KECCAK_EMPTY so both
+    // layers agree (the overlay write does this via insert_contract; the backend
+    // write must too). Seed the backend (unnormalized) with a ZERO hash, then patch.
+    use alloy_primitives::B256;
+    use revm::primitives::KECCAK_EMPTY;
+    let acct = Address::repeat_byte(0x7f);
+    let mut cache = setup_cache().await?;
+    cache.blockchain_db().accounts().write().insert(
+        acct,
+        AccountInfo {
+            balance: U256::from(1),
+            code_hash: B256::ZERO,
+            ..Default::default()
+        },
+    );
+
+    cache.apply_update(&StateUpdate::balance(acct, U256::from(2)));
+
+    let backend_hash = cache
+        .blockchain_db()
+        .accounts()
+        .read()
+        .get(&acct)
+        .map(|i| i.code_hash);
+    assert_eq!(
+        backend_hash,
+        Some(KECCAK_EMPTY),
+        "backend code_hash must be normalized to KECCAK_EMPTY, not left ZERO"
+    );
+    Ok(())
+}

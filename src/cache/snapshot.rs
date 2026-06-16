@@ -28,7 +28,7 @@
 //!
 //! [`EvmOverlay`]: super::EvmOverlay
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use alloy_primitives::{Address, B256, U256};
 use revm::primitives::hardfork::SpecId;
@@ -45,6 +45,11 @@ use revm::state::{AccountInfo, Bytecode};
 pub struct EvmSnapshot {
     pub(crate) accounts: HashMap<Address, AccountInfo>,
     pub(crate) storage: HashMap<Address, HashMap<U256, U256>>,
+    /// Accounts whose storage is locally complete (revm `StorageCleared` /
+    /// `NotExisting`): a slot absent from `storage` for such an account reads as
+    /// ZERO and must NOT fall through to an `ext_db`, mirroring the live EVM SLOAD
+    /// and [`EvmCache::cached_storage_value`](super::EvmCache::cached_storage_value).
+    pub(crate) storage_cleared: HashSet<Address>,
     pub(crate) block_hashes: HashMap<u64, B256>,
     /// Bytecode lookup by code_hash (derived from accounts at creation time).
     pub(crate) code_by_hash: HashMap<B256, Bytecode>,
@@ -60,15 +65,26 @@ pub struct EvmSnapshot {
 }
 
 impl EvmSnapshot {
-    /// Return the snapshot's value for a storage slot, if present.
+    /// Return the snapshot's value for a storage slot, mirroring the live read.
     ///
-    /// Used by the freshness validator to compare a freshly-fetched value
-    /// against the value the snapshot was built from. A missing entry means the
-    /// snapshot never captured that slot (it would read as zero in a sim).
+    /// Used by the freshness validator to compare a freshly-fetched value against
+    /// the value the snapshot was built from. Resolution matches
+    /// [`EvmCache::cached_storage_value`](super::EvmCache::cached_storage_value):
+    /// a captured slot returns its value; a slot absent from a cleared account
+    /// (revm `StorageCleared`/`NotExisting`) returns `Some(ZERO)` (its storage is
+    /// locally complete); any other absent slot returns `None`.
     pub fn storage_value(&self, address: Address, slot: U256) -> Option<U256> {
-        self.storage
+        if let Some(value) = self
+            .storage
             .get(&address)
             .and_then(|s| s.get(&slot).copied())
+        {
+            return Some(value);
+        }
+        if self.storage_cleared.contains(&address) {
+            return Some(U256::ZERO);
+        }
+        None
     }
 }
 
@@ -89,6 +105,7 @@ mod tests {
         let snap = EvmSnapshot {
             accounts: HashMap::new(),
             storage: HashMap::new(),
+            storage_cleared: HashSet::new(),
             block_hashes: HashMap::new(),
             code_by_hash: HashMap::new(),
             block_number: Some(100),

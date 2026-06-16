@@ -140,6 +140,22 @@ pre-release development phases (see [`docs/ROADMAP.md`](docs/ROADMAP.md)).
   changes, instead of unconditionally inserting `AccountInfo::default()` into the
   shared backend for an all-`None` (or value-unchanged) patch on an absent address.
   A real field change still materializes the backend account (unchanged intent).
+- **`account_state`-awareness extended to the snapshot + account-info paths**
+  (Phase 3 fix-review, HIGH + MED). A follow-up adversarial review found the §16.0
+  `cached_storage_value` fix had not been propagated to two sibling read paths:
+  - `create_snapshot` now mirrors the live read: a `StorageCleared`/`NotExisting`
+    account's storage is captured as **only** its overlay slots (shadowed backend
+    slots dropped) and recorded in a new `EvmSnapshot.storage_cleared` set, so
+    `EvmSnapshot::storage_value` and snapshot-backed `EvmOverlay`s read such a
+    slot as ZERO instead of the shadowed backend value (which also kept the
+    background freshness validator's `old` consistent with `verify_slots`). The
+    `EvmOverlay` storage read honors the set and does **not** fall through to its
+    `ext_db` for a cleared account.
+  - `loaded_account_info` now mirrors revm `DbAccount::info()`: a `NotExisting`
+    overlay account is treated as absent (returns `None`), so a `BalanceDelta` /
+    partial `Account` patch skips rather than computing against a stale `info`.
+  - `write_account_info_through` normalizes a `ZERO` `code_hash` to `KECCAK_EMPTY`
+    so both cache layers store an identical hash (matching revm's `insert_contract`).
 
 ### Notes
 

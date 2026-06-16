@@ -592,6 +592,12 @@ impl Database for EvmOverlay {
         {
             return Ok(*value);
         }
+        // 2b. A cleared account's storage is locally complete: an absent slot reads
+        //     ZERO and must NOT fall through to the ext_db, mirroring the live EVM
+        //     SLOAD for a StorageCleared/NotExisting account.
+        if self.snapshot.storage_cleared.contains(&address) {
+            return Ok(U256::ZERO);
+        }
         // 3. RPC fallback
         if let Some(ref ext_db) = self.ext_db {
             let value = ext_db.storage_ref(address, index)?;
@@ -659,6 +665,7 @@ mod tests {
             accounts,
             storage: HashMap::new(),
             block_hashes: HashMap::new(),
+            storage_cleared: std::collections::HashSet::new(),
             code_by_hash: HashMap::new(),
             block_number: None,
             basefee: None,
@@ -691,6 +698,7 @@ mod tests {
             accounts: HashMap::new(),
             storage,
             block_hashes: HashMap::new(),
+            storage_cleared: std::collections::HashSet::new(),
             code_by_hash: HashMap::new(),
             block_number: None,
             basefee: None,
@@ -721,6 +729,7 @@ mod tests {
             accounts: HashMap::new(),
             storage,
             block_hashes: HashMap::new(),
+            storage_cleared: std::collections::HashSet::new(),
             code_by_hash: HashMap::new(),
             block_number: None,
             basefee: None,
@@ -752,6 +761,7 @@ mod tests {
             accounts: HashMap::new(),
             storage: HashMap::new(),
             block_hashes: HashMap::new(),
+            storage_cleared: std::collections::HashSet::new(),
             code_by_hash: HashMap::new(),
             block_number: None,
             basefee: None,
@@ -784,6 +794,7 @@ mod tests {
             accounts: HashMap::new(),
             storage: HashMap::new(),
             block_hashes: HashMap::new(),
+            storage_cleared: std::collections::HashSet::new(),
             code_by_hash,
             block_number: None,
             basefee: None,
@@ -809,6 +820,7 @@ mod tests {
         let snapshot = Arc::new(EvmSnapshot {
             accounts: HashMap::new(),
             storage: HashMap::new(),
+            storage_cleared: std::collections::HashSet::new(),
             block_hashes,
             code_by_hash: HashMap::new(),
             block_number: None,

@@ -1585,18 +1585,30 @@ impl EvmCache {
     /// backend), without touching RPC. `None` when the account is absent from
     /// both layers.
     fn loaded_account_info(&self, address: Address) -> Option<AccountInfo> {
-        self.db
-            .cache
-            .accounts
-            .get(&address)
-            .map(|a| a.info.clone())
-            .or_else(|| self.blockchain_db.accounts().read().get(&address).cloned())
+        if let Some(a) = self.db.cache.accounts.get(&address) {
+            // Mirror revm `DbAccount::info()` / `basic_ref`: a NotExisting overlay
+            // account is absent to the EVM (returns None) and does NOT fall through
+            // to the backend. Without this, a relative balance update / partial
+            // patch would compute against a stale `info` the EVM never sees.
+            if matches!(a.account_state, AccountState::NotExisting) {
+                return None;
+            }
+            return Some(a.info.clone());
+        }
+        self.blockchain_db.accounts().read().get(&address).cloned()
     }
 
     /// Write an `AccountInfo` through both layers, mirroring the slot policy:
     /// backend (layer 2) always; overlay (layer 1) only if an overlay account
     /// already exists (never materialize a new overlay account).
-    fn write_account_info_through(&mut self, address: Address, info: AccountInfo) {
+    fn write_account_info_through(&mut self, address: Address, mut info: AccountInfo) {
+        // Normalize the code hash the way revm's `insert_contract` (applied on the
+        // overlay write below) does, so both layers store an identical hash: a ZERO
+        // code_hash denotes empty code → KECCAK_EMPTY. Otherwise the overlay would
+        // hold KECCAK_EMPTY while the backend kept ZERO for the same account.
+        if info.code_hash == B256::ZERO {
+            info.code_hash = revm::primitives::KECCAK_EMPTY;
+        }
         let overlay_present = self.db.cache.accounts.contains_key(&address);
         {
             let mut accounts = self.blockchain_db.accounts().write();
@@ -1929,20 +1941,38 @@ impl EvmCache {
         }
 
         // 2. Overlay from CacheDB (Layer 1, takes precedence)
+        let mut storage_cleared = std::collections::HashSet::new();
         for (addr, db_account) in &self.db.cache.accounts {
             if let Some(code) = &db_account.info.code {
                 code_by_hash.insert(db_account.info.code_hash, code.clone());
             }
             accounts.insert(*addr, db_account.info.clone());
-            let account_storage = storage.entry(*addr).or_default();
-            for (slot, value) in &db_account.storage {
-                account_storage.insert(*slot, *value);
+
+            // Mirror the live read path (cached_storage_value / the EVM SLOAD): a
+            // StorageCleared/NotExisting account's storage is locally complete, so
+            // the snapshot holds ONLY its overlay slots (any shadowed backend slots
+            // are dropped) and an absent slot reads ZERO via `storage_cleared`,
+            // rather than falling through to the (shadowed) backend or an ext_db.
+            if matches!(
+                db_account.account_state,
+                AccountState::StorageCleared | AccountState::NotExisting
+            ) {
+                storage_cleared.insert(*addr);
+                let account_storage: HashMap<U256, U256> =
+                    db_account.storage.iter().map(|(k, v)| (*k, *v)).collect();
+                storage.insert(*addr, account_storage);
+            } else {
+                let account_storage = storage.entry(*addr).or_default();
+                for (slot, value) in &db_account.storage {
+                    account_storage.insert(*slot, *value);
+                }
             }
         }
 
         Arc::new(snapshot::EvmSnapshot {
             accounts,
             storage,
+            storage_cleared,
             block_hashes: HashMap::new(),
             code_by_hash,
             block_number: self.block_number,

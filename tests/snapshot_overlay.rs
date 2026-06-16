@@ -177,3 +177,40 @@ async fn overlay_reads_reflect_snapshot_state() -> Result<()> {
 
     Ok(())
 }
+
+/// Regression (§16 fix-review HIGH): `create_snapshot` must mirror the live
+/// account-state-aware read. A `StorageCleared` account with a backend-only
+/// (shadowed) slot reads ZERO live; the snapshot, `storage_value`, and a
+/// snapshot-backed overlay must all agree — not the shadowed backend value. Pre-
+/// fix the snapshot/overlay read the shadowed 100 while the live cache read 0.
+#[tokio::test]
+async fn snapshot_mirrors_live_read_for_cleared_account() -> Result<()> {
+    let token = Address::repeat_byte(0x5c);
+    let slot = U256::from(MOCK_ERC20_BALANCE_SLOT); // absent from the cleared overlay
+    let mut cache = setup_cache().await?;
+    install_mock_erc20(&mut cache, token); // sets account_state = StorageCleared
+    cache.inject_storage_batch(&[(token, slot, U256::from(100))]); // backend-only shadow
+
+    // Live read is ZERO (the §16.0 fix).
+    assert_eq!(cache.cached_storage_value(token, slot), Some(U256::ZERO));
+
+    let snapshot: Arc<EvmSnapshot> = cache.create_snapshot();
+    assert_eq!(
+        snapshot.storage_value(token, slot),
+        Some(U256::ZERO),
+        "snapshot.storage_value must mirror the live cleared read, not the shadowed 100"
+    );
+
+    // A snapshot-backed overlay (no ext_db, as the freshness validator uses) must
+    // also read ZERO for the cleared account's absent slot.
+    let mut overlay = EvmOverlay::new(Arc::clone(&snapshot), None);
+    let value = overlay
+        .storage(token, slot)
+        .map_err(|e| anyhow!("overlay storage read failed: {e:?}"))?;
+    assert_eq!(
+        value,
+        U256::ZERO,
+        "snapshot-backed overlay must read ZERO for a cleared account's absent slot"
+    );
+    Ok(())
+}

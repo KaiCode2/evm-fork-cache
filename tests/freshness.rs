@@ -335,7 +335,13 @@ async fn cache_with_balance(token: Address, owner: Address, balance: U256) -> Re
     install_default_account(&mut cache, owner);
     install_mock_erc20(&mut cache, token);
     if balance > U256::ZERO {
-        cache.inject_storage_batch(&[(token, balance_slot_for(owner), balance)]);
+        // Overlay-resident seed so the balance is EVM-visible: `token` is a
+        // StorageCleared MockERC20, so a backend-only seed reads as ZERO via the
+        // account_state-aware read path (invisible to the optimistic sim and the
+        // snapshot). Mirrors `state_update::balance_tracking_scenario`.
+        cache
+            .db_mut()
+            .insert_account_storage(token, balance_slot_for(owner), balance)?;
     }
     Ok(cache)
 }
@@ -390,10 +396,14 @@ async fn run_mismatch_path_corrected_only_affected_rerun() -> Result<()> {
     install_default_account(&mut cache, owner2);
     install_mock_erc20(&mut cache, token);
     install_mock_erc20(&mut cache, token2);
-    cache.inject_storage_batch(&[
-        (token, balance_slot_for(owner), U256::from(1000)),
-        (token2, balance_slot_for(owner2), U256::from(5000)),
-    ]);
+    // Overlay-resident seeds (EVM-visible): both tokens are StorageCleared, so a
+    // backend-only seed would read ZERO via the account_state-aware read path.
+    cache
+        .db_mut()
+        .insert_account_storage(token, balance_slot_for(owner), U256::from(1000))?;
+    cache
+        .db_mut()
+        .insert_account_storage(token2, balance_slot_for(owner2), U256::from(5000))?;
 
     // Fetcher: owner's balance slot DROPPED to 50 (< the 100 transfer, so the
     // re-run now reverts); owner2's slot unchanged; recipient slots read as zero
@@ -767,7 +777,11 @@ async fn optimistic_result_reports_status_per_outcome() -> Result<()> {
     install_default_account(&mut cache, owner);
     install_mock_erc20(&mut cache, token);
     let slot = balance_slot_for(owner);
-    cache.inject_storage_batch(&[(token, slot, U256::from(1000))]);
+    // Overlay-resident (EVM-visible) seed: `token` is a StorageCleared MockERC20,
+    // so a backend-only seed reads ZERO via the account_state-aware read path.
+    cache
+        .db_mut()
+        .insert_account_storage(token, slot, U256::from(1000))?;
     cache.set_storage_batch_fetcher(stub_fetcher(HashMap::from([(
         (token, slot),
         U256::from(1000),
@@ -823,7 +837,11 @@ async fn dropping_after_fetch_started_suppresses_correction() -> Result<()> {
     install_default_account(&mut cache, owner);
     install_mock_erc20(&mut cache, token);
     let slot = balance_slot_for(owner);
-    cache.inject_storage_batch(&[(token, slot, U256::from(1000))]);
+    // Overlay-resident (EVM-visible) seed: `token` is a StorageCleared MockERC20,
+    // so a backend-only seed reads ZERO via the account_state-aware read path.
+    cache
+        .db_mut()
+        .insert_account_storage(token, slot, U256::from(1000))?;
 
     // Two rendezvous: R1 = "fetch started", R2 = "released by the test". After R2
     // the fetcher reports a CHANGED balance, so absent the cancel the validator
@@ -903,7 +921,10 @@ async fn run_corrected_rerun_verifies_newly_read_volatile_slot() -> Result<()> {
     let slot_a = U256::from(0);
     let slot_b = U256::from(1);
     // Snapshot: A = 5 (nonzero) → optimistic takes "return A" and never reads B.
-    cache.inject_storage_batch(&[(contract, slot_a, U256::from(5))]);
+    // Overlay-resident (EVM-visible) seed: `contract` is StorageCleared.
+    cache
+        .db_mut()
+        .insert_account_storage(contract, slot_a, U256::from(5))?;
     // Fresh chain: A dropped to 0 (flips the branch) and B is 777.
     cache.set_storage_batch_fetcher(stub_fetcher(HashMap::from([
         ((contract, slot_a), U256::from(0)),
@@ -1017,7 +1038,11 @@ async fn run_honors_tx_gas_limit() -> Result<()> {
     install_default_account(&mut cache, owner);
     install_mock_erc20(&mut cache, token);
     let slot = balance_slot_for(owner);
-    cache.inject_storage_batch(&[(token, slot, U256::from(1000))]);
+    // Overlay-resident (EVM-visible) seed: `token` is a StorageCleared MockERC20,
+    // so a backend-only seed reads ZERO via the account_state-aware read path.
+    cache
+        .db_mut()
+        .insert_account_storage(token, slot, U256::from(1000))?;
     cache.set_storage_batch_fetcher(stub_fetcher(HashMap::from([(
         (token, slot),
         U256::from(1000),
