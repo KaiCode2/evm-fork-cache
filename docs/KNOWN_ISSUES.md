@@ -139,11 +139,27 @@ Confidence legend: **[V]** verified against the source during review;
   unit tests assume the default feature. Extraction into `evm-amm-state` is
   planned (roadmap), blocked partly by `ImmutableDataCache` coupling generic
   token-decimals with V2/V3/Balancer pool metadata.
-- **Event-driven sync (roadmap Pillar B) is not implemented.** Targeted
-  inject/purge exist; the Phase 3 **writer half** (the `StateUpdate` vocabulary +
-  `apply_update`/`apply_updates`) lands the apply mechanism, but decoding logs
-  into state updates and the WS ingestion loop with reorg handling are future
-  phases (Pillar B.2).
+- **Event-driven sync (roadmap Pillar B) — reader/writer halves done; live WS
+  transport is not.** The Phase 3 **writer half** (`StateUpdate` +
+  `apply_update`/`apply_updates`) and the Phase 4 **reader half** (the `events`
+  module: `EventDecoder`/`DecoderRegistry`, the ERC-20 + UniswapV3 adapters, and
+  the `EventPipeline` with `ingest_logs`/`reorg_to`/`reconcile`) are implemented.
+  What is **not** shipped is a concrete production WS transport: the async
+  `events::drive`/`LogSource` convenience is generic over a log source and is
+  exercised only by the offline example feeding an in-memory source; wiring it to
+  a live `subscribe_logs`/WS provider (and detecting reorgs from block-hash
+  mismatches) is left to the consumer.
+- **[V] V3 event-derived tick maintenance does not reconstruct fee-growth /
+  oracle state (Phase 4 §6.4).** `UniswapV3Decoder`'s `Mint`/`Burn` handling
+  maintains `liquidityGross`/`liquidityNet` (tick slot +0), the `initialized` flag
+  (+3), the `tickBitmap`, and the in-range global `liquidity`, but **not**
+  `feeGrowthOutside0/1X128` (slots +1/+2), `secondsOutside`, or oracle
+  observations — these are not derivable from the `Mint`/`Burn`/`Swap` events.
+  **Swap price/liquidity quoting is unaffected** (the swap-amount math does not
+  read `feeGrowthOutside`), but fee accounting and `collect`-style reads against
+  event-maintained ticks are not kept current. Sampled
+  `EventPipeline::reconcile` (RPC re-read) and reorg `reorg_to` (purge-and-resync)
+  are the backstop; seed a full tick via `inject_v3_ticks` when fee state matters.
 - **`inject_v2/v3_*` layer behavior changed in Phase 3 (Decision 2).** The
   `protocols`-gated `inject_v2_pool_metadata` / `inject_v3_tick_bitmap*` /
   `inject_v3_ticks*` helpers were refolded onto the write-through

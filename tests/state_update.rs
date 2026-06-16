@@ -22,8 +22,8 @@ use common::{
 };
 use evm_fork_cache::cache::EvmCache;
 use evm_fork_cache::{
-    AccountPatch, PurgeScope, SkippedBalanceDelta, SkippedDelta, SlotChange, SlotDelta, StateDiff,
-    StateUpdate,
+    AccountPatch, PurgeScope, SkippedBalanceDelta, SkippedDelta, SkippedMask, SlotChange,
+    SlotDelta, StateDiff, StateUpdate,
 };
 use revm::state::{AccountInfo, Bytecode};
 
@@ -1604,5 +1604,197 @@ async fn account_patch_normalizes_zero_code_hash_across_layers() -> Result<()> {
         Some(KECCAK_EMPTY),
         "backend code_hash must be normalized to KECCAK_EMPTY, not left ZERO"
     );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4 — SlotMasked: cold-aware read-modify-write masked slot write.
+//
+// `new = (old & !mask) | (value & mask)`. Only the `mask` bits are touched; the
+// rest of the packed word is preserved. Cold (slot absent from both layers) is
+// skipped and surfaced in `diff.skipped_masks` (the un-masked bits are unknown).
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn slot_masked_sets_only_masked_bits() -> Result<()> {
+    let token = Address::repeat_byte(0x11);
+    let slot = U256::from(0);
+    let mut cache = setup_cache().await?;
+    install_mock_erc20(&mut cache, token);
+    // Seed a packed word with the high bits set and the low byte clear.
+    let seeded = U256::MAX - U256::from(0xFF); // 0xFF..FF00
+    cache.db_mut().insert_account_storage(token, slot, seeded)?;
+
+    // Mask the low byte only, set it to 0x42.
+    let diff = cache.apply_update(&StateUpdate::slot_masked(
+        token,
+        slot,
+        U256::from(0xFF),
+        U256::from(0x42),
+    ));
+
+    let expected = seeded | U256::from(0x42); // high bits preserved, low byte = 0x42
+    assert_eq!(cache.cached_storage_value(token, slot), Some(expected));
+    assert_eq!(
+        diff.slots,
+        vec![SlotChange {
+            address: token,
+            slot,
+            old: seeded,
+            new: expected,
+        }]
+    );
+    assert!(diff.skipped_masks.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn slot_masked_noop_when_masked_bits_already_equal() -> Result<()> {
+    let token = Address::repeat_byte(0x12);
+    let slot = U256::from(1);
+    let mut cache = setup_cache().await?;
+    install_mock_erc20(&mut cache, token);
+    cache
+        .db_mut()
+        .insert_account_storage(token, slot, U256::from(0x42))?;
+
+    // The masked bits already equal the target → no change.
+    let diff = cache.apply_update(&StateUpdate::slot_masked(
+        token,
+        slot,
+        U256::from(0xFF),
+        U256::from(0x42),
+    ));
+
+    assert!(
+        diff.is_empty(),
+        "masked write that changes nothing is a no-op"
+    );
+    assert!(diff.skipped_masks.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn slot_masked_cold_slot_is_skipped_and_surfaced() -> Result<()> {
+    // Fresh address with no overlay account and no backend value: the slot is
+    // cold. A masked write cannot know the un-masked bits, so it is skipped.
+    let pool = Address::repeat_byte(0x13);
+    let slot = U256::from(0);
+    let mut cache = setup_cache().await?;
+
+    let diff = cache.apply_update(&StateUpdate::slot_masked(
+        pool,
+        slot,
+        U256::from(0xFF),
+        U256::from(0x42),
+    ));
+
+    assert!(diff.slots.is_empty());
+    assert_eq!(
+        diff.skipped_masks,
+        vec![SkippedMask {
+            address: pool,
+            slot,
+            mask: U256::from(0xFF),
+            value: U256::from(0x42),
+        }]
+    );
+    assert!(diff.has_skipped());
+    assert!(!diff.is_fully_applied());
+    assert_eq!(diff.skipped_len(), 1);
+    // Still cold — nothing was written.
+    assert_eq!(cache.cached_storage_value(pool, slot), None);
+    Ok(())
+}
+
+#[tokio::test]
+async fn slot_masked_writes_through_both_layers() -> Result<()> {
+    let token = Address::repeat_byte(0x14);
+    let slot = U256::from(2);
+    let mut cache = setup_cache().await?;
+    install_mock_erc20(&mut cache, token);
+    // Overlay-resident (hot) seed so an overlay account exists.
+    let seeded = U256::from(0xFF00);
+    cache.db_mut().insert_account_storage(token, slot, seeded)?;
+
+    cache.apply_update(&StateUpdate::slot_masked(
+        token,
+        slot,
+        U256::from(0x00FF),
+        U256::from(0x0042),
+    ));
+
+    let expected = U256::from(0xFF42);
+    assert_eq!(
+        overlay_slot(&mut cache, token, slot),
+        Some(expected),
+        "overlay (layer 1) updated"
+    );
+    assert_eq!(
+        backend_slot(&cache, token, slot),
+        Some(expected),
+        "backend (layer 2) updated"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn slot_masked_full_mask_equals_absolute_on_hot_but_skips_cold() -> Result<()> {
+    // mask == U256::MAX behaves like an absolute write on a hot slot, but still
+    // skip-and-surfaces on a cold one (unlike StateUpdate::Slot).
+    let token = Address::repeat_byte(0x15);
+    let hot = U256::from(0);
+    let cold_addr = Address::repeat_byte(0x16);
+    let cold = U256::from(0);
+    let mut cache = setup_cache().await?;
+    install_mock_erc20(&mut cache, token);
+    cache
+        .db_mut()
+        .insert_account_storage(token, hot, U256::from(7))?;
+
+    let hot_diff = cache.apply_update(&StateUpdate::slot_masked(
+        token,
+        hot,
+        U256::MAX,
+        U256::from(99),
+    ));
+    assert_eq!(cache.cached_storage_value(token, hot), Some(U256::from(99)));
+    assert_eq!(hot_diff.slots.len(), 1);
+    assert!(hot_diff.skipped_masks.is_empty());
+
+    let cold_diff = cache.apply_update(&StateUpdate::slot_masked(
+        cold_addr,
+        cold,
+        U256::MAX,
+        U256::from(99),
+    ));
+    assert!(cold_diff.slots.is_empty());
+    assert_eq!(cold_diff.skipped_masks.len(), 1);
+    assert_eq!(cache.cached_storage_value(cold_addr, cold), None);
+    Ok(())
+}
+
+#[tokio::test]
+async fn slot_masked_serde_round_trips() -> Result<()> {
+    let update = StateUpdate::slot_masked(
+        Address::repeat_byte(0x17),
+        U256::from(5),
+        U256::from(0xFF),
+        U256::from(3),
+    );
+    let json = serde_json::to_string(&update)?;
+    let back: StateUpdate = serde_json::from_str(&json)?;
+    assert_eq!(update, back);
+
+    let mut diff = StateDiff::default();
+    diff.skipped_masks.push(SkippedMask {
+        address: Address::repeat_byte(0x18),
+        slot: U256::from(1),
+        mask: U256::from(0xFF),
+        value: U256::from(2),
+    });
+    let json = serde_json::to_string(&diff)?;
+    let back: StateDiff = serde_json::from_str(&json)?;
+    assert_eq!(diff, back);
     Ok(())
 }

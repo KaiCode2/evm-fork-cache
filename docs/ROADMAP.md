@@ -73,7 +73,7 @@ RPC node                     Event-driven sync  ← WS logs · new block
 | **1** | Engine seam: typed errors, configurable tx/block env, hot-path benches, builder, `protocols` feature. | **Done** (`phase-1-engine-seam`) |
 | **2** | Freshness core (Pillar C): `Validity` + `FreshnessRegistry`; observation tracker; policies; optimistic verify-and-rerun loop. | **Done** (`phase-2-freshness`) |
 | **3** | State-update primitives (Pillar B.1): `StateUpdate` + targeted writers; refold `inject_*`; surface state-diff output. | **Done** (`phase-3-state-updates`) |
-| **4** | Event pipeline + adapters (Pillar B.2): `EventDecoder` trait, V3 adapter, WS ingestion loop, reorg handling. | Planned |
+| **4** | Event pipeline + adapters (Pillar B.2): `EventDecoder` trait, ERC-20 + V3 adapters, ingest/reorg/reconcile pipeline. | **Done** (`phase-4-event-pipeline`) |
 | **5** | COW snapshots (Pillar A): structural sharing; overlay buffer reuse. | Planned |
 
 Cross-cutting (land opportunistically): call tracer Inspector, full offline
@@ -353,6 +353,56 @@ accessors (`has_skipped`/`skipped_len`/`is_fully_applied`) and the
 `StateUpdate::nonce`/`code`/`account` constructors; and `apply_updates` gained a
 batched single-lock fast-path (byte-identical to the sequential fold, pinned by an
 equivalence test).
+
+---
+
+## Phase 4 — event pipeline + adapters (detailed, decisions locked)
+
+Builds **Pillar B.2 — the reader half** of the event → state pipeline: decode an
+on-chain `Log` into the Phase 3 `StateUpdate` vocabulary, apply it, and run the
+reactive maintenance (reconcile, reorg) that keeps event-derived state honest.
+Decoders are pure functions of `(log, pre-state)`; the `!Send` cache discipline is
+preserved by keeping the tested core synchronous (the async ingestion driver is a
+thin convenience). The full build contract is in
+[`phase-4-spec.md`](phase-4-spec.md).
+
+### Locked decisions
+
+1. **Packed-slot updates → `StateUpdate::SlotMasked`** (a cold-aware RMW masked
+   write), so a pure decoder can express a partial update to a packed word (V3
+   `slot0`) without clobbering the bits it does not own (notably `unlocked`).
+2. **V3 adapter coverage → `Swap` **and** `Mint`/`Burn` (full ticks).** `slot0` +
+   `liquidity` from `Swap`; per-tick `liquidityGross`/`liquidityNet` +
+   `initialized` + `tickBitmap` + in-range global `liquidity` from `Mint`/`Burn`,
+   computed against the `StateView`. Fee-growth/oracle state is out of scope (a
+   documented limitation; reconcile/purge are the backstop).
+3. **Reorg → purge-and-resync.** A depth-bounded ring tracks addresses touched per
+   block; `reorg_to(n)` purges everything touched after `n` so reads re-fetch.
+   `ValidThrough` is the freshness lever.
+4. **Reconciliation → sampled re-read, correct **and** alarm.** `reconcile` samples
+   event-derived slots and re-reads via `EvmCache::reconcile_slots` (a honest
+   wrapper over `verify_slots` that errors on a total fetch failure rather than
+   reporting a false all-clear); the fresh chain value wins and the drift is
+   surfaced.
+
+### Acceptance — met
+
+`cargo fmt --check`, `clippy --all-targets -- -D warnings` (default +
+`--lib --no-default-features`), `cargo test` (both feature configs),
+`RUSTDOCFLAGS=-D warnings cargo doc`, `cargo bench --no-run`.
+
+Landed on `phase-4-event-pipeline`: `src/events/` (the generic core —
+`EventDecoder`/`StateView`, `DecoderRegistry`, `EventPipeline` with
+`ingest_logs`/`reorg_to`/`reconcile` + `BlockDigest`/`ReconcileReport`/
+`ReorgConfig`, and the async `drive`/`LogSource`), the generic
+`Erc20TransferDecoder` (`events::erc20`), and the `protocols`-gated
+`UniswapV3Decoder`/`UniswapV3Layout` (`events::uniswap_v3`); the cold-aware
+`StateUpdate::SlotMasked` vocabulary + `StateDiff.skipped_masks`/`SkippedMask`
+(`state_update`) and its dual-layer apply arm; `EvmCache::reconcile_slots` and the
+`StateView` impl; the offline `examples/reactive_cache.rs`;
+`benches/event_pipeline.rs`; and `tests/event_pipeline.rs` (+ the `SlotMasked`
+tests in `tests/state_update.rs`). The §6.4 V3 fee-growth/oracle maintenance gap
+is recorded in `KNOWN_ISSUES.md`.
 
 ---
 

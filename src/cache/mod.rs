@@ -68,7 +68,7 @@ use crate::freshness::SlotChange;
 use crate::inspector::TransferInspector;
 use crate::state_update::{
     AccountChange, AccountPatch, PurgeRecord, PurgeScope, SkippedBalanceDelta, SkippedDelta,
-    SlotDelta, StateDiff, StateUpdate,
+    SkippedMask, SlotDelta, StateDiff, StateUpdate,
 };
 
 use bytecode::BytecodeCache;
@@ -1264,6 +1264,36 @@ impl EvmCache {
                     delta: *delta,
                 }),
             },
+            StateUpdate::SlotMasked {
+                address,
+                slot,
+                mask,
+                value,
+            } => match self.cached_storage_value(*address, *slot) {
+                // Hot slot: overwrite only the masked bits, preserving the rest.
+                // Build the change from the value we already read (mirroring the
+                // `SlotDelta` arm; do not re-read through `apply_slot`).
+                Some(old) => {
+                    let new = (old & !*mask) | (*value & *mask);
+                    self.write_slot_through(*address, *slot, new);
+                    if old != new {
+                        diff.slots.push(SlotChange {
+                            address: *address,
+                            slot: *slot,
+                            old,
+                            new,
+                        });
+                    }
+                }
+                // Cold slot: the un-masked bits are unknown, so the result cannot
+                // be computed; write nothing and surface the skip for re-seeding.
+                None => diff.skipped_masks.push(SkippedMask {
+                    address: *address,
+                    slot: *slot,
+                    mask: *mask,
+                    value: *value,
+                }),
+            },
             StateUpdate::BalanceDelta { address, delta } => {
                 match self.apply_balance_delta(*address, *delta) {
                     // Hot account: the saturating delta was applied.
@@ -1774,8 +1804,20 @@ impl EvmCache {
     /// none is available. This is the synchronous main-thread primitive; the
     /// background validator performs the equivalent comparison against a snapshot.
     pub fn verify_slots(&mut self, slots: &[(Address, U256)]) -> Result<Vec<SlotChange>> {
+        Ok(self.verify_slots_inner(slots)?.0)
+    }
+
+    /// Shared implementation for [`verify_slots`](Self::verify_slots) and the
+    /// pipeline's reconcile path. Returns `(changed, fetched_ok)` where
+    /// `fetched_ok` is the number of requested slots the fetcher returned a value
+    /// for (failed per-slot fetches are skipped, not errors). Errors only when no
+    /// batch fetcher is configured.
+    fn verify_slots_inner(
+        &mut self,
+        slots: &[(Address, U256)],
+    ) -> Result<(Vec<SlotChange>, usize)> {
         if slots.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), 0));
         }
         let fetcher = self
             .storage_batch_fetcher
@@ -1794,6 +1836,7 @@ impl EvmCache {
 
         let mut changed = Vec::new();
         let mut to_inject = Vec::new();
+        let mut fetched_ok = 0usize;
         for (addr, slot, fetched) in results {
             let fresh = match fetched {
                 Ok(value) => value,
@@ -1802,6 +1845,7 @@ impl EvmCache {
                     continue;
                 }
             };
+            fetched_ok += 1;
             // A slot the cache never saw is treated as old = ZERO (the value a
             // sim would have read), so a non-zero fresh value counts as a change.
             let old = cached
@@ -1822,6 +1866,29 @@ impl EvmCache {
 
         if !to_inject.is_empty() {
             self.inject_storage_batch_fresh(&to_inject);
+        }
+        Ok((changed, fetched_ok))
+    }
+
+    /// Reconciliation re-read used by [`EventPipeline::reconcile`](crate::events::EventPipeline::reconcile).
+    ///
+    /// Like [`verify_slots`](Self::verify_slots) it fetches the requested slots,
+    /// injects the ones that changed, and returns the changed set — but it is
+    /// **honest about reachability**: it errors not only when no batch fetcher is
+    /// configured, but also when a non-empty request could not fetch **any** slot
+    /// (a total fetch failure — e.g. the default RPC fetcher invoked with no usable
+    /// runtime, or an unreachable provider). Reconciliation that silently "verified
+    /// nothing" would be a false all-clear, so it surfaces as an error for the
+    /// caller to retry. A partially-successful fetch returns `Ok` with whatever
+    /// changed.
+    pub fn reconcile_slots(&mut self, slots: &[(Address, U256)]) -> Result<Vec<SlotChange>> {
+        let (changed, fetched_ok) = self.verify_slots_inner(slots)?;
+        if !slots.is_empty() && fetched_ok == 0 {
+            return Err(anyhow!(
+                "reconcile could not fetch any of the {} requested slot(s) \
+                 (no usable storage fetcher / provider unreachable)",
+                slots.len()
+            ));
         }
         Ok(changed)
     }
@@ -3466,6 +3533,16 @@ impl EvmCache {
             role,
             address
         ))
+    }
+}
+
+/// Read-only state view for the event pipeline (Pillar B.2): a decoder reads the
+/// current cached value of a slot through [`cached_storage_value`](EvmCache::cached_storage_value),
+/// which never touches RPC and is `account_state`-aware (a cold slot reads
+/// `None`).
+impl crate::events::StateView for EvmCache {
+    fn storage(&self, address: Address, slot: U256) -> Option<U256> {
+        self.cached_storage_value(address, slot)
     }
 }
 
