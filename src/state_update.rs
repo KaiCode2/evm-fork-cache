@@ -364,6 +364,17 @@ impl AccountPatch {
 ///
 /// The enum is `#[non_exhaustive]`: new scopes may be added pre-1.0 without a
 /// breaking change.
+///
+/// # `StorageCleared`/`NotExisting` accounts
+/// Purging *storage* ([`AllStorage`](Self::AllStorage) / [`Slots`](Self::Slots))
+/// removes the slot from the backend so a normal forked account re-fetches it on
+/// the next read. For an account revm marks `StorageCleared`/`NotExisting` (a
+/// locally-created/cleared account, e.g. after a `CREATE`/selfdestruct), the EVM
+/// reads a missing slot as **zero without re-fetching** — its storage is locally
+/// complete — so a purged slot reads `0`, not a fresh RPC value. This is correct
+/// (such an account has no on-chain storage to refetch), but it means
+/// [`Slots`](Self::Slots) does not force a refetch for those accounts. Use
+/// [`Account`](Self::Account) (or `purge_account`) to fully drop the account.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[non_exhaustive]
 pub enum PurgeScope {

@@ -156,6 +156,34 @@ pre-release development phases (see [`docs/ROADMAP.md`](docs/ROADMAP.md)).
     partial `Account` patch skips rather than computing against a stale `info`.
   - `write_account_info_through` normalizes a `ZERO` `code_hash` to `KECCAK_EMPTY`
     so both cache layers store an identical hash (matching revm's `insert_contract`).
+- **`account_state`-awareness completed on the account (`basic`) axis** (round-2
+  review, HIGH). The snapshot path still leaked a `NotExisting` account's stale
+  info: `create_snapshot` inserted it into `accounts`, so `EvmOverlay::basic`
+  returned a phantom existing account where live revm / `loaded_account_info`
+  return `None`. Now `create_snapshot` excludes `NotExisting` accounts from
+  `accounts`/`code_by_hash` and records them in a new
+  `EvmSnapshot.accounts_not_existing` set; `EvmOverlay::basic` returns `None` for
+  them (no `ext_db` fall-through). `target_account_info` (deploy path) and
+  `loaded_account_info` (code_hash normalized at load) were brought into line too.
+- **Freshness validator trust contract hardened** (Phase 2 review). The
+  background validator no longer returns a *trusted* verdict on incomplete or
+  ambiguous verification:
+  - **Fixed-point round cap → `Unverified`.** Exceeding `MAX_VALIDATION_ROUNDS`
+    (corrections kept opening new volatile slots) now returns
+    `Validation::Unverified` and queues no corrections, instead of a best-effort
+    `Corrected` resting on un-verified state.
+  - **Corrected re-run host error → `Unverified`.** A failed corrected re-run
+    (a `transact` error, not a revert/halt) returns `Unverified` rather than
+    silently keeping the stale optimistic result.
+  - **Missing fetcher results → `Unverified`.** A new `collect_fetch_results`
+    helper requires the batch fetcher to return *every* requested slot; an omitted
+    slot yields `Unverified` instead of defaulting to zero (which could produce a
+    false confirmation/correction with a custom fetcher).
+- **`call_raw_with_access_list*` reverts its checkpoint on transact errors**
+  (Phase 2 review; `EvmCache` + `EvmOverlay`). Previously the host-error path
+  `?`-returned before `checkpoint_revert`, leaving the journal checkpoint
+  un-reverted; both methods now revert on every path. (See `docs/KNOWN_ISSUES.md`
+  #9, now resolved.)
 
 ### Notes
 

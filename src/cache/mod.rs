@@ -1510,9 +1510,10 @@ impl EvmCache {
     ///   balance changed;
     /// - `None` writes nothing (no account is materialized) and returns `None`.
     ///
-    /// "Cold" for a balance is the account being absent from both layers; the
-    /// revm `account_state` does **not** matter here (it governs storage, not the
-    /// basic `AccountInfo`). To skip cold accounts, map through the `Option`:
+    /// "Cold" for a balance is the account being absent from both layers — or
+    /// present in the overlay as revm `NotExisting` (absent to the EVM), which the
+    /// internal account read also treats as cold, mirroring `DbAccount::info()`.
+    /// To skip cold accounts, map through the `Option`:
     /// `|cur| cur.map(|v| v.saturating_add(amount))`.
     ///
     /// ```no_run
@@ -1585,7 +1586,7 @@ impl EvmCache {
     /// backend), without touching RPC. `None` when the account is absent from
     /// both layers.
     fn loaded_account_info(&self, address: Address) -> Option<AccountInfo> {
-        if let Some(a) = self.db.cache.accounts.get(&address) {
+        let mut info = if let Some(a) = self.db.cache.accounts.get(&address) {
             // Mirror revm `DbAccount::info()` / `basic_ref`: a NotExisting overlay
             // account is absent to the EVM (returns None) and does NOT fall through
             // to the backend. Without this, a relative balance update / partial
@@ -1593,9 +1594,22 @@ impl EvmCache {
             if matches!(a.account_state, AccountState::NotExisting) {
                 return None;
             }
-            return Some(a.info.clone());
+            a.info.clone()
+        } else {
+            self.blockchain_db
+                .accounts()
+                .read()
+                .get(&address)
+                .cloned()?
+        };
+        // Normalize like revm `insert_contract`: a ZERO code_hash denotes empty
+        // code -> KECCAK_EMPTY. Done at load time so a patch's `old_code_hash`
+        // matches what `write_account_info_through` stores (a self-consistent diff,
+        // no phantom/under-reported code_hash change).
+        if info.code_hash == B256::ZERO {
+            info.code_hash = revm::primitives::KECCAK_EMPTY;
         }
-        self.blockchain_db.accounts().read().get(&address).cloned()
+        Some(info)
     }
 
     /// Write an `AccountInfo` through both layers, mirroring the slot policy:
@@ -1942,21 +1956,33 @@ impl EvmCache {
 
         // 2. Overlay from CacheDB (Layer 1, takes precedence)
         let mut storage_cleared = std::collections::HashSet::new();
+        let mut accounts_not_existing = std::collections::HashSet::new();
         for (addr, db_account) in &self.db.cache.accounts {
-            if let Some(code) = &db_account.info.code {
-                code_by_hash.insert(db_account.info.code_hash, code.clone());
-            }
-            accounts.insert(*addr, db_account.info.clone());
+            let not_existing = matches!(db_account.account_state, AccountState::NotExisting);
+            let cleared =
+                not_existing || matches!(db_account.account_state, AccountState::StorageCleared);
 
-            // Mirror the live read path (cached_storage_value / the EVM SLOAD): a
-            // StorageCleared/NotExisting account's storage is locally complete, so
-            // the snapshot holds ONLY its overlay slots (any shadowed backend slots
-            // are dropped) and an absent slot reads ZERO via `storage_cleared`,
-            // rather than falling through to the (shadowed) backend or an ext_db.
-            if matches!(
-                db_account.account_state,
-                AccountState::StorageCleared | AccountState::NotExisting
-            ) {
+            // Account info. Mirror revm `DbAccount::info()` / `loaded_account_info`:
+            // a NotExisting overlay account is absent to the EVM (`basic` returns
+            // None), so it must NOT contribute info/code to the snapshot — and any
+            // backend-merged entry from step 1 is dropped, since loaded_account_info
+            // short-circuits to None before consulting the backend.
+            if not_existing {
+                accounts_not_existing.insert(*addr);
+                accounts.remove(addr);
+            } else {
+                if let Some(code) = &db_account.info.code {
+                    code_by_hash.insert(db_account.info.code_hash, code.clone());
+                }
+                accounts.insert(*addr, db_account.info.clone());
+            }
+
+            // Storage. A StorageCleared/NotExisting account's storage is locally
+            // complete: the snapshot holds ONLY its overlay slots (any shadowed
+            // backend slots are dropped) and an absent slot reads ZERO via
+            // `storage_cleared`, rather than falling through to the (shadowed)
+            // backend or an ext_db.
+            if cleared {
                 storage_cleared.insert(*addr);
                 let account_storage: HashMap<U256, U256> =
                     db_account.storage.iter().map(|(k, v)| (*k, *v)).collect();
@@ -1973,6 +1999,7 @@ impl EvmCache {
             accounts,
             storage,
             storage_cleared,
+            accounts_not_existing,
             block_hashes: HashMap::new(),
             code_by_hash,
             block_number: self.block_number,
@@ -2558,24 +2585,29 @@ impl EvmCache {
         let mut evm = self.build_evm();
 
         let checkpoint = evm.journaled_state.checkpoint();
-        let result = evm
-            .transact_one(tx)
-            .map_err(|e| anyhow!("Failed to transact: {:?}", e))?;
-
-        // Extract access list from journaled state before reverting.
-        // After transact_one, journaled_state.state contains all touched accounts/slots.
-        let mut access_list = StorageAccessList::default();
-        for (address, account) in evm.journaled_state.state.iter() {
-            if account.is_touched() {
-                access_list.accounts.insert(*address);
-                for (slot_key, _) in account.storage.iter() {
-                    access_list.slots.insert((*address, *slot_key));
+        match evm.transact_one(tx) {
+            Ok(result) => {
+                // Extract access list from journaled state before reverting. After
+                // transact_one, journaled_state.state holds all touched accounts/slots.
+                let mut access_list = StorageAccessList::default();
+                for (address, account) in evm.journaled_state.state.iter() {
+                    if account.is_touched() {
+                        access_list.accounts.insert(*address);
+                        for (slot_key, _) in account.storage.iter() {
+                            access_list.slots.insert((*address, *slot_key));
+                        }
+                    }
                 }
+                evm.journaled_state.checkpoint_revert(checkpoint);
+                Ok((result, access_list))
+            }
+            Err(e) => {
+                // Revert the checkpoint even on a host/transact error so the EVM
+                // journal is not left dirty (mirrors `call_raw`).
+                evm.journaled_state.checkpoint_revert(checkpoint);
+                Err(anyhow!("Failed to transact: {:?}", e))
             }
         }
-
-        evm.journaled_state.checkpoint_revert(checkpoint);
-        Ok((result, access_list))
     }
 
     /// Execute a call and return its emitted logs and gas used.
@@ -3399,7 +3431,12 @@ impl EvmCache {
         missing_target: MissingTargetBehavior,
     ) -> Result<AccountInfo> {
         if let Some(account) = self.db.cache.accounts.get(&target) {
-            return Ok(account.info.clone());
+            // A NotExisting overlay account is absent to the EVM (revm
+            // `DbAccount::info()` returns None); treat it as a missing target
+            // rather than returning its stale/default info.
+            if !matches!(account.account_state, AccountState::NotExisting) {
+                return Ok(account.info.clone());
+            }
         }
 
         match missing_target {

@@ -467,22 +467,27 @@ impl EvmOverlay {
         let mut evm = self.build_evm();
         use revm::context_interface::JournalTr;
         let checkpoint = evm.journaled_state.checkpoint();
-        let result = evm
-            .transact_one(tx_env)
-            .map_err(|e| anyhow!("Failed to transact: {:?}", e))?;
-
-        let mut access_list = StorageAccessList::default();
-        for (address, account) in evm.journaled_state.state.iter() {
-            if account.is_touched() {
-                access_list.accounts.insert(*address);
-                for (slot_key, _) in account.storage.iter() {
-                    access_list.slots.insert((*address, *slot_key));
+        match evm.transact_one(tx_env) {
+            Ok(result) => {
+                let mut access_list = StorageAccessList::default();
+                for (address, account) in evm.journaled_state.state.iter() {
+                    if account.is_touched() {
+                        access_list.accounts.insert(*address);
+                        for (slot_key, _) in account.storage.iter() {
+                            access_list.slots.insert((*address, *slot_key));
+                        }
+                    }
                 }
+                evm.journaled_state.checkpoint_revert(checkpoint);
+                Ok((result, access_list))
+            }
+            Err(e) => {
+                // Revert the checkpoint even on a host/transact error so the EVM
+                // journal is not left dirty (mirrors `call_raw`).
+                evm.journaled_state.checkpoint_revert(checkpoint);
+                Err(anyhow!("Failed to transact: {:?}", e))
             }
         }
-
-        evm.journaled_state.checkpoint_revert(checkpoint);
-        Ok((result, access_list))
     }
 
     /// Write a storage value into this overlay's dirty layer.
@@ -547,6 +552,12 @@ impl Database for EvmOverlay {
         // 2. Check snapshot (O(1) HashMap lookup, no locks)
         if let Some(info) = self.snapshot.accounts.get(&address) {
             return Ok(Some(info.clone()));
+        }
+        // 2b. A NotExisting account is absent to the EVM: return None and do NOT
+        //     fall through to the ext_db, mirroring revm `DbAccount::info()` and the
+        //     live `EvmCache` account read (symmetric with `storage_cleared`).
+        if self.snapshot.accounts_not_existing.contains(&address) {
+            return Ok(None);
         }
         // 3. RPC fallback
         if let Some(ref ext_db) = self.ext_db {
@@ -666,6 +677,7 @@ mod tests {
             storage: HashMap::new(),
             block_hashes: HashMap::new(),
             storage_cleared: std::collections::HashSet::new(),
+            accounts_not_existing: std::collections::HashSet::new(),
             code_by_hash: HashMap::new(),
             block_number: None,
             basefee: None,
@@ -699,6 +711,7 @@ mod tests {
             storage,
             block_hashes: HashMap::new(),
             storage_cleared: std::collections::HashSet::new(),
+            accounts_not_existing: std::collections::HashSet::new(),
             code_by_hash: HashMap::new(),
             block_number: None,
             basefee: None,
@@ -730,6 +743,7 @@ mod tests {
             storage,
             block_hashes: HashMap::new(),
             storage_cleared: std::collections::HashSet::new(),
+            accounts_not_existing: std::collections::HashSet::new(),
             code_by_hash: HashMap::new(),
             block_number: None,
             basefee: None,
@@ -762,6 +776,7 @@ mod tests {
             storage: HashMap::new(),
             block_hashes: HashMap::new(),
             storage_cleared: std::collections::HashSet::new(),
+            accounts_not_existing: std::collections::HashSet::new(),
             code_by_hash: HashMap::new(),
             block_number: None,
             basefee: None,
@@ -795,6 +810,7 @@ mod tests {
             storage: HashMap::new(),
             block_hashes: HashMap::new(),
             storage_cleared: std::collections::HashSet::new(),
+            accounts_not_existing: std::collections::HashSet::new(),
             code_by_hash,
             block_number: None,
             basefee: None,
@@ -821,6 +837,7 @@ mod tests {
             accounts: HashMap::new(),
             storage: HashMap::new(),
             storage_cleared: std::collections::HashSet::new(),
+            accounts_not_existing: std::collections::HashSet::new(),
             block_hashes,
             code_by_hash: HashMap::new(),
             block_number: None,

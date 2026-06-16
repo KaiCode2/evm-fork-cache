@@ -214,3 +214,47 @@ async fn snapshot_mirrors_live_read_for_cleared_account() -> Result<()> {
     );
     Ok(())
 }
+
+/// Regression (round-2 HIGH, account axis): `create_snapshot` / `EvmOverlay::basic`
+/// must mirror the live account read for a `NotExisting` account. revm treats such
+/// an account as absent (`DbAccount::info()` → None), and `loaded_account_info`
+/// already does; the snapshot/parallel path must agree — not surface a phantom
+/// existing account with stale info. Pre-fix `EvmOverlay::basic` returned
+/// `Some(info)`.
+#[tokio::test]
+async fn snapshot_basic_returns_none_for_notexisting_account() -> Result<()> {
+    use revm::database::AccountState;
+    use revm::database_interface::Database;
+    use revm::state::AccountInfo;
+
+    let acct = Address::repeat_byte(0x6e);
+    let mut cache = setup_cache().await?;
+    // An overlay account revm marks NotExisting (e.g. after a selfdestruct) carries
+    // (default) info but is absent to the EVM.
+    cache.db_mut().insert_account_info(
+        acct,
+        AccountInfo {
+            balance: U256::from(1000),
+            ..Default::default()
+        },
+    );
+    cache
+        .db_mut()
+        .cache
+        .accounts
+        .get_mut(&acct)
+        .expect("overlay account present")
+        .account_state = AccountState::NotExisting;
+
+    let snapshot: Arc<EvmSnapshot> = cache.create_snapshot();
+    let mut overlay = EvmOverlay::new(Arc::clone(&snapshot), None);
+    let basic = overlay
+        .basic(acct)
+        .map_err(|e| anyhow!("overlay basic read failed: {e:?}"))?;
+    assert!(
+        basic.is_none(),
+        "snapshot-backed overlay must read a NotExisting account as absent (None), \
+         not a phantom Some(info); got {basic:?}"
+    );
+    Ok(())
+}

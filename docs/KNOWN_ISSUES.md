@@ -59,11 +59,12 @@ Confidence legend: **[V]** verified against the source during review;
    Either the field is meaningless on this path or the population was missed —
    the docs now state the field is empty here; reconcile before relying on it.
 
-9. **[V] `call_raw_with_access_list` does not revert its checkpoint on a transact
-   error.** It propagates the EVM `transact` error with `?` *before* reverting the
-   journaled checkpoint, whereas `call_raw` / `simulate_with_transfer_tracking`
-   revert on every path. A host-level transact error therefore leaves the overlay
-   checkpoint un-reverted. (Reverts normally on success and on revert/halt.)
+9. **[FIXED] `call_raw_with_access_list` did not revert its checkpoint on a
+   transact error.** Both `EvmCache::call_raw_with_access_list` and
+   `EvmOverlay::call_raw_with_access_list_with` now match on the `transact_one`
+   result and `checkpoint_revert` on **every** path (success and host error),
+   matching `call_raw` / `simulate_with_transfer_tracking`. A host-level transact
+   error no longer leaves the overlay checkpoint un-reverted.
 
 10. **[V] `SystemTime::now().unwrap()` panic risk in EVM construction.**
     `build_evm` / `make_local_context` (and the overlay equivalents) call

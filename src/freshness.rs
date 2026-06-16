@@ -908,8 +908,41 @@ struct ValidatorInput {
 /// Maximum fixed-point iterations the background validator performs while a
 /// correction keeps expanding a sim's volatile read set. A backstop against
 /// pathological contracts that read an unbounded chain of new volatile slots;
-/// reaching it yields a best-effort `Corrected` (logged via `tracing::warn!`).
+/// reaching it yields [`Validation::Unverified`] (the results have not reached a
+/// verified fixed point, so they must not be trusted), logged via `tracing::warn!`.
 const MAX_VALIDATION_ROUNDS: u32 = 8;
+
+/// Collect batch-fetcher results into a lookup map, requiring **every** requested
+/// `(address, slot)` to be present and `Ok`.
+///
+/// The validator must never silently trust a gap: a fetch error *or* a slot the
+/// fetcher omitted from its response yields `Err(reason)` (mapped to
+/// [`Validation::Unverified`] by the caller) rather than defaulting the missing
+/// value to zero — a custom fetcher that drops a slot would otherwise produce a
+/// false confirmation or correction.
+fn collect_fetch_results(
+    requested: &[(Address, U256)],
+    results: Vec<(Address, U256, anyhow::Result<U256>)>,
+) -> Result<HashMap<(Address, U256), U256>, String> {
+    let mut map: HashMap<(Address, U256), U256> = HashMap::new();
+    for (addr, slot, value) in results {
+        match value {
+            Ok(v) => {
+                map.insert((addr, slot), v);
+            }
+            Err(e) => return Err(format!("fetch failed for {addr}:{slot}: {e}")),
+        }
+    }
+    for &key in requested {
+        if !map.contains_key(&key) {
+            return Err(format!(
+                "fetcher omitted requested slot {}:{}",
+                key.0, key.1
+            ));
+        }
+    }
+    Ok(map)
+}
 
 /// The background validation routine. Touches only `Send` data — never the cache.
 fn run_validator(input: ValidatorInput) -> Validation {
@@ -961,21 +994,13 @@ fn run_validator(input: ValidatorInput) -> Validation {
         return Validation::Confirmed;
     }
 
-    // Fetch fresh values. Any error → Unverified (never trust silently).
+    // Fetch fresh values. Any error OR any omitted slot → Unverified (never trust
+    // silently: a missing result must not default to zero).
     let results = (fetcher)(verify.clone(), validation_block);
-    let mut fresh: HashMap<(Address, U256), U256> = HashMap::new();
-    for (addr, slot, value) in results {
-        match value {
-            Ok(v) => {
-                fresh.insert((addr, slot), v);
-            }
-            Err(e) => {
-                return Validation::Unverified {
-                    reason: format!("fetch failed for {addr}:{slot}: {e}"),
-                };
-            }
-        }
-    }
+    let fresh = match collect_fetch_results(&verify, results) {
+        Ok(map) => map,
+        Err(reason) => return Validation::Unverified { reason },
+    };
 
     // Checkpoint: cancelled after the fetch returned but before we record any
     // observations or queue a correction. A cancel seen here discards the
@@ -991,7 +1016,8 @@ fn run_validator(input: ValidatorInput) -> Validation {
     {
         let mut tracker = tracker.lock().unwrap_or_else(|e| e.into_inner());
         for &(addr, slot) in &verify {
-            let new = fresh.get(&(addr, slot)).copied().unwrap_or(U256::ZERO);
+            // `collect_fetch_results` guarantees every requested slot is present.
+            let new = fresh[&(addr, slot)];
             let old = snapshot.storage_value(addr, slot).unwrap_or(U256::ZERO);
             tracker.observe(addr, slot, new, now);
             if new != old {
@@ -1047,26 +1073,35 @@ fn run_validator(input: ValidatorInput) -> Validation {
             for &(addr, slot, value) in &overrides {
                 overlay.override_slot(addr, slot, value);
             }
-            if let Ok((result, access)) = overlay.call_raw_with_access_list_with(
+            // A host/transact error means the corrected re-run could not execute;
+            // we must not keep the stale optimistic result and call it "Corrected".
+            // (A revert/halt is `Ok(..)`, not an `Err`.) → Unverified.
+            let (result, access) = match overlay.call_raw_with_access_list_with(
                 req.from,
                 req.to,
                 req.calldata.clone(),
                 &req.tx,
             ) {
-                results[i] = result_to_sim(result, &access.to_eip2930());
-                let new_volatile: Vec<(Address, U256)> = access
-                    .slots
-                    .iter()
-                    .copied()
-                    .filter(|(a, s)| registry.is_volatile(*a, *s, now))
-                    .collect();
-                for &key in &new_volatile {
-                    if !verified.contains(&key) {
-                        new_candidates.insert(key);
-                    }
+                Ok(v) => v,
+                Err(e) => {
+                    return Validation::Unverified {
+                        reason: format!("corrected re-run failed for request {i}: {e}"),
+                    };
                 }
-                sim_reads[i] = new_volatile;
+            };
+            results[i] = result_to_sim(result, &access.to_eip2930());
+            let new_volatile: Vec<(Address, U256)> = access
+                .slots
+                .iter()
+                .copied()
+                .filter(|(a, s)| registry.is_volatile(*a, *s, now))
+                .collect();
+            for &key in &new_volatile {
+                if !verified.contains(&key) {
+                    new_candidates.insert(key);
+                }
             }
+            sim_reads[i] = new_volatile;
         }
 
         // No sim read a changed slot (the change came from the predicted
@@ -1075,14 +1110,21 @@ fn run_validator(input: ValidatorInput) -> Validation {
         if !any_rerun || new_candidates.is_empty() {
             break;
         }
-        // Results already reflect every override applied so far. Stop here rather
-        // than expanding the verified set further when the cap is reached.
+        // The fixed point was not reached within the cap: corrections kept opening
+        // new volatile slots. The results still rest on un-verified state, so we
+        // must NOT return a trusted `Corrected`. Return `Unverified` without
+        // queuing any pending corrections (matching the fetch-error paths); the
+        // still-volatile slots are re-discovered and re-fetched on the next run.
         if round >= MAX_VALIDATION_ROUNDS {
             tracing::warn!(
                 rounds = round,
-                "freshness validator hit fixed-point iteration cap; returning best-effort Corrected"
+                "freshness validator exceeded fixed-point round cap; returning Unverified"
             );
-            break;
+            return Validation::Unverified {
+                reason: format!(
+                    "freshness validation exceeded fixed-point round cap ({MAX_VALIDATION_ROUNDS})"
+                ),
+            };
         }
 
         // Checkpoint: cancelled mid-loop. Results so far reflect the applied
@@ -1091,22 +1133,14 @@ fn run_validator(input: ValidatorInput) -> Validation {
             return Validation::Confirmed;
         }
 
-        // Fetch the newly-discovered candidates; any error → Unverified.
+        // Fetch the newly-discovered candidates; any error OR omitted slot →
+        // Unverified (a missing result must not default to zero).
         let new_vec: Vec<(Address, U256)> = new_candidates.into_iter().collect();
         let fetched = (fetcher)(new_vec.clone(), validation_block);
-        let mut new_fresh: HashMap<(Address, U256), U256> = HashMap::new();
-        for (addr, slot, value) in fetched {
-            match value {
-                Ok(v) => {
-                    new_fresh.insert((addr, slot), v);
-                }
-                Err(e) => {
-                    return Validation::Unverified {
-                        reason: format!("fetch failed for {addr}:{slot}: {e}"),
-                    };
-                }
-            }
-        }
+        let new_fresh = match collect_fetch_results(&new_vec, fetched) {
+            Ok(map) => map,
+            Err(reason) => return Validation::Unverified { reason },
+        };
 
         // Diff + observe the newly fetched slots, growing the changed set.
         let mut grew = false;
@@ -1114,7 +1148,8 @@ fn run_validator(input: ValidatorInput) -> Validation {
             let mut tracker = tracker.lock().unwrap_or_else(|e| e.into_inner());
             for &(addr, slot) in &new_vec {
                 verified.insert((addr, slot));
-                let new = new_fresh.get(&(addr, slot)).copied().unwrap_or(U256::ZERO);
+                // `collect_fetch_results` guarantees every requested slot is present.
+                let new = new_fresh[&(addr, slot)];
                 let old = snapshot.storage_value(addr, slot).unwrap_or(U256::ZERO);
                 tracker.observe(addr, slot, new, now);
                 if new != old {

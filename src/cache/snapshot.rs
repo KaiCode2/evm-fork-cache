@@ -50,6 +50,11 @@ pub struct EvmSnapshot {
     /// ZERO and must NOT fall through to an `ext_db`, mirroring the live EVM SLOAD
     /// and [`EvmCache::cached_storage_value`](super::EvmCache::cached_storage_value).
     pub(crate) storage_cleared: HashSet<Address>,
+    /// Accounts that are absent to the EVM (revm `NotExisting`): `basic` returns
+    /// `None` for them and must NOT fall through to an `ext_db`, mirroring revm
+    /// `DbAccount::info()` and [`EvmCache`](super::EvmCache)'s live account read.
+    /// These addresses are excluded from `accounts` / `code_by_hash`.
+    pub(crate) accounts_not_existing: HashSet<Address>,
     pub(crate) block_hashes: HashMap<u64, B256>,
     /// Bytecode lookup by code_hash (derived from accounts at creation time).
     pub(crate) code_by_hash: HashMap<B256, Bytecode>,
@@ -106,6 +111,7 @@ mod tests {
             accounts: HashMap::new(),
             storage: HashMap::new(),
             storage_cleared: HashSet::new(),
+            accounts_not_existing: HashSet::new(),
             block_hashes: HashMap::new(),
             code_by_hash: HashMap::new(),
             block_number: Some(100),

@@ -1716,3 +1716,122 @@ async fn on_new_block_ages_valid_through() -> Result<()> {
     );
     Ok(())
 }
+
+// ===========================================================================
+// Phase 2 review (trust-contract hardening): the validator must NEVER return a
+// trusted verdict on incomplete/ambiguous verification.
+// ===========================================================================
+
+/// P2: a custom fetcher that OMITS a requested slot must yield `Unverified`, not
+/// a false `Confirmed`/`Corrected` (missing results must not default to zero).
+#[tokio::test(flavor = "multi_thread")]
+async fn run_unverified_when_fetcher_omits_requested_slot() -> Result<()> {
+    let token = Address::repeat_byte(0x11);
+    let owner = Address::repeat_byte(0x22);
+    let recipient = Address::repeat_byte(0x33);
+
+    let mut cache = cache_with_balance(token, owner, U256::from(1000)).await?;
+    // A fetcher that returns NOTHING — it omits every requested slot.
+    cache.set_storage_batch_fetcher(Arc::new(
+        |_req: Vec<(Address, U256)>, _block: Option<BlockId>| {
+            Vec::<(Address, U256, Result<U256>)>::new()
+        },
+    ));
+
+    let mut controller = FreshnessController::new(FreshnessRegistry::new(), AlwaysVerify);
+    let req = SimRequest::new(owner, token, transfer_calldata(recipient, U256::from(100)));
+    let sim = controller.run(&mut cache, vec![req])?;
+
+    let validation = sim.validate().await;
+    assert!(
+        matches!(validation, Validation::Unverified { .. }),
+        "a fetcher that omits a requested slot must yield Unverified, not a false \
+         confirmation/correction: {validation:?}"
+    );
+    assert_eq!(
+        controller.pending_len(),
+        0,
+        "Unverified must not queue any correction"
+    );
+    Ok(())
+}
+
+/// Build runtime bytecode that reads slots `0..n` in order, returning the first
+/// nonzero one (else zero). Reading slot `i+1` is gated on slot `i` being zero, so
+/// each correction (slot → 0) opens exactly one new volatile slot — driving the
+/// validator's fixed-point loop one round deeper per correction.
+fn chained_sload_bytecode(n: u8) -> Bytes {
+    let ret_dest = 8u16 * (n as u16) + 2; // JUMPDEST offset (after the chain + PUSH1 0)
+    assert!(ret_dest <= 255, "return dest must fit in PUSH1");
+    let ret = ret_dest as u8;
+    let mut code = Vec::new();
+    for i in 0..n {
+        code.extend_from_slice(&[0x60, i, 0x54, 0x80, 0x60, ret, 0x57, 0x50]);
+        // PUSH1 i; SLOAD; DUP1; PUSH1 ret; JUMPI (if nonzero -> return it); POP
+    }
+    code.extend_from_slice(&[0x60, 0x00]); // all zero: PUSH1 0
+    code.extend_from_slice(&[0x5b, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3]);
+    // JUMPDEST; PUSH1 0; MSTORE; PUSH1 0x20; PUSH1 0; RETURN (store TOS, return 32 bytes)
+    Bytes::from(code)
+}
+
+/// P1: when corrections keep opening new volatile slots past
+/// `MAX_VALIDATION_ROUNDS`, the validator must return `Unverified` — NOT a
+/// best-effort (trusted) `Corrected` resting on un-verified state — and must
+/// queue no corrections.
+#[tokio::test(flavor = "multi_thread")]
+async fn run_unverified_when_fixed_point_round_cap_exceeded() -> Result<()> {
+    use revm::state::{AccountInfo, Bytecode};
+
+    let mut cache = setup_cache().await?;
+    install_default_account(&mut cache, Address::ZERO);
+    let caller = Address::repeat_byte(0x66);
+    install_default_account(&mut cache, caller);
+
+    // A 12-deep chain: each corrected slot opens the next, so the loop needs one
+    // round per slot — exceeding the 8-round cap well before the chain runs out.
+    let contract = Address::repeat_byte(0x55);
+    let code = Bytecode::new_raw(chained_sload_bytecode(12));
+    let code_hash = code.hash_slow();
+    cache.db_mut().insert_account_info(
+        contract,
+        AccountInfo {
+            balance: U256::ZERO,
+            nonce: 0,
+            code: Some(code),
+            code_hash,
+            account_id: None,
+        },
+    );
+    cache
+        .db_mut()
+        .replace_account_storage(contract, Default::default())
+        .unwrap();
+    // Snapshot: slots 0..12 all nonzero (EVM-visible overlay seed). The optimistic
+    // run reads only slot 0 (nonzero → returns).
+    for i in 0..12u64 {
+        cache
+            .db_mut()
+            .insert_account_storage(contract, U256::from(i), U256::from(1))?;
+    }
+    // Fresh chain: every slot dropped to 0 (stub returns 0 for all), so each
+    // correction flips the next branch and the loop never reaches a fixed point.
+    cache.set_storage_batch_fetcher(stub_fetcher(HashMap::new()));
+
+    let mut controller = FreshnessController::new(FreshnessRegistry::new(), AlwaysVerify);
+    let req = SimRequest::new(caller, contract, Bytes::new());
+    let sim = controller.run(&mut cache, vec![req])?;
+
+    let validation = sim.validate().await;
+    assert!(
+        matches!(validation, Validation::Unverified { .. }),
+        "exceeding the fixed-point round cap must yield Unverified, not a trusted \
+         Corrected: {validation:?}"
+    );
+    assert_eq!(
+        controller.pending_len(),
+        0,
+        "an Unverified (cap-exceeded) validation must queue no corrections"
+    );
+    Ok(())
+}
