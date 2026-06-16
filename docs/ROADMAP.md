@@ -74,7 +74,7 @@ RPC node                     Event-driven sync  ← WS logs · new block
 | **2** | Freshness core (Pillar C): `Validity` + `FreshnessRegistry`; observation tracker; policies; optimistic verify-and-rerun loop. | **Done** (`phase-2-freshness`) |
 | **3** | State-update primitives (Pillar B.1): `StateUpdate` + targeted writers; refold `inject_*`; surface state-diff output. | **Done** (`phase-3-state-updates`) |
 | **4** | Event pipeline + adapters (Pillar B.2): `EventDecoder` trait, ERC-20 + V3 adapters, ingest/reorg/reconcile pipeline. | **Done** (`phase-4-event-pipeline`) |
-| **5** | COW snapshots (Pillar A): structural sharing; overlay buffer reuse. | Planned |
+| **5** | COW snapshots (Pillar A): structural sharing; overlay buffer reuse. | **Done** (`phase-5-cow-snapshots`) |
 
 Cross-cutting (land opportunistically): call tracer Inspector, full offline
 (`default-features = false`, no provider) build split, CHANGELOG/CONTRIBUTING.
@@ -403,6 +403,56 @@ Landed on `phase-4-event-pipeline`: `src/events/` (the generic core —
 `benches/event_pipeline.rs`; and `tests/event_pipeline.rs` (+ the `SlotMasked`
 tests in `tests/state_update.rs`). The §6.4 V3 fee-growth/oracle maintenance gap
 is recorded in `KNOWN_ISSUES.md`.
+
+---
+
+## Phase 5 — copy-on-write snapshots (detailed, decisions locked)
+
+Builds **Pillar A**: replace the O(total state) deep-clone `create_snapshot` with
+a two-tier copy-on-write view whose cost tracks *changed* state, not *total*
+state. The cold `BlockchainDb` index (layer 2) is flattened once into an
+internal, immutable, `Arc`-shared base — both the base as a whole and each
+account's storage map are shared by `Arc`, so structural sharing needs no new
+dependency (Decision D1) — memoized across snapshots and rebuilt copy-on-write
+only for the addresses that changed; each snapshot then folds just the hot
+CacheDB delta (layer 1). Reads stay O(1), lock-free, and bit-for-bit identical to
+the deep clone. The full build contract is in
+[`phase-5-spec.md`](phase-5-spec.md).
+
+### Locked decisions
+
+1. **`Arc`-shared maps, not a persistent HAMT** (D1). Reads stay O(1) with no
+   per-`SLOAD` regression and no external dependency.
+2. **Base memoized as immutable; over-invalidation is acceptable, silent
+   staleness is not** (D2). The write-through funnel marks an address dirty
+   unconditionally; the differential-equivalence test is the hard backstop.
+3. **Keep the deep clone** as `create_snapshot_deep_clone` (D3) — the A/B
+   benchmark baseline and the read-equivalence reference.
+4. **Overlay reuse: buffer reuse *and* `reset()` recycle** (D4) — both in scope.
+5. **`create_snapshot` becomes `&mut self`** (D5) — the memoization cost; the
+   freshness controller and all callers are updated.
+
+### Acceptance — met
+
+`cargo fmt --check`, `clippy --all-targets -- -D warnings` (default +
+`--lib --no-default-features`), `cargo test` (both feature configs),
+`RUSTDOCFLAGS=-D warnings cargo doc`, `cargo bench --no-run`; the
+`tests/cow_snapshot.rs` differential-equivalence gate and the existing
+snapshot/overlay/freshness tests pass unchanged.
+
+Landed on `phase-5-cow-snapshots`: the memoized two-tier base (`BaseState` +
+the rewritten two-tier `EvmSnapshot` with `account_info`/`storage_value`/`code`
+accessors, `src/cache/snapshot.rs`); `EvmCache::refresh_base`/`build_base_full`,
+the COW `create_snapshot` (now `&mut self`), the retained
+`create_snapshot_deep_clone`, and the `mark_base_dirty`/`invalidate_base`
+invalidation wired into `write_slot_through`/`apply_slot_run`/
+`write_account_info_through`/`inject_storage_batch`/the `purge_*` paths and
+`set_block` (`src/cache/mod.rs`); `EvmOverlay::reset` plus the reusable
+shared-memory buffer recycled across the call methods (`src/cache/overlay.rs`);
+the layer-2-seeded A/B + hot-loop + `reset()`-fanout benches
+(`benches/simulation.rs`); and the differential-equivalence gate
+(`tests/cow_snapshot.rs`). The residual O(accounts) length-scan / O(layer-1)
+fold cost model is recorded in `KNOWN_ISSUES.md`.
 
 ---
 

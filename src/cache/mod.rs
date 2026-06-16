@@ -432,6 +432,26 @@ pub struct EvmCache {
     /// layer hardfork for accurate gas accounting. Configured per-chain via `evm_spec`
     /// in `chains.toml`.
     spec_id: SpecId,
+    /// Memoized, `Arc`-shared flatten of the cold layer-2 index, reused across
+    /// successive [`create_snapshot`](Self::create_snapshot) calls (Pillar A).
+    /// `None` until the first snapshot. Rebuilt copy-on-write by
+    /// [`refresh_base`](Self::refresh_base); never mutated in place once shared.
+    /// Not part of any public API and not serialized.
+    base: Option<Arc<snapshot::BaseState>>,
+    /// Layer-2 addresses changed since `base` was built, folded into the next base
+    /// rebuild. Populated by the base-invalidation sites (write-through, batch
+    /// injects, layer-2 seeding, purges). Not serialized.
+    base_dirty: HashSet<Address>,
+    /// When set, the next [`refresh_base`](Self::refresh_base) rebuilds the base
+    /// from scratch. Set by [`set_block`](Self::set_block) /
+    /// [`repin_to_block`](Self::repin_to_block), which replace layer 2 wholesale.
+    /// Not serialized.
+    base_full_rebuild: bool,
+    /// Per-account layer-2 slot count at the last base build, used by
+    /// [`refresh_base`](Self::refresh_base)'s `O(accounts)` length-scan to detect
+    /// uncontrolled lazy-fetch growth that bypasses the write funnel. Not
+    /// serialized.
+    base_storage_lens: HashMap<Address, usize>,
 }
 
 /// Outcome of a balance-delta-tracking simulation.
@@ -909,6 +929,10 @@ impl EvmCache {
             batch_block_id,
             erc20_balance_slots: HashMap::new(),
             spec_id,
+            base: None,
+            base_dirty: HashSet::new(),
+            base_full_rebuild: false,
+            base_storage_lens: HashMap::new(),
         }
     }
 
@@ -983,6 +1007,10 @@ impl EvmCache {
             batch_block_id: Arc::new(Mutex::new(block.unwrap_or_default())),
             erc20_balance_slots: HashMap::new(),
             spec_id,
+            base: None,
+            base_dirty: HashSet::new(),
+            base_full_rebuild: false,
+            base_storage_lens: HashMap::new(),
         }
     }
 
@@ -1064,6 +1092,19 @@ impl EvmCache {
     /// consistency model: reads here see only the backend layer, not the
     /// CacheDB overlay, and any writes performed through it skip the overlay.
     /// Prefer the higher-level accessors; use with care.
+    ///
+    /// # Snapshot base
+    /// Writing layer 2 directly through this handle also bypasses the memoized
+    /// copy-on-write snapshot base (Pillar A): an **in-place value overwrite at an
+    /// unchanged slot count** is invisible to the [`create_snapshot`](Self::create_snapshot)
+    /// growth scan (which is count/absence-based — the lazily-fetched backend only
+    /// ever *appends*, so that is sufficient for the supported write paths), and a
+    /// later `create_snapshot` may reuse a stale base. After a direct layer-2 write
+    /// through this handle, call
+    /// [`invalidate_snapshot_base`](Self::invalidate_snapshot_base) (or re-pin via
+    /// [`set_block`](Self::set_block)) before the next snapshot. Writes via the
+    /// crate's own mutators (`inject_storage_batch`, `apply_update`, the `inject_*`
+    /// helpers, the purges) keep the base honest automatically.
     pub fn blockchain_db(&self) -> &BlockchainDb {
         &self.blockchain_db
     }
@@ -1074,6 +1115,15 @@ impl EvmCache {
     /// This exposes an internal and bypasses the cache's two-layer consistency
     /// model: it reads/fetches directly without consulting the CacheDB overlay.
     /// Prefer the higher-level accessors; use with care.
+    ///
+    /// # Snapshot base
+    /// `SharedBackend::insert_or_update_storage` / `insert_or_update_address` rewrite
+    /// layer-2 entries **in place**, which (unlike the append-only lazy fetch) can
+    /// leave the memoized copy-on-write snapshot base stale at an unchanged slot
+    /// count. After such a direct write, call
+    /// [`invalidate_snapshot_base`](Self::invalidate_snapshot_base) before the next
+    /// [`create_snapshot`](Self::create_snapshot). The lazy RPC fetch path needs no
+    /// such call (it only ever appends, which the snapshot growth scan catches).
     pub fn backend(&self) -> &SharedBackend {
         &self.backend
     }
@@ -1124,15 +1174,26 @@ impl EvmCache {
         self.storage_batch_fetcher.as_ref()
     }
 
-    /// Inject batch-fetched storage values directly into BlockchainDb.
+    /// Inject batch-fetched storage values directly into BlockchainDb (layer 2).
     ///
     /// This bypasses SharedBackend and makes values available for subsequent
     /// `storage_ref()` calls and EVM SLOADs. Used after `StorageBatchFetchFn`
     /// returns results to populate the cache in bulk.
-    pub fn inject_storage_batch(&self, results: &[(Address, U256, U256)]) {
-        let mut storage = self.blockchain_db.storage().write();
-        for &(addr, slot, value) in results {
-            storage.entry(addr).or_default().insert(slot, value);
+    ///
+    /// Takes `&mut self` (as of Pillar A) so it can mark each touched address dirty
+    /// for the memoized copy-on-write base; the write itself is still a direct
+    /// layer-2 backend write. Overwriting an existing slot at an unchanged slot
+    /// count is invalidated here too, since the `refresh_base` growth scan only
+    /// catches length changes.
+    pub fn inject_storage_batch(&mut self, results: &[(Address, U256, U256)]) {
+        {
+            let mut storage = self.blockchain_db.storage().write();
+            for &(addr, slot, value) in results {
+                storage.entry(addr).or_default().insert(slot, value);
+            }
+        }
+        for &(addr, _, _) in results {
+            self.mark_base_dirty(addr);
         }
     }
 
@@ -1384,7 +1445,10 @@ impl EvmCache {
     fn apply_slot_run(&mut self, run: &[StateUpdate], diff: &mut StateDiff) {
         // Borrow the two layers as disjoint fields: the backend storage guard
         // (layer 2) held for the whole run, and the overlay accounts map (layer 1,
-        // lock-free).
+        // lock-free). Base invalidation is deferred until after the guard is
+        // dropped (it needs `&mut self`): collect the layer-2 addresses written
+        // here and mark them dirty below.
+        let mut dirtied: Vec<Address> = Vec::new();
         let overlay = &mut self.db.cache.accounts;
         let mut storage = self.blockchain_db.storage().write();
 
@@ -1425,6 +1489,9 @@ impl EvmCache {
             };
 
             write_slot_into(overlay, &mut storage, address, slot, new);
+            // Layer 2 was written for this address → it must be re-folded into the
+            // memoized base. Mirrors `write_slot_through`'s `mark_base_dirty`.
+            dirtied.push(address);
             if old != new {
                 diff.slots.push(SlotChange {
                     address,
@@ -1433,6 +1500,12 @@ impl EvmCache {
                     new,
                 });
             }
+        }
+
+        // Drop the storage write-guard before taking `&mut self` for invalidation.
+        drop(storage);
+        for address in dirtied {
+            self.mark_base_dirty(address);
         }
     }
 
@@ -1475,6 +1548,10 @@ impl EvmCache {
         if let Some(db_account) = self.db.cache.accounts.get_mut(&address) {
             db_account.storage.insert(slot, value);
         }
+
+        // Layer 2 changed → invalidate the memoized base for this address (D2:
+        // over-invalidation when also shadowed by layer 1 is safe).
+        self.mark_base_dirty(address);
     }
 
     /// Read-modify-write one storage slot through a caller-supplied transform.
@@ -1661,6 +1738,9 @@ impl EvmCache {
         if overlay_present {
             self.db.insert_account_info(address, info);
         }
+        // Layer-2 account info changed → invalidate the memoized base for this
+        // address (D2: over-invalidation when also in layer 1 is safe).
+        self.mark_base_dirty(address);
     }
 
     /// Apply a partial [`AccountPatch`] write-through (§5.2). Returns an
@@ -1938,6 +2018,8 @@ impl EvmCache {
                 "purged account from both cache layers"
             );
         }
+        // Layer 2 (account + storage) changed for this address → invalidate base.
+        self.mark_base_dirty(addr);
         (slots_removed, account_removed)
     }
 
@@ -1997,12 +2079,259 @@ impl EvmCache {
     ///
     /// For cheap same-thread save/restore of just the overlay, prefer
     /// [`snapshot`](Self::snapshot) / [`restore`](Self::restore) instead.
-    pub fn create_snapshot(&self) -> Arc<snapshot::EvmSnapshot> {
+    pub fn create_snapshot(&mut self) -> Arc<snapshot::EvmSnapshot> {
+        // 1. Refresh / memoize the cold layer-2 base, then take a cheap Arc handle
+        //    (O(1) when layer 2 is unchanged since the last snapshot).
+        self.refresh_base();
+        let base = Arc::clone(self.base.as_ref().expect("refresh_base sets base"));
+
+        // 2. Fold layer 1 (the hot CacheDB overlay) into the snapshot's overlay
+        //    maps + cleared/not-existing sets, applying the same classification as
+        //    the legacy flatten (O(layer-1)).
+        let mut overlay_accounts = HashMap::new();
+        let mut overlay_storage = HashMap::new();
+        let mut overlay_code_by_hash = HashMap::new();
+        let mut storage_cleared = std::collections::HashSet::new();
+        let mut accounts_not_existing = std::collections::HashSet::new();
+        for (addr, db_account) in &self.db.cache.accounts {
+            let not_existing = matches!(db_account.account_state, AccountState::NotExisting);
+            let cleared =
+                not_existing || matches!(db_account.account_state, AccountState::StorageCleared);
+
+            // Account info. Mirror revm `DbAccount::info()` / `loaded_account_info`:
+            // a NotExisting overlay account is absent to the EVM (`basic` returns
+            // None), so it must NOT contribute info/code to the overlay — and
+            // `accounts_not_existing` makes the read short-circuit to None before
+            // ever consulting the base.
+            if not_existing {
+                accounts_not_existing.insert(*addr);
+            } else {
+                if let Some(code) = &db_account.info.code {
+                    overlay_code_by_hash.insert(db_account.info.code_hash, code.clone());
+                }
+                overlay_accounts.insert(*addr, db_account.info.clone());
+            }
+
+            // Storage. A StorageCleared/NotExisting account's storage is locally
+            // complete: the overlay holds ONLY its own slots (so a cleared account
+            // ALWAYS gets an `overlay_storage` entry, possibly empty), an absent
+            // slot reads ZERO via `storage_cleared`, and the base is never consulted
+            // for it. A non-cleared overlay account contributes its slots; absent
+            // slots fall through to the base on a read.
+            if cleared {
+                storage_cleared.insert(*addr);
+                let account_storage: HashMap<U256, U256> =
+                    db_account.storage.iter().map(|(k, v)| (*k, *v)).collect();
+                overlay_storage.insert(*addr, account_storage);
+            } else if !db_account.storage.is_empty() {
+                let account_storage = overlay_storage.entry(*addr).or_default();
+                for (slot, value) in &db_account.storage {
+                    account_storage.insert(*slot, *value);
+                }
+            }
+        }
+
+        Arc::new(snapshot::EvmSnapshot {
+            base,
+            overlay_accounts,
+            overlay_storage,
+            overlay_code_by_hash,
+            storage_cleared,
+            accounts_not_existing,
+            block_hashes: HashMap::new(),
+            block_number: self.block_number,
+            basefee: self.basefee,
+            coinbase: self.coinbase,
+            prevrandao: self.prevrandao,
+            gas_limit: self.block_gas_limit,
+            chain_id: self.chain_id,
+            timestamp: self.timestamp_override,
+            spec_id: self.spec_id,
+        })
+    }
+
+    /// Force the next [`create_snapshot`](Self::create_snapshot) to rebuild the
+    /// memoized copy-on-write base from scratch (Pillar A).
+    ///
+    /// The crate's own mutators keep the base honest automatically. This is the
+    /// **escape-hatch re-honest hook**: call it after writing layer 2 directly
+    /// through [`blockchain_db`](Self::blockchain_db) or
+    /// [`backend`](Self::backend) — those bypass the write funnel, and an in-place
+    /// value overwrite at an unchanged slot count is invisible to the snapshot
+    /// growth scan (it is count/absence-based, which suffices for the append-only
+    /// lazy-fetch path but not for an out-of-band overwrite). Calling this before
+    /// the next snapshot guarantees it reflects the direct write rather than a
+    /// stale memoized value. Over-invalidation is always safe (Decision D2); the
+    /// only cost is one full base rebuild on the next snapshot.
+    pub fn invalidate_snapshot_base(&mut self) {
+        self.invalidate_base();
+    }
+
+    /// Refresh the memoized cold layer-2 [`BaseState`](snapshot::BaseState),
+    /// reusing the previous `Arc` wherever layer 2 is unchanged (Pillar A).
+    ///
+    /// Called at the top of [`create_snapshot`](Self::create_snapshot). It never
+    /// mutates an `Arc<BaseState>` that may already be shared with a live
+    /// snapshot: on any change it builds a *new* `BaseState` that shares the `Arc`
+    /// handles of unchanged accounts and rebuilds only the changed ones
+    /// (copy-on-write).
+    ///
+    /// Algorithm (see `docs/phase-5-spec.md` §2.3):
+    /// 1. **Full rebuild** when there is no base yet or `base_full_rebuild` is set
+    ///    (`set_block` / re-pin replaced layer 2): flatten all of layer 2.
+    /// 2. **Detect uncontrolled growth**: a lazy RPC fetch / prefetch can write
+    ///    layer 2 from inside `foundry-fork-db`, bypassing our write funnel. An
+    ///    `O(accounts)` length-scan over the current layer-2 storage/accounts marks
+    ///    any address whose slot count differs from the recorded length, or any
+    ///    account absent from the base, as dirty.
+    /// 3. **Nothing dirty** → reuse the existing `Arc<BaseState>` unchanged (the
+    ///    common hot-loop case; the base side of `create_snapshot` is then O(1)).
+    /// 4. **Some addresses dirty** → build a new `BaseState` sharing the `Arc`s of
+    ///    unchanged accounts and rebuilding only the dirty ones.
+    fn refresh_base(&mut self) {
+        // Case 1: full rebuild.
+        if self.base.is_none() || self.base_full_rebuild {
+            self.base = Some(Arc::new(self.build_base_full()));
+            self.base_dirty.clear();
+            self.base_full_rebuild = false;
+            return;
+        }
+
+        // Case 2: detect uncontrolled layer-2 growth via an O(accounts) length scan
+        // (NOT an O(slots) value scan). Any address whose slot count changed, or any
+        // account that newly appeared in layer 2, is folded into `base_dirty`.
+        //
+        // LOAD-BEARING INVARIANT: the count/absence scan is sufficient *only* because
+        // the one uncontrolled layer-2 writer — the foundry-fork-db `SharedBackend`
+        // lazy fetch — is append-only at a fixed block (its request handler answers an
+        // already-cached account/slot from the store and only inserts on a miss; it
+        // never overwrites an existing entry in place). So an uncontrolled fetch can
+        // only add a new account (caught by the absence check) or a new slot (caught
+        // by the count check). An in-place value overwrite at unchanged length is
+        // invisible here; the controlled writers therefore call `mark_base_dirty`
+        // explicitly, and a direct out-of-band write via `blockchain_db()`/`backend()`
+        // must call `invalidate_snapshot_base`. If a future foundry-fork-db bump makes
+        // the lazy path overwrite-in-place, this scan must gain a value/version check.
+        {
+            let db_storage = self.blockchain_db.storage().read();
+            for (addr, slots) in db_storage.iter() {
+                if self.base_storage_lens.get(addr).copied() != Some(slots.len()) {
+                    self.base_dirty.insert(*addr);
+                }
+            }
+            let db_accounts = self.blockchain_db.accounts().read();
+            let base = self.base.as_ref().expect("base present in case 2/3/4");
+            for addr in db_accounts.keys() {
+                if !base.accounts.contains_key(addr) {
+                    self.base_dirty.insert(*addr);
+                }
+            }
+        }
+
+        // Case 3: nothing changed → reuse the existing Arc unchanged.
+        if self.base_dirty.is_empty() {
+            return;
+        }
+
+        // Case 4: rebuild copy-on-write — clone the outer maps (Arc handles +
+        // AccountInfo, no per-slot copy) and rebuild only the dirty addresses.
+        let prev = self.base.as_ref().expect("base present in case 4");
+        let mut accounts = prev.accounts.clone();
+        let mut storage = prev.storage.clone();
+        let mut code_by_hash = prev.code_by_hash.clone();
+
+        let db_accounts = self.blockchain_db.accounts().read();
+        let db_storage = self.blockchain_db.storage().read();
+        for addr in self.base_dirty.iter().copied() {
+            // Account info + code: refresh from the current layer-2 account, or drop
+            // it if the account no longer exists in layer 2 (e.g. after a purge).
+            match db_accounts.get(&addr) {
+                Some(info) => {
+                    if let Some(code) = &info.code {
+                        code_by_hash.insert(info.code_hash, code.clone());
+                    }
+                    accounts.insert(addr, info.clone());
+                }
+                None => {
+                    accounts.remove(&addr);
+                }
+            }
+
+            // Storage: rebuild this account's Arc<HashMap> from the current layer-2
+            // storage, or drop it if the account has no layer-2 storage anymore.
+            match db_storage.get(&addr) {
+                Some(slots) => {
+                    let rebuilt: HashMap<U256, U256> =
+                        slots.iter().map(|(k, v)| (*k, *v)).collect();
+                    self.base_storage_lens.insert(addr, rebuilt.len());
+                    storage.insert(addr, Arc::new(rebuilt));
+                }
+                None => {
+                    storage.remove(&addr);
+                    self.base_storage_lens.remove(&addr);
+                }
+            }
+        }
+
+        self.base = Some(Arc::new(snapshot::BaseState {
+            accounts,
+            storage,
+            code_by_hash,
+        }));
+        self.base_dirty.clear();
+    }
+
+    /// Build a fresh [`BaseState`](snapshot::BaseState) by flattening all of layer
+    /// 2, recording `base_storage_lens`. Shared by `refresh_base`'s full-rebuild
+    /// path and [`create_snapshot_deep_clone`](Self::create_snapshot_deep_clone).
+    fn build_base_full(&mut self) -> snapshot::BaseState {
         let mut accounts = HashMap::new();
+        let mut code_by_hash = HashMap::new();
+        {
+            let db_accounts = self.blockchain_db.accounts().read();
+            for (addr, info) in db_accounts.iter() {
+                if let Some(code) = &info.code {
+                    code_by_hash.insert(info.code_hash, code.clone());
+                }
+                accounts.insert(*addr, info.clone());
+            }
+        }
         let mut storage = HashMap::new();
+        self.base_storage_lens.clear();
+        {
+            let db_storage = self.blockchain_db.storage().read();
+            for (addr, slots) in db_storage.iter() {
+                let converted: HashMap<U256, U256> = slots.iter().map(|(k, v)| (*k, *v)).collect();
+                self.base_storage_lens.insert(*addr, converted.len());
+                storage.insert(*addr, Arc::new(converted));
+            }
+        }
+        snapshot::BaseState {
+            accounts,
+            storage,
+            code_by_hash,
+        }
+    }
+
+    /// The retained deep-clone snapshot — today's full flatten, kept reachable for
+    /// A/B benchmarking and as the read-equivalence reference (Decision D3).
+    ///
+    /// Produces the same two-tier [`EvmSnapshot`](snapshot::EvmSnapshot) shape as
+    /// [`create_snapshot`](Self::create_snapshot), but with `base` set to the
+    /// fully-merged flatten of **both** layers and **empty** overlay maps (the
+    /// cleared / not-existing sets still in place). It is read-indistinguishable
+    /// from `create_snapshot` by construction (the `tests/cow_snapshot.rs`
+    /// differential gate pins this), at the cost of an O(total state) deep copy
+    /// every call — exactly the cost `create_snapshot` now amortizes away.
+    ///
+    /// Stays `&self`: it does not touch the memoized base.
+    #[doc(hidden)]
+    pub fn create_snapshot_deep_clone(&self) -> Arc<snapshot::EvmSnapshot> {
+        let mut accounts = HashMap::new();
+        let mut storage: HashMap<Address, HashMap<U256, U256>> = HashMap::new();
         let mut code_by_hash = HashMap::new();
 
-        // 1. Load from BlockchainDb (persistent cache / Layer 2)
+        // 1. Load from BlockchainDb (persistent cache / Layer 2).
         {
             let db_accounts = self.blockchain_db.accounts().read();
             for (addr, info) in db_accounts.iter() {
@@ -2015,13 +2344,19 @@ impl EvmCache {
         {
             let db_storage = self.blockchain_db.storage().read();
             for (addr, slots) in db_storage.iter() {
-                // Convert from DefaultHashBuilder to RandomState HashMap
                 let converted: HashMap<U256, U256> = slots.iter().map(|(k, v)| (*k, *v)).collect();
                 storage.insert(*addr, converted);
             }
         }
 
-        // 2. Overlay from CacheDB (Layer 1, takes precedence)
+        // 2. Overlay from CacheDB (Layer 1, takes precedence). Merge into the same
+        //    flat maps, dropping shadowed entries, exactly as the original
+        //    `create_snapshot` did. A cleared account's storage is routed into
+        //    `overlay_storage` (not the base), because `EvmSnapshot::storage_value`
+        //    only applies the cleared-as-ZERO rule for an address with an
+        //    `overlay_storage` entry — so the cleared semantics must be expressed
+        //    there for both snapshot constructors to read identically.
+        let mut overlay_storage: HashMap<Address, HashMap<U256, U256>> = HashMap::new();
         let mut storage_cleared = std::collections::HashSet::new();
         let mut accounts_not_existing = std::collections::HashSet::new();
         for (addr, db_account) in &self.db.cache.accounts {
@@ -2029,11 +2364,6 @@ impl EvmCache {
             let cleared =
                 not_existing || matches!(db_account.account_state, AccountState::StorageCleared);
 
-            // Account info. Mirror revm `DbAccount::info()` / `loaded_account_info`:
-            // a NotExisting overlay account is absent to the EVM (`basic` returns
-            // None), so it must NOT contribute info/code to the snapshot — and any
-            // backend-merged entry from step 1 is dropped, since loaded_account_info
-            // short-circuits to None before consulting the backend.
             if not_existing {
                 accounts_not_existing.insert(*addr);
                 accounts.remove(addr);
@@ -2044,17 +2374,16 @@ impl EvmCache {
                 accounts.insert(*addr, db_account.info.clone());
             }
 
-            // Storage. A StorageCleared/NotExisting account's storage is locally
-            // complete: the snapshot holds ONLY its overlay slots (any shadowed
-            // backend slots are dropped) and an absent slot reads ZERO via
-            // `storage_cleared`, rather than falling through to the (shadowed)
-            // backend or an ext_db.
             if cleared {
+                // Cleared: storage is locally complete. Drop any shadowed base
+                // slots and keep ONLY the overlay slots, in `overlay_storage`.
                 storage_cleared.insert(*addr);
+                storage.remove(addr);
                 let account_storage: HashMap<U256, U256> =
                     db_account.storage.iter().map(|(k, v)| (*k, *v)).collect();
-                storage.insert(*addr, account_storage);
+                overlay_storage.insert(*addr, account_storage);
             } else {
+                // Non-cleared: overlay slots win over base; fold them into base.
                 let account_storage = storage.entry(*addr).or_default();
                 for (slot, value) in &db_account.storage {
                     account_storage.insert(*slot, *value);
@@ -2062,13 +2391,23 @@ impl EvmCache {
             }
         }
 
-        Arc::new(snapshot::EvmSnapshot {
+        let base = snapshot::BaseState {
             accounts,
-            storage,
+            storage: storage
+                .into_iter()
+                .map(|(addr, slots)| (addr, Arc::new(slots)))
+                .collect(),
+            code_by_hash,
+        };
+
+        Arc::new(snapshot::EvmSnapshot {
+            base: Arc::new(base),
+            overlay_accounts: HashMap::new(),
+            overlay_storage,
+            overlay_code_by_hash: HashMap::new(),
             storage_cleared,
             accounts_not_existing,
             block_hashes: HashMap::new(),
-            code_by_hash,
             block_number: self.block_number,
             basefee: self.basefee,
             coinbase: self.coinbase,
@@ -2078,6 +2417,28 @@ impl EvmCache {
             timestamp: self.timestamp_override,
             spec_id: self.spec_id,
         })
+    }
+
+    /// Mark a layer-2 address dirty so the next [`refresh_base`](Self::refresh_base)
+    /// re-folds it into the memoized base (Pillar A invalidation; see
+    /// `docs/phase-5-spec.md` §3).
+    ///
+    /// Called from every site that can change a layer-2 value a snapshot read
+    /// would surface (write-through, batch injects, layer-2 seeding, purges).
+    /// Over-invalidation is safe (Decision D2): marking an address that is also
+    /// shadowed by layer 1 just re-folds that one account.
+    fn mark_base_dirty(&mut self, address: Address) {
+        self.base_dirty.insert(address);
+    }
+
+    /// Force a full rebuild of the memoized base on the next
+    /// [`refresh_base`](Self::refresh_base) (Pillar A invalidation).
+    ///
+    /// Used by layer-2 changes too broad to enumerate per-address efficiently
+    /// (multi-contract / full-storage purges, block re-pins). Coarser than
+    /// [`mark_base_dirty`](Self::mark_base_dirty) but always correct.
+    fn invalidate_base(&mut self) {
+        self.base_full_rebuild = true;
     }
 
     /// Update the block that RPC fetches are pinned to.
@@ -2102,6 +2463,9 @@ impl EvmCache {
     pub fn set_block(&mut self, block: Option<BlockId>) {
         if self.block != block {
             self.block = block;
+            // Re-pinning replaces layer 2 wholesale (state at a new block): the
+            // memoized base must be rebuilt from scratch on the next snapshot.
+            self.invalidate_base();
             if let Some(block_id) = block {
                 let _ = self.backend.set_pinned_block(block_id);
                 *self.batch_block_id.lock().unwrap() = block_id;
@@ -2949,11 +3313,13 @@ impl EvmCache {
         };
 
         // Layer 2: Clear BlockchainDb backend
-        let mut storage = self.blockchain_db.storage().write();
-        let backend_cleared = if let Some(slots) = storage.remove(&address) {
-            slots.len()
-        } else {
-            0
+        let backend_cleared = {
+            let mut storage = self.blockchain_db.storage().write();
+            if let Some(slots) = storage.remove(&address) {
+                slots.len()
+            } else {
+                0
+            }
         };
 
         if cache_db_cleared > 0 || backend_cleared > 0 {
@@ -2965,6 +3331,8 @@ impl EvmCache {
             );
         }
 
+        // Layer-2 storage for this address was removed → invalidate base.
+        self.mark_base_dirty(address);
         backend_cleared
     }
 
@@ -3006,11 +3374,13 @@ impl EvmCache {
         }
 
         // Layer 2: Remove specific slots from BlockchainDb backend
-        let mut storage = self.blockchain_db.storage().write();
-        if let Some(address_storage) = storage.get_mut(&address) {
-            for slot in slots {
-                if address_storage.remove(slot).is_some() {
-                    backend_removed += 1;
+        {
+            let mut storage = self.blockchain_db.storage().write();
+            if let Some(address_storage) = storage.get_mut(&address) {
+                for slot in slots {
+                    if address_storage.remove(slot).is_some() {
+                        backend_removed += 1;
+                    }
                 }
             }
         }
@@ -3025,6 +3395,9 @@ impl EvmCache {
             );
         }
 
+        // Layer-2 storage for this address changed (slots dropped) → invalidate
+        // base. The growth scan only catches length changes; mark explicitly.
+        self.mark_base_dirty(address);
         backend_removed
     }
 
@@ -3064,6 +3437,9 @@ impl EvmCache {
                 "purged contract storage from both cache layers"
             );
         }
+        // Multiple layer-2 contracts changed → full base rebuild (coarse but
+        // correct; cheaper than enumerating each touched address here).
+        self.invalidate_base();
         total_purged
     }
 
@@ -3092,10 +3468,13 @@ impl EvmCache {
         }
 
         // Layer 2: Clear BlockchainDb backend
-        let mut storage = self.blockchain_db.storage().write();
-        let total_slots: usize = storage.values().map(|s| s.len()).sum();
-        let contract_count = storage.len();
-        storage.clear();
+        let (total_slots, contract_count) = {
+            let mut storage = self.blockchain_db.storage().write();
+            let total_slots: usize = storage.values().map(|s| s.len()).sum();
+            let contract_count = storage.len();
+            storage.clear();
+            (total_slots, contract_count)
+        };
 
         if total_slots > 0 || cache_db_cleared > 0 {
             warn!(
@@ -3105,6 +3484,8 @@ impl EvmCache {
                 "purged ALL storage from both cache layers (full refresh)"
             );
         }
+        // All layer-2 storage was cleared → full base rebuild.
+        self.invalidate_base();
         total_slots
     }
 
@@ -3483,6 +3864,12 @@ impl EvmCache {
             let mut accounts = self.blockchain_db.accounts().write();
             accounts.insert(target, target_info);
         }
+
+        // Layer 2 changed → invalidate the memoized base for `target`. The layer-1
+        // `insert_account_info` above currently shadows it on every snapshot read,
+        // but we dirty unconditionally for uniformity with every other layer-2 write
+        // site (D2), so base correctness never relies on that shadowing invariant.
+        self.mark_base_dirty(target);
 
         Ok(())
     }

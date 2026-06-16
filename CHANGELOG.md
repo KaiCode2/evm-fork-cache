@@ -142,8 +142,37 @@ pre-release development phases (see [`docs/ROADMAP.md`](docs/ROADMAP.md)).
 - **`protocols` feature** (default-on) gating the Uniswap V2/V3 storage layouts,
   V3 tick snapshots, and `inject_v3_*` / `inject_v2_pool_metadata` helpers, so
   the generic engine builds with `--no-default-features`.
+- **Copy-on-write snapshots** (Phase 5, Pillar A) — `create_snapshot` is now a
+  two-tier copy-on-write view instead of an O(total state) deep clone. The cold
+  `BlockchainDb` index (layer 2) is flattened once into an internal, immutable,
+  `Arc`-shared base (`Arc` per account storage map, structural sharing — no new
+  dependency, Decision D1), memoized across snapshots and rebuilt copy-on-write
+  only for the addresses that changed; each `create_snapshot` then folds just the
+  hot CacheDB delta (layer 1) over a cheap `Arc::clone` of that base. Reads stay
+  O(1) and lock-free and are bit-for-bit identical to the deep clone (pinned by
+  the `tests/cow_snapshot.rs` differential-equivalence gate). The retained
+  `EvmCache::create_snapshot_deep_clone()` (`#[doc(hidden)] pub`, Decision D3) is
+  the equivalence reference and the A/B benchmark baseline. `EvmSnapshot` stays
+  `Send + Sync` and `EvmOverlay` stays `Send`.
+- **`EvmOverlay::reset()`** (Phase 5, Pillar A.2) — recycle one overlay across
+  many simulations against the same snapshot without reallocating: it clears the
+  per-simulation dirty layer (keeping the snapshot `Arc`, `ext_db`, and the
+  reusable shared-memory buffer), reading the pristine snapshot again and behaving
+  exactly like a freshly-built overlay. The 64 KB shared-memory buffer is also
+  recycled across the build→transact→revert call methods (stored as a plain
+  `Vec<u8>`, so the overlay stays `Send`).
 
 ### Changed
+
+- **`EvmCache::create_snapshot` is now `&mut self`** (Phase 5, Decision D5) —
+  taking a snapshot memoizes/refreshes the cold copy-on-write base, which requires
+  a mutable borrow. All callers (the freshness controller, tests, examples,
+  benches) are updated; the return type (`Arc<EvmSnapshot>`) is unchanged.
+  Permitted under the pre-1.0 break policy.
+- **`EvmCache::inject_storage_batch` is now `&mut self`** (Phase 5) — the
+  layer-2 bulk write now marks the touched addresses dirty for the memoized
+  copy-on-write base. The write itself is still a direct backend (layer-2) write
+  with the same semantics; only the receiver mutability changed.
 
 - Simulation entry points that distinguish failure modes return
   `SimulationResult<T>` (`Result<T, SimError>`), separating decoded reverts,

@@ -181,7 +181,7 @@ fn bench_apply_per_variant(c: &mut Criterion) {
     group.bench_function("purge_all_storage", |b| {
         b.iter_batched(
             || {
-                let cache = pool_cache(&rt);
+                let mut cache = pool_cache(&rt);
                 cache.inject_storage_batch(&[
                     (POOL, U256::from(0), U256::from(1)),
                     (POOL, U256::from(1), U256::from(2)),
@@ -203,7 +203,7 @@ fn bench_apply_per_variant(c: &mut Criterion) {
     group.bench_function("purge_account", |b| {
         b.iter_batched(
             || {
-                let cache = pool_cache(&rt);
+                let mut cache = pool_cache(&rt);
                 cache.inject_storage_batch(&[
                     (POOL, U256::from(0), U256::from(1)),
                     (POOL, U256::from(1), U256::from(2)),
@@ -223,7 +223,7 @@ fn bench_apply_per_variant(c: &mut Criterion) {
     group.bench_function("purge_slots", |b| {
         b.iter_batched(
             || {
-                let cache = pool_cache(&rt);
+                let mut cache = pool_cache(&rt);
                 cache.inject_storage_batch(&[
                     (POOL, U256::from(0), U256::from(1)),
                     (POOL, U256::from(1), U256::from(2)),
@@ -254,7 +254,7 @@ fn bench_apply_heterogeneous(c: &mut Criterion) {
     group.bench_function("slot_account_purge", |b| {
         b.iter_batched(
             || {
-                let cache = pool_cache(&rt);
+                let mut cache = pool_cache(&rt);
                 cache.inject_storage_batch(&[(POOL, U256::from(9), U256::from(1))]);
                 cache
             },

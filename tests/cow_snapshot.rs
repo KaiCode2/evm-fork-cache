@@ -86,7 +86,11 @@ fn assert_equivalent(cache: &mut EvmCache, addrs: &[Address], slots: &[U256], la
         "{label}: block_number"
     );
     assert_eq!(ov_cow.basefee(), ov_deep.basefee(), "{label}: basefee");
-    assert_eq!(ov_cow.timestamp(), ov_deep.timestamp(), "{label}: timestamp");
+    assert_eq!(
+        ov_cow.timestamp(),
+        ov_deep.timestamp(),
+        "{label}: timestamp"
+    );
 
     for &a in addrs {
         let bc = ov_cow.basic(a).expect("cow basic");
@@ -158,15 +162,32 @@ async fn cow_snapshot_matches_deep_clone_through_mutations() -> Result<()> {
 
     // 4. write-through to an address PRESENT in layer 1 (shadowed there).
     cache.apply_updates(&[StateUpdate::slot(token, owner_bal, U256::from(2_000u64))]);
-    assert_equivalent(&mut cache, &addrs, &slots, "after write-through (in layer 1)");
+    assert_equivalent(
+        &mut cache,
+        &addrs,
+        &slots,
+        "after write-through (in layer 1)",
+    );
 
     // 5. write-through to an address ABSENT from layer 1 (layer-2-only — the §3
     //    footgun: the base must capture it).
-    cache.apply_updates(&[StateUpdate::slot(pool2, U256::from(7u64), U256::from(55u64))]);
-    assert_equivalent(&mut cache, &addrs, &slots, "after write-through (layer-2-only)");
+    cache.apply_updates(&[StateUpdate::slot(
+        pool2,
+        U256::from(7u64),
+        U256::from(55u64),
+    )]);
+    assert_equivalent(
+        &mut cache,
+        &addrs,
+        &slots,
+        "after write-through (layer-2-only)",
+    );
 
     // 6. relative native-balance delta.
-    cache.apply_updates(&[StateUpdate::balance_delta(owner, SlotDelta::Add(U256::from(500)))]);
+    cache.apply_updates(&[StateUpdate::balance_delta(
+        owner,
+        SlotDelta::Add(U256::from(500)),
+    )]);
     assert_equivalent(&mut cache, &addrs, &slots, "after balance delta");
 
     // 7. committing revm call (mutates layer 1 only — never stales the base).
@@ -178,7 +199,12 @@ async fn cow_snapshot_matches_deep_clone_through_mutations() -> Result<()> {
     cache.inject_storage_batch(&[(pool, U256::from(0u64), U256::from(111u64))]);
     assert_equivalent(&mut cache, &addrs, &slots, "after inject (new)");
     cache.inject_storage_batch(&[(pool, U256::from(0u64), U256::from(222u64))]);
-    assert_equivalent(&mut cache, &addrs, &slots, "after inject (overwrite, same len)");
+    assert_equivalent(
+        &mut cache,
+        &addrs,
+        &slots,
+        "after inject (overwrite, same len)",
+    );
 
     // 9. simulated UNCONTROLLED layer-2 growth (a lazy RPC fetch / prefetch writes
     //    `BlockchainDb` from inside foundry-fork-db, bypassing our write funnel):
@@ -204,7 +230,12 @@ async fn cow_snapshot_matches_deep_clone_through_mutations() -> Result<()> {
             .or_default()
             .insert(U256::from(1u64), U256::from(333u64));
     }
-    assert_equivalent(&mut cache, &addrs, &slots, "after uncontrolled layer-2 growth");
+    assert_equivalent(
+        &mut cache,
+        &addrs,
+        &slots,
+        "after uncontrolled layer-2 growth",
+    );
 
     // 10. purge.
     cache.purge_account(owner);
@@ -231,6 +262,43 @@ async fn cow_snapshot_matches_deep_clone_through_mutations() -> Result<()> {
     cache.set_block(None);
     assert_equivalent(&mut cache, &addrs, &slots, "after set_block");
 
+    Ok(())
+}
+
+/// Escape-hatch re-honest hook (adversarial-review finding). A direct, out-of-band
+/// layer-2 write through `blockchain_db()` that overwrites an existing slot at an
+/// unchanged slot count is the one mutation the count-based growth scan cannot see,
+/// so the memoized base can go stale. `invalidate_snapshot_base()` must restore
+/// read-equivalence with the deep-clone reference.
+#[tokio::test(flavor = "multi_thread")]
+async fn invalidate_snapshot_base_rehonest_after_escape_hatch_write() -> Result<()> {
+    let mut cache = setup_cache().await?;
+    let pool = Address::repeat_byte(0x77); // layer-2-only, non-shadowed
+    let slot = U256::from(0u64);
+
+    cache.inject_storage_batch(&[(pool, slot, U256::from(111u64))]);
+    let _warm = cache.create_snapshot(); // memoize the base at 111
+
+    // Out-of-band overwrite at unchanged length (bypasses the write funnel).
+    {
+        let bdb = cache.blockchain_db();
+        bdb.storage()
+            .write()
+            .entry(pool)
+            .or_default()
+            .insert(slot, U256::from(222u64));
+    }
+
+    // The documented re-honest hook must make the next snapshot reflect the write.
+    cache.invalidate_snapshot_base();
+    let cow = cache.create_snapshot();
+    let deep = cache.create_snapshot_deep_clone();
+    assert_eq!(
+        cow.storage_value(pool, slot),
+        deep.storage_value(pool, slot),
+        "invalidate_snapshot_base must re-honest the base after an out-of-band write"
+    );
+    assert_eq!(cow.storage_value(pool, slot), Some(U256::from(222u64)));
     Ok(())
 }
 

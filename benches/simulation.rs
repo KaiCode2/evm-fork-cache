@@ -3,14 +3,23 @@
 //! bundle simulation, and batched storage injection.
 //!
 //! These run fully offline (mocked provider) so they're reproducible. They
-//! establish the baseline for the Pillar A (copy-on-write snapshot) rewrite:
-//! `create_snapshot` is currently an O(total state) deep clone, so its cost
-//! scales with the populated cache size (the `create_snapshot` group sweeps
-//! 100 → 10,000 accounts to show that slope). Once Pillar A lands, the same
-//! sweep should flatten toward O(changed state) — re-run this group before and
-//! after to quantify the win. The `overlay_fanout` group measures the other
-//! half of the value proposition: how cheaply one frozen snapshot fans out into
-//! many isolated simulations.
+//! quantify the Pillar A (copy-on-write snapshot) win.
+//!
+//! Expected shapes:
+//! - **`create_snapshot` group (A/B).** The cold index is seeded into **layer 2**
+//!   via `inject_storage_batch` (`populated_cache_layer2`), the way a fork cache
+//!   actually holds it. For each size it benches both the COW `create_snapshot`
+//!   and the retained `create_snapshot_deep_clone`. The deep clone is an O(total
+//!   state) copy, so its cost slopes up with the index size; the COW path folds
+//!   only the (empty) hot layer over an `Arc`-shared memoized base, so after the
+//!   base is warm it should stay roughly **flat** across sizes.
+//! - **`resnapshot_hot_loop`.** Warms the base with one snapshot, applies a small
+//!   `apply_updates` layer-1 mutation, then measures `create_snapshot`. This is
+//!   the memoization win: ≈ O(changed) and flat across cold-index size, vs. the
+//!   deep clone's slope.
+//! - **`overlay_fanout`.** Measures fanning one frozen snapshot out into many
+//!   isolated simulations, comparing a fresh `EvmOverlay::new` per sim against a
+//!   single `reset()`-recycled overlay (Pillar A.2).
 
 use std::hint::black_box;
 use std::sync::Arc;
@@ -49,34 +58,35 @@ fn offline_cache(rt: &Runtime) -> EvmCache {
     rt.block_on(EvmCache::new(Arc::new(provider), None))
 }
 
-/// A cache populated with `accounts` accounts, each holding `slots_per` slots.
-fn populated_cache(rt: &Runtime, accounts: usize, slots_per: usize) -> EvmCache {
+/// A cache whose cold index lives in **layer 2** — seeded via
+/// `inject_storage_batch`, the path a fork cache actually uses to bulk-load its
+/// cold state. This is what the COW `create_snapshot` memoizes into its base.
+fn populated_cache_layer2(rt: &Runtime, accounts: usize, slots_per: usize) -> EvmCache {
     let mut cache = offline_cache(rt);
+    let mut batch: Vec<(Address, U256, U256)> = Vec::with_capacity(accounts * slots_per);
     for a in 0..accounts {
         let address = addr(a);
-        cache
-            .db_mut()
-            .insert_account_info(address, AccountInfo::default());
         for s in 0..slots_per {
-            cache
-                .db_mut()
-                .insert_account_storage(
-                    address,
-                    U256::from(s as u64),
-                    U256::from((a * 31 + s) as u64),
-                )
-                .unwrap();
+            batch.push((
+                address,
+                U256::from(s as u64),
+                U256::from((a * 31 + s) as u64),
+            ));
         }
     }
+    cache.inject_storage_batch(&batch);
     cache
 }
 
+/// A/B snapshot creation across cold-index sizes: the COW `create_snapshot` vs.
+/// the retained `create_snapshot_deep_clone`, both over a layer-2-seeded index.
+///
+/// The deep clone slopes up with the index; the COW path, after a warm-up
+/// snapshot has memoized the base, should stay roughly flat (the hot layer is
+/// empty, so it is an `Arc` handle copy plus the O(accounts) growth scan).
 fn bench_create_snapshot(c: &mut Criterion) {
     let rt = Runtime::new().unwrap();
     let mut group = c.benchmark_group("create_snapshot");
-    // Sweep from a small pool up to a production-scale index (10k contracts) so
-    // the O(total state) slope of the current deep clone is visible. Pillar A
-    // (copy-on-write) should flatten this curve.
     for &(accounts, slots) in &[
         (100usize, 8usize),
         (1_000, 8),
@@ -84,12 +94,49 @@ fn bench_create_snapshot(c: &mut Criterion) {
         (5_000, 16),
         (10_000, 16),
     ] {
-        let cache = populated_cache(&rt, accounts, slots);
+        let mut cache = populated_cache_layer2(&rt, accounts, slots);
+        // Warm the memoized base once so the COW measurement reflects the
+        // steady-state (reuse) cost, not the first full build.
+        black_box(cache.create_snapshot());
+        group.throughput(criterion::Throughput::Elements((accounts * slots) as u64));
+        group.bench_with_input(
+            BenchmarkId::new("cow", format!("{accounts}acct_x{slots}slot")),
+            &accounts,
+            |b, _| b.iter(|| black_box(cache.create_snapshot())),
+        );
+        group.bench_with_input(
+            BenchmarkId::new("deep_clone", format!("{accounts}acct_x{slots}slot")),
+            &accounts,
+            |b, _| b.iter(|| black_box(cache.create_snapshot_deep_clone())),
+        );
+    }
+    group.finish();
+}
+
+/// The memoization win: a hot re-snapshot loop. Warm the base once, apply a
+/// *small* layer-1 mutation, then measure `create_snapshot`. Cost should track
+/// the changed state (≈ flat across cold-index size), unlike the deep clone.
+fn bench_resnapshot_hot_loop(c: &mut Criterion) {
+    let rt = Runtime::new().unwrap();
+    let mut group = c.benchmark_group("resnapshot_hot_loop");
+    for &(accounts, slots) in &[(1_000usize, 8usize), (5_000, 16), (10_000, 16)] {
+        let mut cache = populated_cache_layer2(&rt, accounts, slots);
+        // Warm the base.
+        black_box(cache.create_snapshot());
+        // A handful of layer-1 writes (does not dirty the memoized base).
+        let target = addr(0);
         group.throughput(criterion::Throughput::Elements((accounts * slots) as u64));
         group.bench_with_input(
             BenchmarkId::from_parameter(format!("{accounts}acct_x{slots}slot")),
-            &cache,
-            |b, cache| b.iter(|| black_box(cache.create_snapshot())),
+            &accounts,
+            |b, _| {
+                b.iter(|| {
+                    cache
+                        .db_mut()
+                        .insert_account_info(target, AccountInfo::default());
+                    black_box(cache.create_snapshot());
+                })
+            },
         );
     }
     group.finish();
@@ -125,20 +172,31 @@ fn bench_overlay_fanout(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("overlay_fanout");
     for &k in &[1usize, 8, 32] {
-        group.bench_with_input(
-            BenchmarkId::from_parameter(format!("{k}way")),
-            &k,
-            |b, &k| {
-                b.iter(|| {
-                    for _ in 0..k {
-                        let mut overlay = EvmOverlay::new(snapshot.clone(), None);
-                        let result = overlay.call_raw(owner, token, calldata.clone()).unwrap();
-                        debug_assert!(matches!(result, ExecutionResult::Success { .. }));
-                        black_box(result);
-                    }
-                })
-            },
-        );
+        // Baseline: a fresh `EvmOverlay::new` (+ dirty maps + Arc clone + buffer)
+        // per simulation.
+        group.bench_with_input(BenchmarkId::new("new_per_sim", k), &k, |b, &k| {
+            b.iter(|| {
+                for _ in 0..k {
+                    let mut overlay = EvmOverlay::new(snapshot.clone(), None);
+                    let result = overlay.call_raw(owner, token, calldata.clone()).unwrap();
+                    debug_assert!(matches!(result, ExecutionResult::Success { .. }));
+                    black_box(result);
+                }
+            })
+        });
+        // Pillar A.2: one overlay built once, `reset()` between sims (reuses the
+        // dirty maps, the snapshot Arc, and the shared-memory buffer).
+        group.bench_with_input(BenchmarkId::new("reset_recycled", k), &k, |b, &k| {
+            b.iter(|| {
+                let mut overlay = EvmOverlay::new(snapshot.clone(), None);
+                for _ in 0..k {
+                    let result = overlay.call_raw(owner, token, calldata.clone()).unwrap();
+                    debug_assert!(matches!(result, ExecutionResult::Success { .. }));
+                    black_box(result);
+                    overlay.reset();
+                }
+            })
+        });
     }
     group.finish();
 }
@@ -253,7 +311,7 @@ fn bench_sim_bundle(c: &mut Criterion) {
 /// Batched direct storage injection (the bypass-RPC write path) across sizes.
 fn bench_inject_storage_batch(c: &mut Criterion) {
     let rt = Runtime::new().unwrap();
-    let cache = offline_cache(&rt);
+    let mut cache = offline_cache(&rt);
 
     let mut group = c.benchmark_group("inject_storage_batch");
     for &n in &[100usize, 1_000, 10_000] {
@@ -271,6 +329,7 @@ fn bench_inject_storage_batch(c: &mut Criterion) {
 criterion_group!(
     benches,
     bench_create_snapshot,
+    bench_resnapshot_hot_loop,
     bench_overlay_fanout,
     bench_cache_call_raw,
     bench_sim_bundle,

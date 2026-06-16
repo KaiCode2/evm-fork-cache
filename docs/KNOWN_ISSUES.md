@@ -131,9 +131,41 @@ Confidence legend: **[V]** verified against the source during review;
 
 ## Limitations by design / roadmap
 
-- **No copy-on-write snapshots yet.** `create_snapshot()` deep-clones state
-  (`O(accounts + slots)`); the COW rewrite is roadmap Pillar A. The `simulation`
-  benchmarks exist to measure the baseline this will improve on.
+- **Copy-on-write snapshots (Phase 5, Pillar A) — done.** `create_snapshot()` is
+  no longer an O(total state) deep clone. The cold `BlockchainDb` index (layer 2)
+  is flattened once into an internal, immutable, `Arc`-shared base (per-account
+  storage shared by `Arc`), memoized across snapshots and rebuilt copy-on-write
+  only for the addresses that changed; each snapshot folds just the hot CacheDB
+  delta (layer 1) over a cheap `Arc::clone`. **Residual cost model (honest):** a
+  snapshot is no longer free. When layer 2 is unchanged since the last snapshot
+  it still pays an **O(accounts) length-scan** of the layer-2 storage/account
+  maps (to catch uncontrolled lazy-fetch growth that bypasses the write funnel,
+  since `foundry-fork-db` cannot be hooked) plus an **O(layer-1) fold** of the hot
+  delta — so the cost tracks `accounts + changed state`, not total slots. A
+  full rebuild (first snapshot, or after `set_block`/re-pin) is still O(total
+  state). `create_snapshot` is now `&mut self` (it memoizes the base, Decision
+  D5). The retained `create_snapshot_deep_clone()` (the legacy full flatten) is
+  kept as the A/B benchmark baseline and the read-equivalence reference; the
+  `create_snapshot` group in `benches/simulation.rs` measures both. Decisions and
+  the cost model are in [`phase-5-spec.md`](phase-5-spec.md) / `ROADMAP.md`.
+- **[V] Memoized-base staleness at the layer-2 escape hatches (Phase 5).** The
+  snapshot base's growth scan is count/absence-based, which is sufficient for the
+  supported writers: the crate's own mutators (`apply_update`, `inject_storage_batch`,
+  the `inject_*` helpers, purges, code overrides) explicitly mark the base dirty,
+  and the `foundry-fork-db` `SharedBackend` lazy fetch is append-only at a fixed
+  block (it only inserts on a cache miss, never overwrites in place — a load-bearing
+  invariant noted in `refresh_base`). The one gap, surfaced by the Phase 5
+  adversarial review: a **direct, out-of-band write through the public
+  `blockchain_db()` / `backend()` handles** that *overwrites an existing slot value
+  at an unchanged slot count* is invisible to the scan, so a subsequent
+  `create_snapshot` may reuse a stale base (`create_snapshot_deep_clone` always
+  re-reads and would diverge). This is a contract boundary, not an internal bug — no
+  in-crate path triggers it, and both accessors are documented as bypassing the
+  two-layer model. Mitigation: call the new
+  [`EvmCache::invalidate_snapshot_base`] after any direct layer-2 write through those
+  handles (or re-pin via `set_block`); the rustdoc on both accessors and the hook
+  carries this warning, and `tests/cow_snapshot.rs`
+  (`invalidate_snapshot_base_rehonest_after_escape_hatch_write`) pins it.
 - **`protocols` not yet extracted.** The DeFi surface is feature-gated but still
   in-crate; `cargo test --no-default-features` is not yet supported because some
   unit tests assume the default feature. Extraction into `evm-amm-state` is
