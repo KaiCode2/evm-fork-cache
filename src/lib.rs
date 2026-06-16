@@ -46,9 +46,14 @@
 //!   policy, mechanism) and the optimistic verify-and-rerun execution loop with
 //!   deferred validation.
 //! - [`state_update`] — the generic state-mutation vocabulary (`StateUpdate` /
-//!   `AccountPatch` / `PurgeScope`, plus relative `SlotDelta` read-modify-write)
-//!   applied by `EvmCache::apply_update` / `apply_updates` / `modify_slot`, with a
-//!   structured `StateDiff` output (Pillar B.1).
+//!   `AccountPatch` / `PurgeScope`, plus relative `SlotDelta` read-modify-write and
+//!   masked `SlotMasked` writes) applied by `EvmCache::apply_update` /
+//!   `apply_updates` / `modify_slot`, with a structured `StateDiff` output
+//!   (Pillar B.1).
+//! - [`events`] — the event → state pipeline (Pillar B.2): `EventDecoder` /
+//!   `StateView` / `DecoderRegistry` decode an on-chain `Log` into `StateUpdate`s,
+//!   and `EventPipeline` ingests, reorg-purges, and reconciles a block's logs.
+//!   Ships an ERC-20 `Transfer` decoder and (under `protocols`) a UniswapV3 adapter.
 //! - [`inspector`] — an [`Inspector`](revm::Inspector) that captures ERC20
 //!   `Transfer` events to reconstruct balance deltas from a simulation.
 //! - [`multicall`] — batched read-only calls through Multicall3.
@@ -102,6 +107,7 @@ pub mod cache;
 pub mod create3;
 pub mod deploy;
 pub mod errors;
+pub mod events;
 pub mod freshness;
 pub mod inspector;
 pub mod multicall;
@@ -109,6 +115,13 @@ pub mod prefetch_registry;
 pub mod state_update;
 
 pub use access_set::StorageAccessList;
+pub use events::erc20::Erc20TransferDecoder;
+#[cfg(feature = "protocols")]
+pub use events::uniswap_v3::{UniswapV3Decoder, UniswapV3Layout};
+pub use events::{
+    BlockDigest, DecoderRegistry, EventDecoder, EventPipeline, ReconcileReport, ReorgConfig,
+    StateView,
+};
 pub use freshness::{
     AlwaysVerify, BlockClock, FreshnessClock, FreshnessController, FreshnessParams,
     FreshnessPolicy, FreshnessRegistry, NeverVerify, ObservationDriven, SimRequest, SlotChange,
