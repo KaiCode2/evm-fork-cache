@@ -88,6 +88,42 @@ pre-release development phases (see [`docs/ROADMAP.md`](docs/ROADMAP.md)).
   and the `SlotDelta` double-read of the old value is eliminated. The result is
   byte-identical to folding `apply_update` over the batch (pinned by the
   batched==sequential equivalence test). Generic core.
+- **Event → state pipeline** (`events` module, Phase 4, Pillar B.2 — the *reader
+  half* of the event pipeline) — turn on-chain logs into the Phase 3 `StateUpdate`
+  vocabulary and drive them through the cache for reactive freshness:
+  - **`EventDecoder` / `StateView`** — a decoder is a pure function of
+    `(log, pre-state)` returning `Vec<StateUpdate>`; the narrow read-only
+    `StateView` (implemented by `EvmCache` via `cached_storage_value`) lets
+    stateful adapters read current cached state without RPC. Generic core.
+  - **`DecoderRegistry`** — dispatches a log to the decoders registered for its
+    emitting address (plus globals) and concatenates their output. Generic core.
+  - **`Erc20TransferDecoder`** — decodes ERC-20 `Transfer` logs into relative
+    balance `SlotDelta`s (skipping the zero-address mint/burn leg), with per-token
+    balance-slot config. The reactive-balance case from Phase 3 §15, now
+    log-driven. Generic core.
+  - **`UniswapV3Decoder` / `UniswapV3Layout`** (`protocols`) — `Swap` → a masked
+    `slot0` write (new `sqrtPriceX96` + `tick`, **preserving** the
+    observation/fee/`unlocked` bits — a clobbered `unlocked` would make a quote
+    revert `LOK`) plus an absolute `liquidity` write; `Mint`/`Burn` → per-tick
+    `liquidityGross`/`liquidityNet`, the `initialized` flag, the `tickBitmap`
+    word bit, and the in-range global `liquidity`, computed against the
+    `StateView` and cold-aware. Uniswap and PancakeSwap layouts.
+  - **`EventPipeline`** — `ingest_logs` decodes + applies a block's logs
+    **log-by-log in order** (so a later log sees earlier applies) and returns a
+    `BlockDigest`; `reorg_to` purges (purge-and-resync) the addresses touched
+    after a new head; `reconcile` re-reads sampled event-derived slots against
+    chain truth (correct **and** alarm) via the new `EvmCache::reconcile_slots`. A
+    thin async `drive`/`LogSource` convenience layers the synchronous core over a
+    stream. Generic core.
+- **`StateUpdate::SlotMasked`** (`state_update`, Phase 4) — a cold-aware
+  read-modify-write *masked* slot write (`new = (old & !mask) | (value & mask)`)
+  with the `StateUpdate::slot_masked` constructor, so a pure decoder can update
+  selected bits of a **packed** storage word (e.g. V3 `slot0`) without clobbering
+  the rest. A masked write to a cold slot is skipped and surfaced in the new
+  `StateDiff.skipped_masks: Vec<SkippedMask>` (counted by `has_skipped` /
+  `skipped_len`, not by the changes-only `is_empty`/`len`); `serde` on
+  `SkippedMask`. Adding the variant and the field is permitted under the pre-1.0
+  break policy (`StateUpdate`/`StateDiff` are `#[non_exhaustive]`). Generic core.
 - **Configurable transaction & block environment** — `TxConfig` (value, gas
   limit, gas price, nonce, access list) threaded through `call_raw_with`; block
   context setters (`set_coinbase`, `set_prevrandao`, `set_block_gas_limit`).

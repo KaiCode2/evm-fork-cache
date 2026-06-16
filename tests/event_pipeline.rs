@@ -609,10 +609,6 @@ mod uniswap_v3 {
         U256::from(sqrt_price) | (tick24 << 160) | (high << 184)
     }
 
-    #[allow(dead_code)]
-    fn tick_word(gross: u128, net: i128) -> U256 {
-        U256::from(gross) | (U256::from(net as u128) << 128)
-    }
     fn unpack_tick_word(w: U256) -> (u128, i128) {
         let gross = u128::try_from(w & U256::from(u128::MAX)).unwrap();
         let net = u128::try_from((w >> 128) & U256::from(u128::MAX)).unwrap() as i128;

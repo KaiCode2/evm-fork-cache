@@ -90,6 +90,10 @@ harness = false
 name = "state_update"
 harness = false
 
+[[bench]]
+name = "event_pipeline"
+harness = false
+
 # RPC-gated real-contract benchmarks. Skipped (not failed) when RPC_URL is unset,
 # so `cargo bench` stays offline by default.
 [[bench]]

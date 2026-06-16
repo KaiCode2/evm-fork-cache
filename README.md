@@ -169,6 +169,7 @@ and inject all state directly:
 | `freshness_optimistic` | Advanced | Optimistic verify-and-rerun loop: a `Corrected` validation via a stub fetcher. |
 | `freshness_multi_sim` | Advanced | Many sims with selective re-run, plus classification and `ValidThrough` aging. |
 | `state_update_apply` | Advanced | Apply a mixed `StateUpdate` batch (`Slot`/`Account`/`Purge`) and inspect the returned `StateDiff`. |
+| `reactive_cache` | Advanced | Decode logs (ERC-20 `Transfer` + UniswapV3 `Swap`) into `StateUpdate`s, ingest a block, reconcile drift, and purge on a reorg. |
 
 **RPC examples** fork real mainnet state. Set `RPC_URL` to an Ethereum RPC
 endpoint (they print instructions and exit if it is unset):
@@ -226,6 +227,7 @@ cache sizes:
 | `simulation` | `create_snapshot` across cache sizes (100 → 10k accounts), overlay fan-out, `call_raw` throughput, sequential bundle execution, batched storage injection. |
 | `freshness` | The optimistic loop end-to-end (CPU and latency-hiding), `verify_slots` at scale (1 → 1000 slots), and multi-sim fan-out. |
 | `state_update` | `apply_updates` throughput across batch sizes (1 → 1000 `Slot`s) and per-variant apply cost (`Slot` vs `Account` vs `Purge`). |
+| `event_pipeline` | Per-event decode cost (ERC-20 `Transfer`, V3 `Swap`/`Mint`), `ingest_logs` decode+apply throughput (1 → 1000 logs), and `reorg_to` purge cost. |
 | `access_list` | Touch-set merge and EIP-2930 list construction. |
 | `revert_decoding` | Built-in and custom revert decoding, including decoder dispatch with many registered errors. |
 | `storage_keys` | Mapping/array storage-key derivation. |
