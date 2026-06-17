@@ -32,6 +32,13 @@ impl FoundryArtifact {
     ///
     /// The legacy direct string shape `{ "bytecode": "0x..." }` is also
     /// accepted to make tests and generated artifacts easier to reuse.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file cannot be read, is not valid JSON, lacks a
+    /// usable `bytecode`/`bytecode.object` field, or contains bytecode that is
+    /// empty, not valid hex, or still has unresolved library placeholders (see
+    /// [`load_foundry_creation_code`]).
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         let creation_code = load_foundry_creation_code(path)?;
@@ -52,6 +59,18 @@ impl FoundryArtifact {
     ///
     /// `constructor_args` must already be ABI encoded. Use
     /// [`encode_constructor_args`] for ordinary Solidity constructor tuples.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the `CREATE` transaction reverts or halts, or if the
+    /// deployment otherwise fails to produce a deployed address (see
+    /// [`EvmCache::deploy_contract`]).
+    ///
+    /// # Panics
+    ///
+    /// Like any method that may fetch missing state, this must run on a
+    /// multi-thread tokio runtime; deploying on a current-thread runtime panics
+    /// when the fork DB attempts a synchronous RPC fetch.
     pub fn deploy(
         &self,
         cache: &mut EvmCache,
@@ -77,6 +96,21 @@ impl FoundryArtifact {
     /// constructor-initialized immutables: the temporary deployment computes the
     /// final runtime bytecode, and `target` keeps its existing storage, balance,
     /// and nonce. `target` must already have non-empty runtime bytecode.
+    ///
+    /// On any error the cache is restored to its pre-deploy snapshot, so a
+    /// failed etch leaves no partial deployment behind.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `target` is missing or has no runtime bytecode, if
+    /// the deployment reverts or halts (see [`Self::deploy`]), or if copying the
+    /// runtime bytecode to `target` fails.
+    ///
+    /// # Panics
+    ///
+    /// Must run on a multi-thread tokio runtime; the underlying deployment
+    /// panics on a current-thread runtime when the fork DB attempts a
+    /// synchronous RPC fetch.
     pub fn etch(
         &self,
         cache: &mut EvmCache,
@@ -98,6 +132,21 @@ impl FoundryArtifact {
     ///
     /// Use this only for synthetic simulation addresses where there is no
     /// storage, balance, or nonce to preserve.
+    ///
+    /// On any error the cache is restored to its pre-deploy snapshot, so a
+    /// failed etch leaves no synthetic target account behind.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the deployment reverts or halts (see
+    /// [`Self::deploy`]), or if copying the runtime bytecode to `target` fails
+    /// (for example when the deployed contract has empty runtime bytecode).
+    ///
+    /// # Panics
+    ///
+    /// Must run on a multi-thread tokio runtime; the underlying deployment
+    /// panics on a current-thread runtime when the fork DB attempts a
+    /// synchronous RPC fetch.
     pub fn etch_or_create(
         &self,
         cache: &mut EvmCache,
@@ -197,9 +246,26 @@ pub struct EtchedContract {
 
 /// ABI-encode constructor arguments.
 ///
-/// Pass a Rust tuple matching the constructor parameter list. This mirrors
-/// Solidity constructor parameter encoding (`abi.encode(arg0, arg1, ...)`) and
-/// avoids the nested tuple encoding produced by `abi.encode((...))`.
+/// Pass a tuple of alloy Solidity values matching the constructor parameter
+/// list, e.g. `(owner, weth, vault)`. Single-argument constructors need a
+/// trailing comma so the value is still a tuple: `(owner,)`. An empty tuple
+/// `()` encodes to empty bytes, which is correct for argument-less
+/// constructors.
+///
+/// The encoding mirrors Solidity constructor parameter encoding
+/// (`abi.encode(arg0, arg1, ...)`): it uses [`SolValue::abi_encode_params`],
+/// which lays the arguments out as a flat parameter list. This differs from
+/// [`SolValue::abi_encode`], which would wrap a tuple in an extra layer
+/// (matching `abi.encode((...))`) and produce the wrong bytes for a
+/// constructor.
+///
+/// The trait bounds spell out "any alloy Solidity value tuple": `T: SolValue`
+/// means each element implements the alloy Solidity-value trait, and the
+/// `TokenSeq` bound on `T::SolType` requires the tuple's token to be a
+/// sequence so it can be encoded as a parameter list. In practice you do not
+/// construct these bounds yourself — they are satisfied automatically by
+/// tuples of alloy primitives such as [`Address`], [`U256`](alloy_primitives::U256),
+/// and `String`.
 ///
 /// ```ignore
 /// let args = evm_fork_cache::deploy::encode_constructor_args((owner, weth, vault));
@@ -213,6 +279,19 @@ where
 }
 
 /// Load creation bytecode from a Foundry artifact.
+///
+/// Reads the JSON at `path` and decodes the creation bytecode from
+/// `bytecode.object` (or the legacy direct-string `bytecode` field).
+///
+/// # Errors
+///
+/// Returns an error when:
+/// - the file cannot be read,
+/// - the contents are not valid JSON,
+/// - the JSON has no `bytecode` field, or `bytecode` has neither an `object`
+///   string nor a direct string value,
+/// - the bytecode hex is empty, still contains unresolved library
+///   placeholders (`__$...$__`), or is otherwise not valid hex.
 pub fn load_foundry_creation_code(path: impl AsRef<Path>) -> Result<Bytes> {
     let path = path.as_ref();
     let content = std::fs::read_to_string(path)
@@ -244,6 +323,19 @@ pub fn load_foundry_creation_code(path: impl AsRef<Path>) -> Result<Bytes> {
 }
 
 /// Build init code from creation bytecode and ABI-encoded constructor args.
+///
+/// Init code is simply the contract's creation bytecode with the ABI-encoded
+/// constructor arguments appended, matching how the EVM expects a `CREATE`
+/// payload to be laid out. The `constructor_args` must already be ABI encoded;
+/// use [`encode_constructor_args`] to produce them from an alloy Solidity
+/// value tuple.
+///
+/// ```
+/// use evm_fork_cache::deploy::build_init_code;
+///
+/// let init = build_init_code([0x60, 0x80], [0x01, 0x02, 0x03]);
+/// assert_eq!(init.as_ref(), &[0x60, 0x80, 0x01, 0x02, 0x03]);
+/// ```
 pub fn build_init_code(
     creation_code: impl AsRef<[u8]>,
     constructor_args: impl AsRef<[u8]>,
@@ -258,6 +350,17 @@ pub fn build_init_code(
 
 /// Deploy a Foundry artifact into the forked EVM and return its temporary
 /// deployed address.
+///
+/// # Errors
+///
+/// Returns an error if the artifact cannot be loaded (see
+/// [`load_foundry_creation_code`]) or if the deployment reverts or halts (see
+/// [`FoundryArtifact::deploy`]).
+///
+/// # Panics
+///
+/// Must run on a multi-thread tokio runtime; the deployment panics on a
+/// current-thread runtime when the fork DB attempts a synchronous RPC fetch.
 pub fn deploy_foundry_artifact(
     cache: &mut EvmCache,
     artifact_path: impl AsRef<Path>,
@@ -273,6 +376,18 @@ pub fn deploy_foundry_artifact(
 /// and nonce are preserved. If `target` is missing or has no runtime bytecode,
 /// this returns an error. Use [`etch_foundry_artifact_or_create`] for synthetic
 /// simulation addresses.
+///
+/// # Errors
+///
+/// Returns an error if the artifact cannot be loaded (see
+/// [`load_foundry_creation_code`]), if `target` is missing or has no runtime
+/// bytecode, if the deployment reverts or halts, or if copying the runtime
+/// bytecode to `target` fails (see [`FoundryArtifact::etch`]).
+///
+/// # Panics
+///
+/// Must run on a multi-thread tokio runtime; the deployment panics on a
+/// current-thread runtime when the fork DB attempts a synchronous RPC fetch.
 pub fn etch_foundry_artifact(
     cache: &mut EvmCache,
     target: Address,
@@ -288,6 +403,19 @@ pub fn etch_foundry_artifact(
 ///
 /// Prefer [`etch_foundry_artifact`] for forked/live contract addresses whose
 /// storage, balance, or nonce should be preserved.
+///
+/// # Errors
+///
+/// Returns an error if the artifact cannot be loaded (see
+/// [`load_foundry_creation_code`]), if the deployment reverts or halts, or if
+/// copying the runtime bytecode to `target` fails, for example when the
+/// deployed contract has empty runtime bytecode (see
+/// [`FoundryArtifact::etch_or_create`]).
+///
+/// # Panics
+///
+/// Must run on a multi-thread tokio runtime; the deployment panics on a
+/// current-thread runtime when the fork DB attempts a synchronous RPC fetch.
 pub fn etch_foundry_artifact_or_create(
     cache: &mut EvmCache,
     target: Address,
@@ -505,7 +633,7 @@ mod tests {
             .build()
             .expect("runtime should build");
 
-        rt.block_on(EvmCache::new(Arc::new(provider), None))
+        rt.block_on(EvmCache::new(Arc::new(provider)))
     }
 
     fn memory_artifact(creation_code: Bytes) -> FoundryArtifact {

@@ -5,42 +5,40 @@
 //! time. Slots that change frequently are rechecked sooner; stable slots are
 //! trusted longer (subject to a maximum age). The observations are persisted to
 //! disk so the heuristics survive across runs.
+//!
+//! # Clock-agnostic
+//!
+//! The tracker does not read the wall clock itself: callers pass `now` (in
+//! clock units) into [`observe`](SlotObservationTracker::observe) and
+//! [`should_refetch`](SlotObservationTracker::should_refetch), and the thresholds
+//! live in a [`crate::freshness::FreshnessParams`]. This lets the freshness
+//! controller drive the tracker from either a block clock or a wall clock.
 
-use std::{
-    collections::HashMap,
-    path::Path,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::{collections::HashMap, path::Path};
 
 use alloy_primitives::{Address, U256};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
-/// Minimum observations before we trust the change frequency data.
-const MIN_OBSERVATIONS: u32 = 10;
+use crate::freshness::FreshnessParams;
 
-/// Maximum time (seconds) to reuse a cached slot value before rechecking.
-/// Even never-changed slots get rechecked after 1 week.
-const MAX_REUSE_SECS: u64 = 7 * 86400;
+use super::versioned;
 
-/// Refetch threshold: if expected probability of change exceeds this, refetch.
-const STALENESS_THRESHOLD: f64 = 0.05;
-
-/// Slots that change more than 90% of the time are always refetched.
-const ALWAYS_REFETCH_RATE: f64 = 0.9;
-
-/// Estimated cycle interval in seconds (used for probabilistic model).
-const ESTIMATED_CYCLE_SECS: f64 = 60.0;
+const SLOT_OBSERVATIONS_MAGIC: &[u8; 8] = b"EFC-SOBS";
+const SLOT_OBSERVATIONS_VERSION: u32 = 1;
 
 /// Per-slot observation record, persisted to disk.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct SlotObservation {
+    /// Most recently observed slot value.
     pub last_value: U256,
+    /// Total number of times this slot has been observed.
     pub observation_count: u32,
+    /// Number of observations that differed from the previous value.
     pub change_count: u32,
-    /// Unix timestamp of most recent observation.
+    /// Clock value (block number or unix seconds) of the most recent observation.
     pub last_checked: u64,
-    /// Unix timestamp of most recent value change.
+    /// Clock value of the most recent value change.
     pub last_changed: u64,
 }
 
@@ -73,12 +71,20 @@ impl SlotObservationTracker {
         }
     }
 
-    /// Load persisted observations from disk (bincode format).
-    /// Returns a fresh tracker if the file doesn't exist or can't be decoded.
+    /// Load persisted observations from disk (versioned binary format).
+    ///
+    /// Returns a fresh tracker if the file doesn't exist, has an unrecognized
+    /// magic/version header, or can't be decoded. Legacy unversioned bincode is
+    /// treated as a cache miss.
     pub fn load(path: &Path) -> Self {
         match std::fs::read(path) {
-            Ok(data) => match bincode::deserialize::<HashMap<SlotKey, SlotObservation>>(&data) {
-                Ok(observations) => {
+            Ok(data) => {
+                if let Some(observations) = versioned::decode::<HashMap<SlotKey, SlotObservation>>(
+                    &data,
+                    SLOT_OBSERVATIONS_MAGIC,
+                    SLOT_OBSERVATIONS_VERSION,
+                    "slot observations",
+                ) {
                     debug!(
                         entries = observations.len(),
                         "Loaded slot observation tracker"
@@ -88,12 +94,11 @@ impl SlotObservationTracker {
                         skipped_this_cycle: Vec::new(),
                         dirty: false,
                     }
-                }
-                Err(e) => {
-                    warn!(?e, "Failed to decode slot observations, starting fresh");
+                } else {
+                    warn!("Slot observations cache miss, starting fresh");
                     Self::new()
                 }
-            },
+            }
             Err(_) => {
                 debug!("No slot observations file found, starting fresh");
                 Self::new()
@@ -101,7 +106,8 @@ impl SlotObservationTracker {
         }
     }
 
-    /// Persist observations to disk. Called at end of cycle or on shutdown.
+    /// Persist observations to disk using the versioned binary format.
+    /// Called at end of cycle or on shutdown.
     pub fn save(&mut self, path: &Path) -> anyhow::Result<()> {
         if !self.dirty {
             return Ok(());
@@ -109,7 +115,12 @@ impl SlotObservationTracker {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let data = bincode::serialize(&self.observations)?;
+        let data = versioned::encode(
+            SLOT_OBSERVATIONS_MAGIC,
+            SLOT_OBSERVATIONS_VERSION,
+            &self.observations,
+            "slot observations",
+        )?;
         std::fs::write(path, data)?;
         self.dirty = false;
         debug!(entries = self.observations.len(), "Saved slot observations");
@@ -120,7 +131,55 @@ impl SlotObservationTracker {
     ///
     /// Returns `true` if the slot should be purged and re-fetched.
     /// Returns `false` if the cached value is likely still valid.
-    pub fn should_refetch(&self, addr: Address, slot: U256) -> bool {
+    ///
+    /// `now` is the current clock value (block number or unix seconds) and
+    /// `params` carries the (clock-unit) thresholds — see
+    /// [`crate::freshness::FreshnessParams`].
+    ///
+    /// The heuristic is fully deterministic (no randomness): a never-observed slot
+    /// always refetches, as does one with fewer than
+    /// [`min_observations`](crate::freshness::FreshnessParams::min_observations);
+    /// once enough observations accrue, a never-changed slot is reused until the
+    /// [`max_reuse`](crate::freshness::FreshnessParams::max_reuse) window elapses,
+    /// while changing slots refetch once the probabilistic expected-change estimate
+    /// crosses [`staleness_threshold`](crate::freshness::FreshnessParams::staleness_threshold).
+    ///
+    /// # Examples
+    /// The deterministic threshold edges around a stable (never-changed) slot:
+    ///
+    /// ```
+    /// use alloy_primitives::{Address, U256};
+    /// use evm_fork_cache::cache::SlotObservationTracker;
+    /// use evm_fork_cache::freshness::FreshnessParams;
+    ///
+    /// let params = FreshnessParams::default();
+    /// let mut tracker = SlotObservationTracker::new();
+    /// let addr = Address::repeat_byte(0x01);
+    /// let slot = U256::from(0);
+    ///
+    /// // An unobserved slot must always be fetched.
+    /// assert!(tracker.should_refetch(addr, slot, 0, &params));
+    ///
+    /// // Record fewer than `min_observations` of the same value: still refetches
+    /// // because there is not enough data to trust the change frequency.
+    /// for now in 0..(params.min_observations - 1) {
+    ///     tracker.observe(addr, slot, U256::from(42), now as u64);
+    /// }
+    /// assert!(tracker.should_refetch(addr, slot, params.min_observations as u64, &params));
+    ///
+    /// // One more identical observation reaches `min_observations`; the slot has
+    /// // never changed, so within the reuse window it is now reused (no refetch).
+    /// let last = params.min_observations as u64 - 1;
+    /// tracker.observe(addr, slot, U256::from(42), last);
+    /// assert!(!tracker.should_refetch(addr, slot, last, &params));
+    /// ```
+    pub fn should_refetch(
+        &self,
+        addr: Address,
+        slot: U256,
+        now: u64,
+        params: &FreshnessParams,
+    ) -> bool {
         let key = SlotKey {
             address: addr,
             slot,
@@ -129,19 +188,17 @@ impl SlotObservationTracker {
             return true; // never observed → must fetch
         };
 
-        let now = unix_now();
-
         // Always refetch if insufficient data to make predictions
-        if obs.observation_count < MIN_OBSERVATIONS {
+        if obs.observation_count < params.min_observations {
             return true;
         }
 
-        // Always refetch if last check was > 1 week ago
-        if now.saturating_sub(obs.last_checked) > MAX_REUSE_SECS {
+        // Always refetch if last check was longer than the reuse window ago
+        if now.saturating_sub(obs.last_checked) > params.max_reuse {
             return true;
         }
 
-        // Never-changed slots: reuse up to the 1-week max
+        // Never-changed slots: reuse up to the max-reuse window
         if obs.change_count == 0 {
             return false;
         }
@@ -149,26 +206,27 @@ impl SlotObservationTracker {
         let change_rate = obs.change_count as f64 / obs.observation_count as f64;
 
         // Always-changing slots: always refetch
-        if change_rate > ALWAYS_REFETCH_RATE {
+        if change_rate > params.always_refetch_rate {
             return true;
         }
 
         // Probabilistic: estimate expected changes since last check
-        let secs_elapsed = now.saturating_sub(obs.last_checked) as f64;
-        let cycles_elapsed = (secs_elapsed / ESTIMATED_CYCLE_SECS).max(1.0);
+        let units_elapsed = now.saturating_sub(obs.last_checked) as f64;
+        let cycle_interval = params.cycle_interval.max(1) as f64;
+        let cycles_elapsed = (units_elapsed / cycle_interval).max(1.0);
         let expected_changes = change_rate * cycles_elapsed;
-        expected_changes > STALENESS_THRESHOLD
+        expected_changes > params.staleness_threshold
     }
 
     /// Record a fresh observation after re-fetch or injection.
     ///
+    /// `now` is the current clock value (block number or unix seconds).
     /// Returns `true` if the value changed from the last observation.
-    pub fn observe(&mut self, addr: Address, slot: U256, value: U256) -> bool {
+    pub fn observe(&mut self, addr: Address, slot: U256, value: U256, now: u64) -> bool {
         let key = SlotKey {
             address: addr,
             slot,
         };
-        let now = unix_now();
         self.dirty = true;
 
         match self.observations.get_mut(&key) {
@@ -249,13 +307,6 @@ impl Default for SlotObservationTracker {
     }
 }
 
-fn unix_now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -264,47 +315,71 @@ mod tests {
         Address::new([n; 20])
     }
 
+    /// Block-clock params with a 1-unit cycle so each `observe` advances exactly
+    /// one cycle — keeps the probabilistic arithmetic easy to reason about.
+    fn params() -> FreshnessParams {
+        FreshnessParams::default()
+    }
+
     #[test]
     fn test_unknown_slot_always_refetches() {
         let tracker = SlotObservationTracker::new();
-        assert!(tracker.should_refetch(addr(1), U256::from(0)));
+        assert!(tracker.should_refetch(addr(1), U256::from(0), 100, &params()));
     }
 
     #[test]
     fn test_insufficient_observations_refetches() {
         let mut tracker = SlotObservationTracker::new();
+        let p = params();
         let a = addr(1);
         let slot = U256::from(4);
-        // Record fewer than MIN_OBSERVATIONS observations
-        for _ in 0..(MIN_OBSERVATIONS - 1) {
-            tracker.observe(a, slot, U256::from(42));
+        // Record fewer than `min_observations` observations.
+        for now in 0..(p.min_observations - 1) {
+            tracker.observe(a, slot, U256::from(42), now as u64);
         }
-        assert!(tracker.should_refetch(a, slot));
+        assert!(tracker.should_refetch(a, slot, p.min_observations as u64, &p));
     }
 
     #[test]
     fn test_never_changed_slot_skips_refetch() {
         let mut tracker = SlotObservationTracker::new();
+        let p = params();
         let a = addr(1);
         let slot = U256::from(4);
         let value = U256::from(42);
-        // Build up enough observations with the same value
-        for _ in 0..MIN_OBSERVATIONS {
-            tracker.observe(a, slot, value);
+        // Build up enough observations with the same value at consecutive ticks.
+        for now in 0..p.min_observations {
+            tracker.observe(a, slot, value, now as u64);
         }
-        assert!(!tracker.should_refetch(a, slot));
+        // Re-check immediately after the last observation (within the reuse window).
+        assert!(!tracker.should_refetch(a, slot, p.min_observations as u64 - 1, &p));
+    }
+
+    #[test]
+    fn test_never_changed_slot_refetches_past_max_reuse() {
+        let mut tracker = SlotObservationTracker::new();
+        let p = params();
+        let a = addr(1);
+        let slot = U256::from(4);
+        for now in 0..p.min_observations {
+            tracker.observe(a, slot, U256::from(42), now as u64);
+        }
+        // Far past the reuse window even a never-changed slot is rechecked.
+        let now = p.min_observations as u64 + p.max_reuse + 1;
+        assert!(tracker.should_refetch(a, slot, now, &p));
     }
 
     #[test]
     fn test_always_changing_slot_refetches() {
         let mut tracker = SlotObservationTracker::new();
+        let p = params();
         let a = addr(1);
         let slot = U256::from(4);
-        // Record MIN_OBSERVATIONS observations, each with a different value
-        for i in 0..(MIN_OBSERVATIONS + 1) {
-            tracker.observe(a, slot, U256::from(i));
+        // Record observations, each with a different value, at consecutive ticks.
+        for now in 0..(p.min_observations + 1) {
+            tracker.observe(a, slot, U256::from(now), now as u64);
         }
-        assert!(tracker.should_refetch(a, slot));
+        assert!(tracker.should_refetch(a, slot, p.min_observations as u64 + 1, &p));
     }
 
     #[test]
@@ -312,24 +387,40 @@ mod tests {
         let mut tracker = SlotObservationTracker::new();
         let a = addr(1);
         let slot = U256::from(0);
-        assert!(!tracker.observe(a, slot, U256::from(1))); // first = baseline
-        assert!(!tracker.observe(a, slot, U256::from(1))); // same
-        assert!(tracker.observe(a, slot, U256::from(2))); // changed
-        assert!(!tracker.observe(a, slot, U256::from(2))); // same again
+        assert!(!tracker.observe(a, slot, U256::from(1), 0)); // first = baseline
+        assert!(!tracker.observe(a, slot, U256::from(1), 1)); // same
+        assert!(tracker.observe(a, slot, U256::from(2), 2)); // changed
+        assert!(!tracker.observe(a, slot, U256::from(2), 3)); // same again
+    }
+
+    #[test]
+    fn test_observe_records_change_clock() {
+        let mut tracker = SlotObservationTracker::new();
+        let a = addr(1);
+        let slot = U256::from(0);
+        tracker.observe(a, slot, U256::from(1), 10); // baseline at tick 10
+        tracker.observe(a, slot, U256::from(2), 25); // change at tick 25
+        let key = SlotKey { address: a, slot };
+        let obs = &tracker.observations[&key];
+        assert_eq!(obs.last_checked, 25);
+        assert_eq!(obs.last_changed, 25);
+        assert_eq!(obs.change_count, 1);
+        assert_eq!(obs.observation_count, 2);
     }
 
     #[test]
     fn test_reset_contract_clears_observations() {
         let mut tracker = SlotObservationTracker::new();
+        let p = params();
         let a = addr(1);
-        for i in 0..MIN_OBSERVATIONS {
-            tracker.observe(a, U256::from(i), U256::from(42));
+        for i in 0..p.min_observations {
+            tracker.observe(a, U256::from(i), U256::from(42), i as u64);
         }
         assert!(!tracker.is_empty());
         tracker.reset_contract(a);
         assert_eq!(tracker.len(), 0);
         // After reset, should_refetch returns true
-        assert!(tracker.should_refetch(a, U256::from(0)));
+        assert!(tracker.should_refetch(a, U256::from(0), 100, &p));
     }
 
     #[test]
@@ -362,9 +453,14 @@ mod tests {
 
         let mut tracker = SlotObservationTracker::new();
         let a = addr(1);
-        tracker.observe(a, U256::from(0), U256::from(100));
-        tracker.observe(a, U256::from(4), U256::from(200));
+        tracker.observe(a, U256::from(0), U256::from(100), 0);
+        tracker.observe(a, U256::from(4), U256::from(200), 0);
         tracker.save(&path).unwrap();
+        let data = std::fs::read(&path).expect("read saved observations");
+        assert!(
+            data.starts_with(b"EFC-SOBS"),
+            "slot observation files must carry a magic/version header"
+        );
 
         let loaded = SlotObservationTracker::load(&path);
         assert_eq!(loaded.len(), 2);
@@ -376,13 +472,130 @@ mod tests {
     }
 
     #[test]
+    fn legacy_raw_bincode_loads_as_default() {
+        let dir = std::env::temp_dir().join("evm_fork_cache_test_slot_obs_legacy");
+        let path = dir.join("legacy_observations.bin");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+
+        let a = addr(1);
+        let slot = U256::from(4);
+        let mut observations = HashMap::new();
+        observations.insert(
+            SlotKey { address: a, slot },
+            SlotObservation {
+                last_value: U256::from(42),
+                observation_count: 3,
+                change_count: 0,
+                last_checked: 2,
+                last_changed: 0,
+            },
+        );
+        let legacy = bincode::serialize(&observations).expect("serialize legacy observations");
+        std::fs::write(&path, legacy).expect("write legacy observations");
+
+        let loaded = SlotObservationTracker::load(&path);
+        assert!(
+            loaded.is_empty(),
+            "legacy raw bincode must be treated as a cache miss"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn test_last_value() {
         let mut tracker = SlotObservationTracker::new();
         let a = addr(1);
         assert_eq!(tracker.last_value(a, U256::from(0)), None);
-        tracker.observe(a, U256::from(0), U256::from(42));
+        tracker.observe(a, U256::from(0), U256::from(42), 0);
         assert_eq!(tracker.last_value(a, U256::from(0)), Some(U256::from(42)));
-        tracker.observe(a, U256::from(0), U256::from(99));
+        tracker.observe(a, U256::from(0), U256::from(99), 1);
         assert_eq!(tracker.last_value(a, U256::from(0)), Some(U256::from(99)));
+    }
+
+    // --- T7: probabilistic should_refetch coverage -------------------------
+
+    /// Insert a fully-specified observation so the probabilistic branch can be
+    /// tested with an exact `change_rate = change_count / observation_count` and
+    /// a known `last_checked`, without replaying an `observe` sequence.
+    fn seed_obs(
+        tracker: &mut SlotObservationTracker,
+        a: Address,
+        slot: U256,
+        observation_count: u32,
+        change_count: u32,
+        last_checked: u64,
+    ) {
+        tracker.observations.insert(
+            SlotKey { address: a, slot },
+            SlotObservation {
+                last_value: U256::from(1),
+                observation_count,
+                change_count,
+                last_checked,
+                last_changed: last_checked,
+            },
+        );
+    }
+
+    #[test]
+    fn test_probabilistic_refetches_at_now_equals_last_checked() {
+        // change_rate = 3/20 = 0.15. At now == last_checked, units_elapsed = 0 so
+        // cycles_elapsed clamps to 1.0; expected = 0.15 > 0.05 → refetch.
+        let mut tracker = SlotObservationTracker::new();
+        let p = params();
+        let a = addr(1);
+        let slot = U256::from(7);
+        seed_obs(&mut tracker, a, slot, 20, 3, 100);
+        // Sanity: this is the probabilistic branch (between never and always).
+        assert!((3.0_f64 / 20.0) < p.always_refetch_rate);
+        assert!(tracker.should_refetch(a, slot, 100, &p));
+    }
+
+    #[test]
+    fn test_probabilistic_reuses_then_refetches_after_elapsed() {
+        // change_rate = 1/100 = 0.01. At now == last_checked, expected = 0.01 <
+        // 0.05 → reuse. After 10 cycles elapsed (cycle_interval = 1), expected =
+        // 0.01 * 10 = 0.10 > 0.05 → refetch. Stays within max_reuse (300).
+        let mut tracker = SlotObservationTracker::new();
+        let p = params();
+        let a = addr(1);
+        let slot = U256::from(7);
+        seed_obs(&mut tracker, a, slot, 100, 1, 100);
+
+        // Immediately: reused.
+        assert!(!tracker.should_refetch(a, slot, 100, &p));
+        // After a few units: still under threshold (0.01 * 4 = 0.04 < 0.05).
+        assert!(!tracker.should_refetch(a, slot, 104, &p));
+        // After enough units: over threshold (0.01 * 10 = 0.10 > 0.05).
+        assert!(tracker.should_refetch(a, slot, 110, &p));
+    }
+
+    #[test]
+    fn test_probabilistic_cycle_interval_scaling() {
+        // change_rate = 1/100 = 0.01, cycle_interval = 10. cycles_elapsed =
+        // units_elapsed / 10, so it takes 10x more elapsed units than a unit
+        // cycle to cross the 0.05 threshold.
+        let mut tracker = SlotObservationTracker::new();
+        let p = FreshnessParams {
+            cycle_interval: 10,
+            ..FreshnessParams::default()
+        };
+        let a = addr(1);
+        let slot = U256::from(7);
+        seed_obs(&mut tracker, a, slot, 100, 1, 100);
+
+        // 60 units elapsed → 6 cycles → expected = 0.06 > 0.05 → refetch.
+        assert!(tracker.should_refetch(a, slot, 160, &p));
+        // 40 units elapsed → 4 cycles → expected = 0.04 < 0.05 → reuse. (Under a
+        // unit cycle_interval this same 40-unit gap would be 40 cycles and would
+        // refetch — proving the cycle_interval scaling is applied.)
+        assert!(!tracker.should_refetch(a, slot, 140, &p));
+        let unit = FreshnessParams::default();
+        assert!(
+            tracker.should_refetch(a, slot, 140, &unit),
+            "with cycle_interval = 1 the same elapsed gap refetches"
+        );
     }
 }

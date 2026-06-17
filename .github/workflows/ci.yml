@@ -10,7 +10,7 @@ env:
 
 jobs:
   check:
-    name: test / clippy / fmt / docs
+    name: release gates
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -29,10 +29,45 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets --no-deps -- -D warnings
 
-      - name: Tests
-        run: cargo test
+      # The generic engine must build and lint cleanly without the `protocols`
+      # feature (which gates the DeFi-specific surface).
+      - name: Clippy (no default features)
+        run: cargo clippy --lib --no-default-features --no-deps -- -D warnings
+
+      - name: Tests (all targets)
+        run: cargo test --all-targets
+
+      - name: Tests (no default features)
+        run: cargo test --no-default-features
+
+      - name: Doc tests
+        run: cargo test --doc
 
       - name: Docs
         run: cargo doc --no-deps
         env:
           RUSTDOCFLAGS: "-D warnings"
+
+      - name: Benchmarks compile
+        run: cargo bench --no-run
+
+      - name: Package
+        run: cargo package --locked
+
+  msrv:
+    name: msrv (1.88)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust 1.88 (declared MSRV)
+        uses: dtolnay/rust-toolchain@1.88.0
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      # The published library must build on the MSRV advertised in Cargo.toml.
+      # Scoped to --lib so the dev-only example/bench toolchain requirements
+      # (e.g. criterion) do not constrain the consumer-facing MSRV.
+      - name: Check library builds on MSRV
+        run: cargo check --lib --locked

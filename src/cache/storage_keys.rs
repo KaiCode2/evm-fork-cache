@@ -64,6 +64,27 @@ pub const V2_RESERVES_SLOT: U256 = U256::from_limbs([8, 0, 0, 0]);
 ///
 /// tickBitmap is a `mapping(int16 => uint256)` at base slot 6.
 /// For a mapping at slot `p`, the value for key `k` is at `keccak256(abi.encode(k, p))`.
+///
+/// This is the convenience wrapper over
+/// [`v3_tick_bitmap_storage_key_with_base`] pinned to
+/// [`V3_TICK_BITMAP_BASE_SLOT`].
+///
+/// # Examples
+///
+/// ```
+/// use evm_fork_cache::cache::{
+///     v3_tick_bitmap_storage_key, v3_tick_bitmap_storage_key_with_base,
+///     V3_TICK_BITMAP_BASE_SLOT,
+/// };
+///
+/// // Equivalent to calling the `_with_base` form with the default base slot.
+/// assert_eq!(
+///     v3_tick_bitmap_storage_key(3),
+///     v3_tick_bitmap_storage_key_with_base(3, V3_TICK_BITMAP_BASE_SLOT),
+/// );
+/// // The key is deterministic and distinct per word position.
+/// assert_ne!(v3_tick_bitmap_storage_key(3), v3_tick_bitmap_storage_key(-3));
+/// ```
 pub fn v3_tick_bitmap_storage_key(word_position: i16) -> U256 {
     v3_tick_bitmap_storage_key_with_base(word_position, V3_TICK_BITMAP_BASE_SLOT)
 }
@@ -71,6 +92,22 @@ pub fn v3_tick_bitmap_storage_key(word_position: i16) -> U256 {
 /// Compute the storage key for a V3-style tickBitmap entry with a custom base slot.
 ///
 /// PancakeSwap V3 uses base slot 7 instead of Uniswap V3's slot 6.
+///
+/// The key is `keccak256(abi.encode(int256(word_position), base_slot))`, so a
+/// different `base_slot` yields a different key for the same word position.
+///
+/// # Examples
+///
+/// ```
+/// use evm_fork_cache::cache::{
+///     v3_tick_bitmap_storage_key_with_base, V3_TICK_BITMAP_BASE_SLOT,
+///     PANCAKE_V3_TICK_BITMAP_BASE_SLOT,
+/// };
+///
+/// let uniswap = v3_tick_bitmap_storage_key_with_base(10, V3_TICK_BITMAP_BASE_SLOT);
+/// let pancake = v3_tick_bitmap_storage_key_with_base(10, PANCAKE_V3_TICK_BITMAP_BASE_SLOT);
+/// assert_ne!(uniswap, pancake);
+/// ```
 pub fn v3_tick_bitmap_storage_key_with_base(word_position: i16, base_slot: U256) -> U256 {
     let word_i256 = i256_from_i16(word_position);
     let mut preimage = [0u8; 64];
@@ -84,13 +121,41 @@ pub fn v3_tick_bitmap_storage_key_with_base(word_position: i16, base_slot: U256)
 /// The ticks mapping is at slot 5: `mapping(int24 => Tick.Info)`
 /// Storage key: `keccak256(abi.encode(int256(tick), uint256(5)))`
 /// The Tick.Info struct occupies 4 consecutive slots starting from the base.
+///
+/// This is the convenience wrapper over [`v3_tick_info_storage_keys_with_base`]
+/// pinned to [`V3_TICKS_BASE_SLOT`].
+///
+/// # Examples
+///
+/// ```
+/// use evm_fork_cache::cache::v3_tick_info_storage_keys;
+/// use alloy_primitives::U256;
+///
+/// let keys = v3_tick_info_storage_keys(0);
+/// // The four slots are consecutive, starting from the hashed base.
+/// assert_eq!(keys[1], keys[0] + U256::from(1));
+/// assert_eq!(keys[2], keys[0] + U256::from(2));
+/// assert_eq!(keys[3], keys[0] + U256::from(3));
+/// ```
 pub fn v3_tick_info_storage_keys(tick: i32) -> [U256; 4] {
     v3_tick_info_storage_keys_with_base(tick, V3_TICKS_BASE_SLOT)
 }
 
 /// Compute the storage slot keys for a V3-style tick's Info struct with a custom ticks mapping slot.
 ///
-/// PancakeSwap V3 uses ticks at slot 6 instead of Uniswap V3's slot 5.
+/// PancakeSwap V3 uses ticks at slot 6 instead of Uniswap V3's slot 5. The four
+/// returned keys are consecutive, starting from
+/// `keccak256(abi.encode(int256(tick), ticks_slot))`.
+///
+/// # Examples
+///
+/// ```
+/// use evm_fork_cache::cache::{v3_tick_info_storage_keys_with_base, V3_TICKS_BASE_SLOT};
+/// use alloy_primitives::U256;
+///
+/// let keys = v3_tick_info_storage_keys_with_base(-100, V3_TICKS_BASE_SLOT);
+/// assert_eq!(keys[3], keys[0] + U256::from(3));
+/// ```
 pub fn v3_tick_info_storage_keys_with_base(tick: i32, ticks_slot: U256) -> [U256; 4] {
     let tick_i256 = i256_from_i24(tick);
     let mut preimage = [0u8; 64];
