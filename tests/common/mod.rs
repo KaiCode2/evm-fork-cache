@@ -6,7 +6,7 @@
 #![allow(dead_code)]
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 
 use alloy_eips::BlockId;
 use alloy_primitives::{Address, Bytes, U256, hex};
@@ -128,19 +128,64 @@ pub fn failing_fetcher() -> StorageBatchFetchFn {
     })
 }
 
-/// Build a stub [`StorageBatchFetchFn`] that reports chosen values *and* flips a
-/// shared flag the first time it is called.
+/// A one-shot synchronous gate: a holder blocks in [`wait`](Gate::wait) until
+/// some other thread calls [`release`](Gate::release). Cloning shares the same
+/// underlying state, and `release` is sticky — once released, every present and
+/// future `wait` returns immediately.
 ///
-/// Used by the Drop-abort test to prove the background validator was cancelled
-/// before it ever fetched (so it could not have queued a correction). The
-/// returned values otherwise behave exactly like [`stub_fetcher`].
-pub fn tracking_fetcher(
+/// Used by the Drop-abort test to make the background validator's fetch
+/// deterministically ordered *after* the drop. The fetcher (running on a worker
+/// thread) cannot return — and therefore the validator cannot reach its
+/// post-fetch checkpoint — until the test has dropped the `SpeculativeSim` and
+/// released the gate, eliminating the spawn/poll race regardless of how the
+/// multi-thread scheduler interleaves the two threads.
+///
+/// Built on a `Mutex<bool>` + `Condvar` so the whole thing is `Send + Sync`,
+/// which a [`StorageBatchFetchFn`] closure must be.
+#[derive(Clone, Default)]
+pub struct Gate {
+    inner: Arc<(Mutex<bool>, Condvar)>,
+}
+
+impl Gate {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Block until [`release`](Gate::release) has been called (returns
+    /// immediately if it already has).
+    pub fn wait(&self) {
+        let (lock, cv) = &*self.inner;
+        let mut released = lock.lock().unwrap_or_else(|e| e.into_inner());
+        while !*released {
+            released = cv.wait(released).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
+    /// Wake any current waiter and let all future waiters pass.
+    pub fn release(&self) {
+        let (lock, cv) = &*self.inner;
+        *lock.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        cv.notify_all();
+    }
+}
+
+/// Build a stub [`StorageBatchFetchFn`] that reports chosen values but blocks on
+/// `gate` before returning.
+///
+/// Used by the Drop-abort test: by releasing the gate only *after* dropping the
+/// `SpeculativeSim`, the test guarantees the validator's fetch completes (and so
+/// its post-fetch, correction-queuing checkpoint runs) strictly after the
+/// cancel flag is set — so the dropped speculation can never queue a correction,
+/// no matter how the scheduler races the two threads. The returned values
+/// otherwise behave exactly like [`stub_fetcher`].
+pub fn gated_tracking_fetcher(
     values: HashMap<(Address, U256), U256>,
-    called: Arc<std::sync::atomic::AtomicBool>,
+    gate: Gate,
 ) -> StorageBatchFetchFn {
     Arc::new(
         move |requests: Vec<(Address, U256)>, _block: Option<BlockId>| {
-            called.store(true, std::sync::atomic::Ordering::SeqCst);
+            gate.wait();
             requests
                 .into_iter()
                 .map(|(addr, slot)| {
