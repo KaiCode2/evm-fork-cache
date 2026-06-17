@@ -10,13 +10,15 @@
 //!   via `inject_storage_batch` (`populated_cache_layer2`), the way a fork cache
 //!   actually holds it. For each size it benches both the COW `create_snapshot`
 //!   and the retained `create_snapshot_deep_clone`. The deep clone is an O(total
-//!   state) copy, so its cost slopes up with the index size; the COW path folds
-//!   only the (empty) hot layer over an `Arc`-shared memoized base, so after the
-//!   base is warm it should stay roughly **flat** across sizes.
+//!   state) copy, so its cost slopes up with the index size; the COW path shares
+//!   the memoized base and avoids cloning total storage slots. It still scans
+//!   accounts and new layer-1 entries, so it should be much flatter than the deep
+//!   clone, especially as slots/account grows, but not strictly flat by account
+//!   count.
 //! - **`resnapshot_hot_loop`.** Warms the base with one snapshot, applies a small
 //!   `apply_updates` layer-1 mutation, then measures `create_snapshot`. This is
-//!   the memoization win: ≈ O(changed) and flat across cold-index size, vs. the
-//!   deep clone's slope.
+//!   the memoization win: the COW path avoids cloning cold storage slots but
+//!   remains sensitive to account scans and new layer-1 entries.
 //! - **`overlay_fanout`.** Measures fanning one frozen snapshot out into many
 //!   isolated simulations, comparing a fresh `EvmOverlay::new` per sim against a
 //!   single `reset()`-recycled overlay (Pillar A.2).
@@ -81,9 +83,9 @@ fn populated_cache_layer2(rt: &Runtime, accounts: usize, slots_per: usize) -> Ev
 /// A/B snapshot creation across cold-index sizes: the COW `create_snapshot` vs.
 /// the retained `create_snapshot_deep_clone`, both over a layer-2-seeded index.
 ///
-/// The deep clone slopes up with the index; the COW path, after a warm-up
-/// snapshot has memoized the base, should stay roughly flat (the hot layer is
-/// empty, so it is an `Arc` handle copy plus the O(accounts) growth scan).
+/// The deep clone slopes up with total slots; the COW path, after a warm-up
+/// snapshot has memoized the base, avoids cloning those slots but still pays the
+/// O(accounts) growth scan.
 fn bench_create_snapshot(c: &mut Criterion) {
     let rt = Runtime::new().unwrap();
     let mut group = c.benchmark_group("create_snapshot");
@@ -115,7 +117,8 @@ fn bench_create_snapshot(c: &mut Criterion) {
 
 /// The memoization win: a hot re-snapshot loop. Warm the base once, apply a
 /// *small* layer-1 mutation, then measure `create_snapshot`. Cost should track
-/// the changed state (≈ flat across cold-index size), unlike the deep clone.
+/// account scanning plus new layer-1 entries, staying much flatter than the deep
+/// clone as cold storage grows.
 fn bench_resnapshot_hot_loop(c: &mut Criterion) {
     let rt = Runtime::new().unwrap();
     let mut group = c.benchmark_group("resnapshot_hot_loop");

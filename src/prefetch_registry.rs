@@ -16,6 +16,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use alloy_primitives::{Address, U256};
+use anyhow::{Context as _, Result};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
@@ -80,36 +81,27 @@ impl PrefetchRegistry {
     /// Persist the registry to `path` in bincode format, creating parent
     /// directories as needed.
     ///
-    /// This is best-effort: I/O and serialization failures (unwritable parent
-    /// directory, failed write, or a serialization error) are logged at `warn`
-    /// and swallowed rather than returned, so a save failure leaves stale or
-    /// missing on-disk data that [`load`](Self::load) will silently treat as an
-    /// empty registry on the next cycle.
-    pub fn save(&self, path: &Path) {
-        if let Some(parent) = path.parent()
-            && let Err(e) = std::fs::create_dir_all(parent)
-        {
-            warn!(error = %e, "Failed to create prefetch registry directory");
-            return;
+    /// Returns an error if the parent directory cannot be created, serialization
+    /// fails, or the write fails.
+    pub fn save(&self, path: &Path) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!("failed to create prefetch registry directory {parent:?}")
+            })?;
         }
-        match bincode::serialize(self) {
-            Ok(data) => {
-                if let Err(e) = std::fs::write(path, data) {
-                    warn!(error = %e, "Failed to persist prefetch registry");
-                } else {
-                    let total_slots: usize =
-                        self.phases.values().map(|al| al.slots.len()).sum::<usize>()
-                            + self
-                                .keyed_phases
-                                .values()
-                                .flat_map(|m| m.values())
-                                .map(|al| al.slots.len())
-                                .sum::<usize>();
-                    debug!(total_slots, "Saved prefetch registry");
-                }
-            }
-            Err(e) => warn!(error = %e, "Failed to serialize prefetch registry"),
-        }
+        let data = bincode::serialize(self).context("failed to serialize prefetch registry")?;
+        std::fs::write(path, data)
+            .with_context(|| format!("failed to persist prefetch registry to {path:?}"))?;
+
+        let total_slots: usize = self.phases.values().map(|al| al.slots.len()).sum::<usize>()
+            + self
+                .keyed_phases
+                .values()
+                .flat_map(|m| m.values())
+                .map(|al| al.slots.len())
+                .sum::<usize>();
+        debug!(total_slots, "Saved prefetch registry");
+        Ok(())
     }
 
     /// Record the aggregated access list for `phase`, **overwriting** any access
@@ -352,7 +344,7 @@ mod tests {
         sal.slots.insert((key, U256::from(99)));
         registry.record_keyed("per_target", key, sal);
 
-        registry.save(&path);
+        registry.save(&path).expect("save registry");
 
         let loaded = PrefetchRegistry::load(&path);
         assert_eq!(loaded.phases.len(), 1);
@@ -372,6 +364,26 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn save_reports_write_failures() {
+        let dir = std::env::temp_dir().join("evm_fork_cache_test_prefetch_registry_write_error");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&dir);
+        std::fs::write(&dir, b"not a directory").expect("create file path conflict");
+
+        let registry = PrefetchRegistry::default();
+        let path = dir.join("registry.bin");
+        let err = registry
+            .save(&path)
+            .expect_err("save must report write failure");
+        assert!(
+            err.to_string().contains("directory") || err.to_string().contains("Not a directory"),
+            "unexpected error: {err:#}"
+        );
+
+        let _ = std::fs::remove_file(&dir);
     }
 
     #[test]

@@ -248,7 +248,7 @@ async fn purge_account_drops_account_and_storage_from_both_layers() -> Result<()
     );
     // Account gone from the backend accounts map.
     {
-        let accounts = cache.blockchain_db().accounts().read();
+        let accounts = cache.unchecked_blockchain_db().accounts().read();
         assert!(!accounts.contains_key(&token), "backend account removed");
     }
 
@@ -1572,8 +1572,8 @@ async fn run_unverified_without_fetcher() -> Result<()> {
     // A `from_backend` cache exposes no fetcher (no provider captured).
     let base = cache_with_balance(token, owner, U256::from(1000)).await?;
     let mut cache = EvmCache::from_backend(
-        base.backend().clone(),
-        base.blockchain_db().clone(),
+        base.unchecked_backend().clone(),
+        base.unchecked_blockchain_db().clone(),
         None,
         base.chain_id(),
         None,

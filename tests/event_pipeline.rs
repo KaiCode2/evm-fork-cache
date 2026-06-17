@@ -9,7 +9,7 @@
 //!
 //! Layering vocabulary mirrors `tests/state_update.rs`:
 //! - **layer 1 / overlay** = the CacheDB overlay (`db_mut().cache.accounts`).
-//! - **layer 2 / backend** = the BlockchainDb backend (`blockchain_db()`).
+//! - **layer 2 / backend** = the BlockchainDb backend (`unchecked_blockchain_db()`).
 
 mod common;
 
@@ -41,7 +41,7 @@ fn mapping_slot(owner: Address, mapping_slot: u64) -> U256 {
 /// Value of a slot in the BlockchainDb backend (layer 2) only.
 fn backend_slot(cache: &EvmCache, addr: Address, slot: U256) -> Option<U256> {
     cache
-        .blockchain_db()
+        .unchecked_blockchain_db()
         .storage()
         .read()
         .get(&addr)

@@ -5,19 +5,24 @@
 //! and write a compact binary file. On load, we populate BlockchainDb directly,
 //! then seed bytecodes from the separate bytecodes.bin cache.
 //!
-//! The file format is raw bincode with no version header or magic bytes, so it
-//! is not migratable: a cache written by a build with a different struct layout
-//! decodes as a failure (cache miss) rather than being upgraded in place.
+//! The file format is a tiny crate-specific envelope (magic bytes + version)
+//! followed by bincode payload. Unknown magic/version values are cache misses.
 
 use std::path::Path;
 use std::time::Instant;
 
 use alloy_primitives::map::HashMap;
 use alloy_primitives::{Address, B256, U256};
+use anyhow::{Context as _, Result};
 use foundry_fork_db::BlockchainDb;
 use revm::state::AccountInfo;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
+
+use super::versioned;
+
+const BINARY_STATE_MAGIC: &[u8; 8] = b"EFCSTAT\0";
+const BINARY_STATE_VERSION: u32 = 1;
 
 /// Binary-serializable EVM state. Stores accounts without bytecode (bytecodes
 /// are loaded separately from bytecodes.bin) and all storage slots.
@@ -42,16 +47,14 @@ struct BinaryAccountInfo {
 /// and persisted separately to `bytecodes.bin`; the saved account info keeps
 /// only the `code_hash`.
 ///
-/// Errors are logged at `warn` level and otherwise swallowed: serialization
-/// failures, parent-directory creation failures, and write failures all return
-/// without signalling to the caller, so a failed save is indistinguishable from
-/// a successful one at the call site.
+/// Returns an error if serialization, parent-directory creation, or writing
+/// fails, so explicit flush callers can distinguish a successful save from a
+/// stale or missing on-disk cache.
 ///
-/// The on-disk format is raw bincode with no version header, so it is not
-/// forward/backward compatible: a file written by a build with a different
-/// layout will fail to decode on load (treated as a cache miss) rather than
+/// The on-disk format carries magic bytes and a version number before the
+/// bincode payload. Unknown versions are treated as a cache miss rather than
 /// being migrated.
-pub fn save_binary_state(blockchain_db: &BlockchainDb, path: &Path) {
+pub fn save_binary_state(blockchain_db: &BlockchainDb, path: &Path) -> Result<()> {
     let start = Instant::now();
 
     let accounts: Vec<(Address, BinaryAccountInfo)> = blockchain_db
@@ -79,27 +82,28 @@ pub fn save_binary_state(blockchain_db: &BlockchainDb, path: &Path) {
 
     let state = BinaryEvmState { accounts, storage };
 
-    match bincode::serialize(&state) {
-        Ok(data) => {
-            if let Some(parent) = path.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            match std::fs::write(path, &data) {
-                Ok(()) => {
-                    let ms = start.elapsed().as_millis();
-                    debug!(
-                        accounts = state.accounts.len(),
-                        storage_contracts = state.storage.len(),
-                        bytes = data.len(),
-                        save_ms = ms,
-                        "Saved binary EVM state"
-                    );
-                }
-                Err(e) => warn!(error = %e, "Failed to write binary EVM state"),
-            }
-        }
-        Err(e) => warn!(error = %e, "Failed to serialize binary EVM state"),
+    let data = versioned::encode(
+        BINARY_STATE_MAGIC,
+        BINARY_STATE_VERSION,
+        &state,
+        "binary EVM state",
+    )?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create binary EVM state directory {parent:?}"))?;
     }
+    std::fs::write(path, &data)
+        .with_context(|| format!("failed to write binary EVM state to {path:?}"))?;
+
+    let ms = start.elapsed().as_millis();
+    debug!(
+        accounts = state.accounts.len(),
+        storage_contracts = state.storage.len(),
+        bytes = data.len(),
+        save_ms = ms,
+        "Saved binary EVM state"
+    );
+    Ok(())
 }
 
 /// Load binary EVM state and populate the BlockchainDb.
@@ -109,9 +113,8 @@ pub fn save_binary_state(blockchain_db: &BlockchainDb, path: &Path) {
 /// Bytecodes should be seeded separately from bytecodes.bin.
 ///
 /// Returns `false` (rather than erroring) when `path` cannot be read or its
-/// contents fail to decode as the expected bincode layout; a decode failure is
-/// logged at `warn` level. Because the format carries no version header, a file
-/// written by an incompatible build is reported as a decode failure here.
+/// contents fail the magic/version check or fail to decode as the expected
+/// bincode layout; failures are logged at `warn` level.
 pub fn load_binary_state(blockchain_db: &BlockchainDb, path: &Path) -> bool {
     let start = Instant::now();
 
@@ -120,12 +123,14 @@ pub fn load_binary_state(blockchain_db: &BlockchainDb, path: &Path) -> bool {
         Err(_) => return false,
     };
 
-    let state: BinaryEvmState = match bincode::deserialize(&data) {
-        Ok(s) => s,
-        Err(e) => {
-            warn!(?e, "Failed to decode binary EVM state, starting fresh");
-            return false;
-        }
+    let Some(state) = versioned::decode::<BinaryEvmState>(
+        &data,
+        BINARY_STATE_MAGIC,
+        BINARY_STATE_VERSION,
+        "binary EVM state",
+    ) else {
+        warn!("Failed to decode binary EVM state, starting fresh");
+        return false;
     };
 
     let account_count = state.accounts.len();
@@ -229,8 +234,18 @@ mod tests {
         }
 
         // Save
-        save_binary_state(&db, &path);
+        save_binary_state(&db, &path).expect("save binary state");
         assert!(path.exists());
+        let bytes = std::fs::read(&path).expect("read saved state");
+        assert!(
+            bytes.starts_with(b"EFCSTAT\0"),
+            "binary state cache must carry a magic header"
+        );
+        assert_eq!(
+            &bytes[8..12],
+            &1u32.to_le_bytes(),
+            "binary state cache must carry an explicit version"
+        );
 
         // Load into a fresh db
         let meta2 = BlockchainDbMeta::default();
@@ -266,6 +281,24 @@ mod tests {
     }
 
     #[test]
+    fn save_binary_state_reports_write_failures() {
+        let dir = std::env::temp_dir().join("evm_fork_cache_test_binary_state_write_error");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&dir);
+        std::fs::write(&dir, b"not a directory").expect("create file path conflict");
+
+        let db = BlockchainDb::new(BlockchainDbMeta::default(), None);
+        let path = dir.join("state.bin");
+        let err = save_binary_state(&db, &path).expect_err("save must report write failure");
+        assert!(
+            err.to_string().contains("directory") || err.to_string().contains("Not a directory"),
+            "unexpected error: {err:#}"
+        );
+
+        let _ = std::fs::remove_file(&dir);
+    }
+
+    #[test]
     fn test_load_missing_file_returns_false() {
         let meta = BlockchainDbMeta::default();
         let db = BlockchainDb::new(meta, None);
@@ -285,6 +318,27 @@ mod tests {
         let meta = BlockchainDbMeta::default();
         let db = BlockchainDb::new(meta, None);
         assert!(!load_binary_state(&db, &path));
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn load_legacy_raw_bincode_returns_false() {
+        let dir = std::env::temp_dir().join("evm_fork_cache_test_binary_state_legacy");
+        let path = dir.join("legacy.bin");
+        let _ = std::fs::create_dir_all(&dir);
+        let legacy = BinaryEvmState {
+            accounts: Vec::new(),
+            storage: Vec::new(),
+        };
+        std::fs::write(&path, bincode::serialize(&legacy).unwrap()).unwrap();
+
+        let db = BlockchainDb::new(BlockchainDbMeta::default(), None);
+        assert!(
+            !load_binary_state(&db, &path),
+            "unversioned legacy bincode must be treated as a cache miss"
+        );
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir(&dir);

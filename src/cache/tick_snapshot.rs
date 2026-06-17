@@ -12,7 +12,11 @@ use std::path::Path;
 use alloy_primitives::{Address, U256};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use tracing::warn;
+
+use super::versioned;
+
+const TICK_SNAPSHOT_CACHE_MAGIC: &[u8; 8] = b"EFCTICK\0";
+const TICK_SNAPSHOT_CACHE_VERSION: u32 = 1;
 
 /// Per-tick liquidity state for a UniswapV3-style concentrated-liquidity pool.
 ///
@@ -151,15 +155,16 @@ pub struct V3TickSnapshotCache {
 impl V3TickSnapshotCache {
     /// Load tick snapshot cache from disk (binary format).
     ///
-    /// Returns `None` if `path` cannot be read or its contents fail to decode as
-    /// bincode for this type; a decode failure is logged at `warn` level and
-    /// treated as a cache miss. The format has no version header, so a file from
-    /// an incompatible build also yields `None`.
+    /// Returns `None` if `path` cannot be read, fails the magic/version check, or
+    /// fails to decode as bincode for this type.
     pub fn load(path: &Path) -> Option<Self> {
         let data = std::fs::read(path).ok()?;
-        bincode::deserialize(&data)
-            .inspect_err(|e| warn!("Failed to parse V3 tick snapshot cache (bincode): {}", e))
-            .ok()
+        versioned::decode(
+            &data,
+            TICK_SNAPSHOT_CACHE_MAGIC,
+            TICK_SNAPSHOT_CACHE_VERSION,
+            "V3 tick snapshot cache",
+        )
     }
 
     /// Save tick snapshot cache to disk (binary format).
@@ -175,7 +180,12 @@ impl V3TickSnapshotCache {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let data = bincode::serialize(self)?;
+        let data = versioned::encode(
+            TICK_SNAPSHOT_CACHE_MAGIC,
+            TICK_SNAPSHOT_CACHE_VERSION,
+            self,
+            "V3 tick snapshot cache",
+        )?;
         std::fs::write(path, data)?;
         Ok(())
     }

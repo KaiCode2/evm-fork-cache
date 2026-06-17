@@ -219,7 +219,7 @@ async fn cow_snapshot_matches_deep_clone_through_mutations() -> Result<()> {
     //    `BlockchainDb` from inside foundry-fork-db, bypassing our write funnel):
     //    a brand-new account+slot, and a NEW slot on the existing `pool`.
     {
-        let bdb = cache.blockchain_db();
+        let bdb = cache.unchecked_blockchain_db();
         bdb.storage()
             .write()
             .entry(pool3)
@@ -275,7 +275,7 @@ async fn cow_snapshot_matches_deep_clone_through_mutations() -> Result<()> {
 }
 
 /// Escape-hatch re-honest hook (adversarial-review finding). A direct, out-of-band
-/// layer-2 write through `blockchain_db()` that overwrites an existing slot at an
+/// layer-2 write through `unchecked_blockchain_db()` that overwrites an existing slot at an
 /// unchanged slot count is the one mutation the count-based growth scan cannot see,
 /// so the memoized base can go stale. `invalidate_snapshot_base()` must restore
 /// read-equivalence with the deep-clone reference.
@@ -290,7 +290,7 @@ async fn invalidate_snapshot_base_rehonest_after_escape_hatch_write() -> Result<
 
     // Out-of-band overwrite at unchanged length (bypasses the write funnel).
     {
-        let bdb = cache.blockchain_db();
+        let bdb = cache.unchecked_blockchain_db();
         bdb.storage()
             .write()
             .entry(pool)
@@ -308,6 +308,195 @@ async fn invalidate_snapshot_base_rehonest_after_escape_hatch_write() -> Result<
         "invalidate_snapshot_base must re-honest the base after an out-of-band write"
     );
     assert_eq!(cow.storage_value(pool, slot), Some(U256::from(222u64)));
+    Ok(())
+}
+
+/// Escape-hatch re-honest hook for account-map overwrites. A direct update of an
+/// existing layer-2 account's balance/code at an unchanged account count is also
+/// invisible to the count/absence growth scan, so callers must invalidate the
+/// memoized base after the direct write lands.
+#[tokio::test(flavor = "multi_thread")]
+async fn invalidate_snapshot_base_rehonest_after_existing_account_write() -> Result<()> {
+    let mut cache = setup_cache().await?;
+    let account = Address::repeat_byte(0xA1);
+    let code_v1 = Bytecode::new_raw(Bytes::from(vec![0x60u8, 0x01]));
+    let code_v2 = Bytecode::new_raw(Bytes::from(vec![0x60u8, 0x02, 0x60, 0x03]));
+    let h1 = code_v1.hash_slow();
+    let h2 = code_v2.hash_slow();
+    assert_ne!(h1, h2);
+
+    let original = AccountInfo {
+        balance: U256::from(111u64),
+        nonce: 1,
+        code_hash: h1,
+        code: Some(code_v1.clone()),
+        account_id: None,
+    };
+    let updated = AccountInfo {
+        balance: U256::from(222u64),
+        nonce: 2,
+        code_hash: h2,
+        code: Some(code_v2.clone()),
+        account_id: None,
+    };
+
+    {
+        let bdb = cache.unchecked_blockchain_db();
+        bdb.accounts().write().insert(account, original.clone());
+    }
+    let warm = cache.create_snapshot(); // memoize the base with `original`.
+    let mut ov_warm = EvmOverlay::new(Arc::clone(&warm), None);
+    let warm_info = ov_warm
+        .basic(account)
+        .expect("warm basic")
+        .expect("warm account");
+    assert_eq!(warm_info.balance, original.balance);
+    assert_eq!(warm_info.nonce, original.nonce);
+    assert_eq!(warm_info.code_hash, h1);
+    assert_eq!(
+        ov_warm
+            .code_by_hash(h1)
+            .expect("warm code")
+            .original_bytes(),
+        code_v1.original_bytes()
+    );
+
+    // Out-of-band account overwrite at unchanged account count (bypasses the
+    // write funnel and is not detectable by the growth scan).
+    {
+        let bdb = cache.unchecked_blockchain_db();
+        let mut accounts = bdb.accounts().write();
+        assert!(
+            accounts.contains_key(&account),
+            "test must update an existing account"
+        );
+        let len_before = accounts.len();
+        accounts.insert(account, updated.clone());
+        assert_eq!(
+            accounts.len(),
+            len_before,
+            "test must keep the account count unchanged"
+        );
+    }
+
+    cache.invalidate_snapshot_base();
+    let cow = cache.create_snapshot();
+    let deep = cache.create_snapshot_deep_clone();
+    let mut ov_cow = EvmOverlay::new(Arc::clone(&cow), None);
+    let mut ov_deep = EvmOverlay::new(Arc::clone(&deep), None);
+
+    let cow_basic = ov_cow.basic(account).expect("cow basic");
+    let deep_basic = ov_deep.basic(account).expect("deep basic");
+    assert!(
+        account_eq(&cow_basic, &deep_basic),
+        "invalidate_snapshot_base must re-honest the base after an out-of-band account write: cow={cow_basic:?} deep={deep_basic:?}"
+    );
+    let cow_info = cow_basic.expect("updated cow account");
+    assert_eq!(cow_info.balance, updated.balance);
+    assert_eq!(cow_info.nonce, updated.nonce);
+    assert_eq!(cow_info.code_hash, h2);
+    assert_eq!(
+        ov_cow.code_by_hash(h2).expect("cow h2").original_bytes(),
+        ov_deep.code_by_hash(h2).expect("deep h2").original_bytes(),
+        "updated code hash must match the deep clone"
+    );
+    assert_eq!(
+        ov_cow.code_by_hash(h2).expect("cow h2").original_bytes(),
+        code_v2.original_bytes()
+    );
+    assert!(
+        ov_deep.code_by_hash(h1).expect("deep h1").is_empty(),
+        "sanity: deep clone drops the unreferenced old hash"
+    );
+    assert_eq!(
+        ov_cow.code_by_hash(h1).expect("cow h1").original_bytes(),
+        ov_deep.code_by_hash(h1).expect("deep h1").original_bytes(),
+        "the old code hash must not linger after invalidation"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn with_blockchain_db_mut_rehonest_after_storage_overwrite() -> Result<()> {
+    let mut cache = setup_cache().await?;
+    let pool = Address::repeat_byte(0x78);
+    let slot = U256::from(0u64);
+
+    cache.inject_storage_batch(&[(pool, slot, U256::from(111u64))]);
+    let _warm = cache.create_snapshot();
+
+    cache.with_blockchain_db_mut(|bdb| {
+        bdb.storage()
+            .write()
+            .entry(pool)
+            .or_default()
+            .insert(slot, U256::from(222u64));
+    });
+
+    let cow = cache.create_snapshot();
+    let deep = cache.create_snapshot_deep_clone();
+    assert_eq!(
+        cow.storage_value(pool, slot),
+        deep.storage_value(pool, slot),
+        "with_blockchain_db_mut must invalidate the COW base after storage writes"
+    );
+    assert_eq!(cow.storage_value(pool, slot), Some(U256::from(222u64)));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn with_blockchain_db_mut_rehonest_after_account_overwrite() -> Result<()> {
+    let mut cache = setup_cache().await?;
+    let account = Address::repeat_byte(0xA2);
+    let code_v1 = Bytecode::new_raw(Bytes::from(vec![0x60u8, 0x01]));
+    let code_v2 = Bytecode::new_raw(Bytes::from(vec![0x60u8, 0x02]));
+    let h1 = code_v1.hash_slow();
+    let h2 = code_v2.hash_slow();
+    let original = AccountInfo {
+        balance: U256::from(111u64),
+        nonce: 1,
+        code_hash: h1,
+        code: Some(code_v1),
+        account_id: None,
+    };
+    let updated = AccountInfo {
+        balance: U256::from(222u64),
+        nonce: 2,
+        code_hash: h2,
+        code: Some(code_v2.clone()),
+        account_id: None,
+    };
+
+    cache.with_blockchain_db_mut(|bdb| {
+        bdb.accounts().write().insert(account, original);
+    });
+    let _warm = cache.create_snapshot();
+
+    cache.with_blockchain_db_mut(|bdb| {
+        let mut accounts = bdb.accounts().write();
+        let len_before = accounts.len();
+        accounts.insert(account, updated.clone());
+        assert_eq!(accounts.len(), len_before);
+    });
+
+    let cow = cache.create_snapshot();
+    let deep = cache.create_snapshot_deep_clone();
+    let mut ov_cow = EvmOverlay::new(Arc::clone(&cow), None);
+    let mut ov_deep = EvmOverlay::new(Arc::clone(&deep), None);
+    let cow_basic = ov_cow.basic(account).expect("cow basic");
+    let deep_basic = ov_deep.basic(account).expect("deep basic");
+    assert!(
+        account_eq(&cow_basic, &deep_basic),
+        "with_blockchain_db_mut must invalidate the COW base after account writes: cow={cow_basic:?} deep={deep_basic:?}"
+    );
+    assert_eq!(
+        cow_basic.expect("updated cow account").balance,
+        updated.balance
+    );
+    assert_eq!(
+        ov_cow.code_by_hash(h2).expect("cow h2").original_bytes(),
+        code_v2.original_bytes()
+    );
     Ok(())
 }
 
@@ -330,7 +519,7 @@ async fn cow_code_index_matches_deep_clone_after_base_account_recoded() -> Resul
     // Seed a code-bearing account (code_v1) directly into the cold base (layer 2),
     // then re-honest the memoized base.
     let put_account = |cache: &EvmCache, code: &Bytecode, hash| {
-        cache.blockchain_db().accounts().write().insert(
+        cache.unchecked_blockchain_db().accounts().write().insert(
             contract,
             AccountInfo {
                 balance: U256::from(1u64),
