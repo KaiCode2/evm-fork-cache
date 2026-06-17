@@ -300,6 +300,7 @@ pub struct EvmCacheBuilder<P> {
     block: Option<BlockId>,
     cache_config: Option<CacheConfig>,
     spec_id: SpecId,
+    shared_memory_capacity: SharedMemoryCapacity,
 }
 
 impl<P> EvmCacheBuilder<P>
@@ -313,6 +314,7 @@ where
             block: None,
             cache_config: None,
             spec_id: SpecId::CANCUN,
+            shared_memory_capacity: SharedMemoryCapacity::default(),
         }
     }
 
@@ -354,9 +356,28 @@ where
         self
     }
 
+    /// Set how much EVM shared memory to pre-allocate per simulation context.
+    ///
+    /// Defaults to [`SharedMemoryCapacity::Fixed`]`(64_000)` (today's behavior).
+    /// Use `Fixed(n)` to pin a size, or [`SharedMemoryCapacity::Auto`] to size it
+    /// from the chain state loaded at [`build`](Self::build) time (e.g. a bincode
+    /// state file supplied via [`cache_config`](Self::cache_config)). See
+    /// [`SharedMemoryCapacity`] for the trade-offs.
+    pub fn shared_memory_capacity(mut self, capacity: SharedMemoryCapacity) -> Self {
+        self.shared_memory_capacity = capacity;
+        self
+    }
+
     /// Build the [`EvmCache`], fetching the pinned block's header for context.
     pub async fn build(self) -> EvmCache {
-        EvmCache::with_cache(self.provider, self.block, self.cache_config, self.spec_id).await
+        EvmCache::with_cache_capacity(
+            self.provider,
+            self.block,
+            self.cache_config,
+            self.spec_id,
+            self.shared_memory_capacity,
+        )
+        .await
     }
 }
 
@@ -368,10 +389,67 @@ type InspectorCacheEvm<'a, INSP> = revm::MainnetEvm<
     INSP,
 >;
 
-/// Default initial capacity for shared memory buffer.
-/// Set to 64KB based on profiling (16x the REVM default of 4KB).
-/// This eliminates reallocation during typical simulations with headroom.
-const DEFAULT_SHARED_MEMORY_CAPACITY: usize = 64 * 1024;
+/// Default initial capacity for the EVM shared-memory (working-memory) buffer.
+/// 64 kB, chosen from profiling a state-heavy workload (16x the revm default of
+/// 4 kB) so simulations rarely reallocate. Exposed for tuning via
+/// [`SharedMemoryCapacity`].
+const DEFAULT_SHARED_MEMORY_CAPACITY: usize = 64_000;
+
+/// How much EVM shared memory (per-context working memory) to pre-allocate for
+/// simulations.
+///
+/// revm grows its shared memory on demand during execution; pre-allocating just
+/// avoids repeated reallocations when simulations touch a lot of memory — the
+/// original motivation was a state-heavy workload where resizing was hot. The
+/// trade-off cuts both ways: a wide parallel fan-out of *small* simulations pays
+/// this much memory per overlay, so general users may want a smaller `Fixed` size,
+/// while state-heavy users can raise it or let it auto-size from the loaded state.
+///
+/// The default is `Fixed(64_000)` (today's behavior). Configure it on
+/// [`EvmCacheBuilder::shared_memory_capacity`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SharedMemoryCapacity {
+    /// Pre-allocate exactly this many bytes. The [`Default`] is `Fixed(64_000)`.
+    Fixed(usize),
+    /// Size the buffer from the amount of chain state loaded into the cache at
+    /// construction (e.g. from a bincode state file via
+    /// [`CacheConfig`]/[`EvmCacheBuilder::cache_config`]), clamped to a sane
+    /// floor/ceiling. Falls back to the floor when nothing is loaded.
+    ///
+    /// This is a heuristic proxy — persisted state size loosely correlates with the
+    /// working-set size of simulations over it, not an exact peak-memory model. Use
+    /// `Fixed` when you have profiled your workload.
+    Auto,
+}
+
+impl Default for SharedMemoryCapacity {
+    fn default() -> Self {
+        Self::Fixed(DEFAULT_SHARED_MEMORY_CAPACITY)
+    }
+}
+
+impl SharedMemoryCapacity {
+    /// Floor for [`Auto`](Self::Auto) (and the default fixed size): 64 kB.
+    pub const MIN_AUTO: usize = DEFAULT_SHARED_MEMORY_CAPACITY;
+    /// Ceiling for [`Auto`](Self::Auto): 4 MiB. A simulation that needs more than
+    /// this still works — revm grows the buffer past it on demand.
+    pub const MAX_AUTO: usize = 4 * 1024 * 1024;
+    /// Heuristic proxy: bytes of pre-allocated working memory per loaded storage
+    /// slot. Tune if profiling warrants.
+    const AUTO_BYTES_PER_SLOT: usize = 16;
+
+    /// Resolve to a concrete byte capacity. `loaded_slots` is the number of layer-2
+    /// storage slots present in the cache at construction (0 when nothing is
+    /// loaded); it is consulted only for [`Auto`](Self::Auto).
+    pub(crate) fn resolve(self, loaded_slots: usize) -> usize {
+        match self {
+            Self::Fixed(bytes) => bytes,
+            Self::Auto => loaded_slots
+                .saturating_mul(Self::AUTO_BYTES_PER_SLOT)
+                .clamp(Self::MIN_AUTO, Self::MAX_AUTO),
+        }
+    }
+}
 
 /// EVM cache with lazy-loading RPC backend.
 ///
@@ -452,6 +530,12 @@ pub struct EvmCache {
     /// uncontrolled lazy-fetch growth that bypasses the write funnel. Not
     /// serialized.
     base_storage_lens: HashMap<Address, usize>,
+    /// Resolved per-context EVM shared-memory pre-allocation (bytes), from the
+    /// [`SharedMemoryCapacity`] at construction (resolving `Auto` against the loaded
+    /// state). Propagated to each [`EvmSnapshot`] so snapshot-backed overlays
+    /// pre-allocate the same amount. See
+    /// [`shared_memory_capacity`](Self::shared_memory_capacity).
+    shared_memory_capacity: usize,
 }
 
 /// Outcome of a balance-delta-tracking simulation.
@@ -585,6 +669,31 @@ impl EvmCache {
         block: Option<BlockId>,
         cache_config: Option<CacheConfig>,
         spec_id: SpecId,
+    ) -> Self
+    where
+        P: Provider<AnyNetwork> + 'static,
+    {
+        Self::with_cache_capacity(
+            provider,
+            block,
+            cache_config,
+            spec_id,
+            SharedMemoryCapacity::default(),
+        )
+        .await
+    }
+
+    /// Like [`with_cache`](Self::with_cache) but takes an explicit
+    /// [`SharedMemoryCapacity`] controlling per-context EVM working-memory
+    /// pre-allocation. This is what [`EvmCacheBuilder::build`] calls; prefer the
+    /// builder. With [`SharedMemoryCapacity::Auto`] the buffer is sized from the
+    /// layer-2 storage loaded at construction (e.g. a bincode state file).
+    pub async fn with_cache_capacity<P>(
+        provider: Arc<P>,
+        block: Option<BlockId>,
+        cache_config: Option<CacheConfig>,
+        spec_id: SpecId,
+        shared_memory_capacity: SharedMemoryCapacity,
     ) -> Self
     where
         P: Provider<AnyNetwork> + 'static,
@@ -904,6 +1013,20 @@ impl EvmCache {
         // Extract chain_id from cache config if available, default to Arbitrum
         let chain_id = cache_config.as_ref().map(|c| c.chain_id).unwrap_or(42161);
 
+        // Resolve the shared-memory pre-allocation. For `Auto` we size from the
+        // amount of layer-2 chain state actually loaded (post-filter), so a large
+        // bincode state file yields a larger buffer; `Fixed` ignores the count.
+        let loaded_slots = match shared_memory_capacity {
+            SharedMemoryCapacity::Auto => blockchain_db
+                .storage()
+                .read()
+                .values()
+                .map(|s| s.len())
+                .sum(),
+            SharedMemoryCapacity::Fixed(_) => 0,
+        };
+        let shared_memory_capacity = shared_memory_capacity.resolve(loaded_slots);
+
         Self {
             backend,
             blockchain_db,
@@ -921,9 +1044,7 @@ impl EvmCache {
             coinbase,
             prevrandao,
             block_gas_limit,
-            shared_memory_buffer: Rc::new(RefCell::new(Vec::with_capacity(
-                DEFAULT_SHARED_MEMORY_CAPACITY,
-            ))),
+            shared_memory_buffer: Rc::new(RefCell::new(Vec::with_capacity(shared_memory_capacity))),
             rpc_caller: Some(rpc_caller),
             storage_batch_fetcher: Some(storage_batch_fetcher),
             batch_block_id,
@@ -933,6 +1054,7 @@ impl EvmCache {
             base_dirty: HashSet::new(),
             base_full_rebuild: false,
             base_storage_lens: HashMap::new(),
+            shared_memory_capacity,
         }
     }
 
@@ -1011,6 +1133,7 @@ impl EvmCache {
             base_dirty: HashSet::new(),
             base_full_rebuild: false,
             base_storage_lens: HashMap::new(),
+            shared_memory_capacity: DEFAULT_SHARED_MEMORY_CAPACITY,
         }
     }
 
@@ -2151,6 +2274,7 @@ impl EvmCache {
             chain_id: self.chain_id,
             timestamp: self.timestamp_override,
             spec_id: self.spec_id,
+            shared_memory_capacity: self.shared_memory_capacity,
         })
     }
 
@@ -2439,6 +2563,7 @@ impl EvmCache {
             chain_id: self.chain_id,
             timestamp: self.timestamp_override,
             spec_id: self.spec_id,
+            shared_memory_capacity: self.shared_memory_capacity,
         })
     }
 
@@ -3298,6 +3423,22 @@ impl EvmCache {
                 "Reserved shared memory buffer capacity"
             );
         }
+        drop(buffer);
+        // Record the high-water mark so snapshots taken afterwards propagate it to
+        // their overlays (snapshots copy the capacity at creation time).
+        self.shared_memory_capacity = self.shared_memory_capacity.max(capacity);
+    }
+
+    /// The resolved per-context EVM shared-memory pre-allocation, in bytes.
+    ///
+    /// This is the [`SharedMemoryCapacity`] configured on the
+    /// [`EvmCacheBuilder`] resolved to a concrete size (with
+    /// [`SharedMemoryCapacity::Auto`] resolved against the state loaded at
+    /// construction), raised by any later [`reserve_shared_memory`](Self::reserve_shared_memory).
+    /// Each [`create_snapshot`](Self::create_snapshot) copies it onto the snapshot
+    /// so snapshot-backed [`EvmOverlay`]s pre-allocate the same amount.
+    pub fn shared_memory_capacity(&self) -> usize {
+        self.shared_memory_capacity
     }
 
     /// Purge all storage slots for a specific pool from both cache layers.
@@ -4203,6 +4344,35 @@ fn extract_access_list(state: &revm::state::EvmState) -> AccessList {
         })
         .collect();
     AccessList(items)
+}
+
+#[cfg(test)]
+mod shared_memory_capacity_tests {
+    use super::SharedMemoryCapacity as Cap;
+
+    #[test]
+    fn default_is_fixed_64k() {
+        assert_eq!(Cap::default(), Cap::Fixed(64_000));
+    }
+
+    #[test]
+    fn fixed_ignores_loaded_slots() {
+        assert_eq!(Cap::Fixed(8_192).resolve(10_000_000), 8_192);
+        assert_eq!(Cap::Fixed(0).resolve(123), 0);
+    }
+
+    #[test]
+    fn auto_floors_clamps_and_scales() {
+        // Nothing / little loaded → floor.
+        assert_eq!(Cap::Auto.resolve(0), Cap::MIN_AUTO);
+        assert_eq!(Cap::Auto.resolve(1_000), Cap::MIN_AUTO); // 16 KB < 64 KB floor
+        // Linear region (16 bytes/slot).
+        assert_eq!(Cap::Auto.resolve(10_000), 160_000);
+        assert_eq!(Cap::Auto.resolve(100_000), 1_600_000);
+        // Ceiling.
+        assert_eq!(Cap::Auto.resolve(usize::MAX), Cap::MAX_AUTO);
+        assert_eq!(Cap::Auto.resolve(262_144), Cap::MAX_AUTO); // 262_144 * 16 == 4 MiB
+    }
 }
 
 #[cfg(all(test, feature = "protocols"))]
