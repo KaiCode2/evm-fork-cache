@@ -16,8 +16,8 @@ use alloy_sol_types::SolCall;
 use anyhow::Result;
 
 use common::{
-    MOCK_ERC20_BALANCE_SLOT, MockERC20, failing_fetcher, install_default_account,
-    install_mock_erc20, panicking_fetcher, setup_cache, stub_fetcher, tracking_fetcher,
+    Gate, MOCK_ERC20_BALANCE_SLOT, MockERC20, failing_fetcher, gated_tracking_fetcher,
+    install_default_account, install_mock_erc20, panicking_fetcher, setup_cache, stub_fetcher,
 };
 use evm_fork_cache::cache::{
     EvmCache, EvmOverlay, SimStatus, SlotObservationTracker, StorageBatchFetchFn,
@@ -73,11 +73,18 @@ async fn verify_slots_detects_and_injects_changes() -> Result<()> {
 
     let slot_a = U256::from(10);
     let slot_b = U256::from(20);
-    // Cache holds these values.
-    cache.inject_storage_batch(&[
-        (contract, slot_a, U256::from(100)),
-        (contract, slot_b, U256::from(200)),
-    ]);
+    // Cache holds these values, seeded OVERLAY-resident so they are EVM-visible:
+    // `contract` is a StorageCleared MockERC20, and after the §16.0 fix a
+    // backend-only `inject_storage_batch` seed on a StorageCleared account is
+    // shadowed to ZERO by `cached_storage_value` (it mirrors the EVM SLOAD). The
+    // test's intent is that the cache *holds* these values, so seed the layer that
+    // actually wins (mirrors `state_update::balance_tracking_scenario`).
+    cache
+        .db_mut()
+        .insert_account_storage(contract, slot_a, U256::from(100))?;
+    cache
+        .db_mut()
+        .insert_account_storage(contract, slot_b, U256::from(200))?;
 
     // Stub reports slot_a changed, slot_b unchanged.
     let values = HashMap::from([
@@ -115,7 +122,13 @@ async fn verify_slots_unchanged_returns_empty() -> Result<()> {
     install_mock_erc20(&mut cache, contract);
 
     let slot = U256::from(7);
-    cache.inject_storage_batch(&[(contract, slot, U256::from(42))]);
+    // Overlay-resident seed so the value is EVM-visible (see the note in
+    // `verify_slots_detects_and_injects_changes`): a backend-only seed on this
+    // StorageCleared MockERC20 would read as ZERO under the §16.0 fix, so the
+    // fetcher's matching 42 would (incorrectly) look like a 0 -> 42 change.
+    cache
+        .db_mut()
+        .insert_account_storage(contract, slot, U256::from(42))?;
     cache.set_storage_batch_fetcher(stub_fetcher(HashMap::from([(
         (contract, slot),
         U256::from(42),
@@ -235,7 +248,7 @@ async fn purge_account_drops_account_and_storage_from_both_layers() -> Result<()
     );
     // Account gone from the backend accounts map.
     {
-        let accounts = cache.blockchain_db().accounts().read();
+        let accounts = cache.unchecked_blockchain_db().accounts().read();
         assert!(!accounts.contains_key(&token), "backend account removed");
     }
 
@@ -322,7 +335,13 @@ async fn cache_with_balance(token: Address, owner: Address, balance: U256) -> Re
     install_default_account(&mut cache, owner);
     install_mock_erc20(&mut cache, token);
     if balance > U256::ZERO {
-        cache.inject_storage_batch(&[(token, balance_slot_for(owner), balance)]);
+        // Overlay-resident seed so the balance is EVM-visible: `token` is a
+        // StorageCleared MockERC20, so a backend-only seed reads as ZERO via the
+        // account_state-aware read path (invisible to the optimistic sim and the
+        // snapshot). Mirrors `state_update::balance_tracking_scenario`.
+        cache
+            .db_mut()
+            .insert_account_storage(token, balance_slot_for(owner), balance)?;
     }
     Ok(cache)
 }
@@ -377,10 +396,14 @@ async fn run_mismatch_path_corrected_only_affected_rerun() -> Result<()> {
     install_default_account(&mut cache, owner2);
     install_mock_erc20(&mut cache, token);
     install_mock_erc20(&mut cache, token2);
-    cache.inject_storage_batch(&[
-        (token, balance_slot_for(owner), U256::from(1000)),
-        (token2, balance_slot_for(owner2), U256::from(5000)),
-    ]);
+    // Overlay-resident seeds (EVM-visible): both tokens are StorageCleared, so a
+    // backend-only seed would read ZERO via the account_state-aware read path.
+    cache
+        .db_mut()
+        .insert_account_storage(token, balance_slot_for(owner), U256::from(1000))?;
+    cache
+        .db_mut()
+        .insert_account_storage(token2, balance_slot_for(owner2), U256::from(5000))?;
 
     // Fetcher: owner's balance slot DROPPED to 50 (< the 100 transfer, so the
     // re-run now reverts); owner2's slot unchanged; recipient slots read as zero
@@ -547,7 +570,15 @@ async fn run_drains_pending_on_next_run() -> Result<()> {
     install_default_account(&mut cache, Address::ZERO);
     install_default_account(&mut cache, owner);
     install_mock_erc20(&mut cache, token);
-    cache.inject_storage_batch(&[(token, balance_slot_for(owner), U256::from(1000))]);
+    // Overlay-resident seed so the balance is EVM-visible on the StorageCleared
+    // token account (see the note in `verify_slots_detects_and_injects_changes`):
+    // after the §16.0 fix, a backend-only `inject_storage_batch` seed here reads as
+    // ZERO via `cached_storage_value` (mirroring the SLOAD), so the live-cache
+    // assertions below would observe 0 instead of the seeded value. This mirrors
+    // `state_update::balance_tracking_scenario`.
+    cache
+        .db_mut()
+        .insert_account_storage(token, balance_slot_for(owner), U256::from(1000))?;
     cache.set_storage_batch_fetcher(stub_fetcher(HashMap::from([(
         (token, balance_slot_for(owner)),
         U256::from(2000),
@@ -746,7 +777,11 @@ async fn optimistic_result_reports_status_per_outcome() -> Result<()> {
     install_default_account(&mut cache, owner);
     install_mock_erc20(&mut cache, token);
     let slot = balance_slot_for(owner);
-    cache.inject_storage_batch(&[(token, slot, U256::from(1000))]);
+    // Overlay-resident (EVM-visible) seed: `token` is a StorageCleared MockERC20,
+    // so a backend-only seed reads ZERO via the account_state-aware read path.
+    cache
+        .db_mut()
+        .insert_account_storage(token, slot, U256::from(1000))?;
     cache.set_storage_batch_fetcher(stub_fetcher(HashMap::from([(
         (token, slot),
         U256::from(1000),
@@ -802,7 +837,11 @@ async fn dropping_after_fetch_started_suppresses_correction() -> Result<()> {
     install_default_account(&mut cache, owner);
     install_mock_erc20(&mut cache, token);
     let slot = balance_slot_for(owner);
-    cache.inject_storage_batch(&[(token, slot, U256::from(1000))]);
+    // Overlay-resident (EVM-visible) seed: `token` is a StorageCleared MockERC20,
+    // so a backend-only seed reads ZERO via the account_state-aware read path.
+    cache
+        .db_mut()
+        .insert_account_storage(token, slot, U256::from(1000))?;
 
     // Two rendezvous: R1 = "fetch started", R2 = "released by the test". After R2
     // the fetcher reports a CHANGED balance, so absent the cancel the validator
@@ -882,7 +921,10 @@ async fn run_corrected_rerun_verifies_newly_read_volatile_slot() -> Result<()> {
     let slot_a = U256::from(0);
     let slot_b = U256::from(1);
     // Snapshot: A = 5 (nonzero) → optimistic takes "return A" and never reads B.
-    cache.inject_storage_batch(&[(contract, slot_a, U256::from(5))]);
+    // Overlay-resident (EVM-visible) seed: `contract` is StorageCleared.
+    cache
+        .db_mut()
+        .insert_account_storage(contract, slot_a, U256::from(5))?;
     // Fresh chain: A dropped to 0 (flips the branch) and B is 777.
     cache.set_storage_batch_fetcher(stub_fetcher(HashMap::from([
         ((contract, slot_a), U256::from(0)),
@@ -996,7 +1038,11 @@ async fn run_honors_tx_gas_limit() -> Result<()> {
     install_default_account(&mut cache, owner);
     install_mock_erc20(&mut cache, token);
     let slot = balance_slot_for(owner);
-    cache.inject_storage_batch(&[(token, slot, U256::from(1000))]);
+    // Overlay-resident (EVM-visible) seed: `token` is a StorageCleared MockERC20,
+    // so a backend-only seed reads ZERO via the account_state-aware read path.
+    cache
+        .db_mut()
+        .insert_account_storage(token, slot, U256::from(1000))?;
     cache.set_storage_batch_fetcher(stub_fetcher(HashMap::from([(
         (token, slot),
         U256::from(1000),
@@ -1036,11 +1082,17 @@ async fn validator_fetches_at_snapshot_block_despite_repin() -> Result<()> {
     install_default_account(&mut cache, owner);
     install_mock_erc20(&mut cache, token);
     cache.set_block(Some(block_n));
-    cache.inject_storage_batch(&[(token, slot, U256::from(1000))]);
+    // Overlay-resident seed so the balance is EVM-visible on the StorageCleared
+    // token account (see the note in `verify_slots_detects_and_injects_changes`):
+    // a backend-only seed would read as ZERO under the §16.0 `cached_storage_value`
+    // fix, failing the precondition below.
+    cache
+        .db_mut()
+        .insert_account_storage(token, slot, U256::from(1000))?;
     assert_eq!(
         cache.cached_storage_value(token, slot),
         Some(U256::from(1000)),
-        "PRECONDITION: seeded balance present after set_block + inject"
+        "PRECONDITION: seeded balance present after set_block + insert"
     );
 
     // Block-aware fetcher: the snapshot value (1000) at block N, a CHANGED value
@@ -1133,6 +1185,12 @@ async fn run_unverified_on_fetcher_error() -> Result<()> {
 // T3 (part 2): into_optimistic aborts the validation task. The fetcher WOULD
 // queue a correction (it reports a changed value), so if the abort failed we
 // would observe a non-zero pending queue. We assert it stays 0.
+//
+// Determinism mirrors the Drop-abort test below: the validator is allowed to
+// reach the synchronous fetch, but the gated fetch cannot return until after
+// `into_optimistic()` has set the cancel flag. That makes the product guarantee
+// precise: a cancel observed at the post-fetch checkpoint suppresses all
+// side-effects, including pending corrections and re-run accounting.
 #[tokio::test(flavor = "multi_thread")]
 async fn run_into_optimistic_aborts_validation() -> Result<()> {
     let token = Address::repeat_byte(0x44);
@@ -1140,11 +1198,12 @@ async fn run_into_optimistic_aborts_validation() -> Result<()> {
     let recipient = Address::repeat_byte(0x66);
 
     let mut cache = cache_with_balance(token, owner, U256::from(1000)).await?;
+    let gate = Gate::new();
     // A CHANGED value: if the validator ran, it would queue a correction.
-    cache.set_storage_batch_fetcher(stub_fetcher(HashMap::from([(
-        (token, balance_slot_for(owner)),
-        U256::from(50),
-    )])));
+    cache.set_storage_batch_fetcher(gated_tracking_fetcher(
+        HashMap::from([((token, balance_slot_for(owner)), U256::from(50))]),
+        gate.clone(),
+    ));
 
     let mut controller = FreshnessController::new(FreshnessRegistry::new(), AlwaysVerify);
     let sim = controller.run(
@@ -1156,6 +1215,7 @@ async fn run_into_optimistic_aborts_validation() -> Result<()> {
         )],
     )?;
     let results = sim.into_optimistic(); // aborts the background validation
+    gate.release();
     assert_eq!(results.len(), 1);
 
     // Give any (incorrectly) surviving task a chance to run, then assert no
@@ -1172,9 +1232,20 @@ async fn run_into_optimistic_aborts_validation() -> Result<()> {
 
 // T3 (part 1): dropping the SpeculativeSim (no validate/into_optimistic) aborts
 // the validation task before it can push a correction. The fetcher reports a
-// CHANGED value and flips a "called" flag; after the drop + settle we assert the
-// pending queue is empty (and, robustly, that the fetcher was never even
-// reached) — proving the abort beat the push.
+// CHANGED value, so an *uncancelled* validator would queue a correction and bump
+// the re-run count; we assert neither happens after the drop.
+//
+// Determinism: the validator's only correction-queuing path runs *after* its
+// fetch returns (the post-fetch cancel checkpoint in `run_validator` gates it).
+// We make that ordering race-free with a gate the test controls — the fetcher
+// blocks until `gate.release()`, and we release only *after* `drop(sim)` has set
+// the cancel flag. So however the multi-thread scheduler interleaves the spawned
+// task and this thread, the fetch (and thus the post-fetch checkpoint) can only
+// complete once cancellation is already observable, and the correction is
+// suppressed. We deliberately do NOT assert the fetcher was never reached: the
+// product only guarantees a cancel seen at a checkpoint suppresses side effects,
+// not that an in-flight fetch is skipped — asserting the latter was the original
+// over-strict, racy condition.
 #[tokio::test(flavor = "multi_thread")]
 async fn dropping_speculative_sim_aborts_before_queueing_correction() -> Result<()> {
     let token = Address::repeat_byte(0x44);
@@ -1182,10 +1253,10 @@ async fn dropping_speculative_sim_aborts_before_queueing_correction() -> Result<
     let recipient = Address::repeat_byte(0x66);
 
     let mut cache = cache_with_balance(token, owner, U256::from(1000)).await?;
-    let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    cache.set_storage_batch_fetcher(tracking_fetcher(
+    let gate = Gate::new();
+    cache.set_storage_batch_fetcher(gated_tracking_fetcher(
         HashMap::from([((token, balance_slot_for(owner)), U256::from(50))]),
-        Arc::clone(&called),
+        gate.clone(),
     ));
 
     let mut controller = FreshnessController::new(FreshnessRegistry::new(), AlwaysVerify);
@@ -1197,9 +1268,12 @@ async fn dropping_speculative_sim_aborts_before_queueing_correction() -> Result<
             transfer_calldata(recipient, U256::from(100)),
         )],
     )?;
-    // Drop immediately, with NO intervening await, so the abort flag is set
-    // before the spawned task is ever polled.
+    // Drop with NO intervening await, then release the gate. Releasing only after
+    // the drop guarantees the validator's fetch (if it even reaches it) returns
+    // strictly after the cancel flag is set, so its post-fetch checkpoint bails
+    // out before queuing anything.
     drop(sim);
+    gate.release();
 
     settle().await;
 
@@ -1207,10 +1281,6 @@ async fn dropping_speculative_sim_aborts_before_queueing_correction() -> Result<
         controller.pending_len(),
         0,
         "dropping the sim must abort validation before it queues a correction"
-    );
-    assert!(
-        !called.load(std::sync::atomic::Ordering::SeqCst),
-        "the aborted validator should never have reached the fetcher"
     );
     assert_eq!(controller.rerun_count(), 0, "no re-run after abort");
     Ok(())
@@ -1510,8 +1580,8 @@ async fn run_unverified_without_fetcher() -> Result<()> {
     // A `from_backend` cache exposes no fetcher (no provider captured).
     let base = cache_with_balance(token, owner, U256::from(1000)).await?;
     let mut cache = EvmCache::from_backend(
-        base.backend().clone(),
-        base.blockchain_db().clone(),
+        base.unchecked_backend().clone(),
+        base.unchecked_blockchain_db().clone(),
         None,
         base.chain_id(),
         None,
@@ -1661,6 +1731,125 @@ async fn on_new_block_ages_valid_through() -> Result<()> {
     assert!(
         matches!(sim.validate().await, Validation::Corrected { .. }),
         "after on_new_block(101) the slot is volatile and the change is caught"
+    );
+    Ok(())
+}
+
+// ===========================================================================
+// Phase 2 review (trust-contract hardening): the validator must NEVER return a
+// trusted verdict on incomplete/ambiguous verification.
+// ===========================================================================
+
+/// P2: a custom fetcher that OMITS a requested slot must yield `Unverified`, not
+/// a false `Confirmed`/`Corrected` (missing results must not default to zero).
+#[tokio::test(flavor = "multi_thread")]
+async fn run_unverified_when_fetcher_omits_requested_slot() -> Result<()> {
+    let token = Address::repeat_byte(0x11);
+    let owner = Address::repeat_byte(0x22);
+    let recipient = Address::repeat_byte(0x33);
+
+    let mut cache = cache_with_balance(token, owner, U256::from(1000)).await?;
+    // A fetcher that returns NOTHING — it omits every requested slot.
+    cache.set_storage_batch_fetcher(Arc::new(
+        |_req: Vec<(Address, U256)>, _block: Option<BlockId>| {
+            Vec::<(Address, U256, Result<U256>)>::new()
+        },
+    ));
+
+    let mut controller = FreshnessController::new(FreshnessRegistry::new(), AlwaysVerify);
+    let req = SimRequest::new(owner, token, transfer_calldata(recipient, U256::from(100)));
+    let sim = controller.run(&mut cache, vec![req])?;
+
+    let validation = sim.validate().await;
+    assert!(
+        matches!(validation, Validation::Unverified { .. }),
+        "a fetcher that omits a requested slot must yield Unverified, not a false \
+         confirmation/correction: {validation:?}"
+    );
+    assert_eq!(
+        controller.pending_len(),
+        0,
+        "Unverified must not queue any correction"
+    );
+    Ok(())
+}
+
+/// Build runtime bytecode that reads slots `0..n` in order, returning the first
+/// nonzero one (else zero). Reading slot `i+1` is gated on slot `i` being zero, so
+/// each correction (slot → 0) opens exactly one new volatile slot — driving the
+/// validator's fixed-point loop one round deeper per correction.
+fn chained_sload_bytecode(n: u8) -> Bytes {
+    let ret_dest = 8u16 * (n as u16) + 2; // JUMPDEST offset (after the chain + PUSH1 0)
+    assert!(ret_dest <= 255, "return dest must fit in PUSH1");
+    let ret = ret_dest as u8;
+    let mut code = Vec::new();
+    for i in 0..n {
+        code.extend_from_slice(&[0x60, i, 0x54, 0x80, 0x60, ret, 0x57, 0x50]);
+        // PUSH1 i; SLOAD; DUP1; PUSH1 ret; JUMPI (if nonzero -> return it); POP
+    }
+    code.extend_from_slice(&[0x60, 0x00]); // all zero: PUSH1 0
+    code.extend_from_slice(&[0x5b, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3]);
+    // JUMPDEST; PUSH1 0; MSTORE; PUSH1 0x20; PUSH1 0; RETURN (store TOS, return 32 bytes)
+    Bytes::from(code)
+}
+
+/// P1: when corrections keep opening new volatile slots past
+/// `MAX_VALIDATION_ROUNDS`, the validator must return `Unverified` — NOT a
+/// best-effort (trusted) `Corrected` resting on un-verified state — and must
+/// queue no corrections.
+#[tokio::test(flavor = "multi_thread")]
+async fn run_unverified_when_fixed_point_round_cap_exceeded() -> Result<()> {
+    use revm::state::{AccountInfo, Bytecode};
+
+    let mut cache = setup_cache().await?;
+    install_default_account(&mut cache, Address::ZERO);
+    let caller = Address::repeat_byte(0x66);
+    install_default_account(&mut cache, caller);
+
+    // A 12-deep chain: each corrected slot opens the next, so the loop needs one
+    // round per slot — exceeding the 8-round cap well before the chain runs out.
+    let contract = Address::repeat_byte(0x55);
+    let code = Bytecode::new_raw(chained_sload_bytecode(12));
+    let code_hash = code.hash_slow();
+    cache.db_mut().insert_account_info(
+        contract,
+        AccountInfo {
+            balance: U256::ZERO,
+            nonce: 0,
+            code: Some(code),
+            code_hash,
+            account_id: None,
+        },
+    );
+    cache
+        .db_mut()
+        .replace_account_storage(contract, Default::default())
+        .unwrap();
+    // Snapshot: slots 0..12 all nonzero (EVM-visible overlay seed). The optimistic
+    // run reads only slot 0 (nonzero → returns).
+    for i in 0..12u64 {
+        cache
+            .db_mut()
+            .insert_account_storage(contract, U256::from(i), U256::from(1))?;
+    }
+    // Fresh chain: every slot dropped to 0 (stub returns 0 for all), so each
+    // correction flips the next branch and the loop never reaches a fixed point.
+    cache.set_storage_batch_fetcher(stub_fetcher(HashMap::new()));
+
+    let mut controller = FreshnessController::new(FreshnessRegistry::new(), AlwaysVerify);
+    let req = SimRequest::new(caller, contract, Bytes::new());
+    let sim = controller.run(&mut cache, vec![req])?;
+
+    let validation = sim.validate().await;
+    assert!(
+        matches!(validation, Validation::Unverified { .. }),
+        "exceeding the fixed-point round cap must yield Unverified, not a trusted \
+         Corrected: {validation:?}"
+    );
+    assert_eq!(
+        controller.pending_len(),
+        0,
+        "an Unverified (cap-exceeded) validation must queue no corrections"
     );
     Ok(())
 }

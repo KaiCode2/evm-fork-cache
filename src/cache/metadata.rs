@@ -12,9 +12,13 @@ use std::path::{Path, PathBuf};
 use alloy_primitives::{Address, B256, U256};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use tracing::warn;
 
 use std::collections::HashSet;
+
+use super::versioned;
+
+const IMMUTABLE_CACHE_MAGIC: &[u8; 8] = b"EFCMETA\0";
+const IMMUTABLE_CACHE_VERSION: u32 = 1;
 
 /// Configuration for disk-based caching of EVM state.
 ///
@@ -158,18 +162,17 @@ pub struct ImmutableDataCache {
 impl ImmutableDataCache {
     /// Load immutable data cache from disk (binary format).
     ///
-    /// Returns `None` if `path` cannot be read or the contents are not valid
-    /// bincode for this type (a parse failure is logged at `warn` level and
-    /// swallowed). Callers should treat `None` as "no cache yet" and start fresh.
-    ///
-    /// Note: the on-disk format is bincode with no version header, so a cache
-    /// written by an incompatible build deserializes as a parse failure (`None`)
-    /// rather than being migrated.
+    /// Returns `None` if `path` cannot be read, fails the magic/version check, or
+    /// the payload is not valid bincode for this type. Callers should treat
+    /// `None` as "no cache yet" and start fresh.
     pub fn load(path: &Path) -> Option<Self> {
         let data = std::fs::read(path).ok()?;
-        bincode::deserialize(&data)
-            .inspect_err(|e| warn!("Failed to parse immutable data cache (bincode): {}", e))
-            .ok()
+        versioned::decode(
+            &data,
+            IMMUTABLE_CACHE_MAGIC,
+            IMMUTABLE_CACHE_VERSION,
+            "immutable data cache",
+        )
     }
 
     /// Save immutable data cache to disk (binary format).
@@ -185,7 +188,12 @@ impl ImmutableDataCache {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let data = bincode::serialize(self)?;
+        let data = versioned::encode(
+            IMMUTABLE_CACHE_MAGIC,
+            IMMUTABLE_CACHE_VERSION,
+            self,
+            "immutable data cache",
+        )?;
         std::fs::write(path, data)?;
         Ok(())
     }

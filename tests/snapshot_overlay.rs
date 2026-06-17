@@ -101,7 +101,15 @@ async fn overlays_from_one_snapshot_are_isolated() -> Result<()> {
 
     let slot = U256::from(7);
     let original = U256::from(1u64);
-    cache.inject_storage_batch(&[(contract, slot, original)]);
+    // Overlay-resident seed so the value is EVM-visible on the StorageCleared
+    // MockERC20: after the §16.0 fix, a backend-only `inject_storage_batch` seed on
+    // a StorageCleared account reads as ZERO via `cached_storage_value` (mirroring
+    // the EVM SLOAD), so the live-cache assertion below would observe 0. Seeding
+    // the overlay (the winning layer) is what the test means by "the cache holds
+    // `original`" and is captured by `create_snapshot`.
+    cache
+        .db_mut()
+        .insert_account_storage(contract, slot, original)?;
 
     let snapshot = cache.create_snapshot();
     let mut overlay_a = EvmOverlay::new(Arc::clone(&snapshot), None);
@@ -167,5 +175,86 @@ async fn overlay_reads_reflect_snapshot_state() -> Result<()> {
         "overlay calls are non-committing"
     );
 
+    Ok(())
+}
+
+/// Regression (§16 fix-review HIGH): `create_snapshot` must mirror the live
+/// account-state-aware read. A `StorageCleared` account with a backend-only
+/// (shadowed) slot reads ZERO live; the snapshot, `storage_value`, and a
+/// snapshot-backed overlay must all agree — not the shadowed backend value. Pre-
+/// fix the snapshot/overlay read the shadowed 100 while the live cache read 0.
+#[tokio::test]
+async fn snapshot_mirrors_live_read_for_cleared_account() -> Result<()> {
+    let token = Address::repeat_byte(0x5c);
+    let slot = U256::from(MOCK_ERC20_BALANCE_SLOT); // absent from the cleared overlay
+    let mut cache = setup_cache().await?;
+    install_mock_erc20(&mut cache, token); // sets account_state = StorageCleared
+    cache.inject_storage_batch(&[(token, slot, U256::from(100))]); // backend-only shadow
+
+    // Live read is ZERO (the §16.0 fix).
+    assert_eq!(cache.cached_storage_value(token, slot), Some(U256::ZERO));
+
+    let snapshot: Arc<EvmSnapshot> = cache.create_snapshot();
+    assert_eq!(
+        snapshot.storage_value(token, slot),
+        Some(U256::ZERO),
+        "snapshot.storage_value must mirror the live cleared read, not the shadowed 100"
+    );
+
+    // A snapshot-backed overlay (no ext_db, as the freshness validator uses) must
+    // also read ZERO for the cleared account's absent slot.
+    let mut overlay = EvmOverlay::new(Arc::clone(&snapshot), None);
+    let value = overlay
+        .storage(token, slot)
+        .map_err(|e| anyhow!("overlay storage read failed: {e:?}"))?;
+    assert_eq!(
+        value,
+        U256::ZERO,
+        "snapshot-backed overlay must read ZERO for a cleared account's absent slot"
+    );
+    Ok(())
+}
+
+/// Regression (round-2 HIGH, account axis): `create_snapshot` / `EvmOverlay::basic`
+/// must mirror the live account read for a `NotExisting` account. revm treats such
+/// an account as absent (`DbAccount::info()` → None), and `loaded_account_info`
+/// already does; the snapshot/parallel path must agree — not surface a phantom
+/// existing account with stale info. Pre-fix `EvmOverlay::basic` returned
+/// `Some(info)`.
+#[tokio::test]
+async fn snapshot_basic_returns_none_for_notexisting_account() -> Result<()> {
+    use revm::database::AccountState;
+    use revm::database_interface::Database;
+    use revm::state::AccountInfo;
+
+    let acct = Address::repeat_byte(0x6e);
+    let mut cache = setup_cache().await?;
+    // An overlay account revm marks NotExisting (e.g. after a selfdestruct) carries
+    // (default) info but is absent to the EVM.
+    cache.db_mut().insert_account_info(
+        acct,
+        AccountInfo {
+            balance: U256::from(1000),
+            ..Default::default()
+        },
+    );
+    cache
+        .db_mut()
+        .cache
+        .accounts
+        .get_mut(&acct)
+        .expect("overlay account present")
+        .account_state = AccountState::NotExisting;
+
+    let snapshot: Arc<EvmSnapshot> = cache.create_snapshot();
+    let mut overlay = EvmOverlay::new(Arc::clone(&snapshot), None);
+    let basic = overlay
+        .basic(acct)
+        .map_err(|e| anyhow!("overlay basic read failed: {e:?}"))?;
+    assert!(
+        basic.is_none(),
+        "snapshot-backed overlay must read a NotExisting account as absent (None), \
+         not a phantom Some(info); got {basic:?}"
+    );
     Ok(())
 }

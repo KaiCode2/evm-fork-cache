@@ -38,6 +38,7 @@ alloy-eips = "1.0.38"
 alloy-network = "1.0.38"
 alloy-primitives = { version = "1.4", features = ["map"] }
 alloy-provider = "1.0.38"
+alloy-rlp = "0.3"
 alloy-rpc-client = "1.0.38"
 alloy-rpc-types-eth = "1.0.38"
 alloy-sol-types = "1.4"
@@ -84,6 +85,14 @@ harness = false
 
 [[bench]]
 name = "freshness"
+harness = false
+
+[[bench]]
+name = "state_update"
+harness = false
+
+[[bench]]
+name = "event_pipeline"
 harness = false
 
 # RPC-gated real-contract benchmarks. Skipped (not failed) when RPC_URL is unset,

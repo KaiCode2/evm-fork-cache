@@ -21,9 +21,6 @@ use crate::access_set::StorageAccessList;
 use crate::errors::{SimError, SimulationError, SimulationResult};
 use crate::inspector::TransferInspector;
 
-/// Default initial capacity for shared memory buffer (64KB).
-const OVERLAY_SHARED_MEMORY_CAPACITY: usize = 64 * 1024;
-
 type OverlayEvm<'a> = revm::MainnetEvm<
     Context<BlockEnv, TxEnv, CfgEnv, &'a mut EvmOverlay, Journal<&'a mut EvmOverlay>, ()>,
 >;
@@ -40,6 +37,13 @@ type InspectorOverlayEvm<'a, INSP> = revm::MainnetEvm<
 /// This type is `Send` (unlike `EvmCache`) because it uses no `Rc`/`RefCell`.
 /// Each simulation task gets its own `EvmOverlay` with a cheap `Arc::clone`
 /// of the shared `EvmSnapshot`.
+///
+/// # Reuse across simulations (Pillar A.2)
+///
+/// A worker doing many sims against the same snapshot can call [`Self::new`]
+/// once and [`Self::reset`] between sims instead of allocating a fresh overlay
+/// each time. The reusable shared-memory buffer is also recycled across calls —
+/// see [`Self::call_raw`] — without making the overlay `!Send`.
 pub struct EvmOverlay {
     snapshot: Arc<EvmSnapshot>,
     /// Per-simulation mutations (accounts fetched from ext_db, committed changes).
@@ -48,17 +52,54 @@ pub struct EvmOverlay {
     dirty_storage: HashMap<Address, HashMap<U256, U256>>,
     /// Optional RPC fallback for data not in snapshot.
     ext_db: Option<SharedBackend>,
+    /// Reusable shared-memory buffer, recycled across the build→transact→revert
+    /// call methods to avoid reallocating a 64 KB `Vec` per call.
+    ///
+    /// Stored as a plain `Vec<u8>` (not an `Rc`) so the overlay stays `Send`. A
+    /// call method `mem::take`s it, wraps it in a method-local `Rc<RefCell<_>>`
+    /// for revm's [`LocalContext`], runs, then reclaims and clears it after the
+    /// EVM is dropped (see [`Self::build_evm_with_local`]).
+    reusable_buffer: Vec<u8>,
+    /// Target pre-allocation (bytes) for [`Self::reusable_buffer`] and each
+    /// per-call buffer, taken from the snapshot's configured
+    /// [`SharedMemoryCapacity`](super::SharedMemoryCapacity) so overlays honor the
+    /// capacity set on the originating [`EvmCache`].
+    buffer_capacity: usize,
 }
 
 impl EvmOverlay {
     /// Create a new overlay on the given snapshot.
+    ///
+    /// The reusable shared-memory buffer is pre-allocated to the snapshot's
+    /// configured shared-memory capacity (see
+    /// [`SharedMemoryCapacity`](super::SharedMemoryCapacity)).
     pub fn new(snapshot: Arc<EvmSnapshot>, ext_db: Option<SharedBackend>) -> Self {
+        let buffer_capacity = snapshot.shared_memory_capacity;
         Self {
             snapshot,
             dirty_accounts: HashMap::new(),
             dirty_storage: HashMap::new(),
             ext_db,
+            reusable_buffer: Vec::with_capacity(buffer_capacity),
+            buffer_capacity,
         }
+    }
+
+    /// Clear the per-simulation dirty layer so this overlay can be reused for the
+    /// next simulation against the same snapshot, without reallocating (Pillar
+    /// A.2).
+    ///
+    /// A worker doing K sims calls [`Self::new`] once and `reset()` between sims
+    /// instead of allocating a fresh overlay (plus dirty maps plus an `Arc`
+    /// clone) each time. After `reset()` the overlay reads the pristine snapshot
+    /// again — it is exactly equivalent to a freshly-built overlay on the same
+    /// snapshot. The snapshot `Arc`, the optional `ext_db`, and the reusable
+    /// shared-memory buffer (kept at capacity) are retained.
+    pub fn reset(&mut self) {
+        self.dirty_accounts.clear();
+        self.dirty_storage.clear();
+        // Keep: snapshot Arc, ext_db, and the reusable buffer. The buffer is
+        // already cleared after each call, so nothing to do for it here.
     }
 
     /// Chain ID of the block context captured by the underlying snapshot.
@@ -95,17 +136,29 @@ impl EvmOverlay {
         self.snapshot.timestamp
     }
 
-    /// Build a revm EVM instance backed by this overlay.
+    /// A fresh [`LocalContext`] with a newly-allocated 64 KB shared-memory buffer.
     ///
-    /// Note: The returned EVM is `!Send` (due to `LocalContext`'s `Rc<RefCell>`),
-    /// but this is fine because it's created and used within a single task.
-    pub fn build_evm(&mut self) -> OverlayEvm<'_> {
-        let local = LocalContext {
-            shared_memory_buffer: Rc::new(RefCell::new(Vec::with_capacity(
-                OVERLAY_SHARED_MEMORY_CAPACITY,
-            ))),
+    /// Used by the public [`Self::build_evm`], which hands out the EVM and cannot
+    /// reclaim its buffer afterwards. The internal call methods instead recycle
+    /// [`Self::reusable_buffer`] via [`Self::build_evm_with_local`].
+    fn fresh_local(&self) -> LocalContext {
+        LocalContext {
+            shared_memory_buffer: Rc::new(RefCell::new(Vec::with_capacity(self.buffer_capacity))),
             precompile_error_message: None,
-        };
+        }
+    }
+
+    /// Build a revm EVM instance backed by this overlay, using a caller-supplied
+    /// [`LocalContext`].
+    ///
+    /// This is the shared body behind [`Self::build_evm`] and the internal call
+    /// methods. The call methods pass a `local` wrapping the recycled
+    /// [`Self::reusable_buffer`] (Pillar A.2) and reclaim it after the EVM is
+    /// dropped; [`Self::build_evm`] passes a fresh one.
+    ///
+    /// Note: the returned EVM is `!Send` (due to `LocalContext`'s `Rc<RefCell>`),
+    /// but this is fine because it's created and used within a single task.
+    fn build_evm_with_local(&mut self, local: LocalContext) -> OverlayEvm<'_> {
         // Read snapshot values before the mutable borrow of self
         let chain_id = self.snapshot.chain_id;
         let spec_id = self.snapshot.spec_id;
@@ -155,6 +208,20 @@ impl EvmOverlay {
         evm
     }
 
+    /// Build a revm EVM instance backed by this overlay.
+    ///
+    /// This allocates a fresh 64 KB shared-memory buffer each call: it hands the
+    /// EVM out to the caller and cannot reclaim the buffer afterwards, so it
+    /// cannot recycle the overlay's reusable buffer. The internal call methods
+    /// ([`Self::call_raw`], etc.) recycle the buffer instead (Pillar A.2).
+    ///
+    /// Note: The returned EVM is `!Send` (due to `LocalContext`'s `Rc<RefCell>`),
+    /// but this is fine because it's created and used within a single task.
+    pub fn build_evm(&mut self) -> OverlayEvm<'_> {
+        let local = self.fresh_local();
+        self.build_evm_with_local(local)
+    }
+
     /// Execute a non-committing call and return the raw [`ExecutionResult`].
     ///
     /// The EVM state is reverted to a checkpoint after execution on *both*
@@ -201,24 +268,59 @@ impl EvmOverlay {
             .build()
             .map_err(|e| anyhow!("Failed to build tx env: {:?}", e))?;
 
-        let mut evm = self.build_evm();
-        use revm::context_interface::JournalTr;
-        let checkpoint = evm.journaled_state.checkpoint();
-        let result = evm
-            .transact_one(tx)
-            .map_err(|e| anyhow!("Failed to transact: {:?}", e));
-        evm.journaled_state.checkpoint_revert(checkpoint);
+        // Recycle the reusable buffer (Pillar A.2): take it out as a plain Vec
+        // (keeping the overlay Send), lend it to a method-local Rc<RefCell> for
+        // revm's LocalContext, then reclaim and clear it after the EVM is dropped.
+        let buffer = Rc::new(RefCell::new(std::mem::take(&mut self.reusable_buffer)));
+        let local = LocalContext {
+            shared_memory_buffer: Rc::clone(&buffer),
+            precompile_error_message: None,
+        };
+
+        let result = {
+            let mut evm = self.build_evm_with_local(local);
+            use revm::context_interface::JournalTr;
+            let checkpoint = evm.journaled_state.checkpoint();
+            let result = evm
+                .transact_one(tx)
+                .map_err(|e| anyhow!("Failed to transact: {:?}", e));
+            evm.journaled_state.checkpoint_revert(checkpoint);
+            result
+        };
+
+        self.reclaim_buffer(buffer);
         result
     }
 
-    /// Build a revm EVM instance with an inspector, backed by this overlay.
-    fn build_evm_with_inspector<INSP>(&mut self, inspector: INSP) -> InspectorOverlayEvm<'_, INSP> {
-        let local = LocalContext {
-            shared_memory_buffer: Rc::new(RefCell::new(Vec::with_capacity(
-                OVERLAY_SHARED_MEMORY_CAPACITY,
-            ))),
-            precompile_error_message: None,
-        };
+    /// Reclaim the recycled shared-memory buffer after the EVM (and its
+    /// `LocalContext` clone of the `Rc`) has been dropped, clearing it for the
+    /// next call.
+    ///
+    /// The `Rc` was only ever held by the dropped EVM and this method's local, so
+    /// `try_unwrap` succeeds in the normal path. If a panic somewhere left an
+    /// extra strong reference the buffer is simply re-allocated next call — no
+    /// correctness impact.
+    fn reclaim_buffer(&mut self, buffer: Rc<RefCell<Vec<u8>>>) {
+        if let Ok(cell) = Rc::try_unwrap(buffer) {
+            let mut buf = cell.into_inner();
+            buf.clear();
+            self.reusable_buffer = buf;
+        } else {
+            self.reusable_buffer = Vec::with_capacity(self.buffer_capacity);
+        }
+    }
+
+    /// Build a revm EVM instance with an inspector, backed by this overlay, using
+    /// a caller-supplied [`LocalContext`].
+    ///
+    /// Like [`Self::build_evm_with_local`] but attaches `inspector`. The call
+    /// methods pass a `local` wrapping the recycled [`Self::reusable_buffer`]
+    /// (Pillar A.2) and reclaim it after the EVM is dropped.
+    fn build_evm_with_inspector_local<INSP>(
+        &mut self,
+        inspector: INSP,
+        local: LocalContext,
+    ) -> InspectorOverlayEvm<'_, INSP> {
         let chain_id = self.snapshot.chain_id;
         let spec_id = self.snapshot.spec_id;
         let timestamp = self.snapshot.timestamp.unwrap_or_else(|| {
@@ -326,62 +428,75 @@ impl EvmOverlay {
             .map_err(|e| SimError::Other(anyhow!("Failed to build tx env: {:?}", e)))?;
 
         let inspector = TransferInspector::new();
-        let mut evm = self.build_evm_with_inspector(inspector);
 
-        use revm::context_interface::JournalTr;
-        let checkpoint = evm.journaled_state.checkpoint();
+        // Recycle the reusable buffer (Pillar A.2); reclaimed after the EVM drops.
+        let buffer = Rc::new(RefCell::new(std::mem::take(&mut self.reusable_buffer)));
+        let local = LocalContext {
+            shared_memory_buffer: Rc::clone(&buffer),
+            precompile_error_message: None,
+        };
 
-        let result = evm
-            .inspect_one_tx(tx)
-            .map_err(|e| SimError::Other(anyhow!("Failed to transact: {:?}", e)));
+        let outcome = {
+            let mut evm = self.build_evm_with_inspector_local(inspector, local);
 
-        match result {
-            Ok(ExecutionResult::Success {
-                logs,
-                gas_used,
-                output,
-                ..
-            }) => {
-                let token_deltas = if let Some(token_list) = tokens {
-                    evm.inspector.balance_deltas_for_tokens(owner, token_list)
-                } else {
-                    evm.inspector.balance_deltas(owner)
-                };
+            use revm::context_interface::JournalTr;
+            let checkpoint = evm.journaled_state.checkpoint();
 
-                // Extract EIP-2930 access list from journaled state
-                let access_list = extract_access_list(&evm.journaled_state.state);
+            let result = evm
+                .inspect_one_tx(tx)
+                .map_err(|e| SimError::Other(anyhow!("Failed to transact: {:?}", e)));
 
-                if commit {
-                    evm.commit_inner();
-                } else {
-                    evm.journaled_state.checkpoint_revert(checkpoint);
-                }
-
-                Ok(CallSimulationResult {
-                    status: SimStatus::Success,
-                    gas_used,
-                    token_deltas,
+            match result {
+                Ok(ExecutionResult::Success {
                     logs,
-                    access_list,
-                    output: output.into_data(),
-                })
-            }
-            Ok(ExecutionResult::Revert { gas_used, output }) => {
-                evm.journaled_state.checkpoint_revert(checkpoint);
-                Err(SimulationError::from_revert(gas_used, output).into())
-            }
-            Ok(ExecutionResult::Halt { reason, gas_used }) => {
-                evm.journaled_state.checkpoint_revert(checkpoint);
-                Err(SimError::Halt {
-                    reason: format!("{reason:?}"),
                     gas_used,
-                })
+                    output,
+                    ..
+                }) => {
+                    let token_deltas = if let Some(token_list) = tokens {
+                        evm.inspector.balance_deltas_for_tokens(owner, token_list)
+                    } else {
+                        evm.inspector.balance_deltas(owner)
+                    };
+
+                    // Extract EIP-2930 access list from journaled state
+                    let access_list = extract_access_list(&evm.journaled_state.state);
+
+                    if commit {
+                        evm.commit_inner();
+                    } else {
+                        evm.journaled_state.checkpoint_revert(checkpoint);
+                    }
+
+                    Ok(CallSimulationResult {
+                        status: SimStatus::Success,
+                        gas_used,
+                        token_deltas,
+                        logs,
+                        access_list,
+                        output: output.into_data(),
+                    })
+                }
+                Ok(ExecutionResult::Revert { gas_used, output }) => {
+                    evm.journaled_state.checkpoint_revert(checkpoint);
+                    Err(SimulationError::from_revert(gas_used, output).into())
+                }
+                Ok(ExecutionResult::Halt { reason, gas_used }) => {
+                    evm.journaled_state.checkpoint_revert(checkpoint);
+                    Err(SimError::Halt {
+                        reason: format!("{reason:?}"),
+                        gas_used,
+                    })
+                }
+                Err(err) => {
+                    evm.journaled_state.checkpoint_revert(checkpoint);
+                    Err(err)
+                }
             }
-            Err(err) => {
-                evm.journaled_state.checkpoint_revert(checkpoint);
-                Err(err)
-            }
-        }
+        };
+
+        self.reclaim_buffer(buffer);
+        outcome
     }
 
     /// Execute a non-committing call and return the result plus the touched
@@ -464,25 +579,42 @@ impl EvmOverlay {
             .build()
             .map_err(|e| anyhow!("Failed to build tx env: {:?}", e))?;
 
-        let mut evm = self.build_evm();
-        use revm::context_interface::JournalTr;
-        let checkpoint = evm.journaled_state.checkpoint();
-        let result = evm
-            .transact_one(tx_env)
-            .map_err(|e| anyhow!("Failed to transact: {:?}", e))?;
+        // Recycle the reusable buffer (Pillar A.2); reclaimed after the EVM drops.
+        let buffer = Rc::new(RefCell::new(std::mem::take(&mut self.reusable_buffer)));
+        let local = LocalContext {
+            shared_memory_buffer: Rc::clone(&buffer),
+            precompile_error_message: None,
+        };
 
-        let mut access_list = StorageAccessList::default();
-        for (address, account) in evm.journaled_state.state.iter() {
-            if account.is_touched() {
-                access_list.accounts.insert(*address);
-                for (slot_key, _) in account.storage.iter() {
-                    access_list.slots.insert((*address, *slot_key));
+        let outcome = {
+            let mut evm = self.build_evm_with_local(local);
+            use revm::context_interface::JournalTr;
+            let checkpoint = evm.journaled_state.checkpoint();
+            match evm.transact_one(tx_env) {
+                Ok(result) => {
+                    let mut access_list = StorageAccessList::default();
+                    for (address, account) in evm.journaled_state.state.iter() {
+                        if account.is_touched() {
+                            access_list.accounts.insert(*address);
+                            for (slot_key, _) in account.storage.iter() {
+                                access_list.slots.insert((*address, *slot_key));
+                            }
+                        }
+                    }
+                    evm.journaled_state.checkpoint_revert(checkpoint);
+                    Ok((result, access_list))
+                }
+                Err(e) => {
+                    // Revert the checkpoint even on a host/transact error so the EVM
+                    // journal is not left dirty (mirrors `call_raw`).
+                    evm.journaled_state.checkpoint_revert(checkpoint);
+                    Err(anyhow!("Failed to transact: {:?}", e))
                 }
             }
-        }
+        };
 
-        evm.journaled_state.checkpoint_revert(checkpoint);
-        Ok((result, access_list))
+        self.reclaim_buffer(buffer);
+        outcome
     }
 
     /// Write a storage value into this overlay's dirty layer.
@@ -544,8 +676,14 @@ impl Database for EvmOverlay {
         if let Some(info) = self.dirty_accounts.get(&address) {
             return Ok(Some(info.clone()));
         }
-        // 2. Check snapshot (O(1) HashMap lookup, no locks)
-        if let Some(info) = self.snapshot.accounts.get(&address) {
+        // 2. Check snapshot (O(1) HashMap lookup, no locks). `account_info` folds
+        //    the two snapshot tiers (overlay ▸ base) and already short-circuits a
+        //    NotExisting account to None — it must NOT fall through to the ext_db,
+        //    mirroring revm `DbAccount::info()` and the live `EvmCache` read.
+        if self.snapshot.accounts_not_existing.contains(&address) {
+            return Ok(None);
+        }
+        if let Some(info) = self.snapshot.account_info(address) {
             return Ok(Some(info.clone()));
         }
         // 3. RPC fallback
@@ -568,8 +706,8 @@ impl Database for EvmOverlay {
                 return Ok(code.clone());
             }
         }
-        // Check snapshot's code_by_hash index
-        if let Some(code) = self.snapshot.code_by_hash.get(&code_hash) {
+        // Check the snapshot's code index (overlay ▸ base).
+        if let Some(code) = self.snapshot.code(code_hash) {
             return Ok(code.clone());
         }
         // RPC fallback
@@ -586,11 +724,12 @@ impl Database for EvmOverlay {
         {
             return Ok(*value);
         }
-        // 2. Check snapshot (O(1))
-        if let Some(account_storage) = self.snapshot.storage.get(&address)
-            && let Some(value) = account_storage.get(&index)
-        {
-            return Ok(*value);
+        // 2. Check snapshot (O(1)). `storage_value` folds the two tiers (overlay ▸
+        //    cleared-as-ZERO ▸ base); a cleared account's absent slot reads ZERO
+        //    and must NOT fall through to the ext_db, mirroring the live EVM SLOAD
+        //    for a StorageCleared/NotExisting account.
+        if let Some(value) = self.snapshot.storage_value(address, index) {
+            return Ok(value);
         }
         // 3. RPC fallback
         if let Some(ref ext_db) = self.ext_db {
@@ -634,7 +773,47 @@ fn extract_access_list(state: &revm::state::EvmState) -> AccessList {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cache::snapshot::BaseState;
     use revm::primitives::hardfork::SpecId;
+    use std::collections::HashSet;
+
+    /// Build a two-tier `EvmSnapshot` whose cold base holds the given accounts,
+    /// storage, and code, with an empty hot overlay — the shape
+    /// `create_snapshot_deep_clone` produces. The `Arc`-per-account storage of the
+    /// base is built from the plain per-account maps.
+    fn snap(
+        accounts: HashMap<Address, AccountInfo>,
+        storage: HashMap<Address, HashMap<U256, U256>>,
+        code_by_hash: HashMap<B256, Bytecode>,
+        block_hashes: HashMap<u64, B256>,
+    ) -> Arc<EvmSnapshot> {
+        let base = BaseState {
+            accounts,
+            storage: storage
+                .into_iter()
+                .map(|(addr, slots)| (addr, Arc::new(slots)))
+                .collect(),
+            code_by_hash,
+        };
+        Arc::new(EvmSnapshot {
+            base: Arc::new(base),
+            overlay_accounts: HashMap::new(),
+            overlay_storage: HashMap::new(),
+            overlay_code_by_hash: HashMap::new(),
+            storage_cleared: HashSet::new(),
+            accounts_not_existing: HashSet::new(),
+            block_hashes,
+            block_number: None,
+            basefee: None,
+            coinbase: None,
+            prevrandao: None,
+            gas_limit: None,
+            chain_id: 42161,
+            timestamp: None,
+            spec_id: SpecId::CANCUN,
+            shared_memory_capacity: 64_000,
+        })
+    }
 
     #[test]
     fn test_overlay_is_send() {
@@ -655,20 +834,7 @@ mod tests {
         let addr = Address::repeat_byte(0x01);
         accounts.insert(addr, info);
 
-        let snapshot = Arc::new(EvmSnapshot {
-            accounts,
-            storage: HashMap::new(),
-            block_hashes: HashMap::new(),
-            code_by_hash: HashMap::new(),
-            block_number: None,
-            basefee: None,
-            coinbase: None,
-            prevrandao: None,
-            gas_limit: None,
-            chain_id: 42161,
-            timestamp: None,
-            spec_id: SpecId::CANCUN,
-        });
+        let snapshot = snap(accounts, HashMap::new(), HashMap::new(), HashMap::new());
 
         let mut overlay = EvmOverlay::new(snapshot, None);
         let result = overlay.basic(addr).unwrap();
@@ -687,20 +853,7 @@ mod tests {
         account_storage.insert(slot, value);
         storage.insert(addr, account_storage);
 
-        let snapshot = Arc::new(EvmSnapshot {
-            accounts: HashMap::new(),
-            storage,
-            block_hashes: HashMap::new(),
-            code_by_hash: HashMap::new(),
-            block_number: None,
-            basefee: None,
-            coinbase: None,
-            prevrandao: None,
-            gas_limit: None,
-            chain_id: 42161,
-            timestamp: None,
-            spec_id: SpecId::CANCUN,
-        });
+        let snapshot = snap(HashMap::new(), storage, HashMap::new(), HashMap::new());
 
         let mut overlay = EvmOverlay::new(snapshot, None);
         let result = overlay.storage(addr, slot).unwrap();
@@ -717,20 +870,7 @@ mod tests {
         account_storage.insert(slot, U256::from(100));
         storage.insert(addr, account_storage);
 
-        let snapshot = Arc::new(EvmSnapshot {
-            accounts: HashMap::new(),
-            storage,
-            block_hashes: HashMap::new(),
-            code_by_hash: HashMap::new(),
-            block_number: None,
-            basefee: None,
-            coinbase: None,
-            prevrandao: None,
-            gas_limit: None,
-            chain_id: 42161,
-            timestamp: None,
-            spec_id: SpecId::CANCUN,
-        });
+        let snapshot = snap(HashMap::new(), storage, HashMap::new(), HashMap::new());
 
         let mut overlay = EvmOverlay::new(snapshot, None);
 
@@ -748,20 +888,12 @@ mod tests {
 
     #[test]
     fn test_overlay_missing_returns_zero() {
-        let snapshot = Arc::new(EvmSnapshot {
-            accounts: HashMap::new(),
-            storage: HashMap::new(),
-            block_hashes: HashMap::new(),
-            code_by_hash: HashMap::new(),
-            block_number: None,
-            basefee: None,
-            coinbase: None,
-            prevrandao: None,
-            gas_limit: None,
-            chain_id: 42161,
-            timestamp: None,
-            spec_id: SpecId::CANCUN,
-        });
+        let snapshot = snap(
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+        );
 
         let mut overlay = EvmOverlay::new(snapshot, None);
         let addr = Address::repeat_byte(0x99);
@@ -780,20 +912,7 @@ mod tests {
         let mut code_by_hash = HashMap::new();
         code_by_hash.insert(hash, code.clone());
 
-        let snapshot = Arc::new(EvmSnapshot {
-            accounts: HashMap::new(),
-            storage: HashMap::new(),
-            block_hashes: HashMap::new(),
-            code_by_hash,
-            block_number: None,
-            basefee: None,
-            coinbase: None,
-            prevrandao: None,
-            gas_limit: None,
-            chain_id: 42161,
-            timestamp: None,
-            spec_id: SpecId::CANCUN,
-        });
+        let snapshot = snap(HashMap::new(), HashMap::new(), code_by_hash, HashMap::new());
 
         let mut overlay = EvmOverlay::new(snapshot, None);
         let result = overlay.code_by_hash(hash).unwrap();
@@ -806,20 +925,7 @@ mod tests {
         let hash = B256::repeat_byte(0xAB);
         block_hashes.insert(42u64, hash);
 
-        let snapshot = Arc::new(EvmSnapshot {
-            accounts: HashMap::new(),
-            storage: HashMap::new(),
-            block_hashes,
-            code_by_hash: HashMap::new(),
-            block_number: None,
-            basefee: None,
-            coinbase: None,
-            prevrandao: None,
-            gas_limit: None,
-            chain_id: 42161,
-            timestamp: None,
-            spec_id: SpecId::CANCUN,
-        });
+        let snapshot = snap(HashMap::new(), HashMap::new(), HashMap::new(), block_hashes);
 
         let mut overlay = EvmOverlay::new(snapshot, None);
         assert_eq!(overlay.block_hash(42).unwrap(), hash);

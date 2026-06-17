@@ -87,6 +87,16 @@ fn immutable_data_cache_round_trips() {
     let len_before = cache.len();
 
     cache.save(&path).expect("save immutable cache");
+    let bytes = std::fs::read(&path).expect("read immutable cache file");
+    assert!(
+        bytes.starts_with(b"EFCMETA\0"),
+        "immutable cache must carry a magic header"
+    );
+    assert_eq!(
+        &bytes[8..12],
+        &1u32.to_le_bytes(),
+        "immutable cache must carry an explicit version"
+    );
     let loaded = ImmutableDataCache::load(&path).expect("load immutable cache");
 
     // Counts and scalar values survive the round trip.
@@ -116,6 +126,20 @@ fn immutable_data_cache_round_trips() {
     assert_eq!(bal.weights, vec![U256::from(80u64), U256::from(20u64)]);
     assert_eq!(bal.swap_fee, U256::from(1_000u64));
     assert_eq!(bal.last_change_block, U256::from(18_000_000u64));
+}
+
+#[test]
+fn immutable_data_cache_load_legacy_raw_bincode_is_none() {
+    let dir = TempDir::new("immutable_legacy");
+    let path = dir.path("legacy_immutable_data.bin");
+    let mut cache = ImmutableDataCache::default();
+    cache.set_token_decimals(Address::repeat_byte(0xA1), 6);
+    std::fs::write(&path, bincode::serialize(&cache).unwrap()).expect("write legacy cache");
+
+    assert!(
+        ImmutableDataCache::load(&path).is_none(),
+        "unversioned legacy bincode must be treated as a cache miss"
+    );
 }
 
 #[test]
@@ -180,6 +204,16 @@ mod tick_snapshots {
         assert_eq!(cache.len(), 1);
 
         cache.save(&path).expect("save tick cache");
+        let bytes = std::fs::read(&path).expect("read tick cache file");
+        assert!(
+            bytes.starts_with(b"EFCTICK\0"),
+            "tick snapshot cache must carry a magic header"
+        );
+        assert_eq!(
+            &bytes[8..12],
+            &1u32.to_le_bytes(),
+            "tick snapshot cache must carry an explicit version"
+        );
         let loaded = V3TickSnapshotCache::load(&path).expect("load tick cache");
 
         let snap = loaded.get(pool).expect("snapshot present");
@@ -188,6 +222,24 @@ mod tick_snapshots {
         // TickInfo derives PartialEq/Eq, so the recovered maps compare directly.
         assert_eq!(snap.to_tick_bitmap(), bitmap, "bitmap survives round trip");
         assert_eq!(snap.to_ticks(), ticks, "ticks survive round trip");
+    }
+
+    #[test]
+    fn v3_tick_snapshot_cache_load_legacy_raw_bincode_is_none() {
+        let dir = TempDir::new("v3_ticks_legacy");
+        let path = dir.path("legacy_v3_tick_snapshots.bin");
+        let pool = Address::repeat_byte(0x77);
+        let mut cache = V3TickSnapshotCache::default();
+        cache.set(
+            pool,
+            V3PoolTickSnapshot::from_pool_data(&HashMap::new(), &HashMap::new(), 0, 0),
+        );
+        std::fs::write(&path, bincode::serialize(&cache).unwrap()).expect("write legacy cache");
+
+        assert!(
+            V3TickSnapshotCache::load(&path).is_none(),
+            "unversioned legacy bincode must be treated as a cache miss"
+        );
     }
 
     #[test]

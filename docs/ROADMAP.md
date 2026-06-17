@@ -72,9 +72,9 @@ RPC node                     Event-driven sync  ← WS logs · new block
 | **0** | API hygiene + correctness: drop `amms`, fix `set_block` divergence + `block_in_place` panic, commit the tree. | **Done** (`p0-oss-prep`) |
 | **1** | Engine seam: typed errors, configurable tx/block env, hot-path benches, builder, `protocols` feature. | **Done** (`phase-1-engine-seam`) |
 | **2** | Freshness core (Pillar C): `Validity` + `FreshnessRegistry`; observation tracker; policies; optimistic verify-and-rerun loop. | **Done** (`phase-2-freshness`) |
-| **3** | State-update primitives (Pillar B.1): `StateUpdate` + targeted writers; refold `inject_*`; surface state-diff output. | Planned |
-| **4** | Event pipeline + adapters (Pillar B.2): `EventDecoder` trait, V3 adapter, WS ingestion loop, reorg handling. | Planned |
-| **5** | COW snapshots (Pillar A): structural sharing; overlay buffer reuse. | Planned |
+| **3** | State-update primitives (Pillar B.1): `StateUpdate` + targeted writers; refold `inject_*`; surface state-diff output. | **Done** (`phase-3-state-updates`) |
+| **4** | Event pipeline + adapters (Pillar B.2): `EventDecoder` trait, ERC-20 + V3 adapters, ingest/reorg/reconcile pipeline. | **Done** (`phase-4-event-pipeline`) |
+| **5** | COW snapshots (Pillar A): structural sharing; overlay buffer reuse. | **Done** (`phase-5-cow-snapshots`) |
 
 Cross-cutting (land opportunistically): call tracer Inspector, full offline
 (`default-features = false`, no provider) build split, CHANGELOG/CONTRIBUTING.
@@ -301,6 +301,158 @@ Landed on `phase-2-freshness`: `src/freshness.rs` (the generic core — `Validit
 `EvmCache::verify_slots`/`purge_account`/`set_storage_batch_fetcher`;
 `EvmSnapshot::storage_value` + `EvmOverlay::override_slot` validator seams; the
 offline `examples/freshness_optimistic.rs`; and `tests/freshness.rs`.
+
+---
+
+## Phase 3 — state-update primitives (detailed, decisions locked)
+
+Builds **Pillar B.1 — the writer half** of the event → state pipeline: the
+generic state-mutation vocabulary and the single apply primitive that writes it
+consistently across both cache layers, returning a structured diff. Out of
+scope (Phase 4): event decoding (`EventDecoder`, `Log` → `StateUpdate`), the WS
+ingestion loop, reorg handling, and overlay-side apply.
+
+### Locked decisions
+
+1. **`Account` variant is a partial `AccountPatch`** (`balance`/`nonce`/`code`,
+   each `Option`), not a full `AccountInfo`: best fit for event-derived writes
+   (one field at a time) and keeps revm's type out of the public vocabulary.
+2. **`inject_v2/v3_*` (`protocols`) normalized to write-through.** Refolded onto
+   the write-through `StateUpdate::Slot` primitive (backend + overlay-if-present)
+   instead of the old overlay-only write — a deliberate behavior change recorded
+   in `CHANGELOG.md` (`### Changed`) and `KNOWN_ISSUES.md`, with a test pinning
+   the new placement. The cold-backfill `inject_storage_batch` stays layer-2-only.
+
+### Acceptance — met
+
+`cargo fmt --check`, `clippy --all-targets -- -D warnings` (default +
+`--lib --no-default-features`), `cargo test`, `RUSTDOCFLAGS=-D warnings cargo doc`.
+
+Landed on `phase-3-state-updates`: `src/state_update.rs` (the generic vocabulary
+— `StateUpdate` / `AccountPatch` / `PurgeScope`, the `StateDiff` / `AccountChange`
+/ `PurgeRecord` output, reusing `freshness::SlotChange`); `EvmCache::apply_update`
+/ `apply_updates` with the dual-layer write-through `Slot`/`Account` and dispatch
+`Purge` semantics; the refold of `inject_storage_batch_fresh` / `purge_account` /
+`purge_pool_storage` / `purge_pool_slots` / `inject_v2_pool_metadata` /
+`inject_v3_*` onto the primitive and the freshness correction-drain routed
+through `apply_updates`; the offline `examples/state_update_apply.rs`;
+`benches/state_update.rs`; and `tests/state_update.rs`. The §15 addendum adds the
+relative / read-modify-write surface — a saturating `SlotDelta`, the
+`StateUpdate::SlotDelta` variant, `EvmCache::modify_slot`, and the cold-aware
+skip-and-surface contract via the new `StateDiff.skipped` field — to keep
+event-derived balances (e.g. ERC-20 `Transfer` deltas) hot without knowing the
+resulting absolute value. The §16 post-audit remediation then fixed a
+HIGH-severity silent-corruption bug — `cached_storage_value` now mirrors the EVM
+`SLOAD` for `StorageCleared`/`NotExisting` overlay accounts instead of returning a
+shadowed backend value — and hardened the surface: a no-op `Account` patch no
+longer materializes a backend account; the vocabulary and diff gained `serde`;
+`StateDiff`/`AccountPatch` became `#[non_exhaustive]`; relative native-balance
+tracking landed (`StateUpdate::BalanceDelta`, `EvmCache::modify_account_balance`,
+`StateDiff.skipped_balances`, `SkippedBalanceDelta`) with discoverable skip
+accessors (`has_skipped`/`skipped_len`/`is_fully_applied`) and the
+`StateUpdate::nonce`/`code`/`account` constructors; and `apply_updates` gained a
+batched single-lock fast-path (byte-identical to the sequential fold, pinned by an
+equivalence test).
+
+---
+
+## Phase 4 — event pipeline + adapters (detailed, decisions locked)
+
+Builds **Pillar B.2 — the reader half** of the event → state pipeline: decode an
+on-chain `Log` into the Phase 3 `StateUpdate` vocabulary, apply it, and run the
+reactive maintenance (reconcile, reorg) that keeps event-derived state honest.
+Decoders are pure functions of `(log, pre-state)`; the `!Send` cache discipline is
+preserved by keeping the tested core synchronous (the async ingestion driver is a
+thin convenience). The full build contract is in
+[`phase-4-spec.md`](phase-4-spec.md).
+
+### Locked decisions
+
+1. **Packed-slot updates → `StateUpdate::SlotMasked`** (a cold-aware RMW masked
+   write), so a pure decoder can express a partial update to a packed word (V3
+   `slot0`) without clobbering the bits it does not own (notably `unlocked`).
+2. **V3 adapter coverage → `Swap` **and** `Mint`/`Burn` (full ticks).** `slot0` +
+   `liquidity` from `Swap`; per-tick `liquidityGross`/`liquidityNet` +
+   `initialized` + `tickBitmap` + in-range global `liquidity` from `Mint`/`Burn`,
+   computed against the `StateView`. Fee-growth/oracle state is out of scope (a
+   documented limitation; reconcile/purge are the backstop).
+3. **Reorg → purge-and-resync.** A depth-bounded ring tracks addresses touched per
+   block; `reorg_to(n)` purges everything touched after `n` so reads re-fetch.
+   `ValidThrough` is the freshness lever.
+4. **Reconciliation → sampled re-read, correct **and** alarm.** `reconcile` samples
+   event-derived slots and re-reads via `EvmCache::reconcile_slots` (a honest
+   wrapper over `verify_slots` that errors on a total fetch failure rather than
+   reporting a false all-clear); the fresh chain value wins and the drift is
+   surfaced.
+
+### Acceptance — met
+
+`cargo fmt --check`, `clippy --all-targets -- -D warnings` (default +
+`--lib --no-default-features`), `cargo test` (both feature configs),
+`RUSTDOCFLAGS=-D warnings cargo doc`, `cargo bench --no-run`.
+
+Landed on `phase-4-event-pipeline`: `src/events/` (the generic core —
+`EventDecoder`/`StateView`, `DecoderRegistry`, `EventPipeline` with
+`ingest_logs`/`reorg_to`/`reconcile` + `BlockDigest`/`ReconcileReport`/
+`ReorgConfig`, and the async `drive`/`LogSource`), the generic
+`Erc20TransferDecoder` (`events::erc20`), and the `protocols`-gated
+`UniswapV3Decoder`/`UniswapV3Layout` (`events::uniswap_v3`); the cold-aware
+`StateUpdate::SlotMasked` vocabulary + `StateDiff.skipped_masks`/`SkippedMask`
+(`state_update`) and its dual-layer apply arm; `EvmCache::reconcile_slots` and the
+`StateView` impl; the offline `examples/reactive_cache.rs`;
+`benches/event_pipeline.rs`; and `tests/event_pipeline.rs` (+ the `SlotMasked`
+tests in `tests/state_update.rs`). The §6.4 V3 fee-growth/oracle maintenance gap
+is recorded in `KNOWN_ISSUES.md`.
+
+---
+
+## Phase 5 — copy-on-write snapshots (detailed, decisions locked)
+
+Builds **Pillar A**: replace the O(total state) deep-clone `create_snapshot` with
+a two-tier copy-on-write view whose cost tracks *changed* state, not *total*
+state. The cold `BlockchainDb` index (layer 2) is flattened once into an
+internal, immutable, `Arc`-shared base — both the base as a whole and each
+account's storage map are shared by `Arc`, so structural sharing needs no new
+dependency (Decision D1) — memoized across snapshots and rebuilt copy-on-write
+only for the addresses that changed; each snapshot then folds just the hot
+CacheDB delta (layer 1). Reads stay O(1), lock-free, and bit-for-bit identical to
+the deep clone. The full build contract is in
+[`phase-5-spec.md`](phase-5-spec.md).
+
+### Locked decisions
+
+1. **`Arc`-shared maps, not a persistent HAMT** (D1). Reads stay O(1) with no
+   per-`SLOAD` regression and no external dependency.
+2. **Base memoized as immutable; over-invalidation is acceptable, silent
+   staleness is not** (D2). The write-through funnel marks an address dirty
+   unconditionally; the differential-equivalence test is the hard backstop.
+3. **Keep the deep clone** as `create_snapshot_deep_clone` (D3) — the A/B
+   benchmark baseline and the read-equivalence reference.
+4. **Overlay reuse: buffer reuse *and* `reset()` recycle** (D4) — both in scope.
+5. **`create_snapshot` becomes `&mut self`** (D5) — the memoization cost; the
+   freshness controller and all callers are updated.
+
+### Acceptance — met
+
+`cargo fmt --check`, `clippy --all-targets -- -D warnings` (default +
+`--lib --no-default-features`), `cargo test` (both feature configs),
+`RUSTDOCFLAGS=-D warnings cargo doc`, `cargo bench --no-run`; the
+`tests/cow_snapshot.rs` differential-equivalence gate and the existing
+snapshot/overlay/freshness tests pass unchanged.
+
+Landed on `phase-5-cow-snapshots`: the memoized two-tier base (`BaseState` +
+the rewritten two-tier `EvmSnapshot` with `account_info`/`storage_value`/`code`
+accessors, `src/cache/snapshot.rs`); `EvmCache::refresh_base`/`build_base_full`,
+the COW `create_snapshot` (now `&mut self`), the retained
+`create_snapshot_deep_clone`, and the `mark_base_dirty`/`invalidate_base`
+invalidation wired into `write_slot_through`/`apply_slot_run`/
+`write_account_info_through`/`inject_storage_batch`/the `purge_*` paths and
+`set_block` (`src/cache/mod.rs`); `EvmOverlay::reset` plus the reusable
+shared-memory buffer recycled across the call methods (`src/cache/overlay.rs`);
+the layer-2-seeded A/B + hot-loop + `reset()`-fanout benches
+(`benches/simulation.rs`); and the differential-equivalence gate
+(`tests/cow_snapshot.rs`). The residual O(accounts) length-scan / O(layer-1)
+fold cost model is recorded in `KNOWN_ISSUES.md`.
 
 ---
 
