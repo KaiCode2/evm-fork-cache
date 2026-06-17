@@ -12,11 +12,26 @@ use std::path::{Path, PathBuf};
 use alloy_primitives::{Address, B256, U256};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use tracing::warn;
 
 use std::collections::HashSet;
 
+use super::versioned;
+
+const IMMUTABLE_CACHE_MAGIC: &[u8; 8] = b"EFCMETA\0";
+const IMMUTABLE_CACHE_VERSION: u32 = 1;
+
 /// Configuration for disk-based caching of EVM state.
+///
+/// Enables on-disk persistence of fetched fork state. Cache files are laid out
+/// per chain under `cache_dir` (see [`CacheConfig::binary_state_cache_path`] and
+/// the other path helpers), so multiple chains can share one base directory
+/// without colliding.
+///
+/// The `maintain_*` fields drive selective retention when state is reloaded:
+/// `maintain_addresses` whitelists accounts whose storage is kept in full, while
+/// `maintain_slots` whitelists individual slots for accounts whose remaining
+/// storage should be purged. Together they let a cache load keep only the
+/// long-lived state worth reusing and drop the rest.
 #[derive(Debug, Clone)]
 pub struct CacheConfig {
     /// Base directory for cache files.
@@ -31,6 +46,10 @@ pub struct CacheConfig {
 
 impl CacheConfig {
     /// Create a new cache configuration.
+    ///
+    /// `cache_dir` is the base directory for all per-chain cache files,
+    /// `chain_id` namespaces them, and `maintain_addresses` / `maintain_slots`
+    /// select which state survives a reload (see the type-level docs).
     pub fn new(
         cache_dir: impl Into<PathBuf>,
         chain_id: u64,
@@ -76,6 +95,10 @@ impl CacheConfig {
 }
 
 /// Cached metadata for a UniswapV2 pool.
+///
+/// Holds the immutable token pair plus a freshness marker
+/// ([`last_block_timestamp`](Self::last_block_timestamp)) used to detect when
+/// cached reserves have gone stale.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct V2PoolMetadata {
     pub token0: Address,
@@ -88,6 +111,9 @@ pub struct V2PoolMetadata {
 }
 
 /// Cached metadata for a UniswapV3 pool.
+///
+/// All fields are immutable for the lifetime of the pool: the token pair, the
+/// fee tier, and the tick spacing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct V3PoolMetadata {
     pub token0: Address,
@@ -97,6 +123,10 @@ pub struct V3PoolMetadata {
 }
 
 /// Cached metadata for a Balancer pool.
+///
+/// Holds the pool's tokens, weights, and swap fee plus a freshness marker
+/// ([`last_change_block`](Self::last_change_block)) used to detect when cached
+/// balances have gone stale.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BalancerPoolMetadata {
     pub tokens: Vec<Address>,
@@ -131,19 +161,39 @@ pub struct ImmutableDataCache {
 
 impl ImmutableDataCache {
     /// Load immutable data cache from disk (binary format).
+    ///
+    /// Returns `None` if `path` cannot be read, fails the magic/version check, or
+    /// the payload is not valid bincode for this type. Callers should treat
+    /// `None` as "no cache yet" and start fresh.
     pub fn load(path: &Path) -> Option<Self> {
         let data = std::fs::read(path).ok()?;
-        bincode::deserialize(&data)
-            .inspect_err(|e| warn!("Failed to parse immutable data cache (bincode): {}", e))
-            .ok()
+        versioned::decode(
+            &data,
+            IMMUTABLE_CACHE_MAGIC,
+            IMMUTABLE_CACHE_VERSION,
+            "immutable data cache",
+        )
     }
 
     /// Save immutable data cache to disk (binary format).
+    ///
+    /// Creates the parent directory if it does not exist, then writes the
+    /// bincode-serialized cache to `path`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the parent directory cannot be created, if bincode
+    /// serialization fails, or if writing the file fails.
     pub fn save(&self, path: &Path) -> Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let data = bincode::serialize(self)?;
+        let data = versioned::encode(
+            IMMUTABLE_CACHE_MAGIC,
+            IMMUTABLE_CACHE_VERSION,
+            self,
+            "immutable data cache",
+        )?;
         std::fs::write(path, data)?;
         Ok(())
     }
@@ -179,17 +229,26 @@ impl ImmutableDataCache {
     }
 
     /// Get cached Balancer pool metadata.
+    ///
+    /// The `pool_id` is keyed by its `Debug` formatting (matching
+    /// [`ImmutableDataCache::set_balancer_pool`]), so a lookup only hits if the
+    /// id was stored through that same setter.
     pub fn get_balancer_pool(&self, pool_id: B256) -> Option<&BalancerPoolMetadata> {
         self.balancer_pools.get(&format!("{:?}", pool_id))
     }
 
     /// Cache Balancer pool metadata.
+    ///
+    /// The `pool_id` is stored under its `Debug` formatting as the map key.
     pub fn set_balancer_pool(&mut self, pool_id: B256, metadata: BalancerPoolMetadata) {
         self.balancer_pools
             .insert(format!("{:?}", pool_id), metadata);
     }
 
     /// Check if the cache is empty.
+    ///
+    /// Returns `true` only when every sub-map (token decimals and all pool
+    /// kinds) is empty.
     pub fn is_empty(&self) -> bool {
         self.token_decimals.is_empty()
             && self.v2_pools.is_empty()
@@ -198,6 +257,9 @@ impl ImmutableDataCache {
     }
 
     /// Get the total number of cached entries.
+    ///
+    /// This is the sum of the entry counts across all sub-maps (token decimals
+    /// plus V2, V3, and Balancer pools), not a count of distinct addresses.
     pub fn len(&self) -> usize {
         self.token_decimals.len()
             + self.v2_pools.len()

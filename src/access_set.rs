@@ -39,6 +39,41 @@ impl StorageAccessList {
         self.slots.len()
     }
 
+    /// Merge another touch set into this one (set union of accounts and slots).
+    ///
+    /// Duplicate accounts and `(account, slot)` pairs already present are not
+    /// counted twice, so [`StorageAccessList::account_count`] and
+    /// [`StorageAccessList::slot_count`] reflect distinct entries after merging.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use evm_fork_cache::StorageAccessList;
+    /// use alloy_primitives::{Address, U256};
+    ///
+    /// let acct_a = Address::repeat_byte(0x01);
+    /// let acct_b = Address::repeat_byte(0x02);
+    ///
+    /// let mut base = StorageAccessList::default();
+    /// base.accounts.insert(acct_a);
+    /// base.slots.insert((acct_a, U256::from(1)));
+    ///
+    /// let mut other = StorageAccessList::default();
+    /// other.accounts.insert(acct_a); // overlaps `base`, not double-counted
+    /// other.accounts.insert(acct_b);
+    /// other.slots.insert((acct_b, U256::from(2)));
+    ///
+    /// base.extend(&other);
+    ///
+    /// assert_eq!(base.account_count(), 2);
+    /// assert_eq!(base.slot_count(), 2);
+    /// assert!(!base.is_empty());
+    /// ```
+    pub fn extend(&mut self, other: &Self) {
+        self.accounts.extend(&other.accounts);
+        self.slots.extend(&other.slots);
+    }
+
     /// Compute EIP-2929 gas saved when this touch set runs after `warm`.
     ///
     /// Cold account access costs 2600 gas versus 100 gas when warm, saving
@@ -48,12 +83,6 @@ impl StorageAccessList {
         let shared_accounts = self.accounts.intersection(&warm.accounts).count() as u64;
         let shared_slots = self.slots.intersection(&warm.slots).count() as u64;
         shared_accounts * 2500 + shared_slots * 2000
-    }
-
-    /// Merge another touch set into this one.
-    pub fn extend(&mut self, other: &Self) {
-        self.accounts.extend(&other.accounts);
-        self.slots.extend(&other.slots);
     }
 
     /// Convert this touch set into an EIP-2930 transaction access list.

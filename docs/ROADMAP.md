@@ -71,10 +71,10 @@ RPC node                     Event-driven sync  ← WS logs · new block
 | --- | --- | --- |
 | **0** | API hygiene + correctness: drop `amms`, fix `set_block` divergence + `block_in_place` panic, commit the tree. | **Done** (`p0-oss-prep`) |
 | **1** | Engine seam: typed errors, configurable tx/block env, hot-path benches, builder, `protocols` feature. | **Done** (`phase-1-engine-seam`) |
-| **2** | Freshness core (Pillar C): `Validity` + `FreshnessRegistry`; `on_new_block` purge; pin immutables. | Planned |
-| **3** | State-update primitives (Pillar B.1): `StateUpdate` + targeted writers; refold `inject_*`; surface state-diff output. | Planned |
-| **4** | Event pipeline + adapters (Pillar B.2): `EventDecoder` trait, V3 adapter, WS ingestion loop, reorg handling. | Planned |
-| **5** | COW snapshots (Pillar A): structural sharing; overlay buffer reuse. | Planned |
+| **2** | Freshness core (Pillar C): `Validity` + `FreshnessRegistry`; observation tracker; policies; optimistic verify-and-rerun loop. | **Done** (`phase-2-freshness`) |
+| **3** | State-update primitives (Pillar B.1): `StateUpdate` + targeted writers; refold `inject_*`; surface state-diff output. | **Done** (`phase-3-state-updates`) |
+| **4** | Event pipeline + adapters (Pillar B.2): `EventDecoder` trait, ERC-20 + V3 adapters, ingest/reorg/reconcile pipeline. | **Done** (`phase-4-event-pipeline`) |
+| **5** | COW snapshots (Pillar A): structural sharing; overlay buffer reuse. | **Done** (`phase-5-cow-snapshots`) |
 
 Cross-cutting (land opportunistically): call tracer Inspector, full offline
 (`default-features = false`, no provider) build split, CHANGELOG/CONTRIBUTING.
@@ -165,6 +165,294 @@ the Pillar A rewrite. These are the breaking changes that must precede a 1.0.
 `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` (default),
 `cargo clippy --lib --no-default-features -- -D warnings`, `cargo test`,
 `RUSTDOCFLAGS=-D warnings cargo doc`, and all examples/benches build.
+
+---
+
+## Phase 2 — freshness core (detailed, decisions locked)
+
+Builds the freshness/invalidation control plane **and** the optimistic
+verify-and-rerun execution loop on top of it. Out of scope: event-derived
+*writes* (Phase 3), the WS ingestion loop and reorg handling (Phase 4).
+
+### Locked decisions
+
+1. **`Validity` has three variants** (`EventDriven` dropped — folded into
+   `Pinned`): `Pinned` (caller-owned: immutable or kept fresh via event writes;
+   the freshness system never touches it), `Volatile` (governed by the active
+   policy), `ValidThrough(block)` (pinned until block N, then volatile). Default
+   is `Volatile`, configurable.
+2. **Optimistic verify-and-rerun is in scope.** Don't block on a purge: snapshot,
+   run sims, and concurrently re-fetch the volatile slots they read (scoped by the
+   `TxConfig.access_list`); on a value mismatch, refresh and re-run only the
+   affected sims. Correctness is independent of access-list completeness (the
+   post-sim actual read-set is re-verified before results are trusted).
+3. **Adaptive freshness via the (revived) `SlotObservationTracker`.** Per-slot
+   `last_value`/`observation_count`/`change_count`/`last_checked`/`last_changed`
+   drive `should_refetch`. Frequently-changing slots are verified often; stable
+   ones rarely.
+4. **Configurable clock, block-based by default.** `SlotObservationTracker` is made
+   clock-agnostic (takes `now: u64`); a `FreshnessClock` supplies it —
+   `BlockClock` (default) or `WallClock` (today's behavior).
+5. **Account-level purge.** A fully-volatile address drops account
+   (balance/nonce/code) + storage via a new `purge_account` primitive; an address
+   with any pinned slot keeps its account and only its volatile slots are purged.
+
+### Four-layer model
+
+| Layer | What | Type |
+| --- | --- | --- |
+| Classification | `Pinned` / `Volatile` / `ValidThrough` per address/slot | `FreshnessRegistry` |
+| Observation | per-slot change-frequency stats (clock-agnostic) | `SlotObservationTracker` (revived) |
+| Policy | which volatile slots to verify this cycle, and how | `FreshnessPolicy` trait |
+| Mechanism | re-fetch+compare, purge, re-run | `EvmCache` + `FreshnessController` |
+
+```rust
+pub enum Validity { Pinned, Volatile, ValidThrough(u64) }   // resolution: slot ▸ account ▸ default
+
+pub trait FreshnessClock { fn now(&self) -> u64; }          // BlockClock (default) | WallClock
+
+pub trait FreshnessPolicy {
+    fn select(&mut self, candidates: &[(Address, U256)],
+              obs: &SlotObservationTracker, now: u64) -> Vec<(Address, U256)>;
+    fn on_new_block(&mut self, block: u64) {}
+}
+// built-ins: AlwaysVerify, ObservationDriven (wraps should_refetch), NeverVerify.
+// tunable heuristics (min-observations, max-reuse, staleness threshold, …) move
+// into a `FreshnessParams` config so users can tune the adaptive model.
+
+pub struct FreshnessController<P: FreshnessPolicy, C: FreshnessClock> { /* registry, tracker, policy, clock, fetcher */ }
+```
+
+### Primitives (on `EvmCache`)
+
+- `verify_slots(&mut self, slots) -> Vec<SlotChange>` — re-fetch current values via
+  the existing batched `StorageBatchFetchFn`, compare to cached values, and inject the
+  changed ones. Returns the changed set. (It does **not** update the observation
+  tracker — only the background validator observes checked slots.)
+- `purge_account(&mut self, addr)` — remove `addr` from the CacheDB overlay, the
+  BlockchainDb accounts map, and its storage, so the next access re-fetches a clean
+  `AccountInfo`. Distinct from storage-only `purge_pool_storage`.
+
+### Optimistic execution loop with deferred validation (`FreshnessController::run`)
+
+`run` returns a `SpeculativeSim { optimistic, validation }` **as soon as the
+optimistic sims finish** — it does *not* await RPC. The caller computes against
+`optimistic()` immediately and `validate().await`s the verdict when ready.
+
+```rust
+pub struct SpeculativeSim { /* optimistic results + JoinHandle<Validation> */ }
+impl SpeculativeSim {
+    pub fn optimistic(&self) -> &[SimOutcome];
+    pub async fn validate(self) -> Validation;
+}
+pub enum Validation {
+    Confirmed,
+    Corrected { results: Vec<SimOutcome>, changed: Vec<SlotChange> },
+    Unverified { reason: String },
+}
+```
+
+Main thread (`run`): drain pending corrections into the cache → `create_snapshot()`
+→ run optimistic sims (capturing read-sets) → **spawn** the validator with `Send`
+data only (`Arc<EvmSnapshot>`, the `Arc` `StorageBatchFetchFn`, requests, read-sets)
+→ return `SpeculativeSim`.
+
+Background validator (spawned task — never touches the `!Send` cache): `verify_slots`
+the predicted volatile set; reconcile by verifying any volatile slot in the actual
+read-set not yet checked; if nothing changed → `Confirmed`; else build *corrected*
+overlays from the snapshot with the fresh values in their dirty layers, re-run only
+the affected sims → `Corrected { results, changed }`. RPC failure → `Unverified`.
+
+Freshness flow-back: the validator can't mutate the live cache, so `changed` is
+returned **and** queued; the next `run` drains the queue and applies it before
+snapshotting (eventually-fresh, no cross-thread cache mutation). Dropping a
+`SpeculativeSim` aborts the background task.
+
+Correctness rests on the reconcile step (verify the actual read-set); the access
+list only buys the overlap. This `FreshnessController` is the seed of the eventual
+`SimulationEngine`.
+
+### Placement
+
+`src/cache/freshness.rs` (child of `cache` → reads private layers for enumeration);
+`slot_observations.rs` revived + made clock-agnostic; `verify_slots`/`purge_account`
+on `EvmCache`. The whole freshness surface lives under the always-on (non-`protocols`)
+core.
+
+### Tests (offline)
+
+Classification resolution (slot ▸ account ▸ default); observation tracker with an
+injected clock (block-based); each built-in policy's `select`; `verify_slots`
+against a **stubbed** `StorageBatchFetchFn` returning chosen "current" values
+(changed vs unchanged); the full loop — match path (no re-run) and mismatch path
+(refresh + selective re-run of only affected sims); `purge_account` drops account +
+storage on both layers; `ValidThrough` boundary; `WallClock` vs `BlockClock`.
+
+### Acceptance — met
+
+`cargo fmt --check`, `clippy --all-targets -- -D warnings` (default +
+`--lib --no-default-features`), `cargo test`, `RUSTDOCFLAGS=-D warnings cargo doc`.
+
+Landed on `phase-2-freshness`: `src/freshness.rs` (the generic core — `Validity`
+/ `FreshnessRegistry`, `FreshnessClock` + `BlockClock`/`WallClock`,
+`FreshnessParams`, `FreshnessPolicy` + `AlwaysVerify`/`NeverVerify`/
+`ObservationDriven`, `SlotChange`/`Validation`/`SpeculativeSim`/`SimRequest`,
+`FreshnessController`); a clock-agnostic `SlotObservationTracker`;
+`EvmCache::verify_slots`/`purge_account`/`set_storage_batch_fetcher`;
+`EvmSnapshot::storage_value` + `EvmOverlay::override_slot` validator seams; the
+offline `examples/freshness_optimistic.rs`; and `tests/freshness.rs`.
+
+---
+
+## Phase 3 — state-update primitives (detailed, decisions locked)
+
+Builds **Pillar B.1 — the writer half** of the event → state pipeline: the
+generic state-mutation vocabulary and the single apply primitive that writes it
+consistently across both cache layers, returning a structured diff. Out of
+scope (Phase 4): event decoding (`EventDecoder`, `Log` → `StateUpdate`), the WS
+ingestion loop, reorg handling, and overlay-side apply.
+
+### Locked decisions
+
+1. **`Account` variant is a partial `AccountPatch`** (`balance`/`nonce`/`code`,
+   each `Option`), not a full `AccountInfo`: best fit for event-derived writes
+   (one field at a time) and keeps revm's type out of the public vocabulary.
+2. **`inject_v2/v3_*` (`protocols`) normalized to write-through.** Refolded onto
+   the write-through `StateUpdate::Slot` primitive (backend + overlay-if-present)
+   instead of the old overlay-only write — a deliberate behavior change recorded
+   in `CHANGELOG.md` (`### Changed`) and `KNOWN_ISSUES.md`, with a test pinning
+   the new placement. The cold-backfill `inject_storage_batch` stays layer-2-only.
+
+### Acceptance — met
+
+`cargo fmt --check`, `clippy --all-targets -- -D warnings` (default +
+`--lib --no-default-features`), `cargo test`, `RUSTDOCFLAGS=-D warnings cargo doc`.
+
+Landed on `phase-3-state-updates`: `src/state_update.rs` (the generic vocabulary
+— `StateUpdate` / `AccountPatch` / `PurgeScope`, the `StateDiff` / `AccountChange`
+/ `PurgeRecord` output, reusing `freshness::SlotChange`); `EvmCache::apply_update`
+/ `apply_updates` with the dual-layer write-through `Slot`/`Account` and dispatch
+`Purge` semantics; the refold of `inject_storage_batch_fresh` / `purge_account` /
+`purge_pool_storage` / `purge_pool_slots` / `inject_v2_pool_metadata` /
+`inject_v3_*` onto the primitive and the freshness correction-drain routed
+through `apply_updates`; the offline `examples/state_update_apply.rs`;
+`benches/state_update.rs`; and `tests/state_update.rs`. The §15 addendum adds the
+relative / read-modify-write surface — a saturating `SlotDelta`, the
+`StateUpdate::SlotDelta` variant, `EvmCache::modify_slot`, and the cold-aware
+skip-and-surface contract via the new `StateDiff.skipped` field — to keep
+event-derived balances (e.g. ERC-20 `Transfer` deltas) hot without knowing the
+resulting absolute value. The §16 post-audit remediation then fixed a
+HIGH-severity silent-corruption bug — `cached_storage_value` now mirrors the EVM
+`SLOAD` for `StorageCleared`/`NotExisting` overlay accounts instead of returning a
+shadowed backend value — and hardened the surface: a no-op `Account` patch no
+longer materializes a backend account; the vocabulary and diff gained `serde`;
+`StateDiff`/`AccountPatch` became `#[non_exhaustive]`; relative native-balance
+tracking landed (`StateUpdate::BalanceDelta`, `EvmCache::modify_account_balance`,
+`StateDiff.skipped_balances`, `SkippedBalanceDelta`) with discoverable skip
+accessors (`has_skipped`/`skipped_len`/`is_fully_applied`) and the
+`StateUpdate::nonce`/`code`/`account` constructors; and `apply_updates` gained a
+batched single-lock fast-path (byte-identical to the sequential fold, pinned by an
+equivalence test).
+
+---
+
+## Phase 4 — event pipeline + adapters (detailed, decisions locked)
+
+Builds **Pillar B.2 — the reader half** of the event → state pipeline: decode an
+on-chain `Log` into the Phase 3 `StateUpdate` vocabulary, apply it, and run the
+reactive maintenance (reconcile, reorg) that keeps event-derived state honest.
+Decoders are pure functions of `(log, pre-state)`; the `!Send` cache discipline is
+preserved by keeping the tested core synchronous (the async ingestion driver is a
+thin convenience). The full build contract is in
+[`phase-4-spec.md`](phase-4-spec.md).
+
+### Locked decisions
+
+1. **Packed-slot updates → `StateUpdate::SlotMasked`** (a cold-aware RMW masked
+   write), so a pure decoder can express a partial update to a packed word (V3
+   `slot0`) without clobbering the bits it does not own (notably `unlocked`).
+2. **V3 adapter coverage → `Swap` **and** `Mint`/`Burn` (full ticks).** `slot0` +
+   `liquidity` from `Swap`; per-tick `liquidityGross`/`liquidityNet` +
+   `initialized` + `tickBitmap` + in-range global `liquidity` from `Mint`/`Burn`,
+   computed against the `StateView`. Fee-growth/oracle state is out of scope (a
+   documented limitation; reconcile/purge are the backstop).
+3. **Reorg → purge-and-resync.** A depth-bounded ring tracks addresses touched per
+   block; `reorg_to(n)` purges everything touched after `n` so reads re-fetch.
+   `ValidThrough` is the freshness lever.
+4. **Reconciliation → sampled re-read, correct **and** alarm.** `reconcile` samples
+   event-derived slots and re-reads via `EvmCache::reconcile_slots` (a honest
+   wrapper over `verify_slots` that errors on a total fetch failure rather than
+   reporting a false all-clear); the fresh chain value wins and the drift is
+   surfaced.
+
+### Acceptance — met
+
+`cargo fmt --check`, `clippy --all-targets -- -D warnings` (default +
+`--lib --no-default-features`), `cargo test` (both feature configs),
+`RUSTDOCFLAGS=-D warnings cargo doc`, `cargo bench --no-run`.
+
+Landed on `phase-4-event-pipeline`: `src/events/` (the generic core —
+`EventDecoder`/`StateView`, `DecoderRegistry`, `EventPipeline` with
+`ingest_logs`/`reorg_to`/`reconcile` + `BlockDigest`/`ReconcileReport`/
+`ReorgConfig`, and the async `drive`/`LogSource`), the generic
+`Erc20TransferDecoder` (`events::erc20`), and the `protocols`-gated
+`UniswapV3Decoder`/`UniswapV3Layout` (`events::uniswap_v3`); the cold-aware
+`StateUpdate::SlotMasked` vocabulary + `StateDiff.skipped_masks`/`SkippedMask`
+(`state_update`) and its dual-layer apply arm; `EvmCache::reconcile_slots` and the
+`StateView` impl; the offline `examples/reactive_cache.rs`;
+`benches/event_pipeline.rs`; and `tests/event_pipeline.rs` (+ the `SlotMasked`
+tests in `tests/state_update.rs`). The §6.4 V3 fee-growth/oracle maintenance gap
+is recorded in `KNOWN_ISSUES.md`.
+
+---
+
+## Phase 5 — copy-on-write snapshots (detailed, decisions locked)
+
+Builds **Pillar A**: replace the O(total state) deep-clone `create_snapshot` with
+a two-tier copy-on-write view whose cost tracks *changed* state, not *total*
+state. The cold `BlockchainDb` index (layer 2) is flattened once into an
+internal, immutable, `Arc`-shared base — both the base as a whole and each
+account's storage map are shared by `Arc`, so structural sharing needs no new
+dependency (Decision D1) — memoized across snapshots and rebuilt copy-on-write
+only for the addresses that changed; each snapshot then folds just the hot
+CacheDB delta (layer 1). Reads stay O(1), lock-free, and bit-for-bit identical to
+the deep clone. The full build contract is in
+[`phase-5-spec.md`](phase-5-spec.md).
+
+### Locked decisions
+
+1. **`Arc`-shared maps, not a persistent HAMT** (D1). Reads stay O(1) with no
+   per-`SLOAD` regression and no external dependency.
+2. **Base memoized as immutable; over-invalidation is acceptable, silent
+   staleness is not** (D2). The write-through funnel marks an address dirty
+   unconditionally; the differential-equivalence test is the hard backstop.
+3. **Keep the deep clone** as `create_snapshot_deep_clone` (D3) — the A/B
+   benchmark baseline and the read-equivalence reference.
+4. **Overlay reuse: buffer reuse *and* `reset()` recycle** (D4) — both in scope.
+5. **`create_snapshot` becomes `&mut self`** (D5) — the memoization cost; the
+   freshness controller and all callers are updated.
+
+### Acceptance — met
+
+`cargo fmt --check`, `clippy --all-targets -- -D warnings` (default +
+`--lib --no-default-features`), `cargo test` (both feature configs),
+`RUSTDOCFLAGS=-D warnings cargo doc`, `cargo bench --no-run`; the
+`tests/cow_snapshot.rs` differential-equivalence gate and the existing
+snapshot/overlay/freshness tests pass unchanged.
+
+Landed on `phase-5-cow-snapshots`: the memoized two-tier base (`BaseState` +
+the rewritten two-tier `EvmSnapshot` with `account_info`/`storage_value`/`code`
+accessors, `src/cache/snapshot.rs`); `EvmCache::refresh_base`/`build_base_full`,
+the COW `create_snapshot` (now `&mut self`), the retained
+`create_snapshot_deep_clone`, and the `mark_base_dirty`/`invalidate_base`
+invalidation wired into `write_slot_through`/`apply_slot_run`/
+`write_account_info_through`/`inject_storage_batch`/the `purge_*` paths and
+`set_block` (`src/cache/mod.rs`); `EvmOverlay::reset` plus the reusable
+shared-memory buffer recycled across the call methods (`src/cache/overlay.rs`);
+the layer-2-seeded A/B + hot-loop + `reset()`-fanout benches
+(`benches/simulation.rs`); and the differential-equivalence gate
+(`tests/cow_snapshot.rs`). The residual O(accounts) length-scan / O(layer-1)
+fold cost model is recorded in `KNOWN_ISSUES.md`.
 
 ---
 

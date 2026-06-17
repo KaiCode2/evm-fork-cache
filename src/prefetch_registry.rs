@@ -16,6 +16,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use alloy_primitives::{Address, U256};
+use anyhow::{Context as _, Result};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
@@ -33,7 +34,13 @@ pub struct PrefetchRegistry {
 }
 
 impl PrefetchRegistry {
-    /// Load from disk (bincode format). Returns empty registry if file missing or corrupt.
+    /// Load a registry from `path` (bincode format).
+    ///
+    /// Returns [`Default`] (an empty registry) on any error — a missing file, an
+    /// unreadable file, or corrupt/undecodable contents. These cases are not
+    /// distinguished by the return value: a corrupt registry is indistinguishable
+    /// from a fresh start, so a decode failure silently discards previously
+    /// persisted prefetch data (logged at `warn`).
     pub fn load(path: &Path) -> Self {
         match std::fs::read(path) {
             Ok(data) => match bincode::deserialize::<PrefetchRegistry>(&data) {
@@ -71,40 +78,70 @@ impl PrefetchRegistry {
         }
     }
 
-    /// Persist to disk (bincode format).
-    pub fn save(&self, path: &Path) {
-        if let Some(parent) = path.parent()
-            && let Err(e) = std::fs::create_dir_all(parent)
-        {
-            warn!(error = %e, "Failed to create prefetch registry directory");
-            return;
+    /// Persist the registry to `path` in bincode format, creating parent
+    /// directories as needed.
+    ///
+    /// Returns an error if the parent directory cannot be created, serialization
+    /// fails, or the write fails.
+    pub fn save(&self, path: &Path) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!("failed to create prefetch registry directory {parent:?}")
+            })?;
         }
-        match bincode::serialize(self) {
-            Ok(data) => {
-                if let Err(e) = std::fs::write(path, data) {
-                    warn!(error = %e, "Failed to persist prefetch registry");
-                } else {
-                    let total_slots: usize =
-                        self.phases.values().map(|al| al.slots.len()).sum::<usize>()
-                            + self
-                                .keyed_phases
-                                .values()
-                                .flat_map(|m| m.values())
-                                .map(|al| al.slots.len())
-                                .sum::<usize>();
-                    debug!(total_slots, "Saved prefetch registry");
-                }
-            }
-            Err(e) => warn!(error = %e, "Failed to serialize prefetch registry"),
-        }
+        let data = bincode::serialize(self).context("failed to serialize prefetch registry")?;
+        std::fs::write(path, data)
+            .with_context(|| format!("failed to persist prefetch registry to {path:?}"))?;
+
+        let total_slots: usize = self.phases.values().map(|al| al.slots.len()).sum::<usize>()
+            + self
+                .keyed_phases
+                .values()
+                .flat_map(|m| m.values())
+                .map(|al| al.slots.len())
+                .sum::<usize>();
+        debug!(total_slots, "Saved prefetch registry");
+        Ok(())
     }
 
-    /// Record an aggregated access list for a phase (replaces any existing).
+    /// Record the aggregated access list for `phase`, **overwriting** any access
+    /// list previously recorded for that phase.
+    ///
+    /// Each call wholesale replaces the phase's slot set; it does not merge with
+    /// the prior list. To accumulate per-address lists instead, use
+    /// [`record_keyed`](Self::record_keyed).
+    ///
+    /// ```
+    /// use evm_fork_cache::prefetch_registry::PrefetchRegistry;
+    /// use evm_fork_cache::StorageAccessList;
+    /// use alloy_primitives::{Address, U256};
+    ///
+    /// let mut registry = PrefetchRegistry::default();
+    /// let addr = Address::repeat_byte(0x01);
+    ///
+    /// let mut al = StorageAccessList::default();
+    /// al.slots.insert((addr, U256::from(1)));
+    /// registry.record("pool_refresh", al);
+    /// assert!(registry.phase_slots("pool_refresh").contains(&(addr, U256::from(1))));
+    ///
+    /// // A second record replaces the slot set rather than merging.
+    /// let mut al2 = StorageAccessList::default();
+    /// al2.slots.insert((addr, U256::from(2)));
+    /// registry.record("pool_refresh", al2);
+    /// let slots = registry.phase_slots("pool_refresh");
+    /// assert_eq!(slots.len(), 1);
+    /// assert!(slots.contains(&(addr, U256::from(2))));
+    /// ```
     pub fn record(&mut self, phase: &str, access_list: StorageAccessList) {
         self.phases.insert(phase.to_string(), access_list);
     }
 
-    /// Record a keyed access list within a phase.
+    /// Record the access list for a single `key` within a keyed `phase`.
+    ///
+    /// Unlike [`record`](Self::record), this **inserts into** the phase's per-key
+    /// nested map: other keys already recorded under `phase` are preserved, and
+    /// only the entry for `key` is replaced. Pairs with
+    /// [`prefetch_keyed`](Self::prefetch_keyed).
     pub fn record_keyed(&mut self, phase: &str, key: Address, access_list: StorageAccessList) {
         self.keyed_phases
             .entry(phase.to_string())
@@ -166,8 +203,12 @@ impl PrefetchRegistry {
         batch_prefetch(cache, slots.into_iter(), phase)
     }
 
-    /// Returns the set of (address, slot) pairs for an aggregated phase.
-    /// Used to build exclusion sets for subsequent prefetches.
+    /// Returns the set of `(address, slot)` pairs recorded for an aggregated
+    /// `phase`, or an empty set if the phase was never [`record`](Self::record)ed.
+    ///
+    /// Typically used to build the `exclude` set passed to
+    /// [`prefetch_keyed`](Self::prefetch_keyed) so a later stage skips slots a
+    /// prior aggregated prefetch already warmed.
     pub fn phase_slots(&self, phase: &str) -> HashSet<(Address, U256)> {
         self.phases
             .get(phase)
@@ -176,7 +217,15 @@ impl PrefetchRegistry {
     }
 }
 
-/// Batch-fetch slots into the EVM cache via `storage_batch_fetcher`.
+/// Batch-fetch `slots` into `cache` via its `storage_batch_fetcher` and inject
+/// the results, returning `(fetched, errors)`.
+///
+/// Deduplicating, exclusion, and phase lookup are the caller's responsibility
+/// ([`PrefetchRegistry::prefetch_phase`] / [`PrefetchRegistry::prefetch_keyed`]).
+/// If `slots` is empty, or the cache has no batch fetcher configured, returns
+/// `(0, 0)` without fetching. Otherwise each slot that the fetcher resolves
+/// successfully is injected into the cache and counted in `fetched`; per-slot
+/// fetch errors are counted in `errors` and skipped.
 fn batch_prefetch(
     cache: &mut EvmCache,
     slots: impl Iterator<Item = (Address, U256)>,
@@ -200,7 +249,8 @@ fn batch_prefetch(
 
     let start = std::time::Instant::now();
     let total_requested = requests.len();
-    let results = fetcher(requests);
+    // `None`: fetch at the cache's currently-pinned block (synchronous, no repin race).
+    let results = fetcher(requests, None);
 
     let mut successes: Vec<(Address, U256, U256)> = Vec::with_capacity(results.len());
     let mut errors = 0usize;
@@ -294,7 +344,7 @@ mod tests {
         sal.slots.insert((key, U256::from(99)));
         registry.record_keyed("per_target", key, sal);
 
-        registry.save(&path);
+        registry.save(&path).expect("save registry");
 
         let loaded = PrefetchRegistry::load(&path);
         assert_eq!(loaded.phases.len(), 1);
@@ -314,6 +364,26 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn save_reports_write_failures() {
+        let dir = std::env::temp_dir().join("evm_fork_cache_test_prefetch_registry_write_error");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&dir);
+        std::fs::write(&dir, b"not a directory").expect("create file path conflict");
+
+        let registry = PrefetchRegistry::default();
+        let path = dir.join("registry.bin");
+        let err = registry
+            .save(&path)
+            .expect_err("save must report write failure");
+        assert!(
+            err.to_string().contains("directory") || err.to_string().contains("Not a directory"),
+            "unexpected error: {err:#}"
+        );
+
+        let _ = std::fs::remove_file(&dir);
     }
 
     #[test]

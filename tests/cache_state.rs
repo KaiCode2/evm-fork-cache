@@ -8,13 +8,13 @@
 
 mod common;
 
-use alloy_primitives::{Address, Bytes, I256, U256};
-use alloy_sol_types::SolValue;
+use alloy_primitives::{Address, B256, Bytes, I256, U256, keccak256};
+use alloy_sol_types::{SolCall, SolValue};
 use anyhow::{Context, Result};
 use revm::state::{AccountInfo, Bytecode};
 
 use common::{
-    MOCK_ERC20_BALANCE_SLOT, balance_of, install_default_account, install_mock_erc20,
+    MOCK_ERC20_BALANCE_SLOT, MockERC20, balance_of, install_default_account, install_mock_erc20,
     mock_erc20_creation_code, mock_erc20_runtime, setup_cache, transfer,
 };
 use evm_fork_cache::cache::TxConfig;
@@ -119,6 +119,75 @@ async fn simulation_reports_balance_deltas() -> Result<()> {
 
     let delta = I256::from_raw(balance_after) - I256::from_raw(balance_before);
     assert_eq!(delta, -I256::from_raw(U256::from(250u64)));
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn balance_delta_simulation_reports_access_list() -> Result<()> {
+    let mut cache = setup_cache().await?;
+    let token = Address::repeat_byte(0x44);
+    let owner = Address::repeat_byte(0x55);
+    let recipient = Address::repeat_byte(0x66);
+
+    install_default_account(&mut cache, Address::ZERO);
+    install_default_account(&mut cache, owner);
+    install_default_account(&mut cache, recipient);
+    install_mock_erc20(&mut cache, token);
+
+    let balance_slot = U256::from(MOCK_ERC20_BALANCE_SLOT);
+    cache.insert_mapping_storage_slot(token, balance_slot, owner, U256::from(1_000u64))?;
+    cache.insert_mapping_storage_slot(token, balance_slot, recipient, U256::ZERO)?;
+
+    let transfer_call = MockERC20::transferCall {
+        to: recipient,
+        amount: U256::from(250u64),
+    };
+    let result = cache.simulate_call_with_balance_deltas(
+        owner,
+        token,
+        Bytes::from(transfer_call.abi_encode()),
+        owner,
+        [token],
+        false,
+    )?;
+
+    assert_eq!(
+        result.token_deltas.get(&token),
+        Some(&-I256::from_raw(U256::from(250u64)))
+    );
+
+    let owner_balance_slot = B256::from(U256::from_be_bytes(
+        keccak256((owner, balance_slot).abi_encode()).0,
+    ));
+    let recipient_balance_slot = B256::from(U256::from_be_bytes(
+        keccak256((recipient, balance_slot).abi_encode()).0,
+    ));
+    let token_item = result
+        .access_list
+        .0
+        .iter()
+        .find(|item| item.address == token)
+        .expect("access list includes the token account");
+    assert!(
+        token_item.storage_keys.contains(&owner_balance_slot),
+        "access list includes owner's balance slot"
+    );
+    assert!(
+        token_item.storage_keys.contains(&recipient_balance_slot),
+        "access list includes recipient's balance slot"
+    );
+
+    assert_eq!(
+        balance_of(&mut cache, token, owner)?,
+        U256::from(1_000u64),
+        "non-committing simulation must not change owner balance"
+    );
+    assert_eq!(
+        balance_of(&mut cache, token, recipient)?,
+        U256::ZERO,
+        "non-committing simulation must not change recipient balance"
+    );
 
     Ok(())
 }
@@ -235,7 +304,7 @@ async fn two_layer_cache_staleness_requires_full_purge() -> Result<()> {
 
     // Clearing ONLY the backend leaves the overlay serving stale data.
     {
-        let mut storage = cache.blockchain_db().storage().write();
+        let mut storage = cache.unchecked_blockchain_db().storage().write();
         storage.remove(&token);
     }
     assert_eq!(

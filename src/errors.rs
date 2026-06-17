@@ -10,6 +10,11 @@
 //! Application-specific selectors therefore live in the application, not in this
 //! generic layer: define them with `sol!` and register them once.
 //!
+//! Note that [`Panic(uint256)`](RevertReason::Panic) codes that exceed
+//! `u64::MAX` are dropped to `None` during decoding (and so surface as
+//! [`RevertReason::Unknown`]). This is benign: real compiler-emitted panic
+//! codes are single-byte constants (e.g. `0x11`, `0x32`).
+//!
 //! ```
 //! use alloy_sol_types::{SolError, sol};
 //! use evm_fork_cache::errors::{RevertDecoder, RevertReason};
@@ -37,10 +42,12 @@ use std::sync::{Arc, OnceLock};
 use alloy_primitives::{Bytes, FixedBytes};
 use alloy_sol_types::SolError;
 
-/// 4-byte selector of the standard Solidity `Error(string)` revert.
+/// 4-byte selector of the standard Solidity `Error(string)` revert
+/// (`0x08c379a0`), emitted by `require`/`revert("msg")`.
 pub const ERROR_SELECTOR: [u8; 4] = [0x08, 0xc3, 0x79, 0xa0];
 
-/// 4-byte selector of the standard Solidity `Panic(uint256)` revert.
+/// 4-byte selector of the standard Solidity `Panic(uint256)` revert
+/// (`0x4e487b71`), emitted on overflow, division-by-zero, etc.
 pub const PANIC_SELECTOR: [u8; 4] = [0x4e, 0x48, 0x7b, 0x71];
 
 /// A decoded contract-defined custom error.
@@ -48,7 +55,8 @@ pub const PANIC_SELECTOR: [u8; 4] = [0x4e, 0x48, 0x7b, 0x71];
 pub struct CustomRevert {
     /// Human-readable signature, e.g. `"Unauthorized(address)"`.
     pub name: Cow<'static, str>,
-    /// The error's 4-byte selector.
+    /// The error's 4-byte selector (the first 4 bytes of [`data`](Self::data)),
+    /// the `keccak256` prefix of [`name`](Self::name).
     pub selector: FixedBytes<4>,
     /// Debug-formatted decoded parameters, when the body decoded successfully.
     ///
@@ -71,13 +79,16 @@ impl fmt::Display for CustomRevert {
 /// A decoded EVM revert reason.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RevertReason {
-    /// The call reverted with no return data.
+    /// The call reverted with no return data (e.g. a bare `revert()` or `assert`
+    /// in older Solidity, or an empty `require`).
     Empty,
     /// Standard Solidity `Error(string)` revert (e.g. `require(cond, "msg")`).
     Error(String),
     /// Standard Solidity `Panic(uint256)` revert (e.g. arithmetic overflow).
     Panic(u64),
-    /// A registered contract-defined custom error.
+    /// A contract-defined custom error whose selector was registered on the
+    /// decoder via [`RevertDecoder::with_error`], [`RevertDecoder::register`],
+    /// or [`RevertDecoder::register_raw`].
     Custom(CustomRevert),
     /// A selector that matched no built-in or registered custom error.
     Unknown {
@@ -137,7 +148,15 @@ impl fmt::Debug for RevertDecoder {
 }
 
 impl RevertDecoder {
-    /// Create a decoder that recognizes only the standard Solidity built-ins.
+    /// Create a decoder that recognizes only the standard Solidity built-ins
+    /// (`Error(string)` and `Panic(uint256)`) and no custom errors.
+    ///
+    /// ```
+    /// use evm_fork_cache::errors::RevertDecoder;
+    ///
+    /// let decoder = RevertDecoder::new();
+    /// assert!(decoder.is_empty());
+    /// ```
     pub fn new() -> Self {
         Self::default()
     }
@@ -194,6 +213,41 @@ impl RevertDecoder {
     /// when the selector and signature come from an ABI loaded at runtime. The
     /// `decode` closure receives the full revert bytes (selector included) and
     /// returns the formatted parameters, or `None` if it cannot decode them.
+    ///
+    /// If the closure returns `None`, the selector still matches: the decode
+    /// yields a [`RevertReason::Custom`] whose
+    /// [`params`](CustomRevert::params) is `None`. If an error with the same
+    /// selector is already registered it is replaced.
+    ///
+    /// ```
+    /// use alloy_primitives::Bytes;
+    /// use evm_fork_cache::errors::{RevertDecoder, RevertReason};
+    ///
+    /// let mut decoder = RevertDecoder::new();
+    /// // A closure that decodes the parameters when there is a payload byte,
+    /// // and otherwise reports a decode failure by returning `None`.
+    /// decoder.register_raw([0xde, 0xad, 0xbe, 0xef], "MyError(uint256)", |data| {
+    ///     (data.len() > 4).then(|| format!("payload {} bytes", data.len() - 4))
+    /// });
+    ///
+    /// // Selector plus a payload byte: the closure decodes the parameters.
+    /// let with_params = Bytes::from(vec![0xde, 0xad, 0xbe, 0xef, 0x00]);
+    /// match decoder.decode(&with_params) {
+    ///     RevertReason::Custom(custom) => {
+    ///         assert_eq!(custom.name, "MyError(uint256)");
+    ///         assert_eq!(custom.params.as_deref(), Some("payload 1 bytes"));
+    ///     }
+    ///     other => panic!("expected Custom, got {other}"),
+    /// }
+    ///
+    /// // Bare selector: the closure returns `None`, but the selector still
+    /// // matches, so the result is a `Custom` with `params == None`.
+    /// let bare = Bytes::from(vec![0xde, 0xad, 0xbe, 0xef]);
+    /// match decoder.decode(&bare) {
+    ///     RevertReason::Custom(custom) => assert!(custom.params.is_none()),
+    ///     other => panic!("expected Custom, got {other}"),
+    /// }
+    /// ```
     pub fn register_raw(
         &mut self,
         selector: [u8; 4],
@@ -210,20 +264,64 @@ impl RevertDecoder {
         self
     }
 
-    /// Number of registered custom errors (built-ins are not counted).
+    /// Number of registered custom errors. The two Solidity built-ins are
+    /// always recognized and are not counted, so a freshly
+    /// [`new`](RevertDecoder::new) decoder reports `0`.
     pub fn len(&self) -> usize {
         self.custom.len()
     }
 
-    /// Returns `true` if no custom errors are registered.
+    /// Returns `true` if no custom errors are registered. The built-ins are
+    /// always recognized regardless, so this is `true` for a freshly
+    /// [`new`](RevertDecoder::new) decoder.
     pub fn is_empty(&self) -> bool {
         self.custom.is_empty()
     }
 
     /// Decode raw EVM revert data into a [`RevertReason`].
     ///
-    /// Resolution order: the two Solidity built-ins, then registered custom
-    /// errors by selector, then [`RevertReason::Unknown`] for anything else.
+    /// Resolution order: the two Solidity built-ins (`Error(string)` and
+    /// `Panic(uint256)`), then registered custom errors by selector, then
+    /// [`RevertReason::Unknown`] for anything else. Empty input decodes to
+    /// [`RevertReason::Empty`], and data shorter than 4 bytes decodes to
+    /// [`RevertReason::Unknown`] with the selector right-padded with zeros.
+    ///
+    /// ```
+    /// use alloy_primitives::{Bytes, U256};
+    /// use alloy_sol_types::{Panic, SolError, sol};
+    /// use evm_fork_cache::errors::{RevertDecoder, RevertReason, ERROR_SELECTOR};
+    ///
+    /// sol! {
+    ///     #[derive(Debug)]
+    ///     error Custom();
+    /// }
+    ///
+    /// let decoder = RevertDecoder::new().with_error::<Custom>();
+    ///
+    /// // Built-in `Error(string)` decodes natively, without registration.
+    /// // Layout: selector | offset(0x20) | length | utf8 bytes (padded).
+    /// let mut bytes = ERROR_SELECTOR.to_vec();
+    /// bytes.extend_from_slice(&{ let mut o = [0u8; 32]; o[31] = 0x20; o }); // offset
+    /// bytes.extend_from_slice(&{ let mut l = [0u8; 32]; l[31] = 2; l });    // length 2
+    /// bytes.extend_from_slice(b"hi");
+    /// bytes.extend_from_slice(&[0u8; 30]);                                  // pad to 32
+    /// assert_eq!(decoder.decode(&Bytes::from(bytes)), RevertReason::Error("hi".into()));
+    ///
+    /// // Built-in `Panic(uint256)` decodes natively too.
+    /// let panic = Bytes::from(Panic { code: U256::from(0x11) }.abi_encode());
+    /// assert_eq!(decoder.decode(&panic), RevertReason::Panic(0x11));
+    ///
+    /// // A registered selector resolves to `Custom`.
+    /// let raw = Bytes::from(Custom::SELECTOR.to_vec());
+    /// match decoder.decode(&raw) {
+    ///     RevertReason::Custom(err) => assert_eq!(err.name, "Custom()"),
+    ///     other => panic!("expected Custom, got {other}"),
+    /// }
+    ///
+    /// // An unregistered selector falls through to `Unknown`.
+    /// let unknown = Bytes::from(vec![0xde, 0xad, 0xbe, 0xef]);
+    /// assert!(matches!(decoder.decode(&unknown), RevertReason::Unknown { .. }));
+    /// ```
     pub fn decode(&self, data: &Bytes) -> RevertReason {
         if data.is_empty() {
             return RevertReason::Empty;
@@ -302,11 +400,12 @@ fn decode_solidity_error_string(data: &Bytes) -> Option<String> {
 /// A structured simulation revert with its decoded reason.
 #[derive(Debug, Clone)]
 pub struct SimulationError {
-    /// Gas used before the revert.
+    /// Gas consumed before the revert.
     pub gas_used: u64,
-    /// Raw revert data returned by the EVM.
+    /// Raw revert data returned by the EVM (the bytes that were decoded into
+    /// [`reason`](Self::reason)).
     pub revert_data: Bytes,
-    /// The decoded revert reason.
+    /// The revert reason decoded from [`revert_data`](Self::revert_data).
     pub reason: RevertReason,
 }
 
@@ -333,7 +432,8 @@ impl SimulationError {
         }
     }
 
-    /// The decoded revert reason.
+    /// The decoded revert reason. Equivalent to borrowing the public
+    /// [`reason`](Self::reason) field.
     pub fn reason(&self) -> &RevertReason {
         &self.reason
     }
@@ -371,7 +471,8 @@ impl SimulationError {
         }
     }
 
-    /// `true` if the call reverted with no return data.
+    /// `true` if the call reverted with no return data, i.e. the reason is
+    /// [`RevertReason::Empty`].
     pub fn is_empty_revert(&self) -> bool {
         matches!(self.reason, RevertReason::Empty)
     }
@@ -389,7 +490,9 @@ impl fmt::Display for SimulationError {
 
 impl std::error::Error for SimulationError {}
 
-/// Result type for simulations that distinguish EVM reverts from host errors.
+/// Result type returned by simulation entry points: `Ok(T)` on success, or a
+/// [`SimError`] distinguishing a transaction-level revert, an EVM halt, and a
+/// host-side failure.
 pub type SimulationResult<T> = Result<T, SimError>;
 
 /// Error returned by simulation entry points.
@@ -398,6 +501,11 @@ pub type SimulationResult<T> = Result<T, SimError>;
 /// [`Revert`](SimError::Revert) (with a decoded reason), an EVM
 /// [`Halt`](SimError::Halt) (e.g. out of gas), and a host-side
 /// [`Other`](SimError::Other) failure (RPC, database, ABI encoding).
+///
+/// Note that when a revert decodes to [`RevertReason::Panic`], panic codes
+/// exceeding `u64::MAX` are dropped to `None` and so surface as
+/// [`RevertReason::Unknown`] rather than `Panic`. This is benign: real
+/// compiler-emitted panic codes are single-byte constants.
 #[derive(Debug, thiserror::Error)]
 pub enum SimError {
     /// The transaction reverted; carries the decoded revert.
@@ -418,17 +526,21 @@ pub enum SimError {
 }
 
 impl SimError {
-    /// `true` if this is a transaction-level revert.
+    /// `true` if this is a transaction-level revert, i.e. the
+    /// [`Revert`](SimError::Revert) variant.
     pub fn is_revert(&self) -> bool {
         matches!(self, SimError::Revert(_))
     }
 
-    /// `true` if the EVM halted (e.g. out of gas).
+    /// `true` if the EVM halted without returning revert data (e.g. out of
+    /// gas), i.e. the [`Halt`](SimError::Halt) variant.
     pub fn is_halt(&self) -> bool {
         matches!(self, SimError::Halt { .. })
     }
 
-    /// The decoded revert, if this error is a revert.
+    /// The decoded [`SimulationError`] if this is a
+    /// [`Revert`](SimError::Revert), or `None` for a
+    /// [`Halt`](SimError::Halt) or [`Other`](SimError::Other) error.
     pub fn as_revert(&self) -> Option<&SimulationError> {
         match self {
             SimError::Revert(e) => Some(e),

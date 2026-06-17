@@ -15,8 +15,9 @@ use alloy_eips::eip2930::{AccessList, AccessListItem};
 use alloy_network::Network;
 use alloy_primitives::{Address, B256, U256, address};
 use alloy_provider::Provider;
+use alloy_rlp::Encodable;
 use alloy_sol_types::{SolCall, sol};
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use revm::context::result::ExecutionResult;
 use tracing::{debug, info};
 
@@ -26,6 +27,10 @@ use crate::cache::EvmCache;
 const ARB_GAS_INFO: Address = address!("000000000000000000000000000000000000006C");
 
 /// Optimism GasPriceOracle predeploy (Bedrock+).
+///
+/// Fixed predeploy address on every OP Stack chain. Queried for the L1 base fee
+/// ([`query_l1_base_fee_for_chain`]) and the full Ecotone L1 data fee
+/// ([`compute_op_l1_fee`]).
 pub const OP_GAS_PRICE_ORACLE: Address = address!("420000000000000000000000000000000000000F");
 
 /// Chain fee model used when deciding whether an access list is worth posting.
@@ -70,11 +75,20 @@ pub struct SmartAccessList {
 
 impl SmartAccessList {
     /// Create an empty smart access-list builder.
+    ///
+    /// Populate it with [`SmartAccessList::add_address`] and
+    /// [`SmartAccessList::add_storage_key`], then finalize with one of the
+    /// `into_access_list_*` methods.
     pub fn new() -> Self {
         Self { items: Vec::new() }
     }
 
     /// Create a builder from precomputed EIP-2930 items.
+    ///
+    /// The items are taken as-is; this constructor does not deduplicate
+    /// addresses or storage keys (unlike [`SmartAccessList::add_address`] and
+    /// [`SmartAccessList::add_storage_key`]). Pass items that are already
+    /// distinct, or rely on downstream encoders to fold duplicates.
     pub fn from_items(items: Vec<AccessListItem>) -> Self {
         Self { items }
     }
@@ -121,11 +135,25 @@ impl SmartAccessList {
     /// Evaluate profitability against current L1/L2 gas prices and return
     /// the access list only if it saves money.
     ///
-    /// Queries the ArbGasInfo precompile for pricing, then compares the
-    /// L2 execution savings (100 gas per entry) against the L1 data cost
-    /// of serializing each entry.
+    /// Queries the Arbitrum `ArbGasInfo` precompile for pricing, then compares
+    /// the L2 execution savings against the estimated L1 data cost of posting
+    /// the serialized list:
     ///
-    /// Returns `Ok(None)` if unprofitable or on pricing query failure.
+    /// - **L2 savings**: `100 gas * entry_count * perArbGas`, where each address
+    ///   and each storage key counts as one entry (the EIP-2929 warm-vs-cold
+    ///   access discount).
+    /// - **L1 cost**: `l1_data_gas * l1_base_fee`, where `l1_data_gas` is the
+    ///   exact per-byte calldata gas ([`l1_data_gas_for_bytes`]) of the EIP-2930
+    ///   RLP-encoded access list.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if the provider/pricing queries fail.
+    ///
+    /// Returns `Ok(None)` when:
+    /// - the list is empty,
+    /// - either the L2 or L1 gas price reads as zero, or
+    /// - the estimated L1 cost meets or exceeds the L2 savings (not profitable).
     pub async fn into_access_list_if_profitable<P: Provider>(
         self,
         provider: &P,
@@ -137,21 +165,15 @@ impl SmartAccessList {
         // Query ArbGasInfo for current pricing
         let arb = ArbGasInfo::new(ARB_GAS_INFO, provider);
         let prices_call = arb.getPricesInWei();
-        let prices = match prices_call.call().await {
-            Ok(p) => p,
-            Err(e) => {
-                debug!(error = %e, "Failed to query ArbGasInfo prices, skipping access list");
-                return Ok(None);
-            }
-        };
+        let prices = prices_call
+            .call()
+            .await
+            .context("failed to query ArbGasInfo prices for access-list profitability")?;
         let l1_fee_call = arb.getL1BaseFeeEstimate();
-        let l1_base_fee = match l1_fee_call.call().await {
-            Ok(fee) => fee,
-            Err(e) => {
-                debug!(error = %e, "Failed to query L1 base fee, skipping access list");
-                return Ok(None);
-            }
-        };
+        let l1_base_fee = l1_fee_call
+            .call()
+            .await
+            .context("failed to query ArbGasInfo L1 base fee for access-list profitability")?;
 
         let l2_gas_price = prices.perArbGas;
 
@@ -160,46 +182,14 @@ impl SmartAccessList {
             return Ok(None);
         }
 
-        // Calculate aggregate L2 savings and L1 cost
-        let mut total_entries: u64 = 0;
-        let mut total_l1_data_gas: u64 = 0;
-
-        for item in &self.items {
-            total_entries += 1;
-            total_l1_data_gas += l1_data_gas_for_bytes(item.address.as_slice());
-            // RLP overhead per address entry (~3-4 bytes, assume non-zero)
-            total_l1_data_gas += 4 * 16;
-
-            for key in &item.storage_keys {
-                total_entries += 1;
-                total_l1_data_gas += l1_data_gas_for_bytes(key.as_slice());
-                // RLP length prefix (1 byte, non-zero)
-                total_l1_data_gas += 16;
-            }
-        }
-        // Top-level RLP list headers (~3 bytes)
-        total_l1_data_gas += 3 * 16;
-
-        // L2 savings: 100 gas per entry × L2 gas price
-        let l2_savings_wei = U256::from(total_entries) * U256::from(100) * l2_gas_price;
-        // L1 cost: serialized data gas × L1 base fee
-        let l1_cost_wei = U256::from(total_l1_data_gas) * l1_base_fee;
-
-        let profitable = l2_savings_wei > l1_cost_wei;
-
-        info!(
-            entries = total_entries,
-            items = self.items.len(),
-            l2_savings_wei = %l2_savings_wei,
-            l1_cost_wei = %l1_cost_wei,
-            l2_gas_price_gwei = %format_gwei(l2_gas_price),
-            l1_base_fee_gwei = %format_gwei(l1_base_fee),
-            profitable,
-            "Access list profitability check"
-        );
-
-        if profitable {
-            Ok(Some(AccessList(self.items)))
+        let access_list = AccessList(self.items);
+        if log_access_list_profitability(
+            &access_list,
+            l2_gas_price,
+            l1_base_fee,
+            "Access list profitability check",
+        ) {
+            Ok(Some(access_list))
         } else {
             Ok(None)
         }
@@ -212,7 +202,18 @@ impl SmartAccessList {
 /// but costs L1 data posting gas for its serialized bytes. This function
 /// computes the net and returns the access list only if profitable.
 ///
-/// Returns `Ok(None)` if the list is empty, unprofitable, or pricing queries fail.
+/// This is the free-function counterpart to
+/// [`SmartAccessList::into_access_list_if_profitable`] for a pre-built
+/// [`AccessList`]; the two share the same cost model and break-even comparison.
+///
+/// # Errors
+///
+/// Returns `Err` if the provider/pricing queries fail.
+///
+/// Returns `Ok(None)` when:
+/// - the list is empty,
+/// - either the L2 or L1 gas price reads as zero, or
+/// - the estimated L1 cost meets or exceeds the L2 savings (not profitable).
 pub async fn access_list_if_profitable<P: Provider>(
     access_list: AccessList,
     provider: &P,
@@ -223,20 +224,16 @@ pub async fn access_list_if_profitable<P: Provider>(
 
     // Query ArbGasInfo for current pricing
     let arb = ArbGasInfo::new(ARB_GAS_INFO, provider);
-    let prices = match arb.getPricesInWei().call().await {
-        Ok(p) => p,
-        Err(e) => {
-            debug!(error = %e, "Failed to query ArbGasInfo prices, skipping access list");
-            return Ok(None);
-        }
-    };
-    let l1_base_fee = match arb.getL1BaseFeeEstimate().call().await {
-        Ok(fee) => fee,
-        Err(e) => {
-            debug!(error = %e, "Failed to query L1 base fee, skipping access list");
-            return Ok(None);
-        }
-    };
+    let prices = arb
+        .getPricesInWei()
+        .call()
+        .await
+        .context("failed to query ArbGasInfo prices for access-list profitability")?;
+    let l1_base_fee = arb
+        .getL1BaseFeeEstimate()
+        .call()
+        .await
+        .context("failed to query ArbGasInfo L1 base fee for access-list profitability")?;
 
     let l2_gas_price = prices.perArbGas;
 
@@ -245,45 +242,12 @@ pub async fn access_list_if_profitable<P: Provider>(
         return Ok(None);
     }
 
-    // Calculate aggregate L2 savings and L1 cost
-    let mut total_entries: u64 = 0;
-    let mut total_l1_data_gas: u64 = 0;
-
-    for item in &access_list.0 {
-        total_entries += 1;
-        total_l1_data_gas += l1_data_gas_for_bytes(item.address.as_slice());
-        // RLP overhead per address entry (~3-4 bytes, assume non-zero)
-        total_l1_data_gas += 4 * 16;
-
-        for key in &item.storage_keys {
-            total_entries += 1;
-            total_l1_data_gas += l1_data_gas_for_bytes(key.as_slice());
-            // RLP length prefix (1 byte, non-zero)
-            total_l1_data_gas += 16;
-        }
-    }
-    // Top-level RLP list headers (~3 bytes)
-    total_l1_data_gas += 3 * 16;
-
-    // L2 savings: 100 gas per entry × L2 gas price
-    let l2_savings_wei = U256::from(total_entries) * U256::from(100) * l2_gas_price;
-    // L1 cost: serialized data gas × L1 base fee
-    let l1_cost_wei = U256::from(total_l1_data_gas) * l1_base_fee;
-
-    let profitable = l2_savings_wei > l1_cost_wei;
-
-    info!(
-        entries = total_entries,
-        items = access_list.0.len(),
-        l2_savings_wei = %l2_savings_wei,
-        l1_cost_wei = %l1_cost_wei,
-        l2_gas_price_gwei = %format_gwei(l2_gas_price),
-        l1_base_fee_gwei = %format_gwei(l1_base_fee),
-        profitable,
-        "Simulation access list profitability check"
-    );
-
-    if profitable {
+    if log_access_list_profitability(
+        &access_list,
+        l2_gas_price,
+        l1_base_fee,
+        "Simulation access list profitability check",
+    ) {
         Ok(Some(access_list))
     } else {
         Ok(None)
@@ -387,10 +351,70 @@ fn push_unique(vec: &mut Vec<B256>, val: B256) {
 }
 
 /// L1 calldata gas for a byte slice: zero bytes = 4 gas, non-zero = 16 gas.
+///
+/// This is the post-EIP-2028 calldata pricing used to approximate the L1 data
+/// cost of serialized access-list entries. It counts the raw bytes only and
+/// does not add any RLP framing overhead.
+///
+/// # Examples
+///
+/// ```
+/// use evm_fork_cache::access_list::l1_data_gas_for_bytes;
+///
+/// // All-zero 32-byte slot: 32 * 4 = 128 gas.
+/// assert_eq!(l1_data_gas_for_bytes(&[0u8; 32]), 128);
+/// // All-non-zero 20-byte address: 20 * 16 = 320 gas.
+/// assert_eq!(l1_data_gas_for_bytes(&[0xFFu8; 20]), 320);
+/// // Empty slice costs nothing.
+/// assert_eq!(l1_data_gas_for_bytes(&[]), 0);
+/// ```
 pub fn l1_data_gas_for_bytes(data: &[u8]) -> u64 {
     data.iter()
         .map(|&b| if b == 0 { 4u64 } else { 16u64 })
         .sum()
+}
+
+/// Exact L1 calldata gas for the EIP-2930 RLP encoding of an access list.
+pub fn access_list_rlp_data_gas(access_list: &AccessList) -> u64 {
+    let mut encoded = Vec::with_capacity(access_list.length());
+    access_list.encode(&mut encoded);
+    l1_data_gas_for_bytes(&encoded)
+}
+
+fn access_list_entry_count(access_list: &AccessList) -> u64 {
+    access_list
+        .0
+        .iter()
+        .map(|item| 1 + item.storage_keys.len() as u64)
+        .sum()
+}
+
+fn log_access_list_profitability(
+    access_list: &AccessList,
+    l2_gas_price: U256,
+    l1_base_fee: U256,
+    message: &'static str,
+) -> bool {
+    let total_entries = access_list_entry_count(access_list);
+    let total_l1_data_gas = access_list_rlp_data_gas(access_list);
+    let l2_savings_wei = U256::from(total_entries) * U256::from(100) * l2_gas_price;
+    let l1_cost_wei = U256::from(total_l1_data_gas) * l1_base_fee;
+    let profitable = l2_savings_wei > l1_cost_wei;
+
+    info!(
+        entries = total_entries,
+        items = access_list.0.len(),
+        l1_data_gas = total_l1_data_gas,
+        l2_savings_wei = %l2_savings_wei,
+        l1_cost_wei = %l1_cost_wei,
+        l2_gas_price_gwei = %format_gwei(l2_gas_price),
+        l1_base_fee_gwei = %format_gwei(l1_base_fee),
+        profitable,
+        check = message,
+        "Access list profitability check"
+    );
+
+    profitable
 }
 
 /// Filter already-warm and excluded addresses from an access list, then apply
@@ -480,5 +504,54 @@ mod tests {
     fn l1_gas_for_nonzero_address_bytes_is_expensive() {
         let addr = Address::repeat_byte(0xFF);
         assert_eq!(l1_data_gas_for_bytes(addr.as_slice()), 320);
+    }
+
+    #[test]
+    fn access_list_rlp_data_gas_uses_exact_eip2930_encoding() {
+        let access_list = AccessList(vec![AccessListItem {
+            address: Address::ZERO,
+            storage_keys: Vec::new(),
+        }]);
+
+        // RLP([[zero_address, []]]) = d7 d6 94 <20 zero bytes> c0.
+        // Four non-zero framing bytes cost 64 gas; twenty zero address bytes cost
+        // 80 gas. The old fixed-overhead approximation returned 192.
+        assert_eq!(access_list_rlp_data_gas(&access_list), 144);
+    }
+
+    #[tokio::test]
+    async fn access_list_profitability_provider_error_returns_err() {
+        use alloy_network::Ethereum;
+        use alloy_provider::RootProvider;
+        use alloy_rpc_client::RpcClient;
+        use alloy_transport::mock::Asserter;
+
+        let provider = RootProvider::<Ethereum>::new(RpcClient::mocked(Asserter::new()));
+        let access_list = AccessList(vec![AccessListItem {
+            address: Address::repeat_byte(0xAA),
+            storage_keys: Vec::new(),
+        }]);
+
+        let err = access_list_if_profitable(access_list, &provider)
+            .await
+            .expect_err("provider failures must be distinguishable from unprofitable lists");
+        assert!(
+            err.to_string().contains("ArbGasInfo") || err.to_string().contains("provider"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn access_list_profitability_empty_list_still_returns_none() {
+        use alloy_network::Ethereum;
+        use alloy_provider::RootProvider;
+        use alloy_rpc_client::RpcClient;
+        use alloy_transport::mock::Asserter;
+
+        let provider = RootProvider::<Ethereum>::new(RpcClient::mocked(Asserter::new()));
+        let result = access_list_if_profitable(AccessList::default(), &provider)
+            .await
+            .expect("empty list must not query provider");
+        assert!(result.is_none());
     }
 }

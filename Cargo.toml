@@ -11,6 +11,14 @@ readme = "README.md"
 repository = "https://github.com/KaiCode2/evm-fork-cache"
 documentation = "https://docs.rs/evm-fork-cache"
 
+# Build docs.rs with every feature enabled so the `protocols` surface is
+# documented, and pass `--cfg docsrs` so feature-gated items render an
+# "available on crate feature X" badge (see `#![cfg_attr(docsrs, feature(doc_cfg))]`
+# in lib.rs). `docsrs` is only set on docs.rs and never affects local/CI builds.
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
 # Standalone workspace root: keeps this crate from being absorbed by any
 # ancestor-directory workspace and gives it its own Cargo.lock.
 [workspace]
@@ -30,6 +38,7 @@ alloy-eips = "1.0.38"
 alloy-network = "1.0.38"
 alloy-primitives = { version = "1.4", features = ["map"] }
 alloy-provider = "1.0.38"
+alloy-rlp = "0.3"
 alloy-rpc-client = "1.0.38"
 alloy-rpc-types-eth = "1.0.38"
 alloy-sol-types = "1.4"
@@ -72,4 +81,22 @@ harness = false
 
 [[bench]]
 name = "simulation"
+harness = false
+
+[[bench]]
+name = "freshness"
+harness = false
+
+[[bench]]
+name = "state_update"
+harness = false
+
+[[bench]]
+name = "event_pipeline"
+harness = false
+
+# RPC-gated real-contract benchmarks. Skipped (not failed) when RPC_URL is unset,
+# so `cargo bench` stays offline by default.
+[[bench]]
+name = "rpc_mainnet"
 harness = false

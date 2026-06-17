@@ -5,8 +5,10 @@
 //! ever reaches the network.
 #![allow(dead_code)]
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Condvar, Mutex};
 
+use alloy_eips::BlockId;
 use alloy_primitives::{Address, Bytes, U256, hex};
 use alloy_provider::RootProvider;
 use alloy_provider::network::AnyNetwork;
@@ -14,7 +16,7 @@ use alloy_rpc_client::RpcClient;
 use alloy_sol_types::{SolCall, sol};
 use alloy_transport::mock::Asserter;
 use anyhow::{Result, anyhow};
-use evm_fork_cache::cache::EvmCache;
+use evm_fork_cache::cache::{EvmCache, StorageBatchFetchFn};
 use revm::context::result::ExecutionResult;
 use revm::state::{AccountInfo, Bytecode};
 
@@ -92,6 +94,119 @@ pub fn balance_of(cache: &mut EvmCache, token: Address, owner: Address) -> Resul
         ),
         other => Err(anyhow!("balanceOf call failed: {other:?}")),
     }
+}
+
+/// Build a stub [`StorageBatchFetchFn`] that returns chosen "current" values.
+///
+/// `values` maps `(address, slot)` to the value the fetcher reports. Any
+/// requested slot not present in the map is reported as `U256::ZERO` (matching
+/// how an unseen slot reads in a simulation). This is the offline stand-in for
+/// the real RPC batch fetcher.
+pub fn stub_fetcher(values: HashMap<(Address, U256), U256>) -> StorageBatchFetchFn {
+    Arc::new(
+        move |requests: Vec<(Address, U256)>, _block: Option<BlockId>| {
+            requests
+                .into_iter()
+                .map(|(addr, slot)| {
+                    let value = values.get(&(addr, slot)).copied().unwrap_or(U256::ZERO);
+                    (addr, slot, Ok(value))
+                })
+                .collect()
+        },
+    )
+}
+
+/// Build a stub [`StorageBatchFetchFn`] that fails every request.
+///
+/// Used to exercise the `Unverified` / error paths offline.
+pub fn failing_fetcher() -> StorageBatchFetchFn {
+    Arc::new(|requests: Vec<(Address, U256)>, _block: Option<BlockId>| {
+        requests
+            .into_iter()
+            .map(|(addr, slot)| (addr, slot, Err(anyhow!("stub fetcher error"))))
+            .collect()
+    })
+}
+
+/// A one-shot synchronous gate: a holder blocks in [`wait`](Gate::wait) until
+/// some other thread calls [`release`](Gate::release). Cloning shares the same
+/// underlying state, and `release` is sticky — once released, every present and
+/// future `wait` returns immediately.
+///
+/// Used by the Drop-abort test to make the background validator's fetch
+/// deterministically ordered *after* the drop. The fetcher (running on a worker
+/// thread) cannot return — and therefore the validator cannot reach its
+/// post-fetch checkpoint — until the test has dropped the `SpeculativeSim` and
+/// released the gate, eliminating the spawn/poll race regardless of how the
+/// multi-thread scheduler interleaves the two threads.
+///
+/// Built on a `Mutex<bool>` + `Condvar` so the whole thing is `Send + Sync`,
+/// which a [`StorageBatchFetchFn`] closure must be.
+#[derive(Clone, Default)]
+pub struct Gate {
+    inner: Arc<(Mutex<bool>, Condvar)>,
+}
+
+impl Gate {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Block until [`release`](Gate::release) has been called (returns
+    /// immediately if it already has).
+    pub fn wait(&self) {
+        let (lock, cv) = &*self.inner;
+        let mut released = lock.lock().unwrap_or_else(|e| e.into_inner());
+        while !*released {
+            released = cv.wait(released).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
+    /// Wake any current waiter and let all future waiters pass.
+    pub fn release(&self) {
+        let (lock, cv) = &*self.inner;
+        *lock.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        cv.notify_all();
+    }
+}
+
+/// Build a stub [`StorageBatchFetchFn`] that reports chosen values but blocks on
+/// `gate` before returning.
+///
+/// Used by the Drop-abort test: by releasing the gate only *after* dropping the
+/// `SpeculativeSim`, the test guarantees the validator's fetch completes (and so
+/// its post-fetch, correction-queuing checkpoint runs) strictly after the
+/// cancel flag is set — so the dropped speculation can never queue a correction,
+/// no matter how the scheduler races the two threads. The returned values
+/// otherwise behave exactly like [`stub_fetcher`].
+pub fn gated_tracking_fetcher(
+    values: HashMap<(Address, U256), U256>,
+    gate: Gate,
+) -> StorageBatchFetchFn {
+    Arc::new(
+        move |requests: Vec<(Address, U256)>, _block: Option<BlockId>| {
+            gate.wait();
+            requests
+                .into_iter()
+                .map(|(addr, slot)| {
+                    let value = values.get(&(addr, slot)).copied().unwrap_or(U256::ZERO);
+                    (addr, slot, Ok(value))
+                })
+                .collect()
+        },
+    )
+}
+
+/// Build a stub [`StorageBatchFetchFn`] that panics, to exercise the validator's
+/// `JoinError` (`Unverified`) path.
+pub fn panicking_fetcher() -> StorageBatchFetchFn {
+    Arc::new(
+        |_requests: Vec<(Address, U256)>,
+         _block: Option<BlockId>|
+         -> Vec<(Address, U256, Result<U256>)> {
+            panic!("panicking fetcher: deliberate failure for the Unverified test")
+        },
+    )
 }
 
 /// Submit a `transfer(to, amount)` to a `MockERC20`, committing the state change.

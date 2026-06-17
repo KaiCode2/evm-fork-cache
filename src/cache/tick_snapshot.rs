@@ -12,7 +12,11 @@ use std::path::Path;
 use alloy_primitives::{Address, U256};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use tracing::warn;
+
+use super::versioned;
+
+const TICK_SNAPSHOT_CACHE_MAGIC: &[u8; 8] = b"EFCTICK\0";
+const TICK_SNAPSHOT_CACHE_VERSION: u32 = 1;
 
 /// Per-tick liquidity state for a UniswapV3-style concentrated-liquidity pool.
 ///
@@ -32,6 +36,10 @@ pub struct TickInfo {
 }
 
 /// Serializable tick info for V3 pools.
+///
+/// On-disk counterpart of [`TickInfo`] with the same three fields. It exists as
+/// a distinct type so the persisted snapshot format can evolve independently of
+/// the public [`TickInfo`] used by the simulation API.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SerializableTickInfo {
     pub liquidity_gross: u128,
@@ -60,6 +68,13 @@ pub struct V3PoolTickSnapshot {
 
 impl V3PoolTickSnapshot {
     /// Create a new tick snapshot from pool data.
+    ///
+    /// Captures the in-memory `tick_bitmap` and `ticks` maps along with the
+    /// pool's current `liquidity` and `tick`, converting the integer map keys to
+    /// their `String` form for serialization. The conversion is total (no entry
+    /// is dropped); the inverse [`V3PoolTickSnapshot::to_tick_bitmap`] /
+    /// [`V3PoolTickSnapshot::to_ticks`] may drop entries whose string keys fail
+    /// to parse.
     pub fn from_pool_data(
         tick_bitmap: &std::collections::HashMap<i16, U256>,
         ticks: &std::collections::HashMap<i32, TickInfo>,
@@ -90,6 +105,11 @@ impl V3PoolTickSnapshot {
     }
 
     /// Convert tick_bitmap back to HashMap<i16, U256>.
+    ///
+    /// Reverses the `i16 -> String` keying done by
+    /// [`V3PoolTickSnapshot::from_pool_data`]. Any entry whose string key does
+    /// not parse back to an `i16` is silently dropped, so a corrupted or
+    /// out-of-range key produces a smaller map rather than an error.
     pub fn to_tick_bitmap(&self) -> std::collections::HashMap<i16, U256> {
         self.tick_bitmap
             .iter()
@@ -98,6 +118,11 @@ impl V3PoolTickSnapshot {
     }
 
     /// Convert ticks back to `HashMap<i32, TickInfo>`.
+    ///
+    /// Reverses the `i32 -> String` keying done by
+    /// [`V3PoolTickSnapshot::from_pool_data`]. Any entry whose string key does
+    /// not parse back to an `i32` is silently dropped, so a corrupted or
+    /// out-of-range key produces a smaller map rather than an error.
     pub fn to_ticks(&self) -> std::collections::HashMap<i32, TickInfo> {
         self.ticks
             .iter()
@@ -129,19 +154,38 @@ pub struct V3TickSnapshotCache {
 
 impl V3TickSnapshotCache {
     /// Load tick snapshot cache from disk (binary format).
+    ///
+    /// Returns `None` if `path` cannot be read, fails the magic/version check, or
+    /// fails to decode as bincode for this type.
     pub fn load(path: &Path) -> Option<Self> {
         let data = std::fs::read(path).ok()?;
-        bincode::deserialize(&data)
-            .inspect_err(|e| warn!("Failed to parse V3 tick snapshot cache (bincode): {}", e))
-            .ok()
+        versioned::decode(
+            &data,
+            TICK_SNAPSHOT_CACHE_MAGIC,
+            TICK_SNAPSHOT_CACHE_VERSION,
+            "V3 tick snapshot cache",
+        )
     }
 
     /// Save tick snapshot cache to disk (binary format).
+    ///
+    /// Creates the parent directory if needed, then writes the
+    /// bincode-serialized cache to `path`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the parent directory cannot be created, if bincode
+    /// serialization fails, or if writing the file fails.
     pub fn save(&self, path: &Path) -> Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let data = bincode::serialize(self)?;
+        let data = versioned::encode(
+            TICK_SNAPSHOT_CACHE_MAGIC,
+            TICK_SNAPSHOT_CACHE_VERSION,
+            self,
+            "V3 tick snapshot cache",
+        )?;
         std::fs::write(path, data)?;
         Ok(())
     }
@@ -152,11 +196,15 @@ impl V3TickSnapshotCache {
     }
 
     /// Store a tick snapshot for a pool.
+    ///
+    /// Overwrites any existing snapshot for `address`.
     pub fn set(&mut self, address: Address, snapshot: V3PoolTickSnapshot) {
         self.snapshots.insert(address, snapshot);
     }
 
     /// Remove a tick snapshot for a pool.
+    ///
+    /// A no-op if no snapshot is stored for `address`.
     pub fn remove(&mut self, address: Address) {
         self.snapshots.remove(&address);
     }
