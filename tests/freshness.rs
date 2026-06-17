@@ -16,8 +16,8 @@ use alloy_sol_types::SolCall;
 use anyhow::Result;
 
 use common::{
-    MOCK_ERC20_BALANCE_SLOT, MockERC20, failing_fetcher, install_default_account,
-    install_mock_erc20, panicking_fetcher, setup_cache, stub_fetcher, tracking_fetcher,
+    Gate, MOCK_ERC20_BALANCE_SLOT, MockERC20, failing_fetcher, gated_tracking_fetcher,
+    install_default_account, install_mock_erc20, panicking_fetcher, setup_cache, stub_fetcher,
 };
 use evm_fork_cache::cache::{
     EvmCache, EvmOverlay, SimStatus, SlotObservationTracker, StorageBatchFetchFn,
@@ -248,7 +248,7 @@ async fn purge_account_drops_account_and_storage_from_both_layers() -> Result<()
     );
     // Account gone from the backend accounts map.
     {
-        let accounts = cache.blockchain_db().accounts().read();
+        let accounts = cache.unchecked_blockchain_db().accounts().read();
         assert!(!accounts.contains_key(&token), "backend account removed");
     }
 
@@ -1185,6 +1185,12 @@ async fn run_unverified_on_fetcher_error() -> Result<()> {
 // T3 (part 2): into_optimistic aborts the validation task. The fetcher WOULD
 // queue a correction (it reports a changed value), so if the abort failed we
 // would observe a non-zero pending queue. We assert it stays 0.
+//
+// Determinism mirrors the Drop-abort test below: the validator is allowed to
+// reach the synchronous fetch, but the gated fetch cannot return until after
+// `into_optimistic()` has set the cancel flag. That makes the product guarantee
+// precise: a cancel observed at the post-fetch checkpoint suppresses all
+// side-effects, including pending corrections and re-run accounting.
 #[tokio::test(flavor = "multi_thread")]
 async fn run_into_optimistic_aborts_validation() -> Result<()> {
     let token = Address::repeat_byte(0x44);
@@ -1192,11 +1198,12 @@ async fn run_into_optimistic_aborts_validation() -> Result<()> {
     let recipient = Address::repeat_byte(0x66);
 
     let mut cache = cache_with_balance(token, owner, U256::from(1000)).await?;
+    let gate = Gate::new();
     // A CHANGED value: if the validator ran, it would queue a correction.
-    cache.set_storage_batch_fetcher(stub_fetcher(HashMap::from([(
-        (token, balance_slot_for(owner)),
-        U256::from(50),
-    )])));
+    cache.set_storage_batch_fetcher(gated_tracking_fetcher(
+        HashMap::from([((token, balance_slot_for(owner)), U256::from(50))]),
+        gate.clone(),
+    ));
 
     let mut controller = FreshnessController::new(FreshnessRegistry::new(), AlwaysVerify);
     let sim = controller.run(
@@ -1208,6 +1215,7 @@ async fn run_into_optimistic_aborts_validation() -> Result<()> {
         )],
     )?;
     let results = sim.into_optimistic(); // aborts the background validation
+    gate.release();
     assert_eq!(results.len(), 1);
 
     // Give any (incorrectly) surviving task a chance to run, then assert no
@@ -1224,9 +1232,20 @@ async fn run_into_optimistic_aborts_validation() -> Result<()> {
 
 // T3 (part 1): dropping the SpeculativeSim (no validate/into_optimistic) aborts
 // the validation task before it can push a correction. The fetcher reports a
-// CHANGED value and flips a "called" flag; after the drop + settle we assert the
-// pending queue is empty (and, robustly, that the fetcher was never even
-// reached) — proving the abort beat the push.
+// CHANGED value, so an *uncancelled* validator would queue a correction and bump
+// the re-run count; we assert neither happens after the drop.
+//
+// Determinism: the validator's only correction-queuing path runs *after* its
+// fetch returns (the post-fetch cancel checkpoint in `run_validator` gates it).
+// We make that ordering race-free with a gate the test controls — the fetcher
+// blocks until `gate.release()`, and we release only *after* `drop(sim)` has set
+// the cancel flag. So however the multi-thread scheduler interleaves the spawned
+// task and this thread, the fetch (and thus the post-fetch checkpoint) can only
+// complete once cancellation is already observable, and the correction is
+// suppressed. We deliberately do NOT assert the fetcher was never reached: the
+// product only guarantees a cancel seen at a checkpoint suppresses side effects,
+// not that an in-flight fetch is skipped — asserting the latter was the original
+// over-strict, racy condition.
 #[tokio::test(flavor = "multi_thread")]
 async fn dropping_speculative_sim_aborts_before_queueing_correction() -> Result<()> {
     let token = Address::repeat_byte(0x44);
@@ -1234,10 +1253,10 @@ async fn dropping_speculative_sim_aborts_before_queueing_correction() -> Result<
     let recipient = Address::repeat_byte(0x66);
 
     let mut cache = cache_with_balance(token, owner, U256::from(1000)).await?;
-    let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    cache.set_storage_batch_fetcher(tracking_fetcher(
+    let gate = Gate::new();
+    cache.set_storage_batch_fetcher(gated_tracking_fetcher(
         HashMap::from([((token, balance_slot_for(owner)), U256::from(50))]),
-        Arc::clone(&called),
+        gate.clone(),
     ));
 
     let mut controller = FreshnessController::new(FreshnessRegistry::new(), AlwaysVerify);
@@ -1249,9 +1268,12 @@ async fn dropping_speculative_sim_aborts_before_queueing_correction() -> Result<
             transfer_calldata(recipient, U256::from(100)),
         )],
     )?;
-    // Drop immediately, with NO intervening await, so the abort flag is set
-    // before the spawned task is ever polled.
+    // Drop with NO intervening await, then release the gate. Releasing only after
+    // the drop guarantees the validator's fetch (if it even reaches it) returns
+    // strictly after the cancel flag is set, so its post-fetch checkpoint bails
+    // out before queuing anything.
     drop(sim);
+    gate.release();
 
     settle().await;
 
@@ -1259,10 +1281,6 @@ async fn dropping_speculative_sim_aborts_before_queueing_correction() -> Result<
         controller.pending_len(),
         0,
         "dropping the sim must abort validation before it queues a correction"
-    );
-    assert!(
-        !called.load(std::sync::atomic::Ordering::SeqCst),
-        "the aborted validator should never have reached the fetcher"
     );
     assert_eq!(controller.rerun_count(), 0, "no re-run after abort");
     Ok(())
@@ -1562,8 +1580,8 @@ async fn run_unverified_without_fetcher() -> Result<()> {
     // A `from_backend` cache exposes no fetcher (no provider captured).
     let base = cache_with_balance(token, owner, U256::from(1000)).await?;
     let mut cache = EvmCache::from_backend(
-        base.backend().clone(),
-        base.blockchain_db().clone(),
+        base.unchecked_backend().clone(),
+        base.unchecked_blockchain_db().clone(),
         None,
         base.chain_id(),
         None,

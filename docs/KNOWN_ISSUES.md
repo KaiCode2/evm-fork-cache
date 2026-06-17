@@ -1,128 +1,116 @@
 # Known issues & limitations
 
 A living triage list of bugs, smells, and limitations surfaced during the
-publication-readiness review. Items here are **flagged, not fixed** — the test
-suite deliberately pins *current* behavior, so changing any of these is a
-conscious, reviewable decision (and a `CHANGELOG.md` entry).
+publication-readiness review. Items here are either **remaining limitations** or
+**recently-fixed issues kept for auditability**; behavior-changing fixes should
+carry red/green tests and a `CHANGELOG.md` entry.
 
 Confidence legend: **[V]** verified against the source during review;
 **[R]** reported by the review and worth confirming before acting.
 
-## Correctness / behavior to review
+## Recently fixed by `codex/phase-5-known-issues-top5`
 
-1. **[V] Silent persistence failures.** `cache::save_binary_state`,
-   `PrefetchRegistry::save`, and `ImmutableDataCache::save` log a warning on I/O
-   error but return `()`, so callers cannot detect a failed write (full disk,
-   permissions, partial flush). Consider returning `Result<()>` (a breaking
-   change worth taking pre-1.0). Tested today only insofar as the happy-path
-   round-trip succeeds.
+1. **[FIXED] Cold absolute `Account` patches no longer materialize unknown
+   accounts.** `StateUpdate::Account` is cold-aware: a partial patch against an
+   address absent from both layers is skipped, does not write a default backend
+   account, and is surfaced through `StateDiff.skipped_accounts`. Intentional
+   cold materialization is now explicit via `StateUpdate::AccountUpsert` /
+   `StateUpdate::account_upsert(...)`.
 
-2. **[V] Access-list L2 profitability uses an approximate gas model.** In
-   `access_list.rs`, `into_access_list_if_profitable` / `access_list_if_profitable`
-   estimate L1 calldata cost with hand-rolled RLP-overhead constants
-   (`4 * 16` per address, `16` per key, `3 * 16` for the list header). This is an
-   intentional heuristic, not a precise EIP-2930 serialization cost — verify it
-   against real serialized sizes before relying on the profitability verdict for
-   anything other than a rough gate. The two functions also duplicate this logic
-   (a maintenance hazard: a fix to one must be mirrored).
+2. **[FIXED] Block-context drift after re-pinning.** `set_block` now sets
+   `block_number` only for concrete numeric pins and clears it for tag/hash/`None`
+   pins. Block changes, plus non-concrete pin calls that can drift under the same
+   tag, clear stale `basefee`; callers refresh `NUMBER`/`BASEFEE` together with
+   `set_block_context` after fetching the new header.
 
-3. **[V] Profitability swallows provider errors.** The same functions catch all
-   provider errors and return `Ok(None)`, which is indistinguishable from
-   "computed: not profitable." A caller cannot tell a skipped check (RPC down)
-   from a real negative. Consider a result type that distinguishes the two.
+3. **[FIXED] Synchronous layer-2 escape hatches have an invalidating wrapper.**
+   Raw handles are now visibly named `unchecked_blockchain_db()` /
+   `unchecked_backend()`, and `EvmCache::with_blockchain_db_mut(...)` runs a
+   synchronous `BlockchainDb` mutation and invalidates the COW snapshot base
+   automatically.
 
-4. **[R] `set_block` with a tag leaves `block.number` stale.** Only
-   `BlockId::Number(n)` syncs the `NUMBER` opcode value; pinning to a tag (e.g.
-   `BlockId::latest()`) leaves the previously-set number in the block env. Either
-   resolve tags to a concrete number at pin time or document the constraint
-   loudly.
+4. **[FIXED] Explicit persistence failures are observable.**
+   `cache::save_binary_state`, `PrefetchRegistry::save`, and
+   `EvmCache::flush` now return `anyhow::Result<()>`. `Drop` remains best-effort
+   and logs flush errors.
 
-5. **[R] Duplicate custom-error selectors shadow silently.** `RevertDecoder`
-   registration replaces an existing entry for the same 4-byte selector with no
-   warning, so an accidental double-registration silently wins. Consider a
-   debug-level log or a `try_register` that reports collisions.
+5. **[FIXED] Access-list profitability uses exact EIP-2930 RLP bytes.**
+   Arbitrum profitability now centralizes data-gas accounting in
+   `access_list_rlp_data_gas(...)` and provider/pricing failures propagate as
+   `Err`, leaving `Ok(None)` for empty/zero-priced/unprofitable lists.
 
-6. **[R] ERC20 `Transfer` decoding assumes the standard layout.** `inspector.rs`
-   reads `from`/`to` from indexed topics and `value` from the first 32 data
-   bytes. Non-standard or packed `Transfer` encodings parse incorrectly. Also, an
-   address that appears as both `from` and `to` in one transfer is both
-   subtracted and added (a semantically-invalid self-transfer is not rejected).
+6. **[FIXED] `simulate_call_with_balance_deltas` now returns the touched access
+   list.** The pre/post `balanceOf` reads and simulated call share one EVM
+   journal, and the method now extracts the EIP-2930 access list before
+   commit/revert, matching the transfer-inspector simulation path.
 
-7. **[R] Panic codes above `u64::MAX` are dropped.** `decode_solidity_panic`
-   converts out-of-range panic codes to `None`. Real compiler-emitted panic codes
-   are single-byte constants, so this is benign in practice; now documented at the
-   call site.
+7. **[FIXED] On-disk cache files carry magic bytes and a version number.**
+   `binary_state`, `bytecode`, `ImmutableDataCache`, and V3 tick snapshots now
+   write a crate-specific magic header plus version `1` before the bincode
+   payload. Unknown magic/version values and legacy raw-bincode files are treated
+   as cache misses.
 
-8. **[V] `simulate_call_with_balance_deltas` returns an empty access list.** It
-   sets `CallSimulationResult.access_list = AccessList::default()`, unlike
-   `simulate_with_transfer_tracking` which populates it via `extract_access_list`.
-   Either the field is meaningless on this path or the population was missed —
-   the docs now state the field is empty here; reconcile before relying on it.
-
-9. **[FIXED] `call_raw_with_access_list` did not revert its checkpoint on a
+8. **[FIXED] `call_raw_with_access_list` did not revert its checkpoint on a
    transact error.** Both `EvmCache::call_raw_with_access_list` and
    `EvmOverlay::call_raw_with_access_list_with` now match on the `transact_one`
    result and `checkpoint_revert` on **every** path (success and host error),
    matching `call_raw` / `simulate_with_transfer_tracking`. A host-level transact
    error no longer leaves the overlay checkpoint un-reverted.
 
-10. **[V] `SystemTime::now().unwrap()` panic risk in EVM construction.**
-    `build_evm` / `make_local_context` (and the overlay equivalents) call
-    `SystemTime::now().duration_since(UNIX_EPOCH).unwrap()` when no timestamp
-    override is set, which panics if the system clock is before the Unix epoch.
-    Setting an explicit timestamp avoids it; consider a saturating fallback.
+## Remaining open issues ranked by unexpected-result risk
 
-18. **[V] Cold absolute `Account` patch masks the real on-chain account.** A
-    *partial* absolute [`StateUpdate::Account`] patch (e.g. balance-only) applied
-    to an address absent from **both** cache layers writes default values for the
-    un-patched fields (nonce `0`, empty code) through the shared BlockchainDb
-    backend as authoritative — pre-empting a later RPC fetch of the real account
-    (`apply_account_patch` materializes the backend account on any real change, by
-    design / spec §5.2). This is a live-fork footgun for callers reconstructing an
-    account from one event field. Mitigations: fetch+seed the account first, or use
-    the relative `StateUpdate::BalanceDelta` / `EvmCache::modify_account_balance`
-    (Phase 3 §16.5), which are cold-aware (a cold target is skipped and surfaced in
-    `StateDiff.skipped_balances`, never materialized). A no-op patch (no field
-    actually changes) does **not** materialize anything (Phase 3 §16.1 fix). The
-    rustdoc on `apply_update` / `StateUpdate::Account` / `AccountPatch` carries a
-    `# Warning` to this effect.
+1. **[R] Duplicate custom-error selectors shadow silently.** `RevertDecoder`
+   registration replaces an existing entry for the same 4-byte selector with no
+   warning, so an accidental double-registration silently wins. Consider a
+   debug-level log or a `try_register` that reports collisions.
+
+2. **[R] ERC20 `Transfer` decoding assumes the standard layout.** `inspector.rs`
+   reads `from`/`to` from indexed topics and `value` from the first 32 data
+   bytes. Non-standard or packed `Transfer` encodings may parse incorrectly or be
+   skipped. A self-transfer where `from == to` nets to zero for that owner; this
+   is now documented at the call site.
+
+3. **[V] `SystemTime::now().unwrap()` panic risk in EVM construction.**
+   `build_evm` / `make_local_context` (and the overlay equivalents) call
+   `SystemTime::now().duration_since(UNIX_EPOCH).unwrap()` when no timestamp
+   override is set, which panics if the system clock is before the Unix epoch.
+   Setting an explicit timestamp avoids it; consider a saturating fallback.
+
+4. **[R] Panic codes above `u64::MAX` are dropped.** `decode_solidity_panic`
+   converts out-of-range panic codes to `None`. Real compiler-emitted panic codes
+   are single-byte constants, so this is benign in practice and documented at the
+   call site.
 
 ## Code-quality nits
 
-11. **[V] Dead branch in `i128_to_u256`** (`cache/storage_keys.rs`): both the
+5. **[V] Dead branch in `i128_to_u256`** (`cache/storage_keys.rs`): both the
     `value >= 0` and `else` arms evaluate the identical `U256::from(value as u128)`.
     The two's-complement cast is correct for both signs, so the `if`/`else` can
     collapse to one line (keep the explanatory comment).
 
-12. **[R] V3 tick-snapshot keys serialize as strings.** `V3PoolTickSnapshot`
+6. **[R] V3 tick-snapshot keys serialize as strings.** `V3PoolTickSnapshot`
     stringifies `i16`/`i32` tick/word keys for bincode, then `parse()`s them back
     in `to_tick_bitmap`/`to_ticks`, silently dropping any key that fails to parse.
     A native integer-keyed encoding would be faster and would not fail silently.
 
-13. **[V] On-disk caches have no version header.** `binary_state`, `bytecode`,
-    `metadata` (`ImmutableDataCache`), and `tick_snapshot` all persist raw bincode
-    with no magic bytes or version field, so a struct-layout change silently
-    invalidates every existing cache file (decoded as a miss). A version header
-    would enable detection/migration.
-
-14. **[R] Balancer pool id keyed by `Debug` formatting.** `ImmutableDataCache`
+7. **[R] Balancer pool id keyed by `Debug` formatting.** `ImmutableDataCache`
     keys `balancer_pools` by `format!("{:?}", pool_id)`. `Debug` output is not a
     stable encoding contract; a hex encoding would be safer for a persisted key.
 
 ## API ergonomics
 
-15. **[R] `snapshot()` vs `create_snapshot()`.** `snapshot()` returns a low-level
+8. **[R] `snapshot()` vs `create_snapshot()`.** `snapshot()` returns a low-level
     `revm::database::Cache` for in-place `restore()`; `create_snapshot()` returns
     an `Arc<EvmSnapshot>` for cross-thread fan-out. The names don't convey the
     difference. Docs now cross-reference them (see the rustdoc), but a rename
     could be considered pre-1.0.
 
-16. **[R] Process-global cache speed mode.** `set_cache_speed_mode` /
+9. **[R] Process-global cache speed mode.** `set_cache_speed_mode` /
     `cache_speed_mode` are a process-wide `static`, so two caches in one process
     cannot tune concurrency independently. Phase 1 moved configuration toward
     per-instance (`EvmCacheBuilder::cache_config`); the global setter remains.
 
-17. **[V] `SpeculativeSim` consumption contract.** Both `validate()` and
+10. **[V] `SpeculativeSim` consumption contract.** Both `validate()` and
     `into_optimistic()` take `self` by value, so double-consumption is unreachable
     under normal ownership. Internally `validate()` uses `.expect("validation
     handle taken twice")` (defensive) while `into_optimistic()` no-ops if the
@@ -131,14 +119,52 @@ Confidence legend: **[V]** verified against the source during review;
 
 ## Limitations by design / roadmap
 
-- **No copy-on-write snapshots yet.** `create_snapshot()` deep-clones state
-  (`O(accounts + slots)`); the COW rewrite is roadmap Pillar A. The `simulation`
-  benchmarks exist to measure the baseline this will improve on.
+- **Copy-on-write snapshots (Phase 5, Pillar A) — done.** `create_snapshot()` is
+  no longer an O(total state) deep clone. The cold `BlockchainDb` index (layer 2)
+  is flattened once into an internal, immutable, `Arc`-shared base (per-account
+  storage shared by `Arc`), memoized across snapshots and rebuilt copy-on-write
+  only for the addresses that changed; each snapshot folds just the hot CacheDB
+  delta (layer 1) over a cheap `Arc::clone`. **Residual cost model (honest):** a
+  snapshot is no longer free. When layer 2 is unchanged since the last snapshot
+  it still pays an **O(accounts) length-scan** of the layer-2 storage/account
+  maps (to catch uncontrolled lazy-fetch growth that bypasses the write funnel,
+  since `foundry-fork-db` cannot be hooked) plus an **O(layer-1) fold** of the hot
+  delta — so the cost tracks `accounts + changed state`, not total slots. A
+  full rebuild (first snapshot, or after `set_block`/re-pin) is still O(total
+  state). `create_snapshot` is now `&mut self` (it memoizes the base, Decision
+  D5). The retained `create_snapshot_deep_clone()` (the legacy full flatten) is
+  kept as the A/B benchmark baseline and the read-equivalence reference; the
+  `create_snapshot` group in `benches/simulation.rs` measures both. Decisions and
+  the cost model are in [`phase-5-spec.md`](phase-5-spec.md) / `ROADMAP.md`.
+- **Layer-2 unchecked accessors remain an explicit contract boundary (Phase 5).** The
+  snapshot base's growth scan is count/absence-based, which is sufficient for the
+  supported writers: the crate's own mutators (`apply_update`, `inject_storage_batch`,
+  the `inject_*` helpers, purges, code overrides) explicitly mark the base dirty,
+  and the `foundry-fork-db` `SharedBackend` lazy fetch is append-only at a fixed
+  block (it only inserts on a cache miss, never overwrites in place — a load-bearing
+  invariant noted in `refresh_base`). Direct out-of-band writes through the
+  `unchecked_blockchain_db()` / `unchecked_backend()` handles still bypass the
+  normal write funnel by design. For synchronous `BlockchainDb` map writes, prefer
+  [`EvmCache::with_blockchain_db_mut`], which invalidates the base automatically
+  after the closure returns. If using the unchecked handle directly, call
+  [`EvmCache::invalidate_snapshot_base`] after the write lands and before the next
+  snapshot (or re-pin via `set_block`). For
+  `SharedBackend::insert_or_update_storage` / `insert_or_update_address`, the call
+  only enqueues work on the backend handler; `invalidate_snapshot_base()` does not
+  wait for that queued update. First synchronize or read back until the expected
+  value is visible in `BlockchainDb` / through the backend, then invalidate before
+  creating the snapshot. The rustdoc on both accessors and the hook carries this
+  warning, and `tests/cow_snapshot.rs`
+  (`invalidate_snapshot_base_rehonest_after_escape_hatch_write`,
+  `invalidate_snapshot_base_rehonest_after_existing_account_write`,
+  `with_blockchain_db_mut_rehonest_after_storage_overwrite`,
+  `with_blockchain_db_mut_rehonest_after_account_overwrite`)
+  pins it.
 - **`protocols` not yet extracted.** The DeFi surface is feature-gated but still
-  in-crate; `cargo test --no-default-features` is not yet supported because some
-  unit tests assume the default feature. Extraction into `evm-amm-state` is
-  planned (roadmap), blocked partly by `ImmutableDataCache` coupling generic
-  token-decimals with V2/V3/Balancer pool metadata.
+  in-crate. The generic core builds and tests with `--no-default-features`, but
+  extraction into `evm-amm-state` is still planned (roadmap), blocked partly by
+  `ImmutableDataCache` coupling generic token-decimals with V2/V3/Balancer pool
+  metadata.
 - **Event-driven sync (roadmap Pillar B) — reader/writer halves done; live WS
   transport is not.** The Phase 3 **writer half** (`StateUpdate` +
   `apply_update`/`apply_updates`) and the Phase 4 **reader half** (the `events`

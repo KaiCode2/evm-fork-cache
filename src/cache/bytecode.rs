@@ -6,10 +6,9 @@
 //! entries are used to re-seed the `code` of accounts that were restored
 //! without it.
 //!
-//! Each entry's bytes are hex-encoded for the serde representation, but the
-//! file is written as raw bincode with no version header, so a cache written by
-//! an incompatible build fails to decode (cache miss) rather than being
-//! migrated.
+//! Each entry's bytes are hex-encoded for the serde representation. The file is
+//! written as a crate-specific versioned envelope followed by bincode payload, so
+//! incompatible versions are detected as cache misses.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -18,7 +17,11 @@ use alloy_primitives::Address;
 use anyhow::Result;
 use foundry_fork_db::BlockchainDb;
 use serde::{Deserialize, Serialize};
-use tracing::warn;
+
+use super::versioned;
+
+const BYTECODE_CACHE_MAGIC: &[u8; 8] = b"EFCBYTE\0";
+const BYTECODE_CACHE_VERSION: u32 = 1;
 
 /// Serializable bytecode cache entry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -38,15 +41,16 @@ pub(crate) struct BytecodeCache {
 impl BytecodeCache {
     /// Load bytecode cache from disk (binary format).
     ///
-    /// Returns `None` if `path` cannot be read or its contents fail to decode as
-    /// bincode for this type; a decode failure is logged at `warn` level. The
-    /// format carries no version header, so a file from an incompatible build is
-    /// reported as `None`.
+    /// Returns `None` if `path` cannot be read, fails the magic/version check, or
+    /// fails to decode as bincode for this type.
     pub(crate) fn load(path: &Path) -> Option<Self> {
         let data = std::fs::read(path).ok()?;
-        bincode::deserialize(&data)
-            .inspect_err(|e| warn!("Failed to parse bytecode cache (bincode): {}", e))
-            .ok()
+        versioned::decode(
+            &data,
+            BYTECODE_CACHE_MAGIC,
+            BYTECODE_CACHE_VERSION,
+            "bytecode cache",
+        )
     }
 
     /// Save bytecode cache to disk (binary format).
@@ -62,7 +66,12 @@ impl BytecodeCache {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let data = bincode::serialize(self)?;
+        let data = versioned::encode(
+            BYTECODE_CACHE_MAGIC,
+            BYTECODE_CACHE_VERSION,
+            self,
+            "bytecode cache",
+        )?;
         std::fs::write(path, data)?;
         Ok(())
     }
@@ -117,12 +126,42 @@ mod tests {
             },
         );
         cache.save(&path).expect("save bytecode cache");
+        let bytes = std::fs::read(&path).expect("read saved bytecode cache");
+        assert!(
+            bytes.starts_with(b"EFCBYTE\0"),
+            "bytecode cache must carry a magic header"
+        );
+        assert_eq!(
+            &bytes[8..12],
+            &1u32.to_le_bytes(),
+            "bytecode cache must carry an explicit version"
+        );
 
         let loaded = BytecodeCache::load(&path).expect("load bytecode cache");
         assert_eq!(
             loaded.contracts.get(&addr).map(|e| e.bytecode.clone()),
             Some(vec![0x60, 0x00, 0x60, 0x00, 0xf3]),
             "bytecode survives the hex-encoded round trip"
+        );
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn load_legacy_raw_bincode_is_none() {
+        let path = temp_path("legacy");
+        let mut cache = BytecodeCache::default();
+        cache.contracts.insert(
+            Address::repeat_byte(0x42),
+            BytecodeCacheEntry {
+                bytecode: vec![0x60, 0x00],
+            },
+        );
+        std::fs::write(&path, bincode::serialize(&cache).unwrap()).expect("write legacy cache");
+
+        assert!(
+            BytecodeCache::load(&path).is_none(),
+            "unversioned legacy bincode must be treated as a cache miss"
         );
 
         let _ = std::fs::remove_dir_all(path.parent().unwrap());

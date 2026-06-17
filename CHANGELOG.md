@@ -142,9 +142,80 @@ pre-release development phases (see [`docs/ROADMAP.md`](docs/ROADMAP.md)).
 - **`protocols` feature** (default-on) gating the Uniswap V2/V3 storage layouts,
   V3 tick snapshots, and `inject_v3_*` / `inject_v2_pool_metadata` helpers, so
   the generic engine builds with `--no-default-features`.
+- **Copy-on-write snapshots** (Phase 5, Pillar A) — `create_snapshot` is now a
+  two-tier copy-on-write view instead of an O(total state) deep clone. The cold
+  `BlockchainDb` index (layer 2) is flattened once into an internal, immutable,
+  `Arc`-shared base (`Arc` per account storage map, structural sharing — no new
+  dependency, Decision D1), memoized across snapshots and rebuilt copy-on-write
+  only for the addresses that changed; each `create_snapshot` then folds just the
+  hot CacheDB delta (layer 1) over a cheap `Arc::clone` of that base. Reads stay
+  O(1) and lock-free and are bit-for-bit identical to the deep clone (pinned by
+  the `tests/cow_snapshot.rs` differential-equivalence gate). The retained
+  `EvmCache::create_snapshot_deep_clone()` (`#[doc(hidden)] pub`, Decision D3) is
+  the equivalence reference and the A/B benchmark baseline. `EvmSnapshot` stays
+  `Send + Sync` and `EvmOverlay` stays `Send`.
+- **`EvmOverlay::reset()`** (Phase 5, Pillar A.2) — recycle one overlay across
+  many simulations against the same snapshot without reallocating: it clears the
+  per-simulation dirty layer (keeping the snapshot `Arc`, `ext_db`, and the
+  reusable shared-memory buffer), reading the pristine snapshot again and behaving
+  exactly like a freshly-built overlay. The 64 KiB shared-memory buffer is also
+  recycled across the build→transact→revert call methods (stored as a plain
+  `Vec<u8>`, so the overlay stays `Send`).
+- **Configurable EVM shared-memory pre-allocation** — `SharedMemoryCapacity`
+  (`Fixed(usize)` / `Auto`, default `Fixed(64 * 1024)` / 65,536 bytes) set via
+  `EvmCacheBuilder::shared_memory_capacity`. `Fixed` pins the per-context working-
+  memory buffer (general users running wide fan-outs of small simulations can lower
+  it to cut per-overlay memory; the previous behavior is the default); `Auto` sizes
+  it from the chain state loaded at build time (e.g. a bincode state file), clamped
+  to a 64 KiB floor / 4 MiB ceiling. The resolved size is readable via
+  `EvmCache::shared_memory_capacity()` and is propagated to every snapshot so
+  snapshot-backed overlays pre-allocate the same amount. `with_cache_capacity` is
+  the lower-level constructor behind the builder setter.
+- **Explicit cold-account materialization** — `StateUpdate::AccountUpsert` and
+  `StateUpdate::account_upsert(...)` intentionally materialize an account absent
+  from both layers. Normal `StateUpdate::Account` patches are now cold-aware and
+  surface skipped cold patches through `StateDiff.skipped_accounts:
+  Vec<SkippedAccountPatch>`.
+- **Invalidating layer-2 mutation wrapper** — `EvmCache::with_blockchain_db_mut`
+  runs a synchronous direct `BlockchainDb` mutation and invalidates the Phase 5
+  memoized COW base automatically after the closure returns.
+- **Exact access-list RLP data-gas helper** —
+  `access_list::access_list_rlp_data_gas(&AccessList)` returns the EIP-2930 RLP
+  calldata gas for an access list and backs the L2 profitability calculation.
+- **Versioned on-disk cache envelope** — binary EVM state, bytecode,
+  `ImmutableDataCache`, and V3 tick snapshot cache files now start with
+  crate-specific magic bytes plus a `u32` version before the bincode payload.
 
 ### Changed
 
+- **`EvmCache::create_snapshot` is now `&mut self`** (Phase 5, Decision D5) —
+  taking a snapshot memoizes/refreshes the cold copy-on-write base, which requires
+  a mutable borrow. All callers (the freshness controller, tests, examples,
+  benches) are updated; the return type (`Arc<EvmSnapshot>`) is unchanged.
+  Permitted under the pre-1.0 break policy.
+- **`EvmCache::inject_storage_batch` is now `&mut self`** (Phase 5) — the
+  layer-2 bulk write now marks the touched addresses dirty for the memoized
+  copy-on-write base. The write itself is still a direct backend (layer-2) write
+  with the same semantics; only the receiver mutability changed.
+- **Raw layer-2 handles were renamed to unchecked accessors** (Phase 5) —
+  `EvmCache::blockchain_db()` is now `unchecked_blockchain_db()` and
+  `EvmCache::backend()` is now `unchecked_backend()`. The rename makes the
+  bypass explicit; use `with_blockchain_db_mut` for synchronous direct writes that
+  should automatically invalidate the snapshot base.
+- **Persistence APIs now return `Result<()>`** — `cache::save_binary_state`,
+  `PrefetchRegistry::save`, and `EvmCache::flush` report serialization,
+  directory-creation, and write failures to explicit callers. `Drop` remains
+  best-effort and logs `flush()` errors.
+- **Block re-pins clear stale context** — `set_block` sets `block_number` only
+  for concrete numeric pins, clears it for tag/hash/`None` pins, and clears stale
+  `basefee` on block changes and on non-concrete pin calls that can drift under
+  the same tag. `repin_to_block` follows the same no-stale-basefee rule; callers
+  refresh `NUMBER`/`BASEFEE` via `set_block_context` after fetching the new
+  header.
+- **Legacy raw-bincode cache files are treated as misses** — the versioned cache
+  envelope intentionally rejects unversioned `evm_state.bin`, `bytecodes.bin`,
+  `immutable_data.bin`, and `v3_tick_snapshots.bin` payloads rather than trying
+  to deserialize ambiguous layouts.
 - Simulation entry points that distinguish failure modes return
   `SimulationResult<T>` (`Result<T, SimError>`), separating decoded reverts,
   EVM halts, and host errors. `SimulationErrorKind` remains as a deprecated alias.
@@ -160,6 +231,19 @@ pre-release development phases (see [`docs/ROADMAP.md`](docs/ROADMAP.md)).
 
 ### Fixed
 
+- **Cold absolute account patches no longer mask on-chain accounts.**
+  `StateUpdate::Account` on an account absent from both layers now skips instead
+  of writing `AccountInfo::default()` fields through the shared backend. The
+  skipped patch is visible in `StateDiff.skipped_accounts`; intentional cold
+  creation uses `StateUpdate::AccountUpsert`.
+- **Access-list profitability no longer conflates provider failures with
+  unprofitable lists.** `SmartAccessList::into_access_list_if_profitable` and
+  `access_list_if_profitable` now propagate provider/pricing failures as `Err`
+  and reserve `Ok(None)` for empty, zero-priced, or genuinely unprofitable lists.
+- **`simulate_call_with_balance_deltas` now reports a real access list.** It
+  extracts the EIP-2930 touched account/slot list from the EVM journal before
+  commit/revert, including the pre/post `balanceOf` reads and the simulated call,
+  instead of returning `AccessList::default()`.
 - **`cached_storage_value` silent-corruption bug** (Phase 3 §16.0, audit HIGH +
   MED). For a storage slot absent from an overlay account whose revm
   `account_state` is `StorageCleared` or `NotExisting`, the accessor now returns
@@ -175,7 +259,9 @@ pre-release development phases (see [`docs/ROADMAP.md`](docs/ROADMAP.md)).
   **skips both layer writes** (returning an empty diff) when no field actually
   changes, instead of unconditionally inserting `AccountInfo::default()` into the
   shared backend for an all-`None` (or value-unchanged) patch on an absent address.
-  A real field change still materializes the backend account (unchanged intent).
+  Phase 5 later tightened this further: real field changes on cold accounts now
+  skip through `StateDiff.skipped_accounts` unless the caller uses
+  `StateUpdate::AccountUpsert`.
 - **`account_state`-awareness extended to the snapshot + account-info paths**
   (Phase 3 fix-review, HIGH + MED). A follow-up adversarial review found the §16.0
   `cached_storage_value` fix had not been propagated to two sibling read paths:
