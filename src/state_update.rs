@@ -15,22 +15,30 @@
 //! - [`StateUpdate::Slot`] — set a single storage slot, authoritative across
 //!   both cache layers.
 //! - [`StateUpdate::Account`] — apply a partial [`AccountPatch`]
-//!   (`balance`/`nonce`/`code`, each optional).
+//!   (`balance`/`nonce`/`code`, each optional) to an already-known account.
+//! - [`StateUpdate::AccountUpsert`] — intentionally materialize a cold account
+//!   from a partial [`AccountPatch`].
 //! - [`StateUpdate::Purge`] — drop cached state at a [`PurgeScope`] so the next
 //!   read re-fetches.
 //!
 //! # The dual-layer write-through policy
 //!
-//! [`apply_update`](crate::cache::EvmCache::apply_update) applies a `Slot` or
-//! `Account` write-through with one consistent rule: the BlockchainDb backend
-//! (layer 2) is written **always**; the CacheDB overlay (layer 1) is written
-//! **only if an overlay account already exists** for the address. A new overlay
-//! account is never materialized for a slot/account write — the read path falls
-//! through to the backend for an absent overlay entry, so a backend-only write
-//! is authoritative, and materializing an overlay entry would pollute layer 1
-//! and could shadow later RPC reads. (This mirrors the established
+//! [`apply_update`](crate::cache::EvmCache::apply_update) applies `Slot` writes
+//! through with one consistent rule: the BlockchainDb backend (layer 2) is
+//! written **always**; the CacheDB overlay (layer 1) is written **only if an
+//! overlay account already exists** for the address. A new overlay account is
+//! never materialized for a slot write — the read path falls through to the
+//! backend for an absent overlay entry, so a backend-only write is authoritative,
+//! and materializing an overlay entry would pollute layer 1 and could shadow
+//! later RPC reads. (This mirrors the established
 //! [`inject_storage_batch_fresh`](crate::cache::EvmCache::inject_storage_batch_fresh)
 //! semantics.)
+//!
+//! `Account` patches follow the same overlay-if-present write-through policy
+//! once the account is already present in either layer. If the account is absent
+//! from **both** layers, the patch is skipped and surfaced in
+//! [`StateDiff::skipped_accounts`]. Use [`StateUpdate::AccountUpsert`] when the
+//! caller intentionally wants to materialize a cold/default account.
 //!
 //! # The output
 //!
@@ -86,21 +94,13 @@
 //! Because a cold-skipped relative update produces **no** change, it is invisible
 //! to the natural [`StateDiff::is_empty`] / [`StateDiff::len`] success check (those
 //! are changes-only). A caller applying relative updates **must** therefore check
-//! [`StateDiff::has_skipped`] (or inspect [`skipped`](StateDiff::skipped) /
-//! [`skipped_balances`](StateDiff::skipped_balances)) — a cold target was dropped,
-//! not applied, and a silently-dropped balance update can break conservation.
-//! [`StateDiff::is_fully_applied`] and [`StateDiff::skipped_len`] are the
-//! companions.
-//!
-//! # Warning — cold absolute `Account` patches
-//!
-//! A *partial* absolute [`StateUpdate::Account`] patch (e.g. balance-only) on an
-//! address absent from **both** cache layers writes default nonce/code through the
-//! shared backend as authoritative, pre-empting a real RPC fetch. Fetch+seed the
-//! account first, or prefer [`StateUpdate::BalanceDelta`] for relative
-//! native-balance tracking. See the warnings on
-//! [`apply_update`](crate::cache::EvmCache::apply_update),
-//! [`StateUpdate::Account`], and [`AccountPatch`].
+//! [`StateDiff::has_skipped`] (or inspect [`skipped`](StateDiff::skipped),
+//! [`skipped_balances`](StateDiff::skipped_balances),
+//! [`skipped_masks`](StateDiff::skipped_masks), or
+//! [`skipped_accounts`](StateDiff::skipped_accounts)) — a cold target was
+//! dropped, not applied, and a silently-dropped balance/account update can break
+//! conservation. [`StateDiff::is_fully_applied`] and
+//! [`StateDiff::skipped_len`] are the companions.
 //!
 //! # Boundary — events are Phase 4
 //!
@@ -246,17 +246,28 @@ pub enum StateUpdate {
         /// The bits to write (only the bits selected by `mask` are applied).
         value: U256,
     },
-    /// Patch an account's balance/nonce/code (partial — see [`AccountPatch`]).
+    /// Patch an already-known account's balance/nonce/code (partial — see
+    /// [`AccountPatch`]).
     ///
-    /// # Warning
-    ///
-    /// A partial absolute patch (e.g. balance-only) on an address absent from
-    /// **both** cache layers writes default nonce/code through the shared backend
-    /// as authoritative, pre-empting a real RPC fetch. Fetch+seed the account
-    /// first, or use [`StateUpdate::BalanceDelta`] for relative native-balance
-    /// tracking.
+    /// Cold-aware: if the account is absent from **both** layers, the patch is not
+    /// applied and is surfaced in [`StateDiff::skipped_accounts`] as a
+    /// [`SkippedAccountPatch`]. Use [`StateUpdate::AccountUpsert`] when
+    /// materializing a cold/default account is intentional.
     Account {
         /// Account to patch.
+        address: Address,
+        /// The partial mutation: each `Some` field overwrites, `None` leaves it.
+        patch: AccountPatch,
+    },
+    /// Apply an [`AccountPatch`], materializing a cold account when needed.
+    ///
+    /// This is the explicit escape hatch for callers that really do want a
+    /// default account to become authoritative in the backend (for example a
+    /// synthetic test account). Normal event-derived account patches should use
+    /// [`StateUpdate::Account`] so a cold account is skipped instead of masking a
+    /// future RPC fetch.
+    AccountUpsert {
+        /// Account to patch or create.
         address: Address,
         /// The partial mutation: each `Some` field overwrites, `None` leaves it.
         patch: AccountPatch,
@@ -337,6 +348,16 @@ impl StateUpdate {
         Self::Account { address, patch }
     }
 
+    /// Construct a [`StateUpdate::AccountUpsert`] from a prebuilt
+    /// [`AccountPatch`].
+    ///
+    /// Use this only when materializing an account absent from both layers is the
+    /// desired behavior. For normal patches to known accounts, use
+    /// [`account`](Self::account).
+    pub fn account_upsert(address: Address, patch: AccountPatch) -> Self {
+        Self::AccountUpsert { address, patch }
+    }
+
     /// Construct a [`StateUpdate::Purge`] for `address` at `scope`.
     pub fn purge(address: Address, scope: PurgeScope) -> Self {
         Self::Purge { address, scope }
@@ -360,11 +381,10 @@ impl StateUpdate {
 /// # Warning
 ///
 /// Applying an absolute patch with [`StateUpdate::Account`] on an address absent
-/// from **both** cache layers writes default values for the un-patched fields
-/// (e.g. nonce `0`, empty code) through the shared backend as authoritative,
-/// masking a later RPC fetch of the real on-chain account. Fetch+seed the account
-/// first, or use [`StateUpdate::BalanceDelta`] for relative native-balance
-/// tracking.
+/// from **both** cache layers is skipped and surfaced in
+/// [`StateDiff::skipped_accounts`]. Use [`StateUpdate::AccountUpsert`] only when
+/// default values for un-patched fields (e.g. nonce `0`, empty code) should become
+/// authoritative in the backend.
 ///
 /// ```
 /// use alloy_primitives::{Bytes, U256};
@@ -448,18 +468,19 @@ pub enum PurgeScope {
 /// changes are recorded, so a no-op write yields a [`Default`] (empty) diff.
 ///
 /// The struct is `#[non_exhaustive]`: it has grown fields pre-1.0
-/// ([`skipped`](Self::skipped), [`skipped_balances`](Self::skipped_balances)) and
-/// may grow more. Construct it via [`Default`] + field assignment, never an
-/// exhaustive struct literal.
+/// ([`skipped`](Self::skipped), [`skipped_balances`](Self::skipped_balances),
+/// [`skipped_masks`](Self::skipped_masks), and
+/// [`skipped_accounts`](Self::skipped_accounts)) and may grow more. Construct it
+/// via [`Default`] + field assignment, never an exhaustive struct literal.
 ///
 /// # Checking for skips
 ///
 /// [`is_empty`](Self::is_empty) / [`len`](Self::len) are **changes-only**, so a
-/// cold-skipped relative update ([`SlotDelta`](StateUpdate::SlotDelta) /
-/// [`BalanceDelta`](StateUpdate::BalanceDelta)) is invisible to them. After
-/// applying relative updates, check [`has_skipped`](Self::has_skipped) (or
-/// inspect [`skipped`](Self::skipped) / [`skipped_balances`](Self::skipped_balances))
-/// — a cold target was dropped, not applied.
+/// cold-skipped update ([`SlotDelta`](StateUpdate::SlotDelta) /
+/// [`BalanceDelta`](StateUpdate::BalanceDelta) / [`Account`](StateUpdate::Account))
+/// is invisible to them. After applying cold-aware updates, check
+/// [`has_skipped`](Self::has_skipped) (or inspect the `skipped_*` fields) — a cold
+/// target was dropped, not applied.
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[non_exhaustive]
 pub struct StateDiff {
@@ -484,6 +505,10 @@ pub struct StateDiff {
     /// bits could not be preserved. Like [`skipped`](Self::skipped) this is
     /// informational metadata, not a change.
     pub skipped_masks: Vec<SkippedMask>,
+    /// Account patches ([`StateUpdate::Account`]) that were **not** applied
+    /// because the account was absent from both layers. Like
+    /// [`skipped`](Self::skipped) this is informational metadata, not a change.
+    pub skipped_accounts: Vec<SkippedAccountPatch>,
 }
 
 impl StateDiff {
@@ -515,12 +540,16 @@ impl StateDiff {
         !self.skipped.is_empty()
             || !self.skipped_balances.is_empty()
             || !self.skipped_masks.is_empty()
+            || !self.skipped_accounts.is_empty()
     }
 
     /// Total number of skipped relative/masked updates (`skipped` +
-    /// `skipped_balances` + `skipped_masks`).
+    /// `skipped_balances` + `skipped_masks` + `skipped_accounts`).
     pub fn skipped_len(&self) -> usize {
-        self.skipped.len() + self.skipped_balances.len() + self.skipped_masks.len()
+        self.skipped.len()
+            + self.skipped_balances.len()
+            + self.skipped_masks.len()
+            + self.skipped_accounts.len()
     }
 
     /// Whether every relative update in the apply was applied (none skipped).
@@ -535,7 +564,8 @@ impl StateDiff {
     /// Used by [`apply_updates`](crate::cache::EvmCache::apply_updates) to merge
     /// per-update diffs; the concatenation preserves order, so two writes to the
     /// same slot record their `old → new` history in sequence. The `skipped`,
-    /// `skipped_balances`, and `skipped_masks` metadata are concatenated too.
+    /// `skipped_balances`, `skipped_masks`, and `skipped_accounts` metadata are
+    /// concatenated too.
     pub fn merge(&mut self, other: StateDiff) {
         self.slots.extend(other.slots);
         self.accounts.extend(other.accounts);
@@ -543,6 +573,7 @@ impl StateDiff {
         self.skipped.extend(other.skipped);
         self.skipped_balances.extend(other.skipped_balances);
         self.skipped_masks.extend(other.skipped_masks);
+        self.skipped_accounts.extend(other.skipped_accounts);
     }
 }
 
@@ -642,6 +673,22 @@ pub struct SkippedMask {
     pub value: U256,
 }
 
+/// An account patch ([`StateUpdate::Account`]) that could not be applied because
+/// the account is absent from **both** cache layers.
+///
+/// A partial patch against a cold account is skipped rather than applied against
+/// [`AccountInfo::default`](revm::state::AccountInfo::default), because default
+/// nonce/code would become authoritative and mask a later RPC fetch. It is
+/// surfaced here so the caller can fetch+seed the account and retry, or opt in to
+/// materialization with [`StateUpdate::AccountUpsert`].
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SkippedAccountPatch {
+    /// Account whose patch was skipped.
+    pub address: Address,
+    /// The patch that was not applied.
+    pub patch: AccountPatch,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -684,6 +731,13 @@ mod tests {
         assert_eq!(
             StateUpdate::balance(a, U256::from(9)),
             StateUpdate::Account {
+                address: a,
+                patch: AccountPatch::default().balance(U256::from(9)),
+            }
+        );
+        assert_eq!(
+            StateUpdate::account_upsert(a, AccountPatch::default().balance(U256::from(9))),
+            StateUpdate::AccountUpsert {
                 address: a,
                 patch: AccountPatch::default().balance(U256::from(9)),
             }

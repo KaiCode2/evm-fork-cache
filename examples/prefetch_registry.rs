@@ -19,7 +19,7 @@ use alloy_primitives::{Address, U256};
 use evm_fork_cache::StorageAccessList;
 use evm_fork_cache::prefetch_registry::PrefetchRegistry;
 
-fn main() {
+fn main() -> anyhow::Result<()> {
     let pool = Address::repeat_byte(0xAA);
     let vault_a = Address::repeat_byte(0x01);
     let vault_b = Address::repeat_byte(0x02);
@@ -45,7 +45,7 @@ fn main() {
 
     // Persist to disk (bincode) and reload — the shape survives the round trip.
     let path = std::env::temp_dir().join("evm_fork_cache_example_prefetch.bin");
-    registry.save(&path);
+    registry.save(&path)?;
     let loaded = PrefetchRegistry::load(&path);
 
     let aggregated = loaded.phase_slots("pool_refresh");
@@ -61,4 +61,5 @@ fn main() {
     );
 
     let _ = std::fs::remove_file(&path);
+    Ok(())
 }

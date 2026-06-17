@@ -217,10 +217,10 @@ println!("installed {} bytes at {}", etched.code_size, etched.target_address);
 
 ## Benchmarks
 
-Criterion benchmarks live in [`benches/`](benches). The offline benches are the
-baseline against which the planned copy-on-write snapshot rewrite (roadmap
-Pillar A) will be measured, so they exercise the real hot paths at a range of
-cache sizes:
+Criterion benchmarks live in [`benches/`](benches). The offline benches exercise
+the current hot paths at a range of cache sizes, including the Phase 5
+copy-on-write snapshot implementation and retained deep-clone baselines where
+useful for A/B comparison:
 
 | Bench | Measures |
 | --- | --- |

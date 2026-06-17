@@ -128,6 +128,6 @@ pub use freshness::{
     SpeculativeSim, Validation, Validity, WallClock,
 };
 pub use state_update::{
-    AccountChange, AccountPatch, PurgeRecord, PurgeScope, SkippedBalanceDelta, SkippedDelta,
-    SkippedMask, SlotDelta, StateDiff, StateUpdate,
+    AccountChange, AccountPatch, PurgeRecord, PurgeScope, SkippedAccountPatch, SkippedBalanceDelta,
+    SkippedDelta, SkippedMask, SlotDelta, StateDiff, StateUpdate,
 };

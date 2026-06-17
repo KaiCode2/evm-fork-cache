@@ -10,7 +10,7 @@
 //! - **layer 1 / overlay** = the CacheDB overlay (`db_mut().cache.accounts`),
 //!   which wins on reads.
 //! - **layer 2 / backend** = the BlockchainDb backend
-//!   (`blockchain_db().storage()` / `.accounts()`).
+//!   (`unchecked_blockchain_db().storage()` / `.accounts()`).
 
 mod common;
 
@@ -22,8 +22,8 @@ use common::{
 };
 use evm_fork_cache::cache::EvmCache;
 use evm_fork_cache::{
-    AccountPatch, PurgeScope, SkippedBalanceDelta, SkippedDelta, SkippedMask, SlotChange,
-    SlotDelta, StateDiff, StateUpdate,
+    AccountPatch, PurgeScope, SkippedAccountPatch, SkippedBalanceDelta, SkippedDelta, SkippedMask,
+    SlotChange, SlotDelta, StateDiff, StateUpdate,
 };
 use revm::state::{AccountInfo, Bytecode};
 
@@ -52,7 +52,7 @@ fn overlay_slot(cache: &mut EvmCache, addr: Address, slot: U256) -> Option<U256>
 /// Value of a slot in the BlockchainDb backend (layer 2) only.
 fn backend_slot(cache: &EvmCache, addr: Address, slot: U256) -> Option<U256> {
     cache
-        .blockchain_db()
+        .unchecked_blockchain_db()
         .storage()
         .read()
         .get(&addr)
@@ -87,7 +87,7 @@ fn overlay_nonce(cache: &mut EvmCache, addr: Address) -> Option<u64> {
 /// Backend (layer 2) balance for `addr`, if a backend account exists.
 fn backend_balance(cache: &EvmCache, addr: Address) -> Option<U256> {
     cache
-        .blockchain_db()
+        .unchecked_blockchain_db()
         .accounts()
         .read()
         .get(&addr)
@@ -129,6 +129,13 @@ fn state_update_constructors_produce_expected_variants() {
     assert_eq!(
         StateUpdate::balance(a, U256::from(9)),
         StateUpdate::Account {
+            address: a,
+            patch: AccountPatch::default().balance(U256::from(9)),
+        }
+    );
+    assert_eq!(
+        StateUpdate::account_upsert(a, AccountPatch::default().balance(U256::from(9))),
+        StateUpdate::AccountUpsert {
             address: a,
             patch: AccountPatch::default().balance(U256::from(9)),
         }
@@ -341,15 +348,46 @@ async fn apply_account_code_patch_recomputes_hash() -> Result<()> {
 }
 
 #[tokio::test]
-async fn apply_account_patch_materializes_absent_account() -> Result<()> {
-    // An account absent from both layers is created (in the backend) by a patch,
-    // and the value is readable.
+async fn apply_account_patch_on_cold_account_is_skipped_and_surfaced() -> Result<()> {
+    // A partial Account patch against a cold account must not materialize a
+    // default backend account, because that would mask the real on-chain account.
     let addr = Address::repeat_byte(0x88);
     let mut cache = setup_cache().await?;
     assert!(!overlay_has_account(&mut cache, addr));
     assert_eq!(backend_balance(&cache, addr), None);
 
-    let diff = cache.apply_update(&StateUpdate::balance(addr, U256::from(1234)));
+    let patch = AccountPatch::default().balance(U256::from(1234));
+    let diff = cache.apply_update(&StateUpdate::account(addr, patch.clone()));
+
+    assert_eq!(
+        backend_balance(&cache, addr),
+        None,
+        "cold patch must not materialize a backend account"
+    );
+    assert!(diff.accounts.is_empty());
+    assert_eq!(
+        diff.skipped_accounts,
+        vec![SkippedAccountPatch {
+            address: addr,
+            patch
+        }]
+    );
+    assert!(diff.has_skipped());
+    assert_eq!(diff.skipped_len(), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn account_upsert_intentionally_materializes_absent_account() -> Result<()> {
+    let addr = Address::repeat_byte(0x88);
+    let mut cache = setup_cache().await?;
+    assert!(!overlay_has_account(&mut cache, addr));
+    assert_eq!(backend_balance(&cache, addr), None);
+
+    let diff = cache.apply_update(&StateUpdate::account_upsert(
+        addr,
+        AccountPatch::default().balance(U256::from(1234)),
+    ));
 
     assert_eq!(backend_balance(&cache, addr), Some(U256::from(1234)));
     assert_eq!(diff.accounts.len(), 1);
@@ -357,6 +395,7 @@ async fn apply_account_patch_materializes_absent_account() -> Result<()> {
         diff.accounts[0].balance,
         Some((U256::ZERO, U256::from(1234)))
     );
+    assert!(diff.skipped_accounts.is_empty());
     Ok(())
 }
 
@@ -394,7 +433,7 @@ async fn apply_purge_account_clears_both_layers() -> Result<()> {
         "backend storage gone"
     );
     {
-        let accounts = cache.blockchain_db().accounts().read();
+        let accounts = cache.unchecked_blockchain_db().accounts().read();
         assert!(!accounts.contains_key(&token), "backend account removed");
     }
     assert_eq!(diff.purged.len(), 1);
@@ -1303,7 +1342,7 @@ async fn account_patch_on_backend_only_account_does_not_materialize_overlay() ->
     let acct = Address::repeat_byte(0x91);
     let mut cache = setup_cache().await?;
     // Seed only the backend (the cold-prefetched, layer-2-only case).
-    cache.blockchain_db().accounts().write().insert(
+    cache.unchecked_blockchain_db().accounts().write().insert(
         acct,
         AccountInfo {
             balance: U256::from(100),
@@ -1582,7 +1621,7 @@ async fn account_patch_normalizes_zero_code_hash_across_layers() -> Result<()> {
     use revm::primitives::KECCAK_EMPTY;
     let acct = Address::repeat_byte(0x7f);
     let mut cache = setup_cache().await?;
-    cache.blockchain_db().accounts().write().insert(
+    cache.unchecked_blockchain_db().accounts().write().insert(
         acct,
         AccountInfo {
             balance: U256::from(1),
@@ -1594,7 +1633,7 @@ async fn account_patch_normalizes_zero_code_hash_across_layers() -> Result<()> {
     cache.apply_update(&StateUpdate::balance(acct, U256::from(2)));
 
     let backend_hash = cache
-        .blockchain_db()
+        .unchecked_blockchain_db()
         .accounts()
         .read()
         .get(&acct)

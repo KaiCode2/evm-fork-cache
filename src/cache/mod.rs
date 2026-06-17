@@ -8,6 +8,7 @@ pub mod snapshot;
 mod storage_keys;
 #[cfg(feature = "protocols")]
 mod tick_snapshot;
+mod versioned;
 
 pub use binary_state::{load_binary_state, save_binary_state};
 pub use metadata::{
@@ -50,7 +51,7 @@ use alloy_primitives::{Address, B256, Bytes, I256, Log, TxKind, U256, keccak256}
 use alloy_provider::{Provider, network::AnyNetwork};
 use alloy_rpc_types_eth::TransactionRequest;
 use alloy_sol_types::{SolCall, SolValue, sol};
-use anyhow::{Result, anyhow};
+use anyhow::{Context as _, Result, anyhow};
 use foundry_fork_db::{BlockchainDb, SharedBackend, cache::BlockchainDbMeta};
 use revm::{
     Context, ExecuteCommitEvm, ExecuteEvm, InspectEvm, MainBuilder, MainContext,
@@ -67,8 +68,8 @@ use crate::errors::{SimError, SimulationError, SimulationResult};
 use crate::freshness::SlotChange;
 use crate::inspector::TransferInspector;
 use crate::state_update::{
-    AccountChange, AccountPatch, PurgeRecord, PurgeScope, SkippedBalanceDelta, SkippedDelta,
-    SkippedMask, SlotDelta, StateDiff, StateUpdate,
+    AccountChange, AccountPatch, PurgeRecord, PurgeScope, SkippedAccountPatch, SkippedBalanceDelta,
+    SkippedDelta, SkippedMask, SlotDelta, StateDiff, StateUpdate,
 };
 
 use bytecode::BytecodeCache;
@@ -181,6 +182,10 @@ fn write_slot_into<S1, S2>(
     if let Some(db_account) = overlay.get_mut(&address) {
         db_account.storage.insert(slot, value);
     }
+}
+
+fn account_patch_is_empty(patch: &AccountPatch) -> bool {
+    patch.balance.is_none() && patch.nonce.is_none() && patch.code.is_none()
 }
 
 static CACHE_SPEED_MODE: AtomicU8 = AtomicU8::new(CacheSpeedMode::Slow as u8);
@@ -358,7 +363,8 @@ where
 
     /// Set how much EVM shared memory to pre-allocate per simulation context.
     ///
-    /// Defaults to [`SharedMemoryCapacity::Fixed`]`(64_000)` (today's behavior).
+    /// Defaults to [`SharedMemoryCapacity::Fixed`] with `64 * 1024` bytes
+    /// (65,536 bytes).
     /// Use `Fixed(n)` to pin a size, or [`SharedMemoryCapacity::Auto`] to size it
     /// from the chain state loaded at [`build`](Self::build) time (e.g. a bincode
     /// state file supplied via [`cache_config`](Self::cache_config)). See
@@ -390,10 +396,10 @@ type InspectorCacheEvm<'a, INSP> = revm::MainnetEvm<
 >;
 
 /// Default initial capacity for the EVM shared-memory (working-memory) buffer.
-/// 64 kB, chosen from profiling a state-heavy workload (16x the revm default of
-/// 4 kB) so simulations rarely reallocate. Exposed for tuning via
+/// 64 KiB (65,536 bytes), chosen from profiling a state-heavy workload (16x the
+/// revm default of 4 KiB) so simulations rarely reallocate. Exposed for tuning via
 /// [`SharedMemoryCapacity`].
-const DEFAULT_SHARED_MEMORY_CAPACITY: usize = 64_000;
+const DEFAULT_SHARED_MEMORY_CAPACITY: usize = 64 * 1024;
 
 /// How much EVM shared memory (per-context working memory) to pre-allocate for
 /// simulations.
@@ -405,11 +411,12 @@ const DEFAULT_SHARED_MEMORY_CAPACITY: usize = 64_000;
 /// this much memory per overlay, so general users may want a smaller `Fixed` size,
 /// while state-heavy users can raise it or let it auto-size from the loaded state.
 ///
-/// The default is `Fixed(64_000)` (today's behavior). Configure it on
+/// The default is `Fixed(64 * 1024)` (65,536 bytes). Configure it on
 /// [`EvmCacheBuilder::shared_memory_capacity`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SharedMemoryCapacity {
-    /// Pre-allocate exactly this many bytes. The [`Default`] is `Fixed(64_000)`.
+    /// Pre-allocate exactly this many bytes. The [`Default`] is
+    /// `Fixed(64 * 1024)`.
     Fixed(usize),
     /// Size the buffer from the amount of chain state loaded into the cache at
     /// construction (e.g. from a bincode state file via
@@ -429,7 +436,8 @@ impl Default for SharedMemoryCapacity {
 }
 
 impl SharedMemoryCapacity {
-    /// Floor for [`Auto`](Self::Auto) (and the default fixed size): 64 kB.
+    /// Floor for [`Auto`](Self::Auto) (and the default fixed size): 64 KiB
+    /// (65,536 bytes).
     pub const MIN_AUTO: usize = DEFAULT_SHARED_MEMORY_CAPACITY;
     /// Ceiling for [`Auto`](Self::Auto): 4 MiB. A simulation that needs more than
     /// this still works — revm grows the buffer past it on demand.
@@ -1147,56 +1155,59 @@ impl EvmCache {
     ///
     /// Call this after loading AMMs and running simulations to speed up subsequent runs.
     /// The cache is also automatically flushed when the EvmCache is dropped.
-    pub fn flush(&self) {
+    pub fn flush(&self) -> Result<()> {
         if let Some(cfg) = &self.cache_config {
             // Save EVM state to binary cache (bincode format)
             let binary_path = cfg.binary_state_cache_path();
-            binary_state::save_binary_state(&self.blockchain_db, &binary_path);
+            binary_state::save_binary_state(&self.blockchain_db, &binary_path)
+                .with_context(|| format!("failed to save binary state cache to {binary_path:?}"))?;
 
             // Save bytecode cache
             let bytecode_path = cfg.bytecode_cache_path();
             let mut bytecode_cache = BytecodeCache::load(&bytecode_path).unwrap_or_default();
             bytecode_cache.merge_from_db(&self.blockchain_db);
-            if let Err(e) = bytecode_cache.save(&bytecode_path) {
-                warn!(error = %e, "Failed to save bytecode cache");
-            } else {
-                debug!(
-                    count = bytecode_cache.contracts.len(),
-                    path = ?bytecode_path,
-                    "Updated bytecode cache (binary format)"
-                );
-            }
+            bytecode_cache
+                .save(&bytecode_path)
+                .with_context(|| format!("failed to save bytecode cache to {bytecode_path:?}"))?;
+            debug!(
+                count = bytecode_cache.contracts.len(),
+                path = ?bytecode_path,
+                "Updated bytecode cache (binary format)"
+            );
 
             // Save the immutable data cache
             let immutable_path = cfg.immutable_cache_path();
-            if let Err(e) = self.immutable_cache.save(&immutable_path) {
-                warn!(error = %e, "Failed to save immutable data cache");
-            } else {
-                debug!(
-                    token_decimals = self.immutable_cache.token_decimals.len(),
-                    v2_pools = self.immutable_cache.v2_pools.len(),
-                    v3_pools = self.immutable_cache.v3_pools.len(),
-                    balancer_pools = self.immutable_cache.balancer_pools.len(),
-                    path = ?immutable_path,
-                    "Updated immutable data cache"
-                );
-            }
+            self.immutable_cache
+                .save(&immutable_path)
+                .with_context(|| {
+                    format!("failed to save immutable data cache to {immutable_path:?}")
+                })?;
+            debug!(
+                token_decimals = self.immutable_cache.token_decimals.len(),
+                v2_pools = self.immutable_cache.v2_pools.len(),
+                v3_pools = self.immutable_cache.v3_pools.len(),
+                balancer_pools = self.immutable_cache.balancer_pools.len(),
+                path = ?immutable_path,
+                "Updated immutable data cache"
+            );
 
             // Save the V3 tick snapshot cache (needed for liquidity validation)
             #[cfg(feature = "protocols")]
             {
                 let tick_snapshot_path = cfg.tick_snapshot_cache_path();
-                if let Err(e) = self.tick_snapshot_cache.save(&tick_snapshot_path) {
-                    warn!(error = %e, "Failed to save V3 tick snapshot cache");
-                } else {
-                    debug!(
-                        snapshots = self.tick_snapshot_cache.len(),
-                        path = ?tick_snapshot_path,
-                        "Updated V3 tick snapshot cache"
-                    );
-                }
+                self.tick_snapshot_cache
+                    .save(&tick_snapshot_path)
+                    .with_context(|| {
+                        format!("failed to save V3 tick snapshot cache to {tick_snapshot_path:?}")
+                    })?;
+                debug!(
+                    snapshots = self.tick_snapshot_cache.len(),
+                    path = ?tick_snapshot_path,
+                    "Updated V3 tick snapshot cache"
+                );
             }
         }
+        Ok(())
     }
 
     /// Get the cache configuration, if any.
@@ -1208,46 +1219,73 @@ impl EvmCache {
         self.cache_config.as_ref()
     }
 
-    /// Get a reference to the underlying [`BlockchainDb`] (the layer-2 backend
-    /// store of accounts, storage, and bytecodes).
+    /// Run a synchronous direct mutation against the underlying [`BlockchainDb`]
+    /// and invalidate the memoized snapshot base afterwards.
+    ///
+    /// This is the preferred escape hatch for unavoidable layer-2 map writes such
+    /// as `accounts().write().insert(...)` or `storage().write().insert(...)`.
+    /// The closure still bypasses the CacheDB overlay and the normal write funnel,
+    /// so use higher-level mutators when they can express the change. Unlike
+    /// [`unchecked_blockchain_db`](Self::unchecked_blockchain_db), this wrapper
+    /// keeps the copy-on-write snapshot base honest automatically after in-place
+    /// overwrites whose map cardinality does not change.
+    pub fn with_blockchain_db_mut<R>(&mut self, f: impl FnOnce(&BlockchainDb) -> R) -> R {
+        let result = f(&self.blockchain_db);
+        self.invalidate_base();
+        result
+    }
+
+    /// Get an unchecked reference to the underlying [`BlockchainDb`] (the layer-2
+    /// backend store of accounts, storage, and bytecodes).
     ///
     /// This exposes an internal store and bypasses the cache's two-layer
-    /// consistency model: reads here see only the backend layer, not the
-    /// CacheDB overlay, and any writes performed through it skip the overlay.
-    /// Prefer the higher-level accessors; use with care.
+    /// consistency model: reads here see only the backend layer, not the CacheDB
+    /// overlay, and any writes performed through it skip the overlay. Prefer
+    /// higher-level accessors or [`with_blockchain_db_mut`](Self::with_blockchain_db_mut)
+    /// for direct synchronous writes.
     ///
     /// # Snapshot base
-    /// Writing layer 2 directly through this handle also bypasses the memoized
-    /// copy-on-write snapshot base (Pillar A): an **in-place value overwrite at an
-    /// unchanged slot count** is invisible to the [`create_snapshot`](Self::create_snapshot)
-    /// growth scan (which is count/absence-based — the lazily-fetched backend only
-    /// ever *appends*, so that is sufficient for the supported write paths), and a
-    /// later `create_snapshot` may reuse a stale base. After a direct layer-2 write
-    /// through this handle, call
+    /// Writing layer 2 directly through this unchecked handle also bypasses the
+    /// memoized copy-on-write snapshot base (Pillar A). The next
+    /// [`create_snapshot`](Self::create_snapshot) only performs a count/absence
+    /// growth scan over layer 2, which catches lazy RPC-populated accounts/slots
+    /// because that path only appends at a fixed block. It does **not** catch
+    /// direct in-place changes where cardinality is unchanged: overwriting an
+    /// existing storage slot, or changing an existing account's info/code/balance
+    /// without adding a new account, can leave a stale snapshot base. After such a
+    /// direct write, call
     /// [`invalidate_snapshot_base`](Self::invalidate_snapshot_base) (or re-pin via
     /// [`set_block`](Self::set_block)) before the next snapshot. Writes via the
     /// crate's own mutators (`inject_storage_batch`, `apply_update`, the `inject_*`
     /// helpers, the purges) keep the base honest automatically.
-    pub fn blockchain_db(&self) -> &BlockchainDb {
+    pub fn unchecked_blockchain_db(&self) -> &BlockchainDb {
         &self.blockchain_db
     }
 
-    /// Get a reference to the underlying [`SharedBackend`] (the lazy RPC-backed
-    /// fetcher shared across clones).
+    /// Get an unchecked reference to the underlying [`SharedBackend`] (the lazy
+    /// RPC-backed fetcher shared across clones).
     ///
-    /// This exposes an internal and bypasses the cache's two-layer consistency
+    /// This exposes an internal handle and bypasses the cache's two-layer consistency
     /// model: it reads/fetches directly without consulting the CacheDB overlay.
     /// Prefer the higher-level accessors; use with care.
     ///
     /// # Snapshot base
-    /// `SharedBackend::insert_or_update_storage` / `insert_or_update_address` rewrite
-    /// layer-2 entries **in place**, which (unlike the append-only lazy fetch) can
-    /// leave the memoized copy-on-write snapshot base stale at an unchanged slot
-    /// count. After such a direct write, call
+    /// Lazy RPC fetches through this backend only append missing accounts/slots at
+    /// the pinned block, so the snapshot growth scan catches them without an
+    /// explicit invalidation. Direct `SharedBackend::insert_or_update_storage` /
+    /// `insert_or_update_address` calls are different: they enqueue a background
+    /// handler request that can rewrite layer-2 entries **in place**, leaving the
+    /// memoized copy-on-write base stale at an unchanged slot/account count.
+    ///
+    /// If you use those helpers directly, first synchronize with the backend
+    /// handler by reading back the updated account/slot through `SharedBackend`
+    /// (for example via `basic_ref` / `storage_ref`), then call
     /// [`invalidate_snapshot_base`](Self::invalidate_snapshot_base) before the next
-    /// [`create_snapshot`](Self::create_snapshot). The lazy RPC fetch path needs no
-    /// such call (it only ever appends, which the snapshot growth scan catches).
-    pub fn backend(&self) -> &SharedBackend {
+    /// [`create_snapshot`](Self::create_snapshot). Calling
+    /// `invalidate_snapshot_base` immediately after `insert_or_update_*` is not, by
+    /// itself, a guarantee that the queued update has been applied before the next
+    /// snapshot.
+    pub fn unchecked_backend(&self) -> &SharedBackend {
         &self.backend
     }
 
@@ -1376,28 +1414,23 @@ impl EvmCache {
     ///   layers (no RPC), apply each `Some` patch field (recomputing the code hash
     ///   when `code` is set), then write through with the same layer policy.
     ///   Records an [`AccountChange`] with `Some((old, new))` only for fields
-    ///   that changed.
+    ///   that changed. If the account is cold (absent from both layers), apply
+    ///   nothing and surface a [`SkippedAccountPatch`] in
+    ///   `diff.skipped_accounts`.
+    /// - [`StateUpdate::AccountUpsert`] — same patch semantics, but intentionally
+    ///   materializes a cold/default account when absent from both layers.
     /// - [`StateUpdate::Purge`] — dispatch to the matching purge layer logic and
     ///   record a [`PurgeRecord`].
     ///
     /// # Warning — relative updates can be skipped
     ///
-    /// A relative [`SlotDelta`](StateUpdate::SlotDelta) /
-    /// [`BalanceDelta`](StateUpdate::BalanceDelta) targeting a **cold** address is
-    /// *dropped, not applied* (applying it against an unknown base would corrupt
-    /// state). Because a skip produces no change, it is invisible to the
-    /// changes-only [`StateDiff::is_empty`] / [`StateDiff::len`] success check, so
-    /// after applying relative updates the caller **must** inspect
-    /// [`StateDiff::has_skipped`] (or `diff.skipped` / `diff.skipped_balances`) and
-    /// fetch+seed the cold target — a silently-dropped balance update can break
-    /// conservation.
-    ///
-    /// # Warning — cold absolute `Account` patches
-    ///
-    /// A partial absolute [`StateUpdate::Account`] patch on an address absent from
-    /// both layers writes default nonce/code through the backend as authoritative,
-    /// masking a real RPC fetch. Fetch+seed the account first, or use
-    /// [`StateUpdate::BalanceDelta`] for relative native-balance tracking.
+    /// A cold-aware update targeting a **cold** address is *dropped, not applied*
+    /// unless it is an explicit [`StateUpdate::AccountUpsert`]. Because a skip
+    /// produces no change, it is invisible to the changes-only
+    /// [`StateDiff::is_empty`] / [`StateDiff::len`] success check, so after
+    /// applying cold-aware updates the caller **must** inspect
+    /// [`StateDiff::has_skipped`] (or the `skipped_*` fields) and fetch+seed the
+    /// cold target.
     ///
     /// ```no_run
     /// # use alloy_primitives::{Address, U256};
@@ -1489,7 +1522,17 @@ impl EvmCache {
                 }
             }
             StateUpdate::Account { address, patch } => {
-                if let Some(change) = self.apply_account_patch(*address, patch) {
+                match self.apply_account_patch(*address, patch, false) {
+                    Ok(Some(change)) => diff.accounts.push(change),
+                    Ok(None) => {}
+                    Err(skipped) => diff.skipped_accounts.push(skipped),
+                }
+            }
+            StateUpdate::AccountUpsert { address, patch } => {
+                if let Some(change) = self
+                    .apply_account_patch(*address, patch, true)
+                    .expect("AccountUpsert never skips cold account patches")
+                {
                     diff.accounts.push(change);
                 }
             }
@@ -1872,10 +1915,22 @@ impl EvmCache {
         &mut self,
         address: Address,
         patch: &AccountPatch,
-    ) -> Option<AccountChange> {
-        // 1. Current info from the cached layers only (overlay ▸ backend ▸
-        //    default). No RPC: apply is a write, not a fetch.
-        let mut info = self.loaded_account_info(address).unwrap_or_default();
+        allow_cold_upsert: bool,
+    ) -> std::result::Result<Option<AccountChange>, SkippedAccountPatch> {
+        // 1. Current info from the cached layers only (overlay ▸ backend). No RPC:
+        //    apply is a write, not a fetch. A partial patch on a cold account is
+        //    skipped unless the caller explicitly chose AccountUpsert.
+        let mut info = match self.loaded_account_info(address) {
+            Some(info) => info,
+            None if account_patch_is_empty(patch) => return Ok(None),
+            None if allow_cold_upsert => AccountInfo::default(),
+            None => {
+                return Err(SkippedAccountPatch {
+                    address,
+                    patch: patch.clone(),
+                });
+            }
+        };
 
         let old_balance = info.balance;
         let old_nonce = info.nonce;
@@ -1906,14 +1961,14 @@ impl EvmCache {
             code_hash: (old_code_hash != info.code_hash).then_some((old_code_hash, info.code_hash)),
         };
         if change.balance.is_none() && change.nonce.is_none() && change.code_hash.is_none() {
-            return None;
+            return Ok(None);
         }
 
         // 4. Write-through, mirroring the slot policy: backend always; overlay
         //    only if an overlay account already exists (do not materialize one).
         self.write_account_info_through(address, info);
 
-        Some(change)
+        Ok(Some(change))
     }
 
     /// Dispatch a [`PurgeScope`] to the matching layer logic (§5.3), returning a
@@ -2283,14 +2338,23 @@ impl EvmCache {
     ///
     /// The crate's own mutators keep the base honest automatically. This is the
     /// **escape-hatch re-honest hook**: call it after writing layer 2 directly
-    /// through [`blockchain_db`](Self::blockchain_db) or
-    /// [`backend`](Self::backend) — those bypass the write funnel, and an in-place
-    /// value overwrite at an unchanged slot count is invisible to the snapshot
-    /// growth scan (it is count/absence-based, which suffices for the append-only
-    /// lazy-fetch path but not for an out-of-band overwrite). Calling this before
-    /// the next snapshot guarantees it reflects the direct write rather than a
-    /// stale memoized value. Over-invalidation is always safe (Decision D2); the
-    /// only cost is one full base rebuild on the next snapshot.
+    /// through [`unchecked_blockchain_db`](Self::unchecked_blockchain_db) or
+    /// [`unchecked_backend`](Self::unchecked_backend) — those bypass the write
+    /// funnel, and in-place changes at unchanged cardinality are invisible to the
+    /// snapshot growth scan.
+    /// That includes overwriting an existing storage slot and changing an existing
+    /// account's info/code/balance without adding a new account. Lazy RPC-populated
+    /// data does not need this call because it only appends accounts/slots, which
+    /// the growth scan catches.
+    ///
+    /// When using `SharedBackend::insert_or_update_*` through
+    /// [`unchecked_backend`](Self::unchecked_backend), remember those helpers only
+    /// enqueue a background update. Synchronize/read back the update through
+    /// `SharedBackend` before the next snapshot; `invalidate_snapshot_base` alone
+    /// is not a backend-handler synchronization point. Once the direct write is
+    /// present, calling this before the next snapshot guarantees it reflects that
+    /// write rather than a stale memoized value. Over-invalidation is always safe
+    /// (Decision D2); the only cost is one full base rebuild on the next snapshot.
     pub fn invalidate_snapshot_base(&mut self) {
         self.invalidate_base();
     }
@@ -2337,7 +2401,7 @@ impl EvmCache {
         // only add a new account (caught by the absence check) or a new slot (caught
         // by the count check). An in-place value overwrite at unchanged length is
         // invisible here; the controlled writers therefore call `mark_base_dirty`
-        // explicitly, and a direct out-of-band write via `blockchain_db()`/`backend()`
+        // explicitly, and a direct out-of-band write via `unchecked_blockchain_db()`/`unchecked_backend()`
         // must call `invalidate_snapshot_base`. If a future foundry-fork-db bump makes
         // the lazy path overwrite-in-place, this scan must gain a value/version check.
         {
@@ -2598,18 +2662,24 @@ impl EvmCache {
     /// To prevent the EVM block context from silently diverging from the pinned
     /// block, when `block` is a concrete `BlockId::Number(Number(n))` this also
     /// updates `block_number` (the `NUMBER` opcode) to `n`. For tag-based block
-    /// ids (`latest`, `pending`, hashes, etc.) the height is not statically known,
-    /// so `block_number` is left unchanged.
+    /// ids (`latest`, `pending`, hashes, etc.) and `None`, the height is not
+    /// statically known, so `block_number` is cleared.
     ///
-    /// `basefee` (the `BASEFEE` opcode) is **not** refreshed here because deriving
-    /// it requires fetching the block header, which this synchronous method cannot
-    /// do. Callers that change blocks should refresh it via
-    /// [`set_block_context`](Self::set_block_context) (e.g. after fetching the new
-    /// header). Prefer [`repin_to_block`](Self::repin_to_block) when re-pinning to
+    /// `basefee` (the `BASEFEE` opcode) is **cleared on every block change** and
+    /// on every non-concrete tag/hash/`None` pin call because deriving it requires
+    /// fetching the block header, which this synchronous method cannot do. Callers
+    /// that change blocks should refresh it via
+    /// [`set_block_context`](Self::set_block_context) after fetching the new
+    /// header. Prefer [`repin_to_block`](Self::repin_to_block) when re-pinning to
     /// a concrete height, since it keeps `block_number` and the pinned block in
     /// lockstep.
     pub fn set_block(&mut self, block: Option<BlockId>) {
-        if self.block != block {
+        let changed = self.block != block;
+        let concrete_number = match block {
+            Some(BlockId::Number(BlockNumberOrTag::Number(n))) => Some(n),
+            _ => None,
+        };
+        if changed {
             self.block = block;
             // Re-pinning replaces layer 2 wholesale (state at a new block): the
             // memoized base must be rebuilt from scratch on the next snapshot.
@@ -2617,14 +2687,16 @@ impl EvmCache {
             if let Some(block_id) = block {
                 let _ = self.backend.set_pinned_block(block_id);
                 *self.batch_block_id.lock().unwrap() = block_id;
-                // Keep the EVM `NUMBER` opcode aligned with the pinned block so the
-                // two cannot silently diverge. Only a concrete height is meaningful;
-                // tags (latest/pending/hash) leave `block_number` untouched.
-                if let BlockId::Number(BlockNumberOrTag::Number(n)) = block_id {
-                    self.block_number = Some(n);
-                }
             }
         }
+        if changed || concrete_number.is_none() {
+            self.basefee = None;
+        }
+
+        // Keep the EVM `NUMBER` opcode aligned with the pin. Only a concrete
+        // height is meaningful; tags, hashes, and no explicit pin clear it so a
+        // stale number from an earlier concrete block cannot leak into simulation.
+        self.block_number = concrete_number;
     }
 
     /// Get the block that RPC fetches are currently pinned to.
@@ -2656,9 +2728,10 @@ impl EvmCache {
 
     /// Get the block number used for EVM simulations (the `NUMBER` opcode).
     ///
-    /// Fetched from the pinned block's header at construction and kept in
-    /// lockstep with the pin by [`set_block`](Self::set_block) /
-    /// [`repin_to_block`](Self::repin_to_block). `None` means revm falls back
+    /// Fetched from the pinned block's header at construction. Concrete-number
+    /// pins set it via [`set_block`](Self::set_block) /
+    /// [`repin_to_block`](Self::repin_to_block); tag/hash/`None` pins clear it
+    /// because their height is not statically known. `None` means revm falls back
     /// to `0`, which can steer contracts that branch on `block.number` down a
     /// different code path. Override directly via
     /// [`set_block_context`](Self::set_block_context).
@@ -2669,10 +2742,12 @@ impl EvmCache {
     /// Get the base fee per gas used for EVM simulations (the `BASEFEE` opcode).
     ///
     /// Fetched from the pinned block's header at construction. `None` means
-    /// revm falls back to `0`. Unlike `block_number` this is **not** refreshed
-    /// by [`set_block`](Self::set_block); refresh it with
-    /// [`set_block_context`](Self::set_block_context) after fetching a new
-    /// header if `BASEFEE` accuracy matters.
+    /// revm falls back to `0`. This is cleared by [`set_block`](Self::set_block)
+    /// / [`repin_to_block`](Self::repin_to_block) when the pin changes, and by
+    /// non-concrete tag/hash/`None` pin calls because those can drift without a
+    /// concrete number in the API. Refresh it with
+    /// [`set_block_context`](Self::set_block_context) after fetching a new header
+    /// if `BASEFEE` accuracy matters.
     pub fn basefee(&self) -> Option<u64> {
         self.basefee
     }
@@ -2717,16 +2792,12 @@ impl EvmCache {
     ///
     /// Updates the SharedBackend pinned block, the batch fetcher block, and the
     /// EVM block context (`NUMBER` opcode) in lockstep. The current `basefee` is
-    /// preserved; callers should refresh it via
-    /// [`set_block_context`](Self::set_block_context) after fetching the new
+    /// cleared because it cannot be refreshed synchronously; callers should set it
+    /// via [`set_block_context`](Self::set_block_context) after fetching the new
     /// block header if `BASEFEE` accuracy matters.
     pub fn repin_to_block(&mut self, block_number: u64) {
         let old_block = self.block;
-        // `set_block` already updates `block_number` for a concrete height; the
-        // explicit `set_block_context` below preserves `basefee` and keeps the
-        // re-pin atomic and self-documenting.
         self.set_block(Some(BlockId::Number(block_number.into())));
-        self.set_block_context(Some(block_number), self.basefee);
 
         if let Some(BlockId::Number(BlockNumberOrTag::Number(old_num))) = old_block {
             let drift = block_number.saturating_sub(old_num);
@@ -3719,8 +3790,9 @@ impl EvmCache {
     /// reverted. Unlike
     /// [`simulate_with_transfer_tracking`](Self::simulate_with_transfer_tracking),
     /// this measures deltas via pre/post balance reads (not transfer-event
-    /// inspection) and the returned
-    /// [`access_list`](CallSimulationResult::access_list) is always empty.
+    /// inspection). The returned [`access_list`](CallSimulationResult::access_list)
+    /// includes the accounts and slots touched by the pre/post `balanceOf` reads
+    /// and the simulated call.
     ///
     /// # Errors
     /// Returns an error if building the tx env fails, if a pre/post
@@ -3768,11 +3840,13 @@ impl EvmCache {
                 token_deltas.insert(*token, I256::from_raw(post) - I256::from_raw(pre));
             }
 
-            Ok((gas_used, token_deltas, logs, output))
+            let access_list = extract_access_list(&evm.journaled_state.state);
+
+            Ok((gas_used, token_deltas, logs, output, access_list))
         })();
 
         match result {
-            Ok((gas_used, token_deltas, logs, output)) => {
+            Ok((gas_used, token_deltas, logs, output, access_list)) => {
                 if commit {
                     evm.commit_inner();
                 } else {
@@ -3783,7 +3857,7 @@ impl EvmCache {
                     gas_used,
                     token_deltas,
                     logs,
-                    access_list: AccessList::default(),
+                    access_list,
                     output,
                 })
             }
@@ -4320,7 +4394,9 @@ impl Drop for EvmCache {
     fn drop(&mut self) {
         if self.cache_config.is_some() {
             debug!("Flushing EVM cache on drop");
-            self.flush();
+            if let Err(e) = self.flush() {
+                warn!(error = %e, "Failed to flush EVM cache on drop");
+            }
         }
     }
 }
@@ -4352,7 +4428,7 @@ mod shared_memory_capacity_tests {
 
     #[test]
     fn default_is_fixed_64k() {
-        assert_eq!(Cap::default(), Cap::Fixed(64_000));
+        assert_eq!(Cap::default(), Cap::Fixed(64 * 1024));
     }
 
     #[test]
@@ -4365,7 +4441,7 @@ mod shared_memory_capacity_tests {
     fn auto_floors_clamps_and_scales() {
         // Nothing / little loaded → floor.
         assert_eq!(Cap::Auto.resolve(0), Cap::MIN_AUTO);
-        assert_eq!(Cap::Auto.resolve(1_000), Cap::MIN_AUTO); // 16 KB < 64 KB floor
+        assert_eq!(Cap::Auto.resolve(1_000), Cap::MIN_AUTO); // 16 KiB < 64 KiB floor
         // Linear region (16 bytes/slot).
         assert_eq!(Cap::Auto.resolve(10_000), 160_000);
         assert_eq!(Cap::Auto.resolve(100_000), 1_600_000);
@@ -4864,6 +4940,126 @@ mod core_tests {
     }
 
     #[test]
+    fn set_block_latest_clears_stale_block_context() {
+        use alloy_provider::RootProvider;
+        use alloy_rpc_client::RpcClient;
+        use alloy_transport::mock::Asserter;
+
+        let asserter = Asserter::new();
+        let client = RpcClient::mocked(asserter);
+        let provider = RootProvider::<AnyNetwork>::new(client);
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut cache = rt.block_on(EvmCache::new(Arc::new(provider), None));
+        cache.set_block_context(Some(148_252_680), Some(50));
+
+        cache.set_block(Some(BlockId::latest()));
+
+        assert_eq!(
+            cache.block_number(),
+            None,
+            "tag pins must not retain a stale NUMBER context"
+        );
+        assert_eq!(
+            cache.basefee(),
+            None,
+            "set_block cannot refresh BASEFEE synchronously, so it must clear stale values"
+        );
+    }
+
+    #[test]
+    fn set_block_none_clears_stale_context_even_when_pin_unchanged() {
+        use alloy_provider::RootProvider;
+        use alloy_rpc_client::RpcClient;
+        use alloy_transport::mock::Asserter;
+
+        let asserter = Asserter::new();
+        let client = RpcClient::mocked(asserter);
+        let provider = RootProvider::<AnyNetwork>::new(client);
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut cache = rt.block_on(EvmCache::new(Arc::new(provider), None));
+        cache.set_block_context(Some(148_252_680), Some(50));
+
+        cache.set_block(None);
+
+        assert_eq!(
+            cache.block_number(),
+            None,
+            "None pins must not retain a stale NUMBER context"
+        );
+        assert_eq!(
+            cache.basefee(),
+            None,
+            "None pins can drift like tags, so stale BASEFEE must be cleared"
+        );
+    }
+
+    #[test]
+    fn set_block_number_sets_number_and_clears_stale_basefee() {
+        use alloy_provider::RootProvider;
+        use alloy_rpc_client::RpcClient;
+        use alloy_transport::mock::Asserter;
+
+        let asserter = Asserter::new();
+        let client = RpcClient::mocked(asserter);
+        let provider = RootProvider::<AnyNetwork>::new(client);
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut cache = rt.block_on(EvmCache::new(Arc::new(provider), None));
+        cache.set_block_context(Some(100), Some(50));
+
+        cache.set_block(Some(BlockId::Number(BlockNumberOrTag::Number(200))));
+
+        assert_eq!(cache.block_number(), Some(200));
+        assert_eq!(
+            cache.basefee(),
+            None,
+            "set_block cannot refresh BASEFEE synchronously, so it must clear stale values"
+        );
+    }
+
+    #[test]
+    fn repin_to_block_clears_stale_basefee() {
+        use alloy_provider::RootProvider;
+        use alloy_rpc_client::RpcClient;
+        use alloy_transport::mock::Asserter;
+
+        let asserter = Asserter::new();
+        let client = RpcClient::mocked(asserter);
+        let provider = RootProvider::<AnyNetwork>::new(client);
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut cache = rt.block_on(EvmCache::new(Arc::new(provider), None));
+        cache.set_block_context(Some(100), Some(50));
+
+        cache.repin_to_block(200);
+
+        assert_eq!(cache.block_number(), Some(200));
+        assert_eq!(
+            cache.basefee(),
+            None,
+            "repin_to_block must not carry stale BASEFEE across blocks"
+        );
+    }
+
+    #[test]
     fn test_build_evm_applies_block_context() {
         use alloy_provider::RootProvider;
         use alloy_rpc_client::RpcClient;
@@ -4918,8 +5114,8 @@ mod core_tests {
         let block_num = Some(148_252_680u64);
         let basefee_val = Some(50u64);
         let child = EvmCache::from_backend(
-            parent.backend().clone(),
-            parent.blockchain_db().clone(),
+            parent.unchecked_backend().clone(),
+            parent.unchecked_blockchain_db().clone(),
             parent.block(),
             42161,
             block_num,

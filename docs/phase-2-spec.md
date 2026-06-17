@@ -54,7 +54,7 @@ evaluation sims only.
   `storage_batch_fetcher() -> Option<&StorageBatchFetchFn>`,
   `inject_storage_batch(&[(Address,U256,U256)])`, `purge_pool_storage`,
   `purge_pool_slots`, `call_raw_with`/`TxConfig`, `CallSimulationResult`,
-  `blockchain_db()`, `db_mut()`.
+  `unchecked_blockchain_db()`, `db_mut()`.
 - `cache::EvmOverlay` / `cache::EvmSnapshot` (`overlay.rs`/`snapshot.rs`):
   `EvmOverlay::new(Arc<EvmSnapshot>, Option<SharedBackend>)`, `call_raw`,
   `simulate_with_transfer_tracking`. `EvmOverlay` is `Send`.

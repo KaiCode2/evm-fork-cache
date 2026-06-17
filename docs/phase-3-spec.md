@@ -358,7 +358,9 @@ in a new `tests/state_update.rs` (reuse `tests/common`).
    `nonce/code_hash == None`.
 6. **Account code patch:** patch code; assert `code_hash` recomputed
    (`Bytecode::hash_slow`), `code_hash` delta recorded; balance/nonce preserved.
-7. **Account create:** patch an absent account → materialized with patched fields.
+7. **Cold account patch:** patch an absent account → skipped and surfaced in
+   `StateDiff.skipped_accounts`; explicit `AccountUpsert` materializes with
+   patched fields.
 8. **Purge Account / AllStorage / Slots:** correct layers cleared; `PurgeRecord`
    counts (`slots_removed`, `account_removed`) correct on both layers.
 9. **`apply_updates` fold + merge:** a mixed batch (Slot, Account, Purge) →
@@ -645,7 +647,7 @@ the `SlotDelta`/`modify_slot` base read (HIGH) and `apply_slot`'s `old`/predicat
   **and** no backend value) stays skip-and-surface. Add a test for the hot-zero
   case (it is currently the untested seam between Decision-4 skip and apply).
 
-### 16.1 No-op `Account` patch must not materialize a backend account (audit LOW)
+### 16.1 No-op / cold `Account` patch must not materialize a backend account (audit LOW; tightened in Phase 5)
 
 `apply_account_patch` (src/cache/mod.rs ~1331-1340) writes the patched
 `AccountInfo` into the backend **unconditionally**, so an all-`None` (or
@@ -654,23 +656,21 @@ otherwise no-change) patch on an address absent from both layers inserts
 diff — breaking no-op parity with the Slot path and (per the cold-account hazard)
 masking a future RPC fetch. **Fix (LOCKED):** compute the change first; **only
 write-through when at least one field actually changes** (i.e. skip both layer
-writes and return `None` when the patched `info` equals the loaded base). A real
-field change on an absent address still materializes the backend account (the
-existing intended behavior — keep `apply_account_patch_materializes_absent_account`
-green). Add a no-op idempotence test (patching balance to its current value ⇒
-empty diff, no backend account materialized).
+writes and return `None` when the patched `info` equals the loaded base).
+Phase 5 tightened the cold-account contract further: a real field change on an
+address absent from both layers now skips and records `SkippedAccountPatch` in
+`StateDiff.skipped_accounts`; explicit materialization uses
+`StateUpdate::AccountUpsert`. Add no-op and cold-skip idempotence tests (patching
+balance to its current value ⇒ empty diff; cold balance patch ⇒ no backend account
+materialized).
 
-### 16.2 Cold absolute-`Account`-patch hazard — document (audit LOW)
+### 16.2 Cold absolute-`Account`-patch hazard — fixed in Phase 5 (audit LOW)
 
-A *partial* absolute `Account` patch on a cold (un-fetched) address writes default
-nonce/code through the shared backend, masking the real on-chain account. This is
-spec-locked §5.2 behavior, **not** changed here, but it is an undocumented
-live-fork footgun. **Fix (LOCKED, docs only):** add a `### Known issues` entry in
-`docs/KNOWN_ISSUES.md` and a prominent `# Warning` doc paragraph on
-`apply_update` / `StateUpdate::Account` / `AccountPatch` stating that a partial
-patch on an address absent from both cache layers writes default nonce/code as
-authoritative (pre-empting RPC), so callers must fetch+seed the account first, or
-use `StateUpdate::BalanceDelta` (§16.5) for relative native-balance tracking.
+A *partial* absolute `Account` patch on a cold (un-fetched) address used to write
+default nonce/code through the shared backend, masking the real on-chain account.
+Phase 5 changed this contract: `StateUpdate::Account` is cold-aware and records a
+`SkippedAccountPatch` instead; callers that intentionally want a synthetic/default
+account use `StateUpdate::AccountUpsert`.
 
 ### 16.3 `serde` on the vocabulary (audit HIGH gap)
 
@@ -778,7 +778,7 @@ Add tests (in `tests/state_update.rs` unless noted). Each must assert the
   materialized where the spec says none should be (mirror
   `apply_slot_no_overlay_account_is_not_materialized`).
 - **Backend-only account patch:** seed an account only in the backend
-  (`blockchain_db().accounts().write().insert`), patch balance, assert
+  (`unchecked_blockchain_db().accounts().write().insert`), patch balance, assert
   `AccountChange.balance == Some((old,new))`, backend updated, overlay still absent.
 - **Nonce-only** and **multi-field (balance+nonce+code)** patches: assert the
   respective `AccountChange` fields are `Some`/`None` correctly.
