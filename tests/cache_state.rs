@@ -11,19 +11,41 @@ mod common;
 use alloy_primitives::{Address, B256, Bytes, I256, U256, keccak256};
 use alloy_sol_types::{SolCall, SolValue};
 use anyhow::{Context, Result};
-use revm::state::{AccountInfo, Bytecode};
+use revm::{
+    context::result::ExecutionResult,
+    state::{AccountInfo, Bytecode},
+};
 
 use common::{
     MOCK_ERC20_BALANCE_SLOT, MockERC20, balance_of, install_default_account, install_mock_erc20,
     mock_erc20_creation_code, mock_erc20_runtime, setup_cache, transfer,
 };
-use evm_fork_cache::cache::TxConfig;
+use evm_fork_cache::cache::{EvmCache, TxConfig};
 
 /// Deterministic CREATE address for `Address::ZERO` at nonce 0:
 /// `keccak256(rlp([ZERO, 0]))[12..]`.
 const CREATE_ADDRESS_ZERO_NONCE_0: Address = Address::new(alloy_primitives::hex!(
     "bd770416a3345f91e4b34576cb804a576fa48eb1"
 ));
+
+fn install_runtime(cache: &mut EvmCache, addr: Address, runtime_hex: &str) -> Result<()> {
+    let bytecode = Bytecode::new_raw(Bytes::from(alloy_primitives::hex::decode(runtime_hex)?));
+    let code_hash = bytecode.hash_slow();
+    cache.db_mut().insert_account_info(
+        addr,
+        AccountInfo {
+            balance: U256::ZERO,
+            nonce: 0,
+            code: Some(bytecode),
+            code_hash,
+            account_id: None,
+        },
+    );
+    cache
+        .db_mut()
+        .replace_account_storage(addr, Default::default())?;
+    Ok(())
+}
 
 #[tokio::test(flavor = "multi_thread")]
 async fn snapshot_restore_reverts_token_state() -> Result<()> {
@@ -187,6 +209,125 @@ async fn balance_delta_simulation_reports_access_list() -> Result<()> {
         balance_of(&mut cache, token, recipient)?,
         U256::ZERO,
         "non-committing simulation must not change recipient balance"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn balance_delta_target_gas_matches_unwarmed_call() -> Result<()> {
+    let mut cache = setup_cache().await?;
+    let token = Address::repeat_byte(0xB1);
+    let owner = Address::repeat_byte(0xB2);
+    let recipient = Address::repeat_byte(0xB3);
+
+    install_default_account(&mut cache, Address::ZERO);
+    install_default_account(&mut cache, owner);
+    install_default_account(&mut cache, recipient);
+    install_mock_erc20(&mut cache, token);
+
+    let balance_slot = U256::from(MOCK_ERC20_BALANCE_SLOT);
+    cache.insert_mapping_storage_slot(token, balance_slot, owner, U256::from(1_000u64))?;
+    cache.insert_mapping_storage_slot(token, balance_slot, recipient, U256::ZERO)?;
+
+    let transfer_call = Bytes::from(
+        MockERC20::transferCall {
+            to: recipient,
+            amount: U256::from(250u64),
+        }
+        .abi_encode(),
+    );
+    let baseline = cache.call_raw(owner, token, transfer_call.clone(), false)?;
+    let baseline_gas = match baseline {
+        ExecutionResult::Success { gas_used, .. } => gas_used,
+        other => panic!("baseline transfer should succeed: {other:?}"),
+    };
+
+    let result = cache.simulate_call_with_balance_deltas(
+        owner,
+        token,
+        transfer_call,
+        owner,
+        [token],
+        false,
+    )?;
+
+    assert_eq!(
+        result.gas_used, baseline_gas,
+        "pre-balance reads must not warm the target call or alter its gas"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn balance_delta_commit_persists_only_target_call() -> Result<()> {
+    let mut cache = setup_cache().await?;
+    let owner = Address::repeat_byte(0xA1);
+    let target = Address::repeat_byte(0xA2);
+    let token = Address::repeat_byte(0xA3);
+
+    install_default_account(&mut cache, owner);
+    // Target call: store 42 at slot 0 and stop.
+    install_runtime(&mut cache, target, "602a60005500")?;
+    // Malicious "balanceOf": increment slot 0, then return a zero uint256.
+    install_runtime(&mut cache, token, "60005460010160005560206000f3")?;
+
+    let result = cache.simulate_call_with_balance_deltas(
+        owner,
+        target,
+        Bytes::new(),
+        owner,
+        [token],
+        true,
+    )?;
+
+    assert_eq!(result.token_deltas.get(&token), Some(&I256::ZERO));
+    assert_eq!(
+        cache.cached_storage_value(target, U256::ZERO),
+        Some(U256::from(42u64)),
+        "commit=true must persist the simulated target call"
+    );
+    assert_eq!(
+        cache
+            .cached_storage_value(token, U256::ZERO)
+            .unwrap_or_default(),
+        U256::ZERO,
+        "pre/post balanceOf calls are measurements and must not commit side effects"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn balance_delta_post_read_error_reverts_target_checkpoint() -> Result<()> {
+    let mut cache = setup_cache().await?;
+    let owner = Address::repeat_byte(0xC1);
+    let token = Address::repeat_byte(0xC2);
+
+    install_default_account(&mut cache, owner);
+    // Empty calldata stores 1 at slot 0 and succeeds. Any non-empty calldata is
+    // treated as balanceOf: it returns zero while slot 0 is zero and reverts
+    // after the target call sets slot 0.
+    install_runtime(
+        &mut cache,
+        token,
+        "36600a576001600055005b60005460165760206000f35b60006000fd",
+    )?;
+
+    let err = cache
+        .simulate_call_with_balance_deltas(owner, token, Bytes::new(), owner, [token], true)
+        .expect_err("post balanceOf failure must surface as an error");
+    assert!(
+        err.to_string().contains("balanceOf call failed"),
+        "unexpected error: {err:#}"
+    );
+    assert_eq!(
+        cache
+            .cached_storage_value(token, U256::ZERO)
+            .unwrap_or_default(),
+        U256::ZERO,
+        "post-read failures must revert the successful target call before returning"
     );
 
     Ok(())

@@ -2,7 +2,6 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::SystemTime;
 
 use alloy_eips::eip2930::{AccessList, AccessListItem};
 use alloy_primitives::{Address, B256, Bytes, TxKind, U256};
@@ -16,7 +15,7 @@ use revm::{
 };
 
 use super::snapshot::EvmSnapshot;
-use super::{CallSimulationResult, SimStatus, TxConfig};
+use super::{CallSimulationResult, SimStatus, TxConfig, unix_timestamp_secs_saturating};
 use crate::access_set::StorageAccessList;
 use crate::errors::{SimError, SimulationError, SimulationResult};
 use crate::inspector::TransferInspector;
@@ -162,12 +161,10 @@ impl EvmOverlay {
         // Read snapshot values before the mutable borrow of self
         let chain_id = self.snapshot.chain_id;
         let spec_id = self.snapshot.spec_id;
-        let timestamp = self.snapshot.timestamp.unwrap_or_else(|| {
-            SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs()
-        });
+        let timestamp = self
+            .snapshot
+            .timestamp
+            .unwrap_or_else(|| unix_timestamp_secs_saturating(std::time::SystemTime::now()));
         let block_number = self.snapshot.block_number;
         let basefee = self.snapshot.basefee;
         let coinbase = self.snapshot.coinbase;
@@ -323,12 +320,10 @@ impl EvmOverlay {
     ) -> InspectorOverlayEvm<'_, INSP> {
         let chain_id = self.snapshot.chain_id;
         let spec_id = self.snapshot.spec_id;
-        let timestamp = self.snapshot.timestamp.unwrap_or_else(|| {
-            SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs()
-        });
+        let timestamp = self
+            .snapshot
+            .timestamp
+            .unwrap_or_else(|| unix_timestamp_secs_saturating(std::time::SystemTime::now()));
         let block_number = self.snapshot.block_number;
         let basefee = self.snapshot.basefee;
         let coinbase = self.snapshot.coinbase;

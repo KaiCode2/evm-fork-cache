@@ -21,9 +21,16 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
 use crate::StorageAccessList;
-use crate::cache::EvmCache;
+use crate::cache::{EvmCache, versioned};
 
-/// Registry of access lists keyed by phase, persisted across cycles via bincode.
+const PREFETCH_REGISTRY_MAGIC: &[u8; 8] = b"EFC-PFRG";
+const PREFETCH_REGISTRY_VERSION: u32 = 1;
+
+/// Registry of access lists keyed by phase, persisted across cycles.
+///
+/// On disk, the registry is stored as a crate-specific magic/version envelope
+/// followed by a bincode payload. Unknown or legacy unversioned files are
+/// treated as cache misses and loaded as an empty registry.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct PrefetchRegistry {
     /// Phases with a single aggregated access list (e.g., a `pool_refresh` phase).
@@ -34,17 +41,22 @@ pub struct PrefetchRegistry {
 }
 
 impl PrefetchRegistry {
-    /// Load a registry from `path` (bincode format).
+    /// Load a registry from `path` (versioned binary format).
     ///
     /// Returns [`Default`] (an empty registry) on any error — a missing file, an
-    /// unreadable file, or corrupt/undecodable contents. These cases are not
-    /// distinguished by the return value: a corrupt registry is indistinguishable
-    /// from a fresh start, so a decode failure silently discards previously
-    /// persisted prefetch data (logged at `warn`).
+    /// unreadable file, an unrecognized magic/version header, or corrupt
+    /// contents. These cases are not distinguished by the return value: an
+    /// incompatible registry is indistinguishable from a fresh start, so it is
+    /// treated as a cache miss (logged at `warn`).
     pub fn load(path: &Path) -> Self {
         match std::fs::read(path) {
-            Ok(data) => match bincode::deserialize::<PrefetchRegistry>(&data) {
-                Ok(registry) => {
+            Ok(data) => {
+                if let Some(registry) = versioned::decode::<PrefetchRegistry>(
+                    &data,
+                    PREFETCH_REGISTRY_MAGIC,
+                    PREFETCH_REGISTRY_VERSION,
+                    "prefetch registry",
+                ) {
                     let phase_count = registry.phases.len();
                     let keyed_phase_count = registry.keyed_phases.len();
                     let total_slots: usize = registry
@@ -65,12 +77,11 @@ impl PrefetchRegistry {
                         "Loaded prefetch registry"
                     );
                     registry
-                }
-                Err(e) => {
-                    warn!(?e, "Failed to decode prefetch registry, starting fresh");
+                } else {
+                    warn!("Prefetch registry cache miss, starting fresh");
                     Self::default()
                 }
-            },
+            }
             Err(_) => {
                 debug!("No prefetch registry file found, starting fresh");
                 Self::default()
@@ -78,8 +89,8 @@ impl PrefetchRegistry {
         }
     }
 
-    /// Persist the registry to `path` in bincode format, creating parent
-    /// directories as needed.
+    /// Persist the registry to `path` in versioned binary format, creating
+    /// parent directories as needed.
     ///
     /// Returns an error if the parent directory cannot be created, serialization
     /// fails, or the write fails.
@@ -89,7 +100,12 @@ impl PrefetchRegistry {
                 format!("failed to create prefetch registry directory {parent:?}")
             })?;
         }
-        let data = bincode::serialize(self).context("failed to serialize prefetch registry")?;
+        let data = versioned::encode(
+            PREFETCH_REGISTRY_MAGIC,
+            PREFETCH_REGISTRY_VERSION,
+            self,
+            "prefetch registry",
+        )?;
         std::fs::write(path, data)
             .with_context(|| format!("failed to persist prefetch registry to {path:?}"))?;
 
@@ -345,6 +361,11 @@ mod tests {
         registry.record_keyed("per_target", key, sal);
 
         registry.save(&path).expect("save registry");
+        let data = std::fs::read(&path).expect("read saved registry");
+        assert!(
+            data.starts_with(b"EFC-PFRG"),
+            "prefetch registry files must carry a magic/version header"
+        );
 
         let loaded = PrefetchRegistry::load(&path);
         assert_eq!(loaded.phases.len(), 1);
@@ -384,6 +405,30 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&dir);
+    }
+
+    #[test]
+    fn legacy_raw_bincode_loads_as_default() {
+        let dir = std::env::temp_dir().join("evm_fork_cache_test_prefetch_registry_legacy");
+        let path = dir.join("legacy_registry.bin");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+
+        let mut registry = PrefetchRegistry::default();
+        let addr = Address::repeat_byte(0xAA);
+        let mut al = StorageAccessList::default();
+        al.slots.insert((addr, U256::from(42)));
+        registry.record("legacy_phase", al);
+        let legacy = bincode::serialize(&registry).expect("serialize legacy registry");
+        std::fs::write(&path, legacy).expect("write legacy registry");
+
+        let loaded = PrefetchRegistry::load(&path);
+        assert!(
+            loaded.phases.is_empty() && loaded.keyed_phases.is_empty(),
+            "legacy raw bincode must be treated as a cache miss"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

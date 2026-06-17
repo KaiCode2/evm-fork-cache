@@ -41,6 +41,7 @@ use std::sync::{Arc, OnceLock};
 
 use alloy_primitives::{Bytes, FixedBytes};
 use alloy_sol_types::SolError;
+use tracing::warn;
 
 /// 4-byte selector of the standard Solidity `Error(string)` revert
 /// (`0x08c379a0`), emitted by `require`/`revert("msg")`.
@@ -122,13 +123,43 @@ struct CustomErrorDecoder {
     decode: DecodeFn,
 }
 
+/// Error returned when registering a custom error selector that already exists.
+///
+/// A [`RevertDecoder`] keeps the first decoder registered for a selector so a
+/// later registration cannot silently change how existing revert data decodes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DuplicateSelectorError {
+    /// The 4-byte selector that was already registered.
+    pub selector: FixedBytes<4>,
+    /// Signature/name of the existing registration that will be kept.
+    pub existing: Cow<'static, str>,
+    /// Signature/name of the attempted duplicate registration.
+    pub attempted: Cow<'static, str>,
+}
+
+impl fmt::Display for DuplicateSelectorError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "duplicate custom error selector {}: keeping {}, ignoring {}",
+            self.selector, self.existing, self.attempted
+        )
+    }
+}
+
+impl std::error::Error for DuplicateSelectorError {}
+
 /// Decodes raw EVM revert data into a [`RevertReason`].
 ///
 /// The two standard Solidity built-ins — `Error(string)` and `Panic(uint256)` —
 /// are always recognized. Register additional contract-defined custom errors
 /// with [`with_error`](RevertDecoder::with_error),
 /// [`register`](RevertDecoder::register), or
-/// [`register_raw`](RevertDecoder::register_raw).
+/// [`register_raw`](RevertDecoder::register_raw). Duplicate custom-error
+/// selectors keep the first registration; use
+/// [`try_register`](RevertDecoder::try_register) or
+/// [`try_register_raw`](RevertDecoder::try_register_raw) when collisions should
+/// be handled as errors instead of warnings.
 ///
 /// The decoder is cheap to [`Clone`] and is `Send + Sync`, so a configured
 /// decoder can be shared across parallel simulations.
@@ -164,6 +195,10 @@ impl RevertDecoder {
     /// Register a `sol!`-generated custom error type for decoding, consuming and
     /// returning `self` for builder-style chaining.
     ///
+    /// If the selector is already registered, the first registration is kept
+    /// and a warning is emitted. Use [`try_register`](Self::try_register) when
+    /// duplicate selectors should fail configuration.
+    ///
     /// ```
     /// use alloy_sol_types::sol;
     /// use evm_fork_cache::errors::RevertDecoder;
@@ -190,21 +225,34 @@ impl RevertDecoder {
 
     /// Register a `sol!`-generated custom error type for decoding.
     ///
-    /// If an error with the same selector is already registered it is replaced.
+    /// If an error with the same selector is already registered, the first
+    /// registration is kept and a warning is emitted. Use
+    /// [`try_register`](Self::try_register) to surface duplicates as errors.
     pub fn register<E>(&mut self) -> &mut Self
+    where
+        E: SolError + fmt::Debug + 'static,
+    {
+        if let Err(err) = self.try_register::<E>() {
+            warn_duplicate_selector(&err);
+        }
+        self
+    }
+
+    /// Register a `sol!`-generated custom error type for decoding, returning an
+    /// error when another custom error already owns the same selector.
+    pub fn try_register<E>(&mut self) -> Result<&mut Self, DuplicateSelectorError>
     where
         E: SolError + fmt::Debug + 'static,
     {
         let decode: DecodeFn =
             Arc::new(|data: &Bytes| E::abi_decode(data).ok().map(|err| format!("{err:?}")));
-        self.custom.insert(
+        self.insert_custom_error(
             E::SELECTOR,
             CustomErrorDecoder {
                 name: Cow::Borrowed(E::SIGNATURE),
                 decode,
             },
-        );
-        self
+        )
     }
 
     /// Register a custom error by raw selector, name, and parameter decoder.
@@ -217,7 +265,9 @@ impl RevertDecoder {
     /// If the closure returns `None`, the selector still matches: the decode
     /// yields a [`RevertReason::Custom`] whose
     /// [`params`](CustomRevert::params) is `None`. If an error with the same
-    /// selector is already registered it is replaced.
+    /// selector is already registered, the first registration is kept and a
+    /// warning is emitted. Use [`try_register_raw`](Self::try_register_raw) to
+    /// surface duplicates as errors.
     ///
     /// ```
     /// use alloy_primitives::Bytes;
@@ -254,14 +304,31 @@ impl RevertDecoder {
         name: impl Into<Cow<'static, str>>,
         decode: impl Fn(&Bytes) -> Option<String> + Send + Sync + 'static,
     ) -> &mut Self {
-        self.custom.insert(
+        if let Err(err) = self.try_register_raw(selector, name, decode) {
+            warn_duplicate_selector(&err);
+        }
+        self
+    }
+
+    /// Register a custom error by raw selector, name, and parameter decoder,
+    /// returning an error when another custom error already owns the selector.
+    ///
+    /// The `decode` closure receives the full revert bytes (selector included)
+    /// and returns formatted parameters, or `None` if the selector matched but
+    /// the parameter payload could not be decoded.
+    pub fn try_register_raw(
+        &mut self,
+        selector: [u8; 4],
+        name: impl Into<Cow<'static, str>>,
+        decode: impl Fn(&Bytes) -> Option<String> + Send + Sync + 'static,
+    ) -> Result<&mut Self, DuplicateSelectorError> {
+        self.insert_custom_error(
             selector,
             CustomErrorDecoder {
                 name: name.into(),
                 decode: Arc::new(decode),
             },
-        );
-        self
+        )
     }
 
     /// Number of registered custom errors. The two Solidity built-ins are
@@ -363,6 +430,32 @@ impl RevertDecoder {
             data: data.clone(),
         }
     }
+
+    fn insert_custom_error(
+        &mut self,
+        selector: [u8; 4],
+        decoder: CustomErrorDecoder,
+    ) -> Result<&mut Self, DuplicateSelectorError> {
+        if let Some(existing) = self.custom.get(&selector) {
+            return Err(DuplicateSelectorError {
+                selector: FixedBytes::from(selector),
+                existing: existing.name.clone(),
+                attempted: decoder.name,
+            });
+        }
+
+        self.custom.insert(selector, decoder);
+        Ok(self)
+    }
+}
+
+fn warn_duplicate_selector(err: &DuplicateSelectorError) {
+    warn!(
+        selector = %err.selector,
+        existing = err.existing.as_ref(),
+        attempted = err.attempted.as_ref(),
+        "duplicate custom error selector registration ignored; keeping first registration"
+    );
 }
 
 /// Decode revert data using only the standard Solidity built-ins.

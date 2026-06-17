@@ -8,7 +8,7 @@ carry red/green tests and a `CHANGELOG.md` entry.
 Confidence legend: **[V]** verified against the source during review;
 **[R]** reported by the review and worth confirming before acting.
 
-## Recently fixed by `codex/phase-5-known-issues-top5`
+## Recently fixed before public release
 
 1. **[FIXED] Cold absolute `Account` patches no longer materialize unknown
    accounts.** `StateUpdate::Account` is cold-aware: a partial patch against an
@@ -17,11 +17,15 @@ Confidence legend: **[V]** verified against the source during review;
    cold materialization is now explicit via `StateUpdate::AccountUpsert` /
    `StateUpdate::account_upsert(...)`.
 
-2. **[FIXED] Block-context drift after re-pinning.** `set_block` now sets
-   `block_number` only for concrete numeric pins and clears it for tag/hash/`None`
-   pins. Block changes, plus non-concrete pin calls that can drift under the same
-   tag, clear stale `basefee`; callers refresh `NUMBER`/`BASEFEE` together with
-   `set_block_context` after fetching the new header.
+2. **[FIXED] Block-context drift and default/latest block-pin ambiguity.**
+   `EvmCache::new(provider)` now pins to `BlockId::latest()` instead of a
+   "no block pin" state; explicit construction uses
+   `EvmCache::at_block(provider, block)`. `set_block` takes a concrete
+   `BlockId`, sets `block_number` only for numeric pins, and clears it for
+   tag/hash pins. Every block change clears stale `basefee`; callers refresh
+   `NUMBER`/`BASEFEE` together with `set_block_context` after fetching the new
+   header. Freshness validation captures the cache's concrete snapshot pin and
+   passes it through to storage fetchers.
 
 3. **[FIXED] Synchronous layer-2 escape hatches have an invalidating wrapper.**
    Raw handles are now visibly named `unchecked_blockchain_db()` /
@@ -39,16 +43,18 @@ Confidence legend: **[V]** verified against the source during review;
    `access_list_rlp_data_gas(...)` and provider/pricing failures propagate as
    `Err`, leaving `Ok(None)` for empty/zero-priced/unprofitable lists.
 
-6. **[FIXED] `simulate_call_with_balance_deltas` now returns the touched access
-   list.** The pre/post `balanceOf` reads and simulated call share one EVM
-   journal, and the method now extracts the EIP-2930 access list before
-   commit/revert, matching the transfer-inspector simulation path.
+6. **[FIXED] `simulate_call_with_balance_deltas` isolates balance reads and
+   returns the touched access list.** Pre/post `balanceOf` reads run in isolated
+   checkpoints so malicious/non-view token reads cannot affect target-call gas or
+   committed state. The method commits only the target call when `commit=true`
+   and returns the deduplicated EIP-2930 access list from the pre-reads, target
+   call, and post-reads.
 
 7. **[FIXED] On-disk cache files carry magic bytes and a version number.**
-   `binary_state`, `bytecode`, `ImmutableDataCache`, and V3 tick snapshots now
-   write a crate-specific magic header plus version `1` before the bincode
-   payload. Unknown magic/version values and legacy raw-bincode files are treated
-   as cache misses.
+   `binary_state`, `bytecode`, `ImmutableDataCache`, `PrefetchRegistry`,
+   `SlotObservationTracker`, and V3 tick snapshots now write a crate-specific
+   magic header plus version `1` before the bincode payload. Unknown
+   magic/version values and legacy raw-bincode files are treated as cache misses.
 
 8. **[FIXED] `call_raw_with_access_list` did not revert its checkpoint on a
    transact error.** Both `EvmCache::call_raw_with_access_list` and
@@ -57,60 +63,52 @@ Confidence legend: **[V]** verified against the source during review;
    matching `call_raw` / `simulate_with_transfer_tracking`. A host-level transact
    error no longer leaves the overlay checkpoint un-reverted.
 
+9. **[FIXED] Duplicate custom-error selectors no longer shadow silently.**
+   `RevertDecoder::try_register` and `try_register_raw` return a
+   `DuplicateSelectorError` when a selector is already registered. The ergonomic
+   `register` / `register_raw` / `with_error` path keeps the first registration
+   and emits a warning instead of replacing it.
+
+10. **[FIXED] EVM timestamp construction no longer panics on pre-epoch clocks.**
+    EVM builders use a shared saturating helper for implicit wall-clock
+    timestamps, returning `0` when the system clock is before the Unix epoch
+    instead of panicking. Explicit timestamp overrides are unchanged.
+
 ## Remaining open issues ranked by unexpected-result risk
 
-1. **[R] Duplicate custom-error selectors shadow silently.** `RevertDecoder`
-   registration replaces an existing entry for the same 4-byte selector with no
-   warning, so an accidental double-registration silently wins. Consider a
-   debug-level log or a `try_register` that reports collisions.
-
-2. **[R] ERC20 `Transfer` decoding assumes the standard layout.** `inspector.rs`
-   reads `from`/`to` from indexed topics and `value` from the first 32 data
-   bytes. Non-standard or packed `Transfer` encodings may parse incorrectly or be
-   skipped. A self-transfer where `from == to` nets to zero for that owner; this
-   is now documented at the call site.
-
-3. **[V] `SystemTime::now().unwrap()` panic risk in EVM construction.**
-   `build_evm` / `make_local_context` (and the overlay equivalents) call
-   `SystemTime::now().duration_since(UNIX_EPOCH).unwrap()` when no timestamp
-   override is set, which panics if the system clock is before the Unix epoch.
-   Setting an explicit timestamp avoids it; consider a saturating fallback.
-
-4. **[R] Panic codes above `u64::MAX` are dropped.** `decode_solidity_panic`
-   converts out-of-range panic codes to `None`. Real compiler-emitted panic codes
-   are single-byte constants, so this is benign in practice and documented at the
-   call site.
+No release-blocking unexpected-result issues remain open from this audit. The
+remaining items below are accepted limitations or code-quality/API nits.
 
 ## Code-quality nits
 
-5. **[V] Dead branch in `i128_to_u256`** (`cache/storage_keys.rs`): both the
+1. **[V] Dead branch in `i128_to_u256`** (`cache/storage_keys.rs`): both the
     `value >= 0` and `else` arms evaluate the identical `U256::from(value as u128)`.
     The two's-complement cast is correct for both signs, so the `if`/`else` can
     collapse to one line (keep the explanatory comment).
 
-6. **[R] V3 tick-snapshot keys serialize as strings.** `V3PoolTickSnapshot`
+2. **[R] V3 tick-snapshot keys serialize as strings.** `V3PoolTickSnapshot`
     stringifies `i16`/`i32` tick/word keys for bincode, then `parse()`s them back
     in `to_tick_bitmap`/`to_ticks`, silently dropping any key that fails to parse.
     A native integer-keyed encoding would be faster and would not fail silently.
 
-7. **[R] Balancer pool id keyed by `Debug` formatting.** `ImmutableDataCache`
+3. **[R] Balancer pool id keyed by `Debug` formatting.** `ImmutableDataCache`
     keys `balancer_pools` by `format!("{:?}", pool_id)`. `Debug` output is not a
     stable encoding contract; a hex encoding would be safer for a persisted key.
 
 ## API ergonomics
 
-8. **[R] `snapshot()` vs `create_snapshot()`.** `snapshot()` returns a low-level
+1. **[R] `snapshot()` vs `create_snapshot()`.** `snapshot()` returns a low-level
     `revm::database::Cache` for in-place `restore()`; `create_snapshot()` returns
     an `Arc<EvmSnapshot>` for cross-thread fan-out. The names don't convey the
     difference. Docs now cross-reference them (see the rustdoc), but a rename
     could be considered pre-1.0.
 
-9. **[R] Process-global cache speed mode.** `set_cache_speed_mode` /
+2. **[R] Process-global cache speed mode.** `set_cache_speed_mode` /
     `cache_speed_mode` are a process-wide `static`, so two caches in one process
     cannot tune concurrency independently. Phase 1 moved configuration toward
     per-instance (`EvmCacheBuilder::cache_config`); the global setter remains.
 
-10. **[V] `SpeculativeSim` consumption contract.** Both `validate()` and
+3. **[V] `SpeculativeSim` consumption contract.** Both `validate()` and
     `into_optimistic()` take `self` by value, so double-consumption is unreachable
     under normal ownership. Internally `validate()` uses `.expect("validation
     handle taken twice")` (defensive) while `into_optimistic()` no-ops if the
@@ -119,6 +117,15 @@ Confidence legend: **[V]** verified against the source during review;
 
 ## Limitations by design / roadmap
 
+- **Solidity `Panic(uint256)` codes above `u64::MAX` decode as `Unknown`.**
+  `decode_solidity_panic` drops out-of-range codes rather than exposing a lossy
+  `u64`. Real compiler-emitted panic codes are single-byte constants, so this is
+  an accepted limitation and is documented in the error module.
+- **ERC20 `Transfer` decoding assumes the standard event layout.** `inspector.rs`
+  reads `from`/`to` from indexed topics and `value` from the first 32 data bytes.
+  Non-standard or packed `Transfer` encodings may parse incorrectly or be skipped.
+  A self-transfer where `from == to` nets to zero for that owner; this is
+  documented at the call site.
 - **Copy-on-write snapshots (Phase 5, Pillar A) — done.** `create_snapshot()` is
   no longer an O(total state) deep clone. The cold `BlockchainDb` index (layer 2)
   is flattened once into an internal, immutable, `Arc`-shared base (per-account

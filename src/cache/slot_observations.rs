@@ -22,6 +22,11 @@ use tracing::{debug, warn};
 
 use crate::freshness::FreshnessParams;
 
+use super::versioned;
+
+const SLOT_OBSERVATIONS_MAGIC: &[u8; 8] = b"EFC-SOBS";
+const SLOT_OBSERVATIONS_VERSION: u32 = 1;
+
 /// Per-slot observation record, persisted to disk.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct SlotObservation {
@@ -66,12 +71,20 @@ impl SlotObservationTracker {
         }
     }
 
-    /// Load persisted observations from disk (bincode format).
-    /// Returns a fresh tracker if the file doesn't exist or can't be decoded.
+    /// Load persisted observations from disk (versioned binary format).
+    ///
+    /// Returns a fresh tracker if the file doesn't exist, has an unrecognized
+    /// magic/version header, or can't be decoded. Legacy unversioned bincode is
+    /// treated as a cache miss.
     pub fn load(path: &Path) -> Self {
         match std::fs::read(path) {
-            Ok(data) => match bincode::deserialize::<HashMap<SlotKey, SlotObservation>>(&data) {
-                Ok(observations) => {
+            Ok(data) => {
+                if let Some(observations) = versioned::decode::<HashMap<SlotKey, SlotObservation>>(
+                    &data,
+                    SLOT_OBSERVATIONS_MAGIC,
+                    SLOT_OBSERVATIONS_VERSION,
+                    "slot observations",
+                ) {
                     debug!(
                         entries = observations.len(),
                         "Loaded slot observation tracker"
@@ -81,12 +94,11 @@ impl SlotObservationTracker {
                         skipped_this_cycle: Vec::new(),
                         dirty: false,
                     }
-                }
-                Err(e) => {
-                    warn!(?e, "Failed to decode slot observations, starting fresh");
+                } else {
+                    warn!("Slot observations cache miss, starting fresh");
                     Self::new()
                 }
-            },
+            }
             Err(_) => {
                 debug!("No slot observations file found, starting fresh");
                 Self::new()
@@ -94,7 +106,8 @@ impl SlotObservationTracker {
         }
     }
 
-    /// Persist observations to disk. Called at end of cycle or on shutdown.
+    /// Persist observations to disk using the versioned binary format.
+    /// Called at end of cycle or on shutdown.
     pub fn save(&mut self, path: &Path) -> anyhow::Result<()> {
         if !self.dirty {
             return Ok(());
@@ -102,7 +115,12 @@ impl SlotObservationTracker {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let data = bincode::serialize(&self.observations)?;
+        let data = versioned::encode(
+            SLOT_OBSERVATIONS_MAGIC,
+            SLOT_OBSERVATIONS_VERSION,
+            &self.observations,
+            "slot observations",
+        )?;
         std::fs::write(path, data)?;
         self.dirty = false;
         debug!(entries = self.observations.len(), "Saved slot observations");
@@ -438,6 +456,11 @@ mod tests {
         tracker.observe(a, U256::from(0), U256::from(100), 0);
         tracker.observe(a, U256::from(4), U256::from(200), 0);
         tracker.save(&path).unwrap();
+        let data = std::fs::read(&path).expect("read saved observations");
+        assert!(
+            data.starts_with(b"EFC-SOBS"),
+            "slot observation files must carry a magic/version header"
+        );
 
         let loaded = SlotObservationTracker::load(&path);
         assert_eq!(loaded.len(), 2);
@@ -446,6 +469,38 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn legacy_raw_bincode_loads_as_default() {
+        let dir = std::env::temp_dir().join("evm_fork_cache_test_slot_obs_legacy");
+        let path = dir.join("legacy_observations.bin");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+
+        let a = addr(1);
+        let slot = U256::from(4);
+        let mut observations = HashMap::new();
+        observations.insert(
+            SlotKey { address: a, slot },
+            SlotObservation {
+                last_value: U256::from(42),
+                observation_count: 3,
+                change_count: 0,
+                last_checked: 2,
+                last_changed: 0,
+            },
+        );
+        let legacy = bincode::serialize(&observations).expect("serialize legacy observations");
+        std::fs::write(&path, legacy).expect("write legacy observations");
+
+        let loaded = SlotObservationTracker::load(&path);
+        assert!(
+            loaded.is_empty(),
+            "legacy raw bincode must be treated as a cache miss"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

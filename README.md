@@ -38,9 +38,10 @@ around three capabilities that target exactly this workload:
 
 > **Maturity.** This crate is **pre-1.0** and under active development against a
 > [phased roadmap](docs/ROADMAP.md). Capabilities (1) and (3) above are
-> implemented today; (2) is partially implemented (targeted purge/inject) with
-> the event-driven pipeline still on the roadmap. The public API still changes
-> between minor versions — see [Stability](#stability).
+> implemented today. Capability (2) has the targeted writer primitives and the
+> event-to-state reader pipeline; a production WebSocket transport remains
+> consumer-provided. The public API still changes between minor versions — see
+> [Stability](#stability).
 
 ## What it provides today
 
@@ -55,6 +56,11 @@ around three capabilities that target exactly this workload:
   deferred validation. See the [`freshness`](src/freshness.rs) module.
 - **Targeted state manipulation** — direct storage injection, account/slot
   purge, and balance overrides for pool-state refresh workflows.
+- **Event-to-state pipeline** — decode ERC-20 and Uniswap V3 logs into
+  `StateUpdate`s, apply them in order, purge touched state on reorg, and
+  reconcile sampled event-derived slots against RPC. The crate ships the generic
+  driver and in-memory examples; production WebSocket subscription/reorg wiring
+  stays with the consumer.
 - **ERC20 helpers** — balances, allowances, decimals, and controlled balance
   mutation (including automatic balance-slot discovery) for simulations.
 - **Transfer-inspector simulation** that reports per-token balance deltas
@@ -68,7 +74,8 @@ around three capabilities that target exactly this workload:
 - **CREATE3 address derivation** utilities.
 - **An extensible revert decoder** — the two Solidity built-ins (`Error(string)`
   and `Panic(uint256)`) decode natively; register your own contract-defined
-  custom errors in one line.
+  custom errors in one line. Duplicate custom-error selectors keep the first
+  registration and can be rejected explicitly with `try_register*`.
 
 ## Quick start
 

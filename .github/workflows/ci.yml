@@ -10,7 +10,7 @@ env:
 
 jobs:
   check:
-    name: test / clippy / fmt / docs
+    name: release gates
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -34,13 +34,25 @@ jobs:
       - name: Clippy (no default features)
         run: cargo clippy --lib --no-default-features --no-deps -- -D warnings
 
-      - name: Tests
-        run: cargo test
+      - name: Tests (all targets)
+        run: cargo test --all-targets
+
+      - name: Tests (no default features)
+        run: cargo test --no-default-features
+
+      - name: Doc tests
+        run: cargo test --doc
 
       - name: Docs
         run: cargo doc --no-deps
         env:
           RUSTDOCFLAGS: "-D warnings"
+
+      - name: Benchmarks compile
+        run: cargo bench --no-run
+
+      - name: Package
+        run: cargo package --locked
 
   msrv:
     name: msrv (1.88)

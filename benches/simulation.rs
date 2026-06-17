@@ -57,7 +57,7 @@ fn addr(i: usize) -> Address {
 
 fn offline_cache(rt: &Runtime) -> EvmCache {
     let provider = RootProvider::<AnyNetwork>::new(RpcClient::mocked(Asserter::new()));
-    rt.block_on(EvmCache::new(Arc::new(provider), None))
+    rt.block_on(EvmCache::new(Arc::new(provider)))
 }
 
 /// A cache whose cold index lives in **layer 2** — seeded via

@@ -20,7 +20,6 @@
 
 use std::sync::Arc;
 
-use alloy_eips::BlockId;
 use alloy_primitives::{Address, U256, address};
 use alloy_provider::ProviderBuilder;
 use alloy_provider::network::AnyNetwork;
@@ -53,7 +52,7 @@ async fn main() -> Result<()> {
     let provider = ProviderBuilder::new()
         .network::<AnyNetwork>()
         .connect_http(rpc_url.parse()?);
-    let mut cache = EvmCache::new(Arc::new(provider), Some(BlockId::latest())).await;
+    let mut cache = EvmCache::new(Arc::new(provider)).await;
 
     // Three calls, all failure-tolerant. The transfer reverts (the Multicall3
     // contract — the msg.sender of each sub-call — holds no USDC), but the batch

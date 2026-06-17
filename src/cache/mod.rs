@@ -8,7 +8,7 @@ pub mod snapshot;
 mod storage_keys;
 #[cfg(feature = "protocols")]
 mod tick_snapshot;
-mod versioned;
+pub(crate) mod versioned;
 
 pub use binary_state::{load_binary_state, save_binary_state};
 pub use metadata::{
@@ -40,7 +40,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicU8, Ordering},
     },
-    time::SystemTime,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use alloy_consensus::BlockHeader;
@@ -59,7 +59,7 @@ use revm::{
     context_interface::JournalTr,
     database::{AccountState, CacheDB},
     primitives::hardfork::SpecId,
-    state::{AccountInfo, Bytecode},
+    state::{Account, AccountInfo, Bytecode},
 };
 use tracing::{debug, instrument, trace, warn};
 
@@ -131,6 +131,12 @@ fn block_in_place_handle() -> Result<tokio::runtime::Handle> {
             "evm-fork-cache RPC operations require a running multi-thread tokio runtime: {e}"
         )),
     }
+}
+
+pub(crate) fn unix_timestamp_secs_saturating(time: SystemTime) -> u64 {
+    time.duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
 }
 
 /// Read a storage slot from already-borrowed layers (`account_state`-aware),
@@ -302,7 +308,7 @@ pub struct TxConfig {
 /// ```
 pub struct EvmCacheBuilder<P> {
     provider: Arc<P>,
-    block: Option<BlockId>,
+    block: BlockId,
     cache_config: Option<CacheConfig>,
     spec_id: SpecId,
     shared_memory_capacity: SharedMemoryCapacity,
@@ -316,7 +322,7 @@ where
     pub fn new(provider: Arc<P>) -> Self {
         Self {
             provider,
-            block: None,
+            block: BlockId::latest(),
             cache_config: None,
             spec_id: SpecId::CANCUN,
             shared_memory_capacity: SharedMemoryCapacity::default(),
@@ -329,7 +335,7 @@ where
     /// a call to [`block`](Self::block) or [`latest_block`](Self::latest_block)
     /// the builder defaults to the latest block at [`build`](Self::build) time.
     pub fn block(mut self, block: BlockId) -> Self {
-        self.block = Some(block);
+        self.block = block;
         self
     }
 
@@ -339,7 +345,7 @@ where
     /// header, so the cache forks at whatever was latest at construction. Use
     /// [`block`](Self::block) instead to pin a fixed, reproducible height.
     pub fn latest_block(mut self) -> Self {
-        self.block = Some(BlockId::latest());
+        self.block = BlockId::latest();
         self
     }
 
@@ -469,7 +475,7 @@ pub struct EvmCache {
     blockchain_db: BlockchainDb,
     db: ForkCacheDB,
     token_decimals: HashMap<Address, u8>,
-    block: Option<BlockId>,
+    block: BlockId,
     cache_config: Option<CacheConfig>,
     /// Cache for immutable on-chain data (token decimals, pool metadata).
     immutable_cache: ImmutableDataCache,
@@ -649,7 +655,18 @@ impl EvmCache {
     /// via `tokio::task::block_in_place`, which is unsupported on a
     /// current-thread runtime. On a current-thread runtime those callbacks
     /// degrade to typed errors rather than panicking.
-    pub async fn new<P>(provider: Arc<P>, block: Option<BlockId>) -> Self
+    pub async fn new<P>(provider: Arc<P>) -> Self
+    where
+        P: Provider<AnyNetwork> + 'static,
+    {
+        Self::at_block(provider, BlockId::latest()).await
+    }
+
+    /// Create a new EvmCache pinned to an explicit block.
+    ///
+    /// Prefer this over [`new`](Self::new) when reproducibility matters and the
+    /// caller has already chosen the fork block.
+    pub async fn at_block<P>(provider: Arc<P>, block: BlockId) -> Self
     where
         P: Provider<AnyNetwork> + 'static,
     {
@@ -674,7 +691,7 @@ impl EvmCache {
     /// degrade to typed errors rather than panicking.
     pub async fn with_cache<P>(
         provider: Arc<P>,
-        block: Option<BlockId>,
+        block: BlockId,
         cache_config: Option<CacheConfig>,
         spec_id: SpecId,
     ) -> Self
@@ -698,7 +715,7 @@ impl EvmCache {
     /// layer-2 storage loaded at construction (e.g. a bincode state file).
     pub async fn with_cache_capacity<P>(
         provider: Arc<P>,
-        block: Option<BlockId>,
+        block: BlockId,
         cache_config: Option<CacheConfig>,
         spec_id: SpecId,
         shared_memory_capacity: SharedMemoryCapacity,
@@ -706,37 +723,35 @@ impl EvmCache {
     where
         P: Provider<AnyNetwork> + 'static,
     {
-        let block_id = block.unwrap_or_default();
+        let block_id = block;
 
-        // Fetch block header for accurate block context (NUMBER, BASEFEE opcodes).
-        // Without this, revm defaults to 0 for both, causing contracts that read
-        // block.number or block.basefee to execute different code paths.
-        let (block_number, basefee, coinbase, prevrandao, block_gas_limit) = match provider
-            .get_block_by_number(match block_id {
-                BlockId::Number(n) => n,
-                _ => BlockNumberOrTag::Latest,
-            })
-            .await
-        {
-            Ok(Some(blk)) => {
-                let h = blk.header();
-                (
-                    Some(h.number()),
-                    h.base_fee_per_gas(),
-                    Some(h.beneficiary()),
-                    h.mix_hash(),
-                    Some(h.gas_limit()),
-                )
-            }
-            Ok(None) => {
-                debug!("Block header not found for block context initialization");
-                (None, None, None, None, None)
-            }
-            Err(e) => {
-                debug!(error = %e, "Failed to fetch block header for block context");
-                (None, None, None, None, None)
-            }
-        };
+        // Fetch the pinned block header for accurate block context (NUMBER,
+        // BASEFEE, COINBASE, PREVRANDAO, GASLIMIT opcodes). Without this, revm
+        // defaults to 0/default values, causing contracts that read block
+        // context to execute different code paths. Use the concrete BlockId the
+        // cache is pinned to so hash pins do not accidentally inherit latest
+        // header context.
+        let (block_number, basefee, coinbase, prevrandao, block_gas_limit) =
+            match provider.get_block(block_id).await {
+                Ok(Some(blk)) => {
+                    let h = blk.header();
+                    (
+                        Some(h.number()),
+                        h.base_fee_per_gas(),
+                        Some(h.beneficiary()),
+                        h.mix_hash(),
+                        Some(h.gas_limit()),
+                    )
+                }
+                Ok(None) => {
+                    debug!("Block header not found for block context initialization");
+                    (None, None, None, None, None)
+                }
+                Err(e) => {
+                    debug!(error = %e, "Failed to fetch block header for block context");
+                    (None, None, None, None, None)
+                }
+            };
 
         // Ensure cache directory exists
         if let Some(cfg) = &cache_config {
@@ -1105,7 +1120,7 @@ impl EvmCache {
     pub fn from_backend(
         backend: SharedBackend,
         blockchain_db: BlockchainDb,
-        block: Option<BlockId>,
+        block: BlockId,
         chain_id: u64,
         block_number: Option<u64>,
         basefee: Option<u64>,
@@ -1134,7 +1149,7 @@ impl EvmCache {
             ))),
             rpc_caller: None,
             storage_batch_fetcher: None,
-            batch_block_id: Arc::new(Mutex::new(block.unwrap_or_default())),
+            batch_block_id: Arc::new(Mutex::new(block)),
             erc20_balance_slots: HashMap::new(),
             spec_id,
             base: None,
@@ -2090,7 +2105,7 @@ impl EvmCache {
             .map(|&(addr, slot)| ((addr, slot), self.cached_storage_value(addr, slot)))
             .collect();
 
-        let results = (fetcher)(slots.to_vec(), self.block);
+        let results = (fetcher)(slots.to_vec(), Some(self.block));
 
         let mut changed = Vec::new();
         let mut to_inject = Vec::new();
@@ -2662,21 +2677,21 @@ impl EvmCache {
     /// To prevent the EVM block context from silently diverging from the pinned
     /// block, when `block` is a concrete `BlockId::Number(Number(n))` this also
     /// updates `block_number` (the `NUMBER` opcode) to `n`. For tag-based block
-    /// ids (`latest`, `pending`, hashes, etc.) and `None`, the height is not
+    /// ids (`latest`, `pending`, hashes, etc.), the height is not
     /// statically known, so `block_number` is cleared.
     ///
     /// `basefee` (the `BASEFEE` opcode) is **cleared on every block change** and
-    /// on every non-concrete tag/hash/`None` pin call because deriving it requires
+    /// on every non-concrete tag/hash pin call because deriving it requires
     /// fetching the block header, which this synchronous method cannot do. Callers
     /// that change blocks should refresh it via
     /// [`set_block_context`](Self::set_block_context) after fetching the new
     /// header. Prefer [`repin_to_block`](Self::repin_to_block) when re-pinning to
     /// a concrete height, since it keeps `block_number` and the pinned block in
     /// lockstep.
-    pub fn set_block(&mut self, block: Option<BlockId>) {
+    pub fn set_block(&mut self, block: BlockId) {
         let changed = self.block != block;
         let concrete_number = match block {
-            Some(BlockId::Number(BlockNumberOrTag::Number(n))) => Some(n),
+            BlockId::Number(BlockNumberOrTag::Number(n)) => Some(n),
             _ => None,
         };
         if changed {
@@ -2684,27 +2699,21 @@ impl EvmCache {
             // Re-pinning replaces layer 2 wholesale (state at a new block): the
             // memoized base must be rebuilt from scratch on the next snapshot.
             self.invalidate_base();
-            if let Some(block_id) = block {
-                let _ = self.backend.set_pinned_block(block_id);
-                *self.batch_block_id.lock().unwrap() = block_id;
-            }
+            let _ = self.backend.set_pinned_block(block);
+            *self.batch_block_id.lock().unwrap() = block;
         }
         if changed || concrete_number.is_none() {
             self.basefee = None;
         }
 
         // Keep the EVM `NUMBER` opcode aligned with the pin. Only a concrete
-        // height is meaningful; tags, hashes, and no explicit pin clear it so a
-        // stale number from an earlier concrete block cannot leak into simulation.
+        // height is meaningful; tags and hashes clear it so a stale number from
+        // an earlier concrete block cannot leak into simulation.
         self.block_number = concrete_number;
     }
 
     /// Get the block that RPC fetches are currently pinned to.
-    ///
-    /// `None` means no explicit pin was set, so the backend reads the latest
-    /// block. Set it with [`set_block`](Self::set_block) or
-    /// [`repin_to_block`](Self::repin_to_block).
-    pub fn block(&self) -> Option<BlockId> {
+    pub fn block(&self) -> BlockId {
         self.block
     }
 
@@ -2730,7 +2739,7 @@ impl EvmCache {
     ///
     /// Fetched from the pinned block's header at construction. Concrete-number
     /// pins set it via [`set_block`](Self::set_block) /
-    /// [`repin_to_block`](Self::repin_to_block); tag/hash/`None` pins clear it
+    /// [`repin_to_block`](Self::repin_to_block); tag/hash pins clear it
     /// because their height is not statically known. `None` means revm falls back
     /// to `0`, which can steer contracts that branch on `block.number` down a
     /// different code path. Override directly via
@@ -2744,7 +2753,7 @@ impl EvmCache {
     /// Fetched from the pinned block's header at construction. `None` means
     /// revm falls back to `0`. This is cleared by [`set_block`](Self::set_block)
     /// / [`repin_to_block`](Self::repin_to_block) when the pin changes, and by
-    /// non-concrete tag/hash/`None` pin calls because those can drift without a
+    /// non-concrete tag/hash pin calls because those can drift without a
     /// concrete number in the API. Refresh it with
     /// [`set_block_context`](Self::set_block_context) after fetching a new header
     /// if `BASEFEE` accuracy matters.
@@ -2797,9 +2806,9 @@ impl EvmCache {
     /// block header if `BASEFEE` accuracy matters.
     pub fn repin_to_block(&mut self, block_number: u64) {
         let old_block = self.block;
-        self.set_block(Some(BlockId::Number(block_number.into())));
+        self.set_block(BlockId::Number(block_number.into()));
 
-        if let Some(BlockId::Number(BlockNumberOrTag::Number(old_num))) = old_block {
+        if let BlockId::Number(BlockNumberOrTag::Number(old_num)) = old_block {
             let drift = block_number.saturating_sub(old_num);
             if drift > 0 {
                 debug!(
@@ -3809,63 +3818,73 @@ impl EvmCache {
     ) -> Result<CallSimulationResult> {
         let token_list: Vec<Address> = tokens.into_iter().collect();
 
+        let mut pre_balances = HashMap::with_capacity(token_list.len());
+        let mut access_lists = Vec::with_capacity(token_list.len().saturating_mul(2) + 1);
+        for token in &token_list {
+            let mut evm = self.build_evm();
+            let synthetic_beneficiary = Self::seed_synthetic_beneficiary(&mut evm);
+            let (balance, access_list) =
+                Self::erc20_balance_of_in_evm_isolated(&mut evm, from, *token, owner)?;
+            Self::remove_synthetic_beneficiary(&mut evm, synthetic_beneficiary);
+            pre_balances.insert(*token, balance);
+            access_lists.push(access_list);
+        }
+
         let tx = Self::build_tx_env(from, to, calldata)?;
         let mut evm = self.build_evm();
-        let checkpoint = evm.journaled_state.checkpoint();
-
-        let result = (|| {
-            let mut pre_balances = HashMap::with_capacity(token_list.len());
-            for token in &token_list {
-                let balance = Self::erc20_balance_of_in_evm(&mut evm, *token, owner)?;
-                pre_balances.insert(*token, balance);
+        let synthetic_beneficiary = Self::seed_synthetic_beneficiary(&mut evm);
+        let target_checkpoint = evm.journaled_state.checkpoint();
+        let result = evm
+            .transact_one(tx)
+            .map_err(|e| anyhow!("Failed to transact: {:?}", e))?;
+        let (logs, gas_used, output) = match result {
+            ExecutionResult::Success {
+                logs,
+                gas_used,
+                output,
+                ..
+            } => (logs, gas_used, output.into_data()),
+            _ => {
+                evm.journaled_state.checkpoint_revert(target_checkpoint);
+                Self::remove_synthetic_beneficiary(&mut evm, synthetic_beneficiary);
+                return Err(anyhow!("Failed to call: {:?}", result));
             }
+        };
+        access_lists.push(extract_access_list(&evm.journaled_state.state));
 
-            let result = evm
-                .transact_one(tx)
-                .map_err(|e| anyhow!("Failed to transact: {:?}", e))?;
-            let (logs, gas_used, output) = match result {
-                ExecutionResult::Success {
-                    logs,
-                    gas_used,
-                    output,
-                    ..
-                } => (logs, gas_used, output.into_data()),
-                _ => return Err(anyhow!("Failed to call: {:?}", result)),
-            };
-
-            let mut token_deltas = HashMap::with_capacity(token_list.len());
-            for token in &token_list {
-                let post = Self::erc20_balance_of_in_evm(&mut evm, *token, owner)?;
-                let pre = pre_balances.get(token).copied().unwrap_or_default();
-                token_deltas.insert(*token, I256::from_raw(post) - I256::from_raw(pre));
-            }
-
-            let access_list = extract_access_list(&evm.journaled_state.state);
-
-            Ok((gas_used, token_deltas, logs, output, access_list))
-        })();
-
-        match result {
-            Ok((gas_used, token_deltas, logs, output, access_list)) => {
-                if commit {
-                    evm.commit_inner();
-                } else {
-                    evm.journaled_state.checkpoint_revert(checkpoint);
-                }
-                Ok(CallSimulationResult {
-                    status: SimStatus::Success,
-                    gas_used,
-                    token_deltas,
-                    logs,
-                    access_list,
-                    output,
-                })
-            }
-            Err(err) => {
-                evm.journaled_state.checkpoint_revert(checkpoint);
-                Err(err)
-            }
+        let mut token_deltas = HashMap::with_capacity(token_list.len());
+        for token in &token_list {
+            let (post, access_list) =
+                match Self::erc20_balance_of_in_evm_isolated(&mut evm, from, *token, owner) {
+                    Ok(result) => result,
+                    Err(err) => {
+                        evm.journaled_state.checkpoint_revert(target_checkpoint);
+                        Self::remove_synthetic_beneficiary(&mut evm, synthetic_beneficiary);
+                        return Err(err);
+                    }
+                };
+            let pre = pre_balances.get(token).copied().unwrap_or_default();
+            token_deltas.insert(*token, I256::from_raw(post) - I256::from_raw(pre));
+            access_lists.push(access_list);
         }
+
+        let access_list = merge_access_lists(access_lists);
+        if commit {
+            Self::remove_synthetic_beneficiary(&mut evm, synthetic_beneficiary);
+            evm.commit_inner();
+        } else {
+            evm.journaled_state.checkpoint_revert(target_checkpoint);
+            Self::remove_synthetic_beneficiary(&mut evm, synthetic_beneficiary);
+        }
+
+        Ok(CallSimulationResult {
+            status: SimStatus::Success,
+            gas_used,
+            token_deltas,
+            logs,
+            access_list,
+            output,
+        })
     }
 
     /// Simulate a call and track token balance changes using a TransferInspector.
@@ -4206,12 +4225,9 @@ impl EvmCache {
             })
             .build_mainnet();
 
-        let timestamp = self.timestamp_override.unwrap_or_else(|| {
-            SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs()
-        });
+        let timestamp = self
+            .timestamp_override
+            .unwrap_or_else(|| unix_timestamp_secs_saturating(SystemTime::now()));
         evm.block.timestamp = U256::from(timestamp);
         if let Some(number) = self.block_number {
             evm.block.number = U256::from(number);
@@ -4249,12 +4265,9 @@ impl EvmCache {
             })
             .build_mainnet_with_inspector(inspector);
 
-        let timestamp = self.timestamp_override.unwrap_or_else(|| {
-            SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs()
-        });
+        let timestamp = self
+            .timestamp_override
+            .unwrap_or_else(|| unix_timestamp_secs_saturating(SystemTime::now()));
         evm.block.timestamp = U256::from(timestamp);
         if let Some(number) = self.block_number {
             evm.block.number = U256::from(number);
@@ -4308,11 +4321,12 @@ impl EvmCache {
 
     fn erc20_balance_of_in_evm(
         evm: &mut CacheEvm<'_>,
+        caller: Address,
         token: Address,
         owner: Address,
     ) -> Result<U256> {
         let call = IERC20::balanceOfCall { target: owner };
-        let tx = Self::build_tx_env(Address::ZERO, token, Bytes::from(call.abi_encode()))?;
+        let tx = Self::build_tx_env(caller, token, Bytes::from(call.abi_encode()))?;
         let result = evm
             .transact_one(tx)
             .map_err(|e| anyhow!("Failed to transact: {:?}", e))?;
@@ -4325,6 +4339,38 @@ impl EvmCache {
                 Ok(balance)
             }
             _ => Err(anyhow!("balanceOf call failed: {:?}", result)),
+        }
+    }
+
+    fn erc20_balance_of_in_evm_isolated(
+        evm: &mut CacheEvm<'_>,
+        caller: Address,
+        token: Address,
+        owner: Address,
+    ) -> Result<(U256, AccessList)> {
+        let state_before = evm.journaled_state.state.clone();
+        let checkpoint = evm.journaled_state.checkpoint();
+        let result = Self::erc20_balance_of_in_evm(evm, caller, token, owner);
+        let access_list = extract_access_list(&evm.journaled_state.state);
+        evm.journaled_state.checkpoint_revert(checkpoint);
+        evm.journaled_state.state = state_before;
+        result.map(|balance| (balance, access_list))
+    }
+
+    fn seed_synthetic_beneficiary(evm: &mut CacheEvm<'_>) -> Option<Address> {
+        let beneficiary = evm.block.beneficiary;
+        if evm.journaled_state.state.contains_key(&beneficiary) {
+            return None;
+        }
+        evm.journaled_state
+            .state
+            .insert(beneficiary, Account::from(AccountInfo::default()));
+        Some(beneficiary)
+    }
+
+    fn remove_synthetic_beneficiary(evm: &mut CacheEvm<'_>, beneficiary: Option<Address>) {
+        if let Some(beneficiary) = beneficiary {
+            evm.journaled_state.state.remove(&beneficiary);
         }
     }
 }
@@ -4420,6 +4466,27 @@ fn extract_access_list(state: &revm::state::EvmState) -> AccessList {
         })
         .collect();
     AccessList(items)
+}
+
+fn merge_access_lists(access_lists: impl IntoIterator<Item = AccessList>) -> AccessList {
+    let mut merged: Vec<AccessListItem> = Vec::new();
+    for access_list in access_lists {
+        for item in access_list.0 {
+            if let Some(existing) = merged
+                .iter_mut()
+                .find(|existing| existing.address == item.address)
+            {
+                for key in item.storage_keys {
+                    if !existing.storage_keys.contains(&key) {
+                        existing.storage_keys.push(key);
+                    }
+                }
+            } else {
+                merged.push(item);
+            }
+        }
+    }
+    AccessList(merged)
 }
 
 #[cfg(test)]
@@ -4908,6 +4975,30 @@ mod core_tests {
     // ==================== block context tests ====================
 
     #[test]
+    fn new_defaults_to_latest_block_pin() {
+        use alloy_provider::RootProvider;
+        use alloy_rpc_client::RpcClient;
+        use alloy_transport::mock::Asserter;
+
+        let asserter = Asserter::new();
+        let client = RpcClient::mocked(asserter);
+        let provider = RootProvider::<AnyNetwork>::new(client);
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let cache = rt.block_on(EvmCache::new(Arc::new(provider)));
+
+        assert_eq!(
+            cache.block(),
+            BlockId::latest(),
+            "a default cache must carry an explicit latest block pin, not None"
+        );
+    }
+
+    #[test]
     fn test_set_block_context_stores_values() {
         use alloy_provider::RootProvider;
         use alloy_rpc_client::RpcClient;
@@ -4922,7 +5013,7 @@ mod core_tests {
             .build()
             .unwrap();
 
-        let mut cache = rt.block_on(EvmCache::new(Arc::new(provider), None));
+        let mut cache = rt.block_on(EvmCache::new(Arc::new(provider)));
 
         // Initially None
         assert_eq!(cache.block_number(), None);
@@ -4954,10 +5045,10 @@ mod core_tests {
             .build()
             .unwrap();
 
-        let mut cache = rt.block_on(EvmCache::new(Arc::new(provider), None));
+        let mut cache = rt.block_on(EvmCache::new(Arc::new(provider)));
         cache.set_block_context(Some(148_252_680), Some(50));
 
-        cache.set_block(Some(BlockId::latest()));
+        cache.set_block(BlockId::latest());
 
         assert_eq!(
             cache.block_number(),
@@ -4972,7 +5063,7 @@ mod core_tests {
     }
 
     #[test]
-    fn set_block_none_clears_stale_context_even_when_pin_unchanged() {
+    fn set_block_latest_clears_stale_context_even_when_pin_unchanged() {
         use alloy_provider::RootProvider;
         use alloy_rpc_client::RpcClient;
         use alloy_transport::mock::Asserter;
@@ -4986,20 +5077,20 @@ mod core_tests {
             .build()
             .unwrap();
 
-        let mut cache = rt.block_on(EvmCache::new(Arc::new(provider), None));
+        let mut cache = rt.block_on(EvmCache::new(Arc::new(provider)));
         cache.set_block_context(Some(148_252_680), Some(50));
 
-        cache.set_block(None);
+        cache.set_block(BlockId::latest());
 
         assert_eq!(
             cache.block_number(),
             None,
-            "None pins must not retain a stale NUMBER context"
+            "latest pins must not retain a stale NUMBER context"
         );
         assert_eq!(
             cache.basefee(),
             None,
-            "None pins can drift like tags, so stale BASEFEE must be cleared"
+            "latest pins can drift like tags, so stale BASEFEE must be cleared"
         );
     }
 
@@ -5018,10 +5109,10 @@ mod core_tests {
             .build()
             .unwrap();
 
-        let mut cache = rt.block_on(EvmCache::new(Arc::new(provider), None));
+        let mut cache = rt.block_on(EvmCache::new(Arc::new(provider)));
         cache.set_block_context(Some(100), Some(50));
 
-        cache.set_block(Some(BlockId::Number(BlockNumberOrTag::Number(200))));
+        cache.set_block(BlockId::Number(BlockNumberOrTag::Number(200)));
 
         assert_eq!(cache.block_number(), Some(200));
         assert_eq!(
@@ -5046,7 +5137,7 @@ mod core_tests {
             .build()
             .unwrap();
 
-        let mut cache = rt.block_on(EvmCache::new(Arc::new(provider), None));
+        let mut cache = rt.block_on(EvmCache::new(Arc::new(provider)));
         cache.set_block_context(Some(100), Some(50));
 
         cache.repin_to_block(200);
@@ -5074,7 +5165,7 @@ mod core_tests {
             .build()
             .unwrap();
 
-        let mut cache = rt.block_on(EvmCache::new(Arc::new(provider), None));
+        let mut cache = rt.block_on(EvmCache::new(Arc::new(provider)));
 
         let block_num = 148_252_680u64;
         let basefee_val = 50u64;
@@ -5109,7 +5200,7 @@ mod core_tests {
             .build()
             .unwrap();
 
-        let parent = rt.block_on(EvmCache::new(Arc::new(provider), None));
+        let parent = rt.block_on(EvmCache::new(Arc::new(provider)));
 
         let block_num = Some(148_252_680u64);
         let basefee_val = Some(50u64);
@@ -5125,5 +5216,15 @@ mod core_tests {
 
         assert_eq!(child.block_number(), block_num);
         assert_eq!(child.basefee(), basefee_val);
+    }
+
+    #[test]
+    fn unix_timestamp_secs_saturating_handles_pre_epoch() {
+        let before_epoch = std::time::UNIX_EPOCH - std::time::Duration::from_secs(5);
+        assert_eq!(
+            unix_timestamp_secs_saturating(before_epoch),
+            0,
+            "pre-epoch system times must saturate instead of panicking"
+        );
     }
 }

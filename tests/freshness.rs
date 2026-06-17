@@ -1063,6 +1063,82 @@ async fn run_honors_tx_gas_limit() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn validator_fetches_at_captured_latest_pin_despite_repin() -> Result<()> {
+    use alloy_eips::BlockNumberOrTag;
+
+    let token = Address::repeat_byte(0x91);
+    let owner = Address::repeat_byte(0x92);
+    let recipient = Address::repeat_byte(0x93);
+    let slot = balance_slot_for(owner);
+
+    let mut cache = setup_cache().await?;
+    install_default_account(&mut cache, Address::ZERO);
+    install_default_account(&mut cache, owner);
+    install_mock_erc20(&mut cache, token);
+    cache
+        .db_mut()
+        .insert_account_storage(token, slot, U256::from(1000))?;
+    assert_eq!(
+        cache.block(),
+        BlockId::latest(),
+        "default construction must expose an explicit latest pin"
+    );
+
+    let barrier = Arc::new(std::sync::Barrier::new(2));
+    let fb = Arc::clone(&barrier);
+    let seen_block: Arc<Mutex<Option<Option<BlockId>>>> = Arc::new(Mutex::new(None));
+    let seen = Arc::clone(&seen_block);
+    let fetcher: StorageBatchFetchFn =
+        Arc::new(move |reqs: Vec<(Address, U256)>, block: Option<BlockId>| {
+            *seen.lock().unwrap() = Some(block);
+            fb.wait();
+            fb.wait();
+            let at_snapshot_pin = block == Some(BlockId::latest());
+            reqs.into_iter()
+                .map(|(a, s)| {
+                    let v = if s == slot {
+                        if at_snapshot_pin {
+                            U256::from(1000)
+                        } else {
+                            U256::from(2000)
+                        }
+                    } else {
+                        U256::ZERO
+                    };
+                    (a, s, Ok(v))
+                })
+                .collect()
+        });
+    cache.set_storage_batch_fetcher(fetcher);
+
+    let mut controller = FreshnessController::new(FreshnessRegistry::new(), AlwaysVerify);
+    let sim = controller.run(
+        &mut cache,
+        vec![SimRequest::new(
+            owner,
+            token,
+            transfer_calldata(recipient, U256::from(100)),
+        )],
+    )?;
+
+    barrier.wait();
+    cache.set_block(BlockId::Number(BlockNumberOrTag::Number(101)));
+    barrier.wait();
+
+    let verdict = sim.validate().await;
+    assert!(
+        matches!(verdict, Validation::Confirmed),
+        "validator must fetch at the captured latest pin, not the later numeric repin; got {verdict:?}"
+    );
+    assert_eq!(
+        *seen_block.lock().unwrap(),
+        Some(Some(BlockId::latest())),
+        "the fetch must receive the concrete snapshot pin"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn validator_fetches_at_snapshot_block_despite_repin() -> Result<()> {
     // F5 regression: the deferred validator must fetch at the block its snapshot
     // was built from, even if the cache is re-pinned while validation is pending.
@@ -1081,7 +1157,7 @@ async fn validator_fetches_at_snapshot_block_despite_repin() -> Result<()> {
     install_default_account(&mut cache, Address::ZERO);
     install_default_account(&mut cache, owner);
     install_mock_erc20(&mut cache, token);
-    cache.set_block(Some(block_n));
+    cache.set_block(block_n);
     // Overlay-resident seed so the balance is EVM-visible on the StorageCleared
     // token account (see the note in `verify_slots_detects_and_injects_changes`):
     // a backend-only seed would read as ZERO under the §16.0 `cached_storage_value`
@@ -1140,7 +1216,7 @@ async fn validator_fetches_at_snapshot_block_despite_repin() -> Result<()> {
 
     barrier.wait(); // R1: the validator is inside the fetcher.
     // Re-pin the cache to N+1 while validation is still outstanding.
-    cache.set_block(Some(BlockId::Number(BlockNumberOrTag::Number(n + 1))));
+    cache.set_block(BlockId::Number(BlockNumberOrTag::Number(n + 1)));
     barrier.wait(); // R2: release the fetcher.
 
     let verdict = sim.validate().await;
@@ -1582,7 +1658,7 @@ async fn run_unverified_without_fetcher() -> Result<()> {
     let mut cache = EvmCache::from_backend(
         base.unchecked_backend().clone(),
         base.unchecked_blockchain_db().clone(),
-        None,
+        base.block(),
         base.chain_id(),
         None,
         None,

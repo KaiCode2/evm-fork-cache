@@ -22,7 +22,7 @@ pre-release development phases (see [`docs/ROADMAP.md`](docs/ROADMAP.md)).
   metadata, and Uniswap V3-style tick snapshots.
 - **`EvmCacheBuilder`** — a fluent constructor (`EvmCache::builder(provider)`)
   subsuming the positional `with_cache` / `from_backend` constructors, with
-  per-instance cache-speed configuration.
+  block pin, EVM spec, cache-config, and shared-memory-capacity configuration.
 - **Snapshots and overlays** — `create_snapshot()` produces an immutable,
   `Send + Sync` `EvmSnapshot`; `EvmOverlay` is a cheap per-simulation clone for
   isolated parallel evaluation.
@@ -137,6 +137,10 @@ pre-release development phases (see [`docs/ROADMAP.md`](docs/ROADMAP.md)).
 - **Extensible revert decoder** (`errors`) — native `Error(string)` / `Panic(uint256)`
   decoding plus one-line custom-error registration; typed `SimError`
   (`Revert` / `Halt` / `Host`).
+- **Fallible custom-error registration** (`errors`) —
+  `RevertDecoder::try_register`, `try_register_raw`, and
+  `DuplicateSelectorError` let callers reject duplicate custom-error selectors
+  during decoder setup instead of relying on the warning-only ergonomic path.
 - **Two-stage prefetch registry** (`prefetch_registry`) for cross-cycle
   storage-slot pre-warming.
 - **`protocols` feature** (default-on) gating the Uniswap V2/V3 storage layouts,
@@ -185,9 +189,18 @@ pre-release development phases (see [`docs/ROADMAP.md`](docs/ROADMAP.md)).
 - **Versioned on-disk cache envelope** — binary EVM state, bytecode,
   `ImmutableDataCache`, and V3 tick snapshot cache files now start with
   crate-specific magic bytes plus a `u32` version before the bincode payload.
+- **Public-release CI gates** — the GitHub Actions workflow now enforces format,
+  clippy on all targets, no-default-feature library linting, all-target tests,
+  no-default-feature tests, doctests, warning-free docs, bench compilation,
+  package verification, and the MSRV library check.
 
 ### Changed
 
+- **Duplicate `RevertDecoder` registrations keep the first selector owner.**
+  `register`, `register_raw`, and builder-style `with_error` no longer replace an
+  existing custom-error decoder for the same 4-byte selector. They retain the
+  original registration and emit a `tracing::warn!`; callers that want hard
+  failure can use `try_register` / `try_register_raw`.
 - **`EvmCache::create_snapshot` is now `&mut self`** (Phase 5, Decision D5) —
   taking a snapshot memoizes/refreshes the cold copy-on-write base, which requires
   a mutable borrow. All callers (the freshness controller, tests, examples,
@@ -231,6 +244,11 @@ pre-release development phases (see [`docs/ROADMAP.md`](docs/ROADMAP.md)).
 
 ### Fixed
 
+- **Duplicate custom-error selectors no longer shadow silently.** A second
+  registration for the same selector is now observable through
+  `DuplicateSelectorError` on the fallible APIs, or through a warning on the
+  ergonomic `register` / `register_raw` / `with_error` path. Decoding keeps using
+  the first registered selector owner.
 - **Cold absolute account patches no longer mask on-chain accounts.**
   `StateUpdate::Account` on an account absent from both layers now skips instead
   of writing `AccountInfo::default()` fields through the shared backend. The
@@ -240,10 +258,11 @@ pre-release development phases (see [`docs/ROADMAP.md`](docs/ROADMAP.md)).
   unprofitable lists.** `SmartAccessList::into_access_list_if_profitable` and
   `access_list_if_profitable` now propagate provider/pricing failures as `Err`
   and reserve `Ok(None)` for empty, zero-priced, or genuinely unprofitable lists.
-- **`simulate_call_with_balance_deltas` now reports a real access list.** It
-  extracts the EIP-2930 touched account/slot list from the EVM journal before
-  commit/revert, including the pre/post `balanceOf` reads and the simulated call,
-  instead of returning `AccessList::default()`.
+- **`simulate_call_with_balance_deltas` now isolates balance reads and reports a
+  real access list.** Pre/post `balanceOf` calls run outside the target-call
+  checkpoint, so they cannot warm the target call or commit side effects. The
+  method commits only the target call when requested and returns the deduplicated
+  EIP-2930 accounts/slots from balance reads plus the target call.
 - **`cached_storage_value` silent-corruption bug** (Phase 3 §16.0, audit HIGH +
   MED). For a storage slot absent from an overlay account whose revm
   `account_state` is `StorageCleared` or `NotExisting`, the accessor now returns
@@ -304,8 +323,8 @@ pre-release development phases (see [`docs/ROADMAP.md`](docs/ROADMAP.md)).
 - **`call_raw_with_access_list*` reverts its checkpoint on transact errors**
   (Phase 2 review; `EvmCache` + `EvmOverlay`). Previously the host-error path
   `?`-returned before `checkpoint_revert`, leaving the journal checkpoint
-  un-reverted; both methods now revert on every path. (See `docs/KNOWN_ISSUES.md`
-  #9, now resolved.)
+  un-reverted; both methods now revert on every path. This is recorded in the
+  fixed-issues section of `docs/KNOWN_ISSUES.md`.
 
 ### Notes
 

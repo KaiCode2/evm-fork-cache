@@ -14,7 +14,6 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use alloy_eips::BlockId;
 use alloy_primitives::{Address, address};
 use alloy_provider::ProviderBuilder;
 use alloy_provider::network::AnyNetwork;
@@ -37,7 +36,7 @@ async fn main() -> Result<()> {
     let provider = ProviderBuilder::new()
         .network::<AnyNetwork>()
         .connect_http(rpc_url.parse()?);
-    let mut cache = EvmCache::new(Arc::new(provider), Some(BlockId::latest())).await;
+    let mut cache = EvmCache::new(Arc::new(provider)).await;
 
     let decimals = cache.erc20_decimals(WETH)?;
     println!("WETH decimals: {decimals}");

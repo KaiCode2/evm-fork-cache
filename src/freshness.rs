@@ -902,7 +902,7 @@ struct ValidatorInput {
     cancelled: Arc<AtomicBool>,
     /// Block the snapshot was built from; passed to the fetcher so the deferred
     /// fetch reads the same block the snapshot represents.
-    validation_block: Option<BlockId>,
+    validation_block: BlockId,
 }
 
 /// Maximum fixed-point iterations the background validator performs while a
@@ -996,7 +996,7 @@ fn run_validator(input: ValidatorInput) -> Validation {
 
     // Fetch fresh values. Any error OR any omitted slot → Unverified (never trust
     // silently: a missing result must not default to zero).
-    let results = (fetcher)(verify.clone(), validation_block);
+    let results = (fetcher)(verify.clone(), Some(validation_block));
     let fresh = match collect_fetch_results(&verify, results) {
         Ok(map) => map,
         Err(reason) => return Validation::Unverified { reason },
@@ -1136,7 +1136,7 @@ fn run_validator(input: ValidatorInput) -> Validation {
         // Fetch the newly-discovered candidates; any error OR omitted slot →
         // Unverified (a missing result must not default to zero).
         let new_vec: Vec<(Address, U256)> = new_candidates.into_iter().collect();
-        let fetched = (fetcher)(new_vec.clone(), validation_block);
+        let fetched = (fetcher)(new_vec.clone(), Some(validation_block));
         let new_fresh = match collect_fetch_results(&new_vec, fetched) {
             Ok(map) => map,
             Err(reason) => return Validation::Unverified { reason },

@@ -56,7 +56,7 @@ pub async fn offline_cache() -> Result<EvmCache> {
     let asserter = Asserter::new();
     let client = RpcClient::mocked(asserter);
     let provider = RootProvider::<AnyNetwork>::new(client);
-    Ok(EvmCache::new(Arc::new(provider), None).await)
+    Ok(EvmCache::new(Arc::new(provider)).await)
 }
 
 /// Install a `MockERC20` account (with runtime bytecode) at `token`.

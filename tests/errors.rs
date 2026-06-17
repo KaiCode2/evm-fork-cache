@@ -4,7 +4,7 @@
 //! the public `SimError` ergonomics a caller branches on (classification,
 //! `Display`, `From` conversions), the decoder's `Send + Sync + Clone` sharing
 //! across threads, and two edge cases flagged in `docs/KNOWN_ISSUES.md`: silent
-//! selector shadowing and out-of-range panic codes.
+//! selector collisions and out-of-range panic codes.
 
 use std::sync::Arc;
 
@@ -83,25 +83,38 @@ fn decoder_is_shareable_across_threads() {
 }
 
 #[test]
-fn duplicate_selector_registration_shadows_silently() {
-    // Pin the documented shadowing behavior (KNOWN_ISSUES): re-registering a
-    // selector replaces the prior decoder with no error, keeping len at 1.
+fn duplicate_selector_registration_keeps_first_and_try_register_reports_error() {
     let mut decoder = RevertDecoder::new();
-    decoder.register_raw([0x11, 0x22, 0x33, 0x44], "First(uint256)", |_| {
-        Some("first".to_string())
-    });
+    decoder
+        .try_register_raw([0x11, 0x22, 0x33, 0x44], "First(uint256)", |_| {
+            Some("first".to_string())
+        })
+        .expect("first registration succeeds");
+    let err = decoder
+        .try_register_raw([0x11, 0x22, 0x33, 0x44], "Second(uint256)", |_| {
+            Some("second".to_string())
+        })
+        .expect_err("try_register_raw must reject duplicate selectors");
+    assert!(
+        err.to_string().contains("duplicate") || err.to_string().contains("selector"),
+        "unexpected duplicate selector error: {err}"
+    );
     decoder.register_raw([0x11, 0x22, 0x33, 0x44], "Second(uint256)", |_| {
         Some("second".to_string())
     });
-    assert_eq!(decoder.len(), 1, "second registration replaced the first");
+    assert_eq!(
+        decoder.len(),
+        1,
+        "duplicate registration must not add an entry"
+    );
 
     let data = Bytes::from(vec![0x11, 0x22, 0x33, 0x44]);
     match decoder.decode(&data) {
         RevertReason::Custom(custom) => {
-            assert_eq!(custom.name, "Second(uint256)");
-            assert_eq!(custom.params.as_deref(), Some("second"));
+            assert_eq!(custom.name, "First(uint256)");
+            assert_eq!(custom.params.as_deref(), Some("first"));
         }
-        other => panic!("expected the shadowing Custom error, got {other}"),
+        other => panic!("expected the original Custom error, got {other}"),
     }
 }
 

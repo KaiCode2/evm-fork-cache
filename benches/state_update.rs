@@ -34,7 +34,7 @@ fn current_thread_rt() -> Runtime {
 /// writes exercise the overlay write-through branch too).
 fn pool_cache(rt: &Runtime) -> EvmCache {
     let provider = RootProvider::<AnyNetwork>::new(RpcClient::mocked(Asserter::new()));
-    let mut cache = rt.block_on(EvmCache::new(Arc::new(provider), None));
+    let mut cache = rt.block_on(EvmCache::new(Arc::new(provider)));
     let runtime = Bytecode::new_raw(Bytes::from(
         hex::decode(MOCK_ERC20_RUNTIME_HEX.trim()).unwrap(),
     ));

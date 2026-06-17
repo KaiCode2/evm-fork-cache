@@ -5,17 +5,24 @@
 //! and cheap to post as L1 data. Skips keccak-derived mapping keys (tick bitmap,
 //! tick info) which are 32 random bytes and expensive on L1.
 //!
-//! On L2 (Arbitrum): Automatically disables itself when L1 fees rise high enough
-//! that the L1 data cost exceeds the L2 execution savings.
+//! On L2, automatically disables itself when L1 fees rise high enough that the
+//! L1 data cost exceeds the L2 execution savings. Arbitrum uses `ArbGasInfo`
+//! pricing with exact EIP-2930 RLP data gas; OP Stack chains use
+//! `GasPriceOracle.getL1Fee(bytes)` to compare whole transactions with and
+//! without the access list.
 //!
 //! On L1 (Ethereum): Access lists always save gas (no L1 data posting overhead),
 //! so use `into_access_list_always()` to skip the profitability check.
 
-use alloy_eips::eip2930::{AccessList, AccessListItem};
+use alloy_eips::{
+    BlockNumberOrTag,
+    eip2930::{AccessList, AccessListItem},
+};
 use alloy_network::Network;
-use alloy_primitives::{Address, B256, U256, address};
+use alloy_primitives::{Address, B256, Bytes, U256, address};
 use alloy_provider::Provider;
 use alloy_rlp::Encodable;
+use alloy_rpc_types_eth::{TransactionInput, TransactionRequest};
 use alloy_sol_types::{SolCall, sol};
 use anyhow::{Context as _, Result};
 use revm::context::result::ExecutionResult;
@@ -33,7 +40,8 @@ const ARB_GAS_INFO: Address = address!("000000000000000000000000000000000000006C
 /// ([`compute_op_l1_fee`]).
 pub const OP_GAS_PRICE_ORACLE: Address = address!("420000000000000000000000000000000000000F");
 
-/// Chain fee model used when deciding whether an access list is worth posting.
+/// Chain fee model used by helpers that only need to identify the chain's L1
+/// base-fee oracle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChainType {
     /// Ethereum L1-like chains where access lists do not incur rollup data fees.
@@ -42,6 +50,22 @@ pub enum ChainType {
     Arbitrum,
     /// OP Stack rollups with GasPriceOracle pricing.
     OpStack,
+}
+
+/// Pricing inputs used when deciding whether to include a simulation access list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AccessListPricing {
+    /// Ethereum L1-like chains where access lists do not incur rollup data fees.
+    L1,
+    /// Arbitrum-style rollups priced through the `ArbGasInfo` precompile.
+    Arbitrum,
+    /// OP Stack rollups priced by comparing oracle L1 fees for full tx bytes.
+    OpStack {
+        /// Serialized unsigned transaction bytes without an access list.
+        tx_without_access_list: Bytes,
+        /// Serialized unsigned transaction bytes with the candidate access list.
+        tx_with_access_list: Bytes,
+    },
 }
 
 sol! {
@@ -132,8 +156,8 @@ impl SmartAccessList {
         Some(AccessList(self.items))
     }
 
-    /// Evaluate profitability against current L1/L2 gas prices and return
-    /// the access list only if it saves money.
+    /// Evaluate Arbitrum profitability against current L1/L2 gas prices and
+    /// return the access list only if it saves money.
     ///
     /// Queries the Arbitrum `ArbGasInfo` precompile for pricing, then compares
     /// the L2 execution savings against the estimated L1 data cost of posting
@@ -196,11 +220,12 @@ impl SmartAccessList {
     }
 }
 
-/// Evaluate whether an existing access list is profitable on L2 chains.
+/// Evaluate whether an existing access list is profitable on Arbitrum.
 ///
-/// On L2, each access list entry saves L2 execution gas (warm vs cold access)
-/// but costs L1 data posting gas for its serialized bytes. This function
-/// computes the net and returns the access list only if profitable.
+/// Each access list entry saves L2 execution gas (warm vs cold access) but
+/// costs L1 data posting gas for its serialized bytes. This function queries
+/// `ArbGasInfo`, computes the exact EIP-2930 RLP data gas, and returns the
+/// access list only if profitable.
 ///
 /// This is the free-function counterpart to
 /// [`SmartAccessList::into_access_list_if_profitable`] for a pre-built
@@ -254,26 +279,95 @@ pub async fn access_list_if_profitable<P: Provider>(
     }
 }
 
-/// Select the appropriate access list strategy based on chain type.
+/// Select the appropriate access list strategy based on pricing inputs.
 ///
 /// - **L1**: Always include the simulation access list (no L1 data cost penalty).
 ///   Returns `None` only if the list is empty.
-/// - **L2 (Arbitrum / OP stack)**: Include only when the L2 execution gas savings
-///   exceed the L1 data posting cost, via [`access_list_if_profitable`].
+/// - **Arbitrum**: Include only when warm-access savings exceed the exact
+///   EIP-2930 RLP data cost priced through `ArbGasInfo`.
+/// - **OP Stack**: Include only when warm-access savings exceed the incremental
+///   `GasPriceOracle.getL1Fee(bytes)` fee between the transaction without and
+///   with the access list.
 pub async fn resolve_access_list<P: Provider>(
     sim_access_list: AccessList,
     provider: &P,
-    chain_type: ChainType,
+    pricing: AccessListPricing,
 ) -> Result<Option<AccessList>> {
-    if chain_type == ChainType::L1 {
-        if sim_access_list.0.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(sim_access_list))
-        }
-    } else {
-        access_list_if_profitable(sim_access_list, provider).await
+    if sim_access_list.0.is_empty() {
+        return Ok(None);
     }
+
+    match pricing {
+        AccessListPricing::L1 => Ok(Some(sim_access_list)),
+        AccessListPricing::Arbitrum => access_list_if_profitable(sim_access_list, provider).await,
+        AccessListPricing::OpStack {
+            tx_without_access_list,
+            tx_with_access_list,
+        } => {
+            access_list_if_profitable_op_stack(
+                sim_access_list,
+                provider,
+                tx_without_access_list,
+                tx_with_access_list,
+            )
+            .await
+        }
+    }
+}
+
+async fn access_list_if_profitable_op_stack<P: Provider>(
+    access_list: AccessList,
+    provider: &P,
+    tx_without_access_list: Bytes,
+    tx_with_access_list: Bytes,
+) -> Result<Option<AccessList>> {
+    let l2_gas_price =
+        U256::from(provider.get_gas_price().await.context(
+            "failed to query OP Stack provider gas price for access-list profitability",
+        )?);
+
+    let l1_fee_without = query_op_l1_fee(provider, tx_without_access_list)
+        .await
+        .context("failed to query OP Stack GasPriceOracle L1 fee without access list")?;
+    let l1_fee_with = query_op_l1_fee(provider, tx_with_access_list)
+        .await
+        .context("failed to query OP Stack GasPriceOracle L1 fee with access list")?;
+
+    let incremental_l1_fee = l1_fee_with.saturating_sub(l1_fee_without);
+    let total_entries = access_list_entry_count(&access_list);
+    let l2_savings_wei = U256::from(total_entries) * U256::from(100) * l2_gas_price;
+    let profitable = l2_savings_wei > incremental_l1_fee;
+
+    info!(
+        entries = total_entries,
+        items = access_list.0.len(),
+        l2_savings_wei = %l2_savings_wei,
+        l1_fee_without_wei = %l1_fee_without,
+        l1_fee_with_wei = %l1_fee_with,
+        incremental_l1_fee_wei = %incremental_l1_fee,
+        l2_gas_price_gwei = %format_gwei(l2_gas_price),
+        profitable,
+        "OP Stack access list profitability check"
+    );
+
+    if profitable {
+        Ok(Some(access_list))
+    } else {
+        Ok(None)
+    }
+}
+
+async fn query_op_l1_fee<P: Provider>(provider: &P, tx_data: Bytes) -> Result<U256> {
+    let calldata = OpGasPriceOracle::getL1FeeCall { _data: tx_data }.abi_encode();
+    let tx = TransactionRequest::default()
+        .to(OP_GAS_PRICE_ORACLE)
+        .input(TransactionInput::from(calldata));
+
+    provider
+        .client()
+        .request("eth_call", (tx, BlockNumberOrTag::Latest))
+        .await
+        .context("OP Stack GasPriceOracle.getL1Fee eth_call failed")
 }
 
 /// Query the current L1 base fee estimate, dispatching to the correct predeploy
@@ -458,6 +552,7 @@ fn format_gwei(wei: U256) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy_primitives::Bytes;
 
     #[test]
     fn add_address_deduplicates_address_only_entries() {
@@ -553,5 +648,125 @@ mod tests {
             .await
             .expect("empty list must not query provider");
         assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn resolve_access_list_l1_returns_non_empty_without_provider_calls() {
+        use alloy_network::Ethereum;
+        use alloy_provider::RootProvider;
+        use alloy_rpc_client::RpcClient;
+        use alloy_transport::mock::Asserter;
+
+        let provider = RootProvider::<Ethereum>::new(RpcClient::mocked(Asserter::new()));
+        let access_list = AccessList(vec![AccessListItem {
+            address: Address::repeat_byte(0xAA),
+            storage_keys: Vec::new(),
+        }]);
+
+        let result = resolve_access_list(access_list.clone(), &provider, AccessListPricing::L1)
+            .await
+            .expect("L1 must not query provider");
+        assert_eq!(result, Some(access_list));
+
+        let empty = resolve_access_list(AccessList::default(), &provider, AccessListPricing::L1)
+            .await
+            .expect("empty L1 list must not query provider");
+        assert!(empty.is_none());
+    }
+
+    #[tokio::test]
+    async fn resolve_access_list_op_stack_uses_oracle_incremental_fee() {
+        use alloy_network::Ethereum;
+        use alloy_provider::RootProvider;
+        use alloy_rpc_client::RpcClient;
+        use alloy_transport::mock::Asserter;
+
+        let asserter = Asserter::new();
+        asserter.push_success(&100u128); // eth_gasPrice
+        asserter.push_success(&U256::from(1_000u64)); // getL1Fee(tx_without)
+        asserter.push_success(&U256::from(1_010u64)); // getL1Fee(tx_with)
+        let provider = RootProvider::<Ethereum>::new(RpcClient::mocked(asserter));
+        let access_list = AccessList(vec![AccessListItem {
+            address: Address::repeat_byte(0xAA),
+            storage_keys: Vec::new(),
+        }]);
+
+        let result = resolve_access_list(
+            access_list.clone(),
+            &provider,
+            AccessListPricing::OpStack {
+                tx_without_access_list: Bytes::from_static(b"without"),
+                tx_with_access_list: Bytes::from_static(b"with"),
+            },
+        )
+        .await
+        .expect("OP Stack pricing succeeds");
+
+        assert_eq!(result, Some(access_list));
+    }
+
+    #[tokio::test]
+    async fn resolve_access_list_op_stack_unprofitable_returns_none() {
+        use alloy_network::Ethereum;
+        use alloy_provider::RootProvider;
+        use alloy_rpc_client::RpcClient;
+        use alloy_transport::mock::Asserter;
+
+        let asserter = Asserter::new();
+        asserter.push_success(&100u128); // eth_gasPrice
+        asserter.push_success(&U256::from(1_000u64)); // getL1Fee(tx_without)
+        asserter.push_success(&U256::from(20_000u64)); // getL1Fee(tx_with)
+        let provider = RootProvider::<Ethereum>::new(RpcClient::mocked(asserter));
+        let access_list = AccessList(vec![AccessListItem {
+            address: Address::repeat_byte(0xAA),
+            storage_keys: Vec::new(),
+        }]);
+
+        let result = resolve_access_list(
+            access_list,
+            &provider,
+            AccessListPricing::OpStack {
+                tx_without_access_list: Bytes::from_static(b"without"),
+                tx_with_access_list: Bytes::from_static(b"with"),
+            },
+        )
+        .await
+        .expect("OP Stack pricing succeeds");
+
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn resolve_access_list_op_stack_provider_failure_returns_err() {
+        use alloy_network::Ethereum;
+        use alloy_provider::RootProvider;
+        use alloy_rpc_client::RpcClient;
+        use alloy_transport::mock::Asserter;
+
+        let asserter = Asserter::new();
+        asserter.push_failure_msg("gas oracle unavailable");
+        let provider = RootProvider::<Ethereum>::new(RpcClient::mocked(asserter));
+        let access_list = AccessList(vec![AccessListItem {
+            address: Address::repeat_byte(0xAA),
+            storage_keys: Vec::new(),
+        }]);
+
+        let err = resolve_access_list(
+            access_list,
+            &provider,
+            AccessListPricing::OpStack {
+                tx_without_access_list: Bytes::from_static(b"without"),
+                tx_with_access_list: Bytes::from_static(b"with"),
+            },
+        )
+        .await
+        .expect_err("provider failures must be distinguishable from unprofitable lists");
+
+        assert!(
+            err.to_string().contains("gas")
+                || err.to_string().contains("oracle")
+                || err.to_string().contains("provider"),
+            "unexpected error: {err:#}"
+        );
     }
 }

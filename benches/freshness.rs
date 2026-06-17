@@ -65,7 +65,7 @@ fn current_thread_rt() -> Runtime {
 /// A swap-shaped cache: MockERC20 with `SENDER` funded `bal`, `RECIPIENT` zero.
 fn swap_cache(rt: &Runtime, bal: u64) -> EvmCache {
     let provider = RootProvider::<AnyNetwork>::new(RpcClient::mocked(Asserter::new()));
-    let mut cache = rt.block_on(EvmCache::new(Arc::new(provider), None));
+    let mut cache = rt.block_on(EvmCache::new(Arc::new(provider)));
     let runtime = Bytecode::new_raw(Bytes::from(
         hex::decode(MOCK_ERC20_RUNTIME_HEX.trim()).unwrap(),
     ));
@@ -325,7 +325,7 @@ fn bench_verify_slots(c: &mut Criterion) {
             slots.iter().map(|&key| (key, U256::from(1u64))).collect();
 
         let provider = RootProvider::<AnyNetwork>::new(RpcClient::mocked(Asserter::new()));
-        let mut cache = rt.block_on(EvmCache::new(Arc::new(provider), None));
+        let mut cache = rt.block_on(EvmCache::new(Arc::new(provider)));
         // Seed the cached values so the fetched (stub) values match → no change.
         let seed: Vec<(Address, U256, U256)> = slots
             .iter()

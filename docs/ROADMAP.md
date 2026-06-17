@@ -1,7 +1,7 @@
 # evm-fork-cache — engineering roadmap
 
-> Status: living document. Last updated alongside the Phase 1 work on branch
-> `phase-1-engine-seam`.
+> Status: living document. Last updated during Phase 1 public-release hardening
+> after Phases 0-5 landed.
 
 ## Vision
 
@@ -15,9 +15,11 @@ backtesting. The moat is three capabilities working together:
 3. **Freshness as a first-class concept** — the engine knows what it can trust,
    for how long, and purges the rest.
 
-Today the crate implements a first draft of #1 and the lazy-fetch plumbing for a
-fork DB. #2 and #3 do not yet exist. This document captures the target shape and
-the phased path to it.
+Today the crate implements the Phase 0-5 core: copy-on-write snapshots and
+overlays, the freshness control plane, targeted state-update writers, and the
+event-to-state reader pipeline. The remaining gap is operational integration
+around that pipeline, especially a production WebSocket/log subscription
+transport and application-specific reorg policy wiring.
 
 ## Target architecture
 
@@ -35,9 +37,10 @@ RPC node                     Event-driven sync  ← WS logs · new block
 
 - **State stack (left):** RPC → fork DB → snapshot → overlays. Reads flow up;
   the fork DB lazily fetches misses from RPC.
-- **Control plane (right):** a WS log + block stream drives an event-driven sync
-  that applies *targeted* writes (e.g. a V3 `Swap` → `slot0`) and purges stale
-  state directly into the fork DB, without RPC.
+- **Control plane (right):** decoded logs drive event-derived targeted writes
+  (e.g. a V3 `Swap` → `slot0`) and purges stale state directly into the fork DB,
+  without RPC on the hot path. The reader/writer pipeline is shipped; production
+  WS subscription and block-hash reorg detection are consumer-provided.
 
 ### The three pillars
 
@@ -50,9 +53,9 @@ RPC node                     Event-driven sync  ← WS logs · new block
   `Mint`/`Burn` emit the affected tick range), so we decode-and-write rather
   than re-derive.
 - **Pillar C — Freshness & invalidation.** A per-address / per-slot validity
-  policy (`Pinned`, `EventDriven`, `ValidThrough(block)`, `VolatilePerBlock`)
-  enforced on each new block: purge what we can no longer trust; the next read
-  lazily re-fetches.
+  policy (`Pinned`, `Volatile`, `ValidThrough(block)`) enforced by freshness
+  policy and validation: purge or verify what we can no longer trust; the next
+  read lazily re-fetches.
 
 ## Design principles
 
@@ -76,8 +79,8 @@ RPC node                     Event-driven sync  ← WS logs · new block
 | **4** | Event pipeline + adapters (Pillar B.2): `EventDecoder` trait, ERC-20 + V3 adapters, ingest/reorg/reconcile pipeline. | **Done** (`phase-4-event-pipeline`) |
 | **5** | COW snapshots (Pillar A): structural sharing; overlay buffer reuse. | **Done** (`phase-5-cow-snapshots`) |
 
-Cross-cutting (land opportunistically): call tracer Inspector, full offline
-(`default-features = false`, no provider) build split, CHANGELOG/CONTRIBUTING.
+Cross-cutting remaining work: call tracer Inspector, full no-provider build split,
+protocol/metadata extraction, and production event-transport integrations.
 
 ---
 
@@ -129,14 +132,15 @@ the Pillar A rewrite. These are the breaking changes that must precede a 1.0.
 
 ### 1d — Builder
 
-- **Change:** add `EvmCacheBuilder` (fluent: block, chain id, spec, cache config,
-  speed mode) subsuming the positional `with_cache`/`from_backend`. Move the
-  process-global `CACHE_SPEED_MODE` into per-instance config so multiple caches
-  (multi-chain search) tune independently.
+- **Change:** add `EvmCacheBuilder` (fluent: block, spec, cache config,
+  shared-memory capacity) as the preferred constructor over positional
+  `with_cache` / `from_backend`.
 - **Files:** `src/cache/mod.rs` (+ a `builder` submodule).
 - **API:** `EvmCache::builder(provider).block(..).spec(..).build().await`.
   Existing constructors retained (possibly deprecated).
-- **Done when:** builder constructs an equivalent cache; speed mode is per-instance.
+- **Done:** builder constructs an equivalent cache. The legacy process-global
+  speed-mode setter remains as accepted API ergonomics debt (tracked in
+  `docs/KNOWN_ISSUES.md`).
 
 ### 1e — `protocols` feature
 
@@ -153,12 +157,11 @@ the Pillar A rewrite. These are the breaking changes that must precede a 1.0.
   gated behind `protocols` (default on). The library builds and lints cleanly
   with `--no-default-features` (CI enforces `cargo clippy --lib
   --no-default-features -- -D warnings`).
-- **Deferred (next, with the `evm-amm-state` move):** the in-crate *unit tests*
-  that exercise the tick math still assume the default feature, so
-  `cargo test --no-default-features` is not yet supported (gate or relocate those
-  tests). Pool *metadata* structs (`V2/V3/BalancerPoolMetadata`, entangled with
-  `ImmutableDataCache`) stay always-on for now, as does the full no-provider build
-  (making revm/foundry-fork-db/alloy-provider optional behind an `rpc` feature).
+- **Deferred (next, with the `evm-amm-state` move):** pool *metadata* structs
+  (`V2/V3/BalancerPoolMetadata`, entangled with `ImmutableDataCache`) stay
+  always-on for now, as does the full no-provider build (making
+  revm/foundry-fork-db/alloy-provider optional behind an `rpc` feature). The
+  generic no-default library and tests are release gates.
 
 ### Phase 1 acceptance — met
 
@@ -171,8 +174,9 @@ the Pillar A rewrite. These are the breaking changes that must precede a 1.0.
 ## Phase 2 — freshness core (detailed, decisions locked)
 
 Builds the freshness/invalidation control plane **and** the optimistic
-verify-and-rerun execution loop on top of it. Out of scope: event-derived
-*writes* (Phase 3), the WS ingestion loop and reorg handling (Phase 4).
+verify-and-rerun execution loop on top of it. Out of scope for Phase 2:
+event-derived *writes* (Phase 3), event decoding, generic ingestion, and reorg
+handling (Phase 4).
 
 ### Locked decisions
 
@@ -456,40 +460,19 @@ fold cost model is recorded in `KNOWN_ISSUES.md`.
 
 ---
 
-## Key abstractions for later phases (sketches)
+## Remaining work toward 1.0
 
-```rust
-// Pillar B — event → state
-enum StateUpdate {
-    Slot   { address: Address, slot: U256, value: U256 },
-    Account{ address: Address, info: AccountInfo },
-    Purge  { address: Address, scope: PurgeScope },
-}
-trait EventDecoder: Send + Sync {
-    fn decode(&self, log: &Log) -> Vec<StateUpdate>;
-}
-
-// Pillar C — freshness
-enum Validity { Pinned, EventDriven, ValidThrough(u64), VolatilePerBlock }
-struct FreshnessRegistry { /* per-address & per-(address,slot) Validity */ }
-
-// The composed engine
-impl SimulationEngine {
-    fn snapshot(&self) -> Arc<EvmSnapshot>;        // Pillar A
-    fn ingest(&mut self, logs: LogStream, blocks: BlockStream); // Pillar B
-    fn on_new_block(&mut self, n: u64);            // Pillar C: apply + purge
-}
-```
-
-## Hard problems to resolve (tracked)
-
-1. **Event-derived correctness** — add a reconciliation mode (sampled RPC re-read
-   vs event-derived value; alarm on mismatch). Build into Phase 4 from day one.
-2. **Reorgs** — purge-and-resync affected addresses on a reorg signal; `ValidThrough`
-   is the lever.
-3. **Snapshot consistency point** — snapshot at block boundaries (between
-   `on_new_block` applies) or behind a generation guard, so the ingestion loop
-   can't produce a torn read.
-4. **Protocol/metadata extraction** — `ImmutableDataCache` couples generic
-   token-decimals with V2/V3/Balancer pool metadata; fully separating them is the
-   precondition for the `evm-amm-state` move.
+1. **Production event transport.** The crate ships the generic `events::drive`
+   convenience, `LogSource` trait, synchronous `EventPipeline`, reorg purge, and
+   sampled reconciliation. It does not ship a concrete production WS provider,
+   block-hash reorg detector, or backfill/resubscribe strategy; consumers wire
+   those pieces to their provider stack.
+2. **Snapshot consistency point in continuous ingestion.** Applications that run
+   a live event loop should snapshot at block boundaries or behind their own
+   generation guard so simulations do not observe a partially applied block.
+3. **Protocol/metadata extraction.** `ImmutableDataCache` couples generic
+   token-decimals with V2/V3/Balancer pool metadata. Fully separating them is the
+   precondition for moving protocol knowledge into `evm-amm-state`.
+4. **Full no-provider build split.** `--no-default-features` covers the generic
+   engine and is CI-gated, but the dependency graph still includes provider/RPC
+   crates. A later `rpc` feature can make those optional for pure offline users.

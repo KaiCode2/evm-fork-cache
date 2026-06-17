@@ -20,7 +20,6 @@
 
 use std::sync::Arc;
 
-use alloy_eips::BlockId;
 use alloy_primitives::{Address, Bytes, U256, address};
 use alloy_provider::ProviderBuilder;
 use alloy_provider::network::AnyNetwork;
@@ -51,7 +50,7 @@ async fn main() -> Result<()> {
     let provider = ProviderBuilder::new()
         .network::<AnyNetwork>()
         .connect_http(rpc_url.parse()?);
-    let mut cache = EvmCache::new(Arc::new(provider), Some(BlockId::latest())).await;
+    let mut cache = EvmCache::new(Arc::new(provider)).await;
 
     // Quote 1 WETH swapped along WETH -> USDC -> DAI.
     let amount_in = U256::from(10u64).pow(U256::from(18u64)); // 1 WETH (1e18)

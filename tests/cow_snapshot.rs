@@ -23,6 +23,7 @@ mod common;
 
 use std::sync::Arc;
 
+use alloy_eips::{BlockId, BlockNumberOrTag};
 use alloy_primitives::{Address, Bytes, U256, keccak256};
 use alloy_sol_types::{SolCall, SolValue};
 use anyhow::{Result, anyhow};
@@ -268,7 +269,7 @@ async fn cow_snapshot_matches_deep_clone_through_mutations() -> Result<()> {
     assert_equivalent(&mut cache, &addrs, &slots, "after NotExisting");
 
     // 12. set_block (re-pin → full base rebuild path).
-    cache.set_block(None);
+    cache.set_block(BlockId::Number(BlockNumberOrTag::Number(1)));
     assert_equivalent(&mut cache, &addrs, &slots, "after set_block");
 
     Ok(())

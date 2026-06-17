@@ -633,7 +633,7 @@ mod tests {
             .build()
             .expect("runtime should build");
 
-        rt.block_on(EvmCache::new(Arc::new(provider), None))
+        rt.block_on(EvmCache::new(Arc::new(provider)))
     }
 
     fn memory_artifact(creation_code: Bytes) -> FoundryArtifact {
