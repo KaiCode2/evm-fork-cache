@@ -1185,6 +1185,12 @@ async fn run_unverified_on_fetcher_error() -> Result<()> {
 // T3 (part 2): into_optimistic aborts the validation task. The fetcher WOULD
 // queue a correction (it reports a changed value), so if the abort failed we
 // would observe a non-zero pending queue. We assert it stays 0.
+//
+// Determinism mirrors the Drop-abort test below: the validator is allowed to
+// reach the synchronous fetch, but the gated fetch cannot return until after
+// `into_optimistic()` has set the cancel flag. That makes the product guarantee
+// precise: a cancel observed at the post-fetch checkpoint suppresses all
+// side-effects, including pending corrections and re-run accounting.
 #[tokio::test(flavor = "multi_thread")]
 async fn run_into_optimistic_aborts_validation() -> Result<()> {
     let token = Address::repeat_byte(0x44);
@@ -1192,11 +1198,12 @@ async fn run_into_optimistic_aborts_validation() -> Result<()> {
     let recipient = Address::repeat_byte(0x66);
 
     let mut cache = cache_with_balance(token, owner, U256::from(1000)).await?;
+    let gate = Gate::new();
     // A CHANGED value: if the validator ran, it would queue a correction.
-    cache.set_storage_batch_fetcher(stub_fetcher(HashMap::from([(
-        (token, balance_slot_for(owner)),
-        U256::from(50),
-    )])));
+    cache.set_storage_batch_fetcher(gated_tracking_fetcher(
+        HashMap::from([((token, balance_slot_for(owner)), U256::from(50))]),
+        gate.clone(),
+    ));
 
     let mut controller = FreshnessController::new(FreshnessRegistry::new(), AlwaysVerify);
     let sim = controller.run(
@@ -1208,6 +1215,7 @@ async fn run_into_optimistic_aborts_validation() -> Result<()> {
         )],
     )?;
     let results = sim.into_optimistic(); // aborts the background validation
+    gate.release();
     assert_eq!(results.len(), 1);
 
     // Give any (incorrectly) surviving task a chance to run, then assert no
