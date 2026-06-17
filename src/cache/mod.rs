@@ -2067,17 +2067,21 @@ impl EvmCache {
         }
     }
 
-    /// Create an immutable snapshot of the current EVM state for cross-thread
-    /// fan-out.
+    /// Create an immutable, `Send + Sync` snapshot of the current EVM state for
+    /// cross-thread fan-out (the copy-on-write two-tier view, Pillar A).
     ///
-    /// Merges both layers (CacheDB overlay + BlockchainDb backend) into a
-    /// single flat HashMap. The snapshot is `Send + Sync` and can be shared
-    /// across threads via `Arc`.
+    /// Rather than deep-copying both layers, this memoizes the cold layer-2
+    /// (`BlockchainDb`) index as an `Arc`-shared base — reused as a cheap
+    /// `Arc::clone` when layer 2 is unchanged, rebuilt copy-on-write only for the
+    /// addresses that changed — and folds the hot layer-1 (`CacheDB` overlay)
+    /// delta over it. Layer-1 values shadow the base on reads, reproducing the
+    /// live cache's layered semantics; the resulting [`EvmSnapshot`] is shared
+    /// across threads via `Arc`. Its cost tracks *changed* state, not *total*
+    /// state. (The retained [`create_snapshot_deep_clone`](Self::create_snapshot_deep_clone)
+    /// is the read-equivalent O(total) reference, kept for benchmarking/testing.)
     ///
-    /// CacheDB overlay values take precedence over BlockchainDb values.
-    /// Use with [`EvmOverlay`] for parallel simulation.
-    ///
-    /// For cheap same-thread save/restore of just the overlay, prefer
+    /// Takes `&mut self` because it refreshes and memoizes the base. For cheap
+    /// same-thread save/restore of just the overlay, prefer
     /// [`snapshot`](Self::snapshot) / [`restore`](Self::restore) instead.
     pub fn create_snapshot(&mut self) -> Arc<snapshot::EvmSnapshot> {
         // 1. Refresh / memoize the cold layer-2 base, then take a cheap Arc handle
@@ -2238,18 +2242,14 @@ impl EvmCache {
         let prev = self.base.as_ref().expect("base present in case 4");
         let mut accounts = prev.accounts.clone();
         let mut storage = prev.storage.clone();
-        let mut code_by_hash = prev.code_by_hash.clone();
 
         let db_accounts = self.blockchain_db.accounts().read();
         let db_storage = self.blockchain_db.storage().read();
         for addr in self.base_dirty.iter().copied() {
-            // Account info + code: refresh from the current layer-2 account, or drop
-            // it if the account no longer exists in layer 2 (e.g. after a purge).
+            // Account info: refresh from the current layer-2 account, or drop it if
+            // the account no longer exists in layer 2 (e.g. after a purge).
             match db_accounts.get(&addr) {
                 Some(info) => {
-                    if let Some(code) = &info.code {
-                        code_by_hash.insert(info.code_hash, code.clone());
-                    }
                     accounts.insert(addr, info.clone());
                 }
                 None => {
@@ -2272,6 +2272,16 @@ impl EvmCache {
                 }
             }
         }
+        drop(db_accounts);
+        drop(db_storage);
+
+        // Rebuild the code index from the refreshed accounts (NOT cloned from the
+        // previous base): a purged or recoded dirty account must not leave a stale
+        // `code_by_hash` entry, which would diverge from `create_snapshot_deep_clone`
+        // on a direct `code_by_hash(old_hash)` lookup. Rebuilding from scratch also
+        // handles shared code hashes correctly (a hash survives iff some present
+        // account still carries it).
+        let code_by_hash = Self::code_index(&accounts);
 
         self.base = Some(Arc::new(snapshot::BaseState {
             accounts,
@@ -2281,21 +2291,34 @@ impl EvmCache {
         self.base_dirty.clear();
     }
 
+    /// Build the bytecode-by-hash index from a set of (layer-2) accounts, matching
+    /// the deep-clone reference: a hash is present iff some account carries that
+    /// code inline. Rebuilt from scratch on every base (re)build so a purged or
+    /// recoded account never leaves a stale entry — preserving read-equivalence
+    /// with [`create_snapshot_deep_clone`](Self::create_snapshot_deep_clone).
+    fn code_index(accounts: &HashMap<Address, AccountInfo>) -> HashMap<B256, Bytecode> {
+        accounts
+            .values()
+            .filter_map(|info| {
+                info.code
+                    .as_ref()
+                    .map(|code| (info.code_hash, code.clone()))
+            })
+            .collect()
+    }
+
     /// Build a fresh [`BaseState`](snapshot::BaseState) by flattening all of layer
     /// 2, recording `base_storage_lens`. Shared by `refresh_base`'s full-rebuild
     /// path and [`create_snapshot_deep_clone`](Self::create_snapshot_deep_clone).
     fn build_base_full(&mut self) -> snapshot::BaseState {
         let mut accounts = HashMap::new();
-        let mut code_by_hash = HashMap::new();
         {
             let db_accounts = self.blockchain_db.accounts().read();
             for (addr, info) in db_accounts.iter() {
-                if let Some(code) = &info.code {
-                    code_by_hash.insert(info.code_hash, code.clone());
-                }
                 accounts.insert(*addr, info.clone());
             }
         }
+        let code_by_hash = Self::code_index(&accounts);
         let mut storage = HashMap::new();
         self.base_storage_lens.clear();
         {

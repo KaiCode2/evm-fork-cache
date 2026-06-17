@@ -23,12 +23,12 @@ mod common;
 
 use std::sync::Arc;
 
-use alloy_primitives::{Address, U256, keccak256};
+use alloy_primitives::{Address, Bytes, U256, keccak256};
 use alloy_sol_types::{SolCall, SolValue};
 use anyhow::{Result, anyhow};
 use revm::database::AccountState;
 use revm::database_interface::Database;
-use revm::state::AccountInfo;
+use revm::state::{AccountInfo, Bytecode};
 
 use common::{
     MOCK_ERC20_BALANCE_SLOT, MockERC20, install_default_account, install_mock_erc20, setup_cache,
@@ -99,6 +99,15 @@ fn assert_equivalent(cache: &mut EvmCache, addrs: &[Address], slots: &[U256], la
             account_eq(&bc, &bd),
             "{label}: basic mismatch at {a}: cow={bc:?} deep={bd:?}"
         );
+        // Code lookup for the account's code hash must agree (spec §8.1).
+        if let Some(info) = &bc {
+            let h = info.code_hash;
+            assert_eq!(
+                ov_cow.code_by_hash(h).expect("cow code").original_bytes(),
+                ov_deep.code_by_hash(h).expect("deep code").original_bytes(),
+                "{label}: code_by_hash mismatch at {a} (hash {h})"
+            );
+        }
         for &s in slots {
             assert_eq!(
                 cow.storage_value(a, s),
@@ -299,6 +308,84 @@ async fn invalidate_snapshot_base_rehonest_after_escape_hatch_write() -> Result<
         "invalidate_snapshot_base must re-honest the base after an out-of-band write"
     );
     assert_eq!(cow.storage_value(pool, slot), Some(U256::from(222u64)));
+    Ok(())
+}
+
+/// Regression (review finding P2): the COW partial rebuild must not leave a stale
+/// `code_by_hash` entry when a base account is recoded or purged. Warm the base
+/// with a code-bearing account, recode it in layer 2, dirty it via a controlled
+/// per-address write (so `refresh_base` takes the Case-4 *partial* rebuild path,
+/// not a full rebuild), and assert the old hash no longer resolves — matching the
+/// deep-clone reference, which rebuilds its code index from current accounts.
+#[tokio::test(flavor = "multi_thread")]
+async fn cow_code_index_matches_deep_clone_after_base_account_recoded() -> Result<()> {
+    let mut cache = setup_cache().await?;
+    let contract = Address::repeat_byte(0xc0);
+    let code_v1 = Bytecode::new_raw(Bytes::from(vec![0x60u8, 0x01]));
+    let code_v2 = Bytecode::new_raw(Bytes::from(vec![0x60u8, 0x02, 0x60, 0x03]));
+    let h1 = code_v1.hash_slow();
+    let h2 = code_v2.hash_slow();
+    assert_ne!(h1, h2);
+
+    // Seed a code-bearing account (code_v1) directly into the cold base (layer 2),
+    // then re-honest the memoized base.
+    let put_account = |cache: &EvmCache, code: &Bytecode, hash| {
+        cache.blockchain_db().accounts().write().insert(
+            contract,
+            AccountInfo {
+                balance: U256::from(1u64),
+                nonce: 1,
+                code_hash: hash,
+                code: Some(code.clone()),
+                account_id: None,
+            },
+        );
+    };
+    put_account(&cache, &code_v1, h1);
+    cache.invalidate_snapshot_base();
+    let warm = cache.create_snapshot(); // base now indexes h1 -> code_v1
+    let mut ov_warm = EvmOverlay::new(Arc::clone(&warm), None);
+    assert_eq!(
+        ov_warm
+            .code_by_hash(h1)
+            .expect("warm code")
+            .original_bytes(),
+        code_v1.original_bytes(),
+        "warm snapshot must resolve the seeded code"
+    );
+
+    // Recode the base account to code_v2 (out-of-band), then dirty `contract` via a
+    // controlled per-address write so the next snapshot takes the Case-4 partial
+    // rebuild — exactly the path that previously failed to prune the old hash.
+    put_account(&cache, &code_v2, h2);
+    cache.apply_updates(&[StateUpdate::slot(
+        contract,
+        U256::from(0u64),
+        U256::from(9u64),
+    )]);
+
+    let cow = cache.create_snapshot();
+    let deep = cache.create_snapshot_deep_clone();
+    let mut ov_cow = EvmOverlay::new(Arc::clone(&cow), None);
+    let mut ov_deep = EvmOverlay::new(Arc::clone(&deep), None);
+
+    // The new hash resolves identically...
+    assert_eq!(
+        ov_cow.code_by_hash(h2).expect("cow h2").original_bytes(),
+        ov_deep.code_by_hash(h2).expect("deep h2").original_bytes(),
+        "new code hash must match the deep clone"
+    );
+    // ...and the now-unreferenced old hash must NOT linger in the COW base: both
+    // resolve to empty (the deep clone never had it after the recode).
+    assert!(
+        ov_deep.code_by_hash(h1).expect("deep h1").is_empty(),
+        "sanity: deep clone drops the unreferenced old hash"
+    );
+    assert_eq!(
+        ov_cow.code_by_hash(h1).expect("cow h1").original_bytes(),
+        ov_deep.code_by_hash(h1).expect("deep h1").original_bytes(),
+        "COW must not return stale bytecode for the recoded account's old hash"
+    );
     Ok(())
 }
 
