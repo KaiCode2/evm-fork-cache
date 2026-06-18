@@ -15,11 +15,27 @@ surface freezes at 1.0.
 This is the first release line. It captures the work done across the
 pre-release development phases (see [`docs/ROADMAP.md`](docs/ROADMAP.md)).
 
+### Changed
+
+- **Breaking:** extracted the old in-crate AMM adapter surface before public
+  release. Protocol-specific storage layouts, protocol metadata, injector
+  helpers, tick snapshots, and protocol log decoders belong in `evm-amm-state`;
+  this crate now exposes only the generic fork cache, simulation, freshness,
+  state-update, ERC-20 decoding, and event-pipeline primitives.
+- **Breaking:** `ImmutableDataCache` is now token-decimals-only and its on-disk
+  format version is bumped to `2`, so older metadata files with protocol payloads
+  are treated as stale cache misses.
+- **Breaking:** renamed the remaining generic storage-purge helpers from
+  pool-oriented names to contract-oriented names:
+  `has_contract_storage`, `contract_storage_slot_count`,
+  `purge_contract_storage`, and `purge_contract_slots`. The old pool-named
+  aliases were removed rather than deprecated before the first public release.
+
 ### Added
 
 - **Forked EVM cache** (`cache::EvmCache`) backed by `foundry-fork-db` with lazy
-  RPC loading and on-disk persistence for accounts, storage, bytecode, immutable
-  metadata, and Uniswap V3-style tick snapshots.
+  RPC loading and on-disk persistence for accounts, storage, bytecode, and
+  immutable metadata.
 - **`EvmCacheBuilder`** — a fluent constructor (`EvmCache::builder(provider)`)
   subsuming the positional `with_cache` / `from_backend` constructors, with
   block pin, EVM spec, cache-config, and shared-memory-capacity configuration.
@@ -41,9 +57,8 @@ pre-release development phases (see [`docs/ROADMAP.md`](docs/ROADMAP.md)).
   overlay-if-present, no new overlay account materialized), returning a structured
   `StateDiff` (`SlotChange`s, `AccountChange`s, `PurgeRecord`s) that records only
   actual changes. The existing `inject_storage_batch_fresh` / `purge_account` /
-  `purge_pool_storage` / `purge_pool_slots` writers and the freshness
-  correction-drain are refolded onto it (signatures unchanged); generic, builds
-  with `--no-default-features`.
+  `purge_contract_storage` / `purge_contract_slots` writers and the freshness
+  correction-drain are refolded onto it (signatures unchanged).
 - **Relative / read-modify-write state updates** (`state_update`, Phase 3 §15) —
   a saturating `SlotDelta` (`Add`/`Sub`, clamping at `U256::MAX`/`U256::ZERO`), a
   `StateUpdate::SlotDelta { address, slot, delta }` variant (with the
@@ -55,7 +70,7 @@ pre-release development phases (see [`docs/ROADMAP.md`](docs/ROADMAP.md)).
   field for the caller to fetch+seed and retry. `skipped` is informational
   metadata and does not affect `StateDiff::is_empty` / `len` (changes-only).
   Adding the `StateDiff.skipped` field is a struct change permitted under the
-  pre-1.0 break policy. Generic core (builds `--no-default-features`).
+  pre-1.0 break policy. Generic core.
 - **Post-audit state-update remediation** (`state_update`, Phase 3 §16):
   - **`serde`** — `Serialize`/`Deserialize` derived (unconditionally) on the whole
     vocabulary (`SlotDelta`, `StateUpdate`, `AccountPatch`, `PurgeScope`) and the
@@ -101,13 +116,6 @@ pre-release development phases (see [`docs/ROADMAP.md`](docs/ROADMAP.md)).
     balance `SlotDelta`s (skipping the zero-address mint/burn leg), with per-token
     balance-slot config. The reactive-balance case from Phase 3 §15, now
     log-driven. Generic core.
-  - **`UniswapV3Decoder` / `UniswapV3Layout`** (`protocols`) — `Swap` → a masked
-    `slot0` write (new `sqrtPriceX96` + `tick`, **preserving** the
-    observation/fee/`unlocked` bits — a clobbered `unlocked` would make a quote
-    revert `LOK`) plus an absolute `liquidity` write; `Mint`/`Burn` → per-tick
-    `liquidityGross`/`liquidityNet`, the `initialized` flag, the `tickBitmap`
-    word bit, and the in-range global `liquidity`, computed against the
-    `StateView` and cold-aware. Uniswap and PancakeSwap layouts.
   - **`EventPipeline`** — `ingest_logs` decodes + applies a block's logs
     **log-by-log in order** (so a later log sees earlier applies) and returns a
     `BlockDigest`; `reorg_to` purges (purge-and-resync) the addresses touched
@@ -118,8 +126,8 @@ pre-release development phases (see [`docs/ROADMAP.md`](docs/ROADMAP.md)).
 - **`StateUpdate::SlotMasked`** (`state_update`, Phase 4) — a cold-aware
   read-modify-write *masked* slot write (`new = (old & !mask) | (value & mask)`)
   with the `StateUpdate::slot_masked` constructor, so a pure decoder can update
-  selected bits of a **packed** storage word (e.g. V3 `slot0`) without clobbering
-  the rest. A masked write to a cold slot is skipped and surfaced in the new
+  selected bits of a **packed** storage word without clobbering the rest. A masked
+  write to a cold slot is skipped and surfaced in the new
   `StateDiff.skipped_masks: Vec<SkippedMask>` (counted by `has_skipped` /
   `skipped_len`, not by the changes-only `is_empty`/`len`); `serde` on
   `SkippedMask`. Adding the variant and the field is permitted under the pre-1.0
@@ -143,9 +151,6 @@ pre-release development phases (see [`docs/ROADMAP.md`](docs/ROADMAP.md)).
   during decoder setup instead of relying on the warning-only ergonomic path.
 - **Two-stage prefetch registry** (`prefetch_registry`) for cross-cycle
   storage-slot pre-warming.
-- **`protocols` feature** (default-on) gating the Uniswap V2/V3 storage layouts,
-  V3 tick snapshots, and `inject_v3_*` / `inject_v2_pool_metadata` helpers, so
-  the generic engine builds with `--no-default-features`.
 - **Copy-on-write snapshots** (Phase 5, Pillar A) — `create_snapshot` is now a
   two-tier copy-on-write view instead of an O(total state) deep clone. The cold
   `BlockchainDb` index (layer 2) is flattened once into an internal, immutable,
@@ -186,13 +191,12 @@ pre-release development phases (see [`docs/ROADMAP.md`](docs/ROADMAP.md)).
 - **Exact access-list RLP data-gas helper** —
   `access_list::access_list_rlp_data_gas(&AccessList)` returns the EIP-2930 RLP
   calldata gas for an access list and backs the L2 profitability calculation.
-- **Versioned on-disk cache envelope** — binary EVM state, bytecode,
-  `ImmutableDataCache`, and V3 tick snapshot cache files now start with
-  crate-specific magic bytes plus a `u32` version before the bincode payload.
+- **Versioned on-disk cache envelope** — binary EVM state, bytecode, and
+  `ImmutableDataCache` files now start with crate-specific magic bytes plus a
+  `u32` version before the bincode payload.
 - **Public-release CI gates** — the GitHub Actions workflow now enforces format,
-  clippy on all targets, no-default-feature library linting, all-target tests,
-  no-default-feature tests, doctests, warning-free docs, bench compilation,
-  package verification, and the MSRV library check.
+  clippy on all targets, all-target tests, doctests, warning-free docs, bench
+  compilation, package verification, and the MSRV library check.
 
 ### Changed
 
@@ -227,20 +231,11 @@ pre-release development phases (see [`docs/ROADMAP.md`](docs/ROADMAP.md)).
   header.
 - **Legacy raw-bincode cache files are treated as misses** — the versioned cache
   envelope intentionally rejects unversioned `evm_state.bin`, `bytecodes.bin`,
-  `immutable_data.bin`, and `v3_tick_snapshots.bin` payloads rather than trying
-  to deserialize ambiguous layouts.
+  and `immutable_data.bin` payloads rather than trying to deserialize ambiguous
+  layouts.
 - Simulation entry points that distinguish failure modes return
   `SimulationResult<T>` (`Result<T, SimError>`), separating decoded reverts,
   EVM halts, and host errors. `SimulationErrorKind` remains as a deprecated alias.
-- **`inject_v2_pool_metadata` / `inject_v3_tick_bitmap*` / `inject_v3_ticks*`
-  (`protocols`) now write through both cache layers** (Phase 3, Decision 2).
-  Previously these wrote only the CacheDB overlay (layer 1); they are now folded
-  onto the write-through `StateUpdate::Slot` primitive, so the injected slots also
-  land in the BlockchainDb backend (layer 2). Signatures and return values are
-  unchanged and the visible `token0()`/`tickBitmap()`/`ticks()` reads are the
-  same; only the slot *placement* across layers changed. See
-  [`docs/KNOWN_ISSUES.md`](docs/KNOWN_ISSUES.md). (The cold-backfill
-  `inject_storage_batch` keeps its layer-2-only intent and is unchanged.)
 
 ### Fixed
 

@@ -1,35 +1,17 @@
 mod binary_state;
 mod bytecode;
+mod journal_access_list;
 mod metadata;
 pub mod overlay;
 pub mod slot_observations;
 pub mod snapshot;
-#[cfg(feature = "protocols")]
-mod storage_keys;
-#[cfg(feature = "protocols")]
-mod tick_snapshot;
 pub(crate) mod versioned;
 
 pub use binary_state::{load_binary_state, save_binary_state};
-pub use metadata::{
-    BalancerPoolMetadata, CacheConfig, ImmutableDataCache, V2PoolMetadata, V3PoolMetadata,
-};
+pub use metadata::{CacheConfig, ImmutableDataCache};
 pub use overlay::EvmOverlay;
 pub use slot_observations::SlotObservationTracker;
 pub use snapshot::EvmSnapshot;
-#[cfg(feature = "protocols")]
-#[cfg_attr(docsrs, doc(cfg(feature = "protocols")))]
-pub use storage_keys::{
-    PANCAKE_V3_LIQUIDITY_SLOT, PANCAKE_V3_TICK_BITMAP_BASE_SLOT, PANCAKE_V3_TICKS_BASE_SLOT,
-    SLIPSTREAM_LIQUIDITY_SLOT, SLIPSTREAM_SLOT0_SLOT, SLIPSTREAM_TICK_BITMAP_BASE_SLOT,
-    SLIPSTREAM_TICKS_BASE_SLOT, V2_RESERVES_SLOT, V3_LIQUIDITY_SLOT, V3_SLOT0_SLOT,
-    V3_TICK_BITMAP_BASE_SLOT, V3_TICKS_BASE_SLOT, v3_tick_bitmap_storage_key,
-    v3_tick_bitmap_storage_key_with_base, v3_tick_info_storage_keys,
-    v3_tick_info_storage_keys_with_base,
-};
-#[cfg(feature = "protocols")]
-#[cfg_attr(docsrs, doc(cfg(feature = "protocols")))]
-pub use tick_snapshot::{SerializableTickInfo, TickInfo, V3PoolTickSnapshot, V3TickSnapshotCache};
 
 use std::{
     cell::RefCell,
@@ -44,7 +26,7 @@ use std::{
 };
 
 use alloy_consensus::BlockHeader;
-use alloy_eips::eip2930::{AccessList, AccessListItem};
+use alloy_eips::eip2930::AccessList;
 use alloy_eips::{BlockId, BlockNumberOrTag};
 use alloy_network::BlockResponse;
 use alloy_primitives::{Address, B256, Bytes, I256, Log, TxKind, U256, keccak256};
@@ -73,8 +55,7 @@ use crate::state_update::{
 };
 
 use bytecode::BytecodeCache;
-#[cfg(feature = "protocols")]
-use storage_keys::{i128_to_u256, i256_from_i16, i256_from_i24};
+use journal_access_list::{extract_access_list, merge_access_lists};
 
 /// Re-export AnyNetwork for callers that need to construct providers.
 pub use alloy_provider::network::AnyNetwork as AnyNetworkType;
@@ -90,9 +71,10 @@ pub type RpcCallFn = Arc<dyn Fn(Address, Bytes) -> Result<Bytes> + Send + Sync>;
 
 /// Callback for batch-fetching storage slots directly from RPC, bypassing SharedBackend.
 ///
-/// Used by V3 tick prefetch to avoid 16K+ individual channel round-trips through
-/// SharedBackend. Fires concurrent `eth_getStorageAt` calls directly via the provider
-/// and returns results for bulk injection into BlockchainDb.
+/// Used by callers that need bulk storage reads without many individual channel
+/// round-trips through SharedBackend. Fires concurrent `eth_getStorageAt` calls
+/// directly via the provider and returns results for bulk injection into
+/// BlockchainDb.
 ///
 /// The second argument pins the fetch to a specific block: `Some(block)` fetches
 /// at exactly that block, while `None` uses the fetcher's configured block (the
@@ -357,11 +339,10 @@ where
 
     /// Enable disk-backed caching with the given configuration.
     ///
-    /// Supplying a [`CacheConfig`] turns on persistence of EVM state,
-    /// bytecodes, immutable data, and (with the `protocols` feature) V3 tick
-    /// snapshots under the configured chain directory; the cache is loaded on
-    /// [`build`](Self::build) and flushed on drop. Omit it for a purely
-    /// in-memory cache backed solely by RPC.
+    /// Supplying a [`CacheConfig`] turns on persistence of EVM state, bytecodes,
+    /// and immutable data under the configured chain directory; the cache is
+    /// loaded on [`build`](Self::build) and flushed on drop. Omit it for a
+    /// purely in-memory cache backed solely by RPC.
     pub fn cache_config(mut self, cache_config: CacheConfig) -> Self {
         self.cache_config = Some(cache_config);
         self
@@ -477,11 +458,8 @@ pub struct EvmCache {
     token_decimals: HashMap<Address, u8>,
     block: BlockId,
     cache_config: Option<CacheConfig>,
-    /// Cache for immutable on-chain data (token decimals, pool metadata).
+    /// Cache for immutable on-chain data (token decimals).
     immutable_cache: ImmutableDataCache,
-    /// Cache for V3 pool tick snapshots (tick_bitmap, ticks, liquidity).
-    #[cfg(feature = "protocols")]
-    tick_snapshot_cache: V3TickSnapshotCache,
     /// Optional timestamp override for simulating future blocks.
     /// When set, EVM simulations use this timestamp instead of the current system time.
     timestamp_override: Option<u64>,
@@ -678,8 +656,7 @@ impl EvmCache {
     /// This enables several caching features:
     /// 1. Unified EVM state: Accounts + storage loaded from `evm_state.bin` (bincode)
     /// 2. Bytecode caching: Contract bytecodes from `bytecodes.bin`
-    /// 3. Tick snapshots: V3 pool tick data for validation
-    /// 4. Immutable data: Token decimals, pool metadata
+    /// 3. Immutable data: Token decimals
     ///
     /// # Runtime requirement
     /// RPC-backed operation requires a **multi-thread** tokio runtime
@@ -839,7 +816,7 @@ impl EvmCache {
             }
         }
 
-        // Load immutable data cache (token decimals, pool metadata)
+        // Load immutable data cache (token decimals).
         // This is still needed for validation and metadata lookups
         let immutable_cache = cache_config
             .as_ref()
@@ -848,9 +825,6 @@ impl EvmCache {
                 ImmutableDataCache::load(&path).inspect(|cache| {
                     debug!(
                         token_decimals = cache.token_decimals.len(),
-                        v2_pools = cache.v2_pools.len(),
-                        v3_pools = cache.v3_pools.len(),
-                        balancer_pools = cache.balancer_pools.len(),
                         path = ?path,
                         "Loaded immutable data from cache"
                     );
@@ -860,22 +834,6 @@ impl EvmCache {
 
         // Pre-populate in-memory token decimals from immutable cache
         let token_decimals = immutable_cache.token_decimals.clone();
-
-        // Load V3 tick snapshot cache (for liquidity validation)
-        #[cfg(feature = "protocols")]
-        let tick_snapshot_cache = cache_config
-            .as_ref()
-            .and_then(|cfg| {
-                let path = cfg.tick_snapshot_cache_path();
-                V3TickSnapshotCache::load(&path).inspect(|cache| {
-                    debug!(
-                        snapshots = cache.len(),
-                        path = ?path,
-                        "Loaded V3 tick snapshots from cache"
-                    );
-                })
-            })
-            .unwrap_or_default();
 
         // Create an RPC callback for direct eth_call before moving provider into backend.
         // This bypasses revm simulation for batch queries where lazy storage fetching is too slow.
@@ -1058,8 +1016,6 @@ impl EvmCache {
             block,
             cache_config,
             immutable_cache,
-            #[cfg(feature = "protocols")]
-            tick_snapshot_cache,
             timestamp_override: None,
             chain_id,
             block_number,
@@ -1135,8 +1091,6 @@ impl EvmCache {
             block,
             cache_config: None,
             immutable_cache: ImmutableDataCache::default(),
-            #[cfg(feature = "protocols")]
-            tick_snapshot_cache: V3TickSnapshotCache::default(),
             timestamp_override: None,
             chain_id,
             block_number,
@@ -1165,10 +1119,10 @@ impl EvmCache {
     /// This persists:
     /// 1. Unified EVM state (accounts + storage) to `evm_state.bin` (bincode)
     /// 2. Contract bytecodes to `bytecodes.bin`
-    /// 3. Immutable data (token decimals, pool metadata) to `immutable_data.bin`
-    /// 4. V3 tick snapshots to `v3_tick_snapshots.bin`
+    /// 3. Immutable data (token decimals) to `immutable_data.bin`
     ///
-    /// Call this after loading AMMs and running simulations to speed up subsequent runs.
+    /// Call this after loading hot contract state and running simulations to
+    /// speed up subsequent runs.
     /// The cache is also automatically flushed when the EvmCache is dropped.
     pub fn flush(&self) -> Result<()> {
         if let Some(cfg) = &self.cache_config {
@@ -1199,28 +1153,9 @@ impl EvmCache {
                 })?;
             debug!(
                 token_decimals = self.immutable_cache.token_decimals.len(),
-                v2_pools = self.immutable_cache.v2_pools.len(),
-                v3_pools = self.immutable_cache.v3_pools.len(),
-                balancer_pools = self.immutable_cache.balancer_pools.len(),
                 path = ?immutable_path,
                 "Updated immutable data cache"
             );
-
-            // Save the V3 tick snapshot cache (needed for liquidity validation)
-            #[cfg(feature = "protocols")]
-            {
-                let tick_snapshot_path = cfg.tick_snapshot_cache_path();
-                self.tick_snapshot_cache
-                    .save(&tick_snapshot_path)
-                    .with_context(|| {
-                        format!("failed to save V3 tick snapshot cache to {tick_snapshot_path:?}")
-                    })?;
-                debug!(
-                    snapshots = self.tick_snapshot_cache.len(),
-                    path = ?tick_snapshot_path,
-                    "Updated V3 tick snapshot cache"
-                );
-            }
         }
         Ok(())
     }
@@ -1451,8 +1386,8 @@ impl EvmCache {
     /// # use alloy_primitives::{Address, U256};
     /// # use evm_fork_cache::StateUpdate;
     /// # fn example(cache: &mut evm_fork_cache::cache::EvmCache) {
-    /// let pool = Address::repeat_byte(0x01);
-    /// let diff = cache.apply_update(&StateUpdate::slot(pool, U256::from(0), U256::from(42)));
+    /// let contract = Address::repeat_byte(0x01);
+    /// let diff = cache.apply_update(&StateUpdate::slot(contract, U256::from(0), U256::from(42)));
     /// assert_eq!(diff.slots.len(), 1);
     /// # }
     /// ```
@@ -2000,7 +1935,7 @@ impl EvmCache {
                 }
             }
             PurgeScope::AllStorage => {
-                let slots_removed = self.purge_pool_storage_inner(address);
+                let slots_removed = self.purge_contract_storage_inner(address);
                 PurgeRecord {
                     address,
                     scope: PurgeScope::AllStorage,
@@ -2009,7 +1944,7 @@ impl EvmCache {
                 }
             }
             PurgeScope::Slots(slots) => {
-                let slots_removed = self.purge_pool_slots_inner(address, slots);
+                let slots_removed = self.purge_contract_slots_inner(address, slots);
                 PurgeRecord {
                     address,
                     scope: PurgeScope::Slots(slots.clone()),
@@ -2172,7 +2107,7 @@ impl EvmCache {
     /// Removes `addr` from the CacheDB overlay accounts map, the BlockchainDb
     /// accounts map, and the BlockchainDb storage map, so the next access
     /// re-fetches a clean account from RPC. This is the account-level
-    /// counterpart to the storage-only [`purge_pool_storage`](Self::purge_pool_storage):
+    /// counterpart to the storage-only [`purge_contract_storage`](Self::purge_contract_storage):
     /// use it when an address is fully volatile (no pinned slots) and even its
     /// balance/nonce/code can no longer be trusted.
     pub fn purge_account(&mut self, addr: Address) {
@@ -2850,7 +2785,7 @@ impl EvmCache {
 
     /// Read a single storage slot through the SharedBackend (BlockchainDb -> RPC fallback).
     ///
-    /// After `purge_pool_slots` removes a slot from BlockchainDb, this method fetches
+    /// After `purge_contract_slots` removes a slot from BlockchainDb, this method fetches
     /// fresh data from RPC and caches it in BlockchainDb. Subsequent EVM SLOADs find
     /// the value there without additional RPC calls.
     pub fn read_storage_slot(&mut self, address: Address, slot: U256) -> Result<U256> {
@@ -2980,197 +2915,6 @@ impl EvmCache {
 
         self.restore(baseline_snapshot);
         Ok(None)
-    }
-
-    /// Inject UniswapV2 pool metadata (token0, token1) directly into the EVM storage cache.
-    ///
-    /// This allows subsequent EVM calls to `token0()` and `token1()` to hit the
-    /// local cache instead of fetching from RPC.
-    ///
-    /// # Storage Layout
-    /// In UniswapV2Pair:
-    /// - Slot 6: token0 (address)
-    /// - Slot 7: token1 (address)
-    ///
-    /// # Arguments
-    /// * `pool_address` - The UniswapV2 pair contract address
-    /// * `metadata` - The cached pool metadata containing token0 and token1
-    ///
-    /// # Layering (Phase 3 change)
-    /// As of Phase 3 this writes **through** the dual-layer policy via
-    /// [`apply_updates`](Self::apply_updates) (backend always, overlay-if-present)
-    /// rather than the old overlay-only write. The slot *placement* is normalized;
-    /// the visible `token0()` / `token1()` reads are unchanged. The slot writes are
-    /// now infallible; the `Result` is retained for signature compatibility.
-    #[cfg(feature = "protocols")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "protocols")))]
-    pub fn inject_v2_pool_metadata(
-        &mut self,
-        pool_address: Address,
-        metadata: &V2PoolMetadata,
-    ) -> Result<()> {
-        const TOKEN0_SLOT: U256 = U256::from_limbs([6, 0, 0, 0]);
-        const TOKEN1_SLOT: U256 = U256::from_limbs([7, 0, 0, 0]);
-
-        // Addresses are stored as 20 bytes right-aligned in a 32-byte slot
-        let token0_value = U256::from_be_slice(metadata.token0.as_slice());
-        let token1_value = U256::from_be_slice(metadata.token1.as_slice());
-
-        self.apply_updates(&[
-            StateUpdate::slot(pool_address, TOKEN0_SLOT, token0_value),
-            StateUpdate::slot(pool_address, TOKEN1_SLOT, token1_value),
-        ]);
-
-        Ok(())
-    }
-
-    /// Inject UniswapV3 tickBitmap data directly into the EVM storage cache.
-    ///
-    /// This allows subsequent EVM calls to `tickBitmap(wordPosition)` to hit the
-    /// local cache instead of fetching from RPC.
-    ///
-    /// # Storage Layout
-    /// In UniswapV3Pool, `tickBitmap` is a `mapping(int16 => uint256)` at storage slot 6.
-    /// For a mapping at slot `p`, the value for key `k` is stored at `keccak256(abi.encode(k, p))`.
-    ///
-    /// # Arguments
-    /// * `pool_address` - The UniswapV3 pool contract address
-    /// * `tick_bitmap` - Map of word position (int16) to bitmap value (uint256)
-    ///
-    /// # Layering (Phase 3 change)
-    /// As of Phase 3 this writes **through** the dual-layer policy via
-    /// [`apply_updates`](Self::apply_updates) (backend always, overlay-if-present)
-    /// rather than the old overlay-only write — so the slots now land in the
-    /// BlockchainDb backend (layer 2) too. See `CHANGELOG.md` / `KNOWN_ISSUES.md`.
-    /// The slot writes are now infallible; the `Result` is retained for signature
-    /// compatibility.
-    #[cfg(feature = "protocols")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "protocols")))]
-    pub fn inject_v3_tick_bitmap(
-        &mut self,
-        pool_address: Address,
-        tick_bitmap: &std::collections::HashMap<i16, U256>,
-    ) -> Result<usize> {
-        self.inject_v3_tick_bitmap_with_base(pool_address, tick_bitmap, V3_TICK_BITMAP_BASE_SLOT)
-    }
-
-    /// Inject V3-style tick bitmap data with a custom base slot.
-    ///
-    /// PancakeSwap V3 uses base slot 7 instead of Uniswap V3's slot 6.
-    #[cfg(feature = "protocols")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "protocols")))]
-    pub fn inject_v3_tick_bitmap_with_base(
-        &mut self,
-        pool_address: Address,
-        tick_bitmap: &std::collections::HashMap<i16, U256>,
-        base_slot: U256,
-    ) -> Result<usize> {
-        let mut updates = Vec::with_capacity(tick_bitmap.len());
-        for (&word_position, &bitmap_value) in tick_bitmap {
-            let word_position_i256 = i256_from_i16(word_position);
-            let mut slot_preimage = [0u8; 64];
-            slot_preimage[..32].copy_from_slice(&word_position_i256);
-            slot_preimage[32..64].copy_from_slice(&base_slot.to_be_bytes::<32>());
-            let storage_slot: U256 = keccak256(slot_preimage).into();
-            updates.push(StateUpdate::slot(pool_address, storage_slot, bitmap_value));
-        }
-        let injected = updates.len();
-        self.apply_updates(&updates);
-        Ok(injected)
-    }
-
-    /// Inject UniswapV3 tick info data directly into the EVM storage cache.
-    ///
-    /// This allows subsequent EVM calls to `ticks(tick)` to partially hit the
-    /// local cache instead of fetching all data from RPC.
-    ///
-    /// # Storage Layout
-    /// In UniswapV3Pool, `ticks` is a `mapping(int24 => Tick.Info)` at storage slot 5.
-    /// `Tick.Info` is a struct that spans 4 storage slots:
-    ///
-    /// - Slot +0: `liquidityGross` (u128, bits 0-127) | `liquidityNet` (i128, bits 128-255)
-    /// - Slot +1: `feeGrowthOutside0X128` (u256)
-    /// - Slot +2: `feeGrowthOutside1X128` (u256)
-    /// - Slot +3: packed (`tickCumulativeOutside`, `secondsPerLiquidityOutsideX128`,
-    ///   `secondsOutside`, `initialized`)
-    ///
-    /// We inject slot 0 (liquidityGross + liquidityNet) and slot 3 (initialized flag).
-    /// Slot 0 covers the most critical data used in swap simulation.
-    /// Slot 3 contains the `initialized` flag which determines whether a tick
-    /// is processed during swap execution -- stale values from Layer 2 can cause
-    /// ticks to be erroneously skipped or processed.
-    ///
-    /// # Arguments
-    /// * `pool_address` - The UniswapV3 pool contract address
-    /// * `ticks` - Map of tick index (int24) to tick info
-    ///
-    /// # Layering (Phase 3 change)
-    /// As of Phase 3 this writes **through** the dual-layer policy via
-    /// [`apply_updates`](Self::apply_updates) (backend always, overlay-if-present)
-    /// rather than the old overlay-only write. See `CHANGELOG.md` /
-    /// `KNOWN_ISSUES.md`. The slot writes are now infallible; the `Result` is
-    /// retained for signature compatibility.
-    #[cfg(feature = "protocols")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "protocols")))]
-    pub fn inject_v3_ticks(
-        &mut self,
-        pool_address: Address,
-        ticks: &std::collections::HashMap<i32, TickInfo>,
-    ) -> Result<usize> {
-        self.inject_v3_ticks_with_base(pool_address, ticks, V3_TICKS_BASE_SLOT)
-    }
-
-    /// Inject V3-style tick info data with a custom ticks mapping slot.
-    ///
-    /// PancakeSwap V3 uses ticks at slot 6 instead of Uniswap V3's slot 5.
-    #[cfg(feature = "protocols")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "protocols")))]
-    pub fn inject_v3_ticks_with_base(
-        &mut self,
-        pool_address: Address,
-        ticks: &std::collections::HashMap<i32, TickInfo>,
-        ticks_slot: U256,
-    ) -> Result<usize> {
-        let mut updates = Vec::with_capacity(ticks.len() * 2);
-        for (&tick, info) in ticks {
-            let tick_i256 = i256_from_i24(tick);
-            let mut slot_preimage = [0u8; 64];
-            slot_preimage[..32].copy_from_slice(&tick_i256);
-            slot_preimage[32..64].copy_from_slice(&ticks_slot.to_be_bytes::<32>());
-
-            let base_slot: U256 = keccak256(slot_preimage).into();
-
-            // Pack liquidityGross and liquidityNet into slot 0
-            // Solidity packing: liquidityGross in lower 128 bits, liquidityNet in upper 128 bits
-            let liquidity_gross_u256 = U256::from(info.liquidity_gross);
-            let liquidity_net_u256 = i128_to_u256(info.liquidity_net);
-            let packed_slot0 = liquidity_gross_u256 | (liquidity_net_u256 << 128);
-
-            updates.push(StateUpdate::slot(pool_address, base_slot, packed_slot0));
-
-            // Also inject slot 3 with the `initialized` flag.
-            // Slot 3 layout: packed (tickCumulativeOutside, secondsPerLiquidityOutsideX128,
-            //                        secondsOutside, initialized)
-            // The `initialized` flag is in the highest byte (bit 248+).
-            // We only set the initialized flag; the other fields in slot 3 are
-            // not used by swap simulation, but without this injection the EVM
-            // would read stale values from Layer 2 (evm_state.bin).
-            let slot3 = base_slot + U256::from(3);
-            let initialized_value = if info.initialized {
-                // initialized is a bool packed at byte offset 31 (rightmost byte of the
-                // last field in the packed struct). In the actual Solidity layout it's at
-                // a higher bit position, but the key thing is we need the bit set.
-                // Actual layout: initialized is at byte 31 of the packed word.
-                U256::from(1u64) << 248
-            } else {
-                U256::ZERO
-            };
-            updates.push(StateUpdate::slot(pool_address, slot3, initialized_value));
-        }
-
-        let injected = ticks.len();
-        self.apply_updates(&updates);
-        Ok(injected)
     }
 
     /// Execute a call with automatic account/storage fetching.
@@ -3381,53 +3125,32 @@ impl EvmCache {
         }
     }
 
-    /// Get a reference to the immutable data cache (token decimals and pool
-    /// metadata that never change for a given contract).
+    /// Get a reference to the immutable data cache (token decimals).
     pub fn immutable_cache(&self) -> &ImmutableDataCache {
         &self.immutable_cache
     }
 
     /// Get a mutable reference to the immutable data cache.
     ///
-    /// Use this to pre-populate token decimals or pool metadata that would
-    /// otherwise be discovered lazily. Entries are persisted on the next
-    /// [`flush`](Self::flush) (and on drop) when a [`CacheConfig`] is set.
+    /// Use this to pre-populate token decimals that would otherwise be discovered
+    /// lazily. Entries are persisted on the next [`flush`](Self::flush) (and on
+    /// drop) when a [`CacheConfig`] is set.
     pub fn immutable_cache_mut(&mut self) -> &mut ImmutableDataCache {
         &mut self.immutable_cache
     }
 
-    /// Get a reference to the V3 pool tick snapshot cache (per-pool
-    /// `tick_bitmap`, `ticks`, and liquidity used for liquidity validation).
-    #[cfg(feature = "protocols")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "protocols")))]
-    pub fn tick_snapshot_cache(&self) -> &V3TickSnapshotCache {
-        &self.tick_snapshot_cache
-    }
-
-    /// Get a mutable reference to the V3 pool tick snapshot cache.
-    ///
-    /// Use this to insert or update tick snapshots. Entries are persisted on
-    /// the next [`flush`](Self::flush) (and on drop) when a [`CacheConfig`] is
-    /// set.
-    #[cfg(feature = "protocols")]
-    #[cfg_attr(docsrs, doc(cfg(feature = "protocols")))]
-    pub fn tick_snapshot_cache_mut(&mut self) -> &mut V3TickSnapshotCache {
-        &mut self.tick_snapshot_cache
-    }
-
-    /// Check if a pool has storage slots pre-loaded in the BlockchainDb.
+    /// Check if an address has storage slots pre-loaded in the BlockchainDb.
     ///
     /// This is useful to determine if we loaded the EVM state from the unified
-    /// `evm_state.bin` cache and the pool's tick data is already in storage.
-    /// If true, we can skip expensive tick injection when liquidity hasn't changed.
+    /// `evm_state.bin` cache and an address already has reusable storage.
     ///
     /// # Arguments
-    /// * `address` - The pool contract address to check
+    /// * `address` - The contract address to check
     ///
     /// # Returns
-    /// `true` if the pool has any storage slots in the underlying BlockchainDb,
+    /// `true` if the address has any storage slots in the underlying BlockchainDb,
     /// `false` otherwise
-    pub fn has_pool_storage(&self, address: Address) -> bool {
+    pub fn has_contract_storage(&self, address: Address) -> bool {
         let storage = self.blockchain_db.storage().read();
         storage
             .get(&address)
@@ -3435,10 +3158,10 @@ impl EvmCache {
             .unwrap_or(false)
     }
 
-    /// Get the number of storage slots loaded for a pool.
+    /// Get the number of storage slots loaded for a contract address.
     ///
     /// Useful for debugging and logging to understand cache state.
-    pub fn pool_storage_slot_count(&self, address: Address) -> usize {
+    pub fn contract_storage_slot_count(&self, address: Address) -> usize {
         let storage = self.blockchain_db.storage().read();
         storage.get(&address).map(|slots| slots.len()).unwrap_or(0)
     }
@@ -3521,7 +3244,7 @@ impl EvmCache {
         self.shared_memory_capacity
     }
 
-    /// Purge all storage slots for a specific pool from both cache layers.
+    /// Purge all storage slots for a specific contract from both cache layers.
     ///
     /// This clears:
     /// 1. **CacheDB overlay** (`self.db.cache.accounts[addr].storage`) - the in-memory
@@ -3531,9 +3254,9 @@ impl EvmCache {
     /// 2. **BlockchainDb backend** (`self.blockchain_db.storage()`) - the persistent
     ///    layer that caches RPC responses and is loaded from `evm_state.bin`.
     ///
-    /// After purging both layers, the next EVM read for this pool's storage will
+    /// After purging both layers, the next EVM read for this contract's storage will
     /// go all the way to the RPC for fresh data.
-    pub fn purge_pool_storage(&mut self, address: Address) -> usize {
+    pub fn purge_contract_storage(&mut self, address: Address) -> usize {
         // Thin wrapper over the unified purge primitive; returns the backend slot
         // count the `AllStorage` scope removed.
         self.apply_update(&StateUpdate::purge(address, PurgeScope::AllStorage))
@@ -3546,7 +3269,7 @@ impl EvmCache {
     /// `AllStorage`-scope purge layer logic. Clears the overlay storage for
     /// `address` and removes its backend storage map. Returns the number of
     /// backend slots removed.
-    fn purge_pool_storage_inner(&mut self, address: Address) -> usize {
+    fn purge_contract_storage_inner(&mut self, address: Address) -> usize {
         // Layer 1: Clear CacheDB overlay
         let cache_db_cleared = if let Some(db_account) = self.db.cache.accounts.get_mut(&address) {
             let count = db_account.storage.len();
@@ -3568,10 +3291,10 @@ impl EvmCache {
 
         if cache_db_cleared > 0 || backend_cleared > 0 {
             debug!(
-                pool = %address,
+                contract = %address,
                 cache_db_slots = cache_db_cleared,
                 backend_slots = backend_cleared,
-                "purged pool storage from both cache layers"
+                "purged contract storage from both cache layers"
             );
         }
 
@@ -3580,16 +3303,14 @@ impl EvmCache {
         backend_cleared
     }
 
-    /// Purge specific storage slots for a pool from both cache layers.
+    /// Purge specific storage slots for a contract from both cache layers.
     ///
-    /// Unlike `purge_pool_storage()` which removes ALL storage, this only removes
-    /// the specified slots. This is critical for performance: V3 pools may have
-    /// hundreds of tick data slots that are expensive to re-fetch. When we only
-    /// need fresh slot0/liquidity values, we can purge just those 2 slots and
-    /// preserve the tick data.
+    /// Unlike `purge_contract_storage()` which removes ALL storage, this only removes
+    /// the specified slots. This is useful when only a narrow subset of hot storage
+    /// became stale and the rest of the contract's cached storage should be kept.
     ///
     /// Returns the number of slots removed from the BlockchainDb backend.
-    pub fn purge_pool_slots(&mut self, address: Address, slots: &[U256]) -> usize {
+    pub fn purge_contract_slots(&mut self, address: Address, slots: &[U256]) -> usize {
         // Thin wrapper over the unified purge primitive; returns the backend slot
         // count the `Slots` scope removed.
         self.apply_update(&StateUpdate::purge(
@@ -3604,7 +3325,7 @@ impl EvmCache {
 
     /// `Slots`-scope purge layer logic. Removes the listed slots from the overlay
     /// and the backend storage map. Returns the number of backend slots removed.
-    fn purge_pool_slots_inner(&mut self, address: Address, slots: &[U256]) -> usize {
+    fn purge_contract_slots_inner(&mut self, address: Address, slots: &[U256]) -> usize {
         let mut cache_db_removed = 0usize;
         let mut backend_removed = 0usize;
 
@@ -3631,11 +3352,11 @@ impl EvmCache {
 
         if cache_db_removed > 0 || backend_removed > 0 {
             trace!(
-                pool = %address,
+                contract = %address,
                 requested = slots.len(),
                 cache_db_removed,
                 backend_removed,
-                "selectively purged pool storage slots from both cache layers"
+                "selectively purged contract storage slots from both cache layers"
             );
         }
 
@@ -3647,7 +3368,7 @@ impl EvmCache {
 
     /// Purge storage slots for multiple contracts from both cache layers.
     ///
-    /// See `purge_pool_storage()` for details on what each layer contains.
+    /// See `purge_contract_storage()` for details on what each layer contains.
     pub fn purge_contracts_storage(
         &mut self,
         addresses: impl IntoIterator<Item = Address>,
@@ -3777,10 +3498,10 @@ impl EvmCache {
         addrs.into_iter().collect()
     }
 
-    /// Get the number of storage slots in the CacheDB overlay for a pool.
+    /// Get the number of storage slots in the CacheDB overlay for a contract.
     ///
-    /// This is useful for diagnostics - if a pool has slots in the CacheDB overlay,
-    /// they will be served on EVM reads without going to the backend.
+    /// This is useful for diagnostics: if a contract has slots in the CacheDB
+    /// overlay, they will be served on EVM reads without going to the backend.
     pub fn cache_db_storage_slot_count(&self, address: Address) -> usize {
         self.db
             .cache
@@ -4447,48 +4168,6 @@ impl Drop for EvmCache {
     }
 }
 
-/// Extract an EIP-2930 access list from the EVM journaled state.
-///
-/// After a transaction executes, `journaled_state.state` contains all accounts
-/// and storage slots that were touched. This converts them into an `AccessList`
-/// suitable for inclusion in a transaction, ensuring all accessed storage is warm.
-fn extract_access_list(state: &revm::state::EvmState) -> AccessList {
-    let items: Vec<AccessListItem> = state
-        .iter()
-        .filter(|(_, account)| account.is_touched())
-        .map(|(address, account)| AccessListItem {
-            address: *address,
-            storage_keys: account
-                .storage
-                .keys()
-                .map(|slot| B256::from(*slot))
-                .collect(),
-        })
-        .collect();
-    AccessList(items)
-}
-
-fn merge_access_lists(access_lists: impl IntoIterator<Item = AccessList>) -> AccessList {
-    let mut merged: Vec<AccessListItem> = Vec::new();
-    for access_list in access_lists {
-        for item in access_list.0 {
-            if let Some(existing) = merged
-                .iter_mut()
-                .find(|existing| existing.address == item.address)
-            {
-                for key in item.storage_keys {
-                    if !existing.storage_keys.contains(&key) {
-                        existing.storage_keys.push(key);
-                    }
-                }
-            } else {
-                merged.push(item);
-            }
-        }
-    }
-    AccessList(merged)
-}
-
 #[cfg(test)]
 mod shared_memory_capacity_tests {
     use super::SharedMemoryCapacity as Cap;
@@ -4518,413 +4197,10 @@ mod shared_memory_capacity_tests {
     }
 }
 
-#[cfg(all(test, feature = "protocols"))]
-mod tests {
-    use super::*;
-    use storage_keys::{i128_to_u256, i256_from_i16, i256_from_i24};
-
-    #[test]
-    fn test_i256_from_i16_positive() {
-        let result = i256_from_i16(1);
-        // Should be 31 zero bytes followed by 0x0001
-        assert_eq!(result[0..30], [0u8; 30]);
-        assert_eq!(result[30], 0x00);
-        assert_eq!(result[31], 0x01);
-    }
-
-    #[test]
-    fn test_i256_from_i16_negative() {
-        let result = i256_from_i16(-1);
-        // Should be 30 0xFF bytes followed by 0xFFFF
-        assert_eq!(result[0..30], [0xFF; 30]);
-        assert_eq!(result[30], 0xFF);
-        assert_eq!(result[31], 0xFF);
-    }
-
-    #[test]
-    fn test_i256_from_i16_zero() {
-        let result = i256_from_i16(0);
-        assert_eq!(result, [0u8; 32]);
-    }
-
-    #[test]
-    fn test_i256_from_i16_max() {
-        let result = i256_from_i16(i16::MAX); // 32767 = 0x7FFF
-        assert_eq!(result[0..30], [0u8; 30]);
-        assert_eq!(result[30], 0x7F);
-        assert_eq!(result[31], 0xFF);
-    }
-
-    #[test]
-    fn test_i256_from_i16_min() {
-        let result = i256_from_i16(i16::MIN); // -32768 = 0x8000
-        assert_eq!(result[0..30], [0xFF; 30]);
-        assert_eq!(result[30], 0x80);
-        assert_eq!(result[31], 0x00);
-    }
-
-    #[test]
-    fn test_tick_bitmap_storage_slot_calculation() {
-        // This test verifies our storage slot calculation matches Solidity's behavior.
-        // In Solidity: mapping(int16 => uint256) tickBitmap at slot 6
-        // Storage slot = keccak256(abi.encode(wordPosition, 6))
-        //
-        // For wordPosition = 0:
-        // abi.encode(int256(0), uint256(6)) =
-        //   0x0000...0000 (32 bytes for 0) ++ 0x0000...0006 (32 bytes for 6)
-        // keccak256 of that gives the storage slot
-
-        const TICK_BITMAP_SLOT: U256 = U256::from_limbs([6, 0, 0, 0]);
-
-        // Test word position 0
-        let word_pos: i16 = 0;
-        let word_position_i256 = i256_from_i16(word_pos);
-
-        let mut slot_preimage = [0u8; 64];
-        slot_preimage[..32].copy_from_slice(&word_position_i256);
-        slot_preimage[32..64].copy_from_slice(&TICK_BITMAP_SLOT.to_be_bytes::<32>());
-
-        let storage_slot: U256 = keccak256(slot_preimage).into();
-
-        // The slot should be a valid keccak256 hash (non-zero, 256 bits)
-        assert!(storage_slot != U256::ZERO);
-
-        // Verify the preimage is correctly formed
-        assert_eq!(&slot_preimage[..32], &[0u8; 32]); // word position 0
-        assert_eq!(slot_preimage[63], 6); // slot 6 in last byte
-        assert_eq!(&slot_preimage[32..63], &[0u8; 31]); // rest of slot is zeros
-    }
-
-    #[test]
-    fn test_tick_bitmap_storage_slot_negative_word() {
-        // Test with negative word position to ensure sign extension works
-        const TICK_BITMAP_SLOT: U256 = U256::from_limbs([6, 0, 0, 0]);
-
-        let word_pos: i16 = -1;
-        let word_position_i256 = i256_from_i16(word_pos);
-
-        let mut slot_preimage = [0u8; 64];
-        slot_preimage[..32].copy_from_slice(&word_position_i256);
-        slot_preimage[32..64].copy_from_slice(&TICK_BITMAP_SLOT.to_be_bytes::<32>());
-
-        let storage_slot: U256 = keccak256(slot_preimage).into();
-
-        // Should produce a valid slot
-        assert!(storage_slot != U256::ZERO);
-
-        // Verify the preimage has sign-extended -1
-        assert_eq!(&slot_preimage[..32], &[0xFF; 32]); // -1 sign-extended
-    }
-
-    #[test]
-    fn test_different_word_positions_give_different_slots() {
-        const TICK_BITMAP_SLOT: U256 = U256::from_limbs([6, 0, 0, 0]);
-
-        let calc_slot = |word_pos: i16| -> U256 {
-            let word_position_i256 = i256_from_i16(word_pos);
-            let mut slot_preimage = [0u8; 64];
-            slot_preimage[..32].copy_from_slice(&word_position_i256);
-            slot_preimage[32..64].copy_from_slice(&TICK_BITMAP_SLOT.to_be_bytes::<32>());
-            keccak256(slot_preimage).into()
-        };
-
-        let slot_0 = calc_slot(0);
-        let slot_1 = calc_slot(1);
-        let slot_neg1 = calc_slot(-1);
-        let slot_100 = calc_slot(100);
-
-        // All should be different
-        assert_ne!(slot_0, slot_1);
-        assert_ne!(slot_0, slot_neg1);
-        assert_ne!(slot_0, slot_100);
-        assert_ne!(slot_1, slot_neg1);
-        assert_ne!(slot_1, slot_100);
-        assert_ne!(slot_neg1, slot_100);
-    }
-
-    // ==================== i256_from_i24 tests ====================
-
-    #[test]
-    fn test_i256_from_i24_zero() {
-        let result = i256_from_i24(0);
-        assert_eq!(result, [0u8; 32]);
-    }
-
-    #[test]
-    fn test_i256_from_i24_positive() {
-        let result = i256_from_i24(1);
-        assert_eq!(result[0..31], [0u8; 31]);
-        assert_eq!(result[31], 0x01);
-    }
-
-    #[test]
-    fn test_i256_from_i24_negative_one() {
-        // -1 in 24-bit two's complement is 0xFFFFFF
-        let result = i256_from_i24(-1);
-        // Should be sign-extended: 29 0xFF bytes followed by 0xFFFFFF
-        assert_eq!(result[0..29], [0xFF; 29]);
-        assert_eq!(result[29], 0xFF);
-        assert_eq!(result[30], 0xFF);
-        assert_eq!(result[31], 0xFF);
-    }
-
-    #[test]
-    fn test_i256_from_i24_max_positive() {
-        // Max int24 is 8388607 = 0x7FFFFF
-        let max_i24: i32 = 0x7FFFFF;
-        let result = i256_from_i24(max_i24);
-        assert_eq!(result[0..29], [0u8; 29]);
-        assert_eq!(result[29], 0x7F);
-        assert_eq!(result[30], 0xFF);
-        assert_eq!(result[31], 0xFF);
-    }
-
-    #[test]
-    fn test_i256_from_i24_min_negative() {
-        // Min int24 is -8388608 = 0x800000 (as 24-bit signed)
-        let min_i24: i32 = -8388608;
-        let result = i256_from_i24(min_i24);
-        // Should be sign-extended with 0xFF
-        assert_eq!(result[0..29], [0xFF; 29]);
-        assert_eq!(result[29], 0x80);
-        assert_eq!(result[30], 0x00);
-        assert_eq!(result[31], 0x00);
-    }
-
-    #[test]
-    fn test_i256_from_i24_typical_tick_positive() {
-        // Test a typical positive tick value (e.g., 1000)
-        let tick: i32 = 1000; // 0x0003E8
-        let result = i256_from_i24(tick);
-        assert_eq!(result[0..30], [0u8; 30]);
-        assert_eq!(result[30], 0x03);
-        assert_eq!(result[31], 0xE8);
-    }
-
-    #[test]
-    fn test_i256_from_i24_typical_tick_negative() {
-        // Test a typical negative tick value (e.g., -1000)
-        // -1000 in 24-bit two's complement: 0xFFFC18
-        let tick: i32 = -1000;
-        let result = i256_from_i24(tick);
-        assert_eq!(result[0..29], [0xFF; 29]);
-        assert_eq!(result[29], 0xFF);
-        assert_eq!(result[30], 0xFC);
-        assert_eq!(result[31], 0x18);
-    }
-
-    // ==================== i128_to_u256 tests ====================
-
-    #[test]
-    fn test_i128_to_u256_positive() {
-        let result = i128_to_u256(12345);
-        assert_eq!(result, U256::from(12345u128));
-    }
-
-    #[test]
-    fn test_i128_to_u256_zero() {
-        let result = i128_to_u256(0);
-        assert_eq!(result, U256::ZERO);
-    }
-
-    #[test]
-    fn test_i128_to_u256_negative_one() {
-        // -1 in two's complement u128 is all 1s
-        let result = i128_to_u256(-1);
-        // Lower 128 bits should be all 1s
-        let expected = U256::from(u128::MAX);
-        assert_eq!(result, expected);
-    }
-
-    #[test]
-    fn test_i128_to_u256_negative() {
-        // -100 should give us the two's complement representation
-        let result = i128_to_u256(-100);
-        let expected = U256::from((-100i128) as u128);
-        assert_eq!(result, expected);
-    }
-
-    #[test]
-    fn test_i128_to_u256_max() {
-        let result = i128_to_u256(i128::MAX);
-        assert_eq!(result, U256::from(i128::MAX as u128));
-    }
-
-    #[test]
-    fn test_i128_to_u256_min() {
-        let result = i128_to_u256(i128::MIN);
-        // i128::MIN as u128 = 0x8000...0000
-        assert_eq!(result, U256::from(i128::MIN as u128));
-    }
-
-    // ==================== Tick storage slot tests ====================
-
-    #[test]
-    fn test_tick_info_packing() {
-        // Test that liquidityGross and liquidityNet are packed correctly
-        let liquidity_gross: u128 = 1_000_000_000;
-        let liquidity_net: i128 = -500_000_000;
-
-        let liquidity_gross_u256 = U256::from(liquidity_gross);
-        let liquidity_net_u256 = i128_to_u256(liquidity_net);
-        let packed = liquidity_gross_u256 | (liquidity_net_u256 << 128);
-
-        // Extract and verify
-        let extracted_gross = packed & U256::from(u128::MAX);
-        let extracted_net_u256 = packed >> 128;
-
-        assert_eq!(extracted_gross, U256::from(liquidity_gross));
-        assert_eq!(extracted_net_u256, liquidity_net_u256);
-    }
-
-    #[test]
-    fn test_tick_storage_slot_calculation() {
-        const TICKS_SLOT: U256 = U256::from_limbs([5, 0, 0, 0]);
-
-        // Test tick 0
-        let tick: i32 = 0;
-        let tick_i256 = i256_from_i24(tick);
-
-        let mut slot_preimage = [0u8; 64];
-        slot_preimage[..32].copy_from_slice(&tick_i256);
-        slot_preimage[32..64].copy_from_slice(&TICKS_SLOT.to_be_bytes::<32>());
-
-        let storage_slot: U256 = keccak256(slot_preimage).into();
-
-        // Should produce a valid slot
-        assert!(storage_slot != U256::ZERO);
-
-        // Verify preimage
-        assert_eq!(&slot_preimage[..32], &[0u8; 32]); // tick 0
-        assert_eq!(slot_preimage[63], 5); // slot 5
-    }
-
-    #[test]
-    fn test_different_ticks_give_different_slots() {
-        const TICKS_SLOT: U256 = U256::from_limbs([5, 0, 0, 0]);
-
-        let calc_slot = |tick: i32| -> U256 {
-            let tick_i256 = i256_from_i24(tick);
-            let mut slot_preimage = [0u8; 64];
-            slot_preimage[..32].copy_from_slice(&tick_i256);
-            slot_preimage[32..64].copy_from_slice(&TICKS_SLOT.to_be_bytes::<32>());
-            keccak256(slot_preimage).into()
-        };
-
-        let slot_0 = calc_slot(0);
-        let slot_60 = calc_slot(60);
-        let slot_neg60 = calc_slot(-60);
-        let slot_887272 = calc_slot(887272); // MAX_TICK
-
-        // All should be different
-        assert_ne!(slot_0, slot_60);
-        assert_ne!(slot_0, slot_neg60);
-        assert_ne!(slot_0, slot_887272);
-        assert_ne!(slot_60, slot_neg60);
-    }
-
-    // -- PancakeSwap V3 storage slot tests --
-
-    #[test]
-    fn test_pancake_v3_constants_correct_values() {
-        // PancakeSwap V3 slots are shifted +1 from Uniswap V3
-        assert_eq!(V3_LIQUIDITY_SLOT, U256::from(4));
-        assert_eq!(PANCAKE_V3_LIQUIDITY_SLOT, U256::from(5));
-
-        assert_eq!(V3_TICKS_BASE_SLOT, U256::from(5));
-        assert_eq!(PANCAKE_V3_TICKS_BASE_SLOT, U256::from(6));
-
-        assert_eq!(V3_TICK_BITMAP_BASE_SLOT, U256::from(6));
-        assert_eq!(PANCAKE_V3_TICK_BITMAP_BASE_SLOT, U256::from(7));
-    }
-
-    #[test]
-    fn test_tick_bitmap_with_base_matches_original_for_uniswap() {
-        // v3_tick_bitmap_storage_key_with_base using Uniswap base slot should
-        // produce identical results to v3_tick_bitmap_storage_key
-        for word_pos in [-100i16, -1, 0, 1, 42, 100] {
-            let original = v3_tick_bitmap_storage_key(word_pos);
-            let with_base =
-                v3_tick_bitmap_storage_key_with_base(word_pos, V3_TICK_BITMAP_BASE_SLOT);
-            assert_eq!(
-                original, with_base,
-                "with_base should match original for word_pos={word_pos}"
-            );
-        }
-    }
-
-    #[test]
-    fn test_tick_bitmap_pancake_differs_from_uniswap() {
-        // PancakeSwap base slot 7 must produce different keys than Uniswap slot 6
-        for word_pos in [-1i16, 0, 1, 42] {
-            let uniswap = v3_tick_bitmap_storage_key(word_pos);
-            let pancake =
-                v3_tick_bitmap_storage_key_with_base(word_pos, PANCAKE_V3_TICK_BITMAP_BASE_SLOT);
-            assert_ne!(
-                uniswap, pancake,
-                "PancakeSwap bitmap key should differ from Uniswap for word_pos={word_pos}"
-            );
-        }
-    }
-
-    #[test]
-    fn test_tick_info_with_base_matches_original_for_uniswap() {
-        // v3_tick_info_storage_keys_with_base using Uniswap base slot should
-        // produce identical results to v3_tick_info_storage_keys
-        for tick in [-887_272i32, -1000, 0, 1000, 887_272] {
-            let original = v3_tick_info_storage_keys(tick);
-            let with_base = v3_tick_info_storage_keys_with_base(tick, V3_TICKS_BASE_SLOT);
-            assert_eq!(
-                original, with_base,
-                "with_base should match original for tick={tick}"
-            );
-        }
-    }
-
-    #[test]
-    fn test_tick_info_pancake_differs_from_uniswap() {
-        // PancakeSwap ticks base slot 6 must produce different keys than Uniswap slot 5
-        for tick in [-1000i32, 0, 1000] {
-            let uniswap = v3_tick_info_storage_keys(tick);
-            let pancake = v3_tick_info_storage_keys_with_base(tick, PANCAKE_V3_TICKS_BASE_SLOT);
-            for i in 0..4 {
-                assert_ne!(
-                    uniswap[i], pancake[i],
-                    "PancakeSwap tick info key[{i}] should differ from Uniswap for tick={tick}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn test_tick_info_with_base_keys_are_sequential() {
-        // The 4 keys returned should be consecutive (base, base+1, base+2, base+3)
-        let keys = v3_tick_info_storage_keys_with_base(500, PANCAKE_V3_TICKS_BASE_SLOT);
-        assert_eq!(keys[1], keys[0] + U256::from(1));
-        assert_eq!(keys[2], keys[0] + U256::from(2));
-        assert_eq!(keys[3], keys[0] + U256::from(3));
-    }
-}
-
-/// Tests that exercise only the generic (protocol-independent) engine, so they
-/// run under `--no-default-features` too. The protocol-gated unit tests live in
-/// the `tests` module above, which is `#[cfg(feature = "protocols")]`.
+/// Tests that exercise the generic cache engine.
 #[cfg(test)]
 mod core_tests {
     use super::*;
-
-    // ==================== V2 pool metadata injection tests ====================
-
-    #[test]
-    fn test_v2_pool_metadata_storage_slots() {
-        // Verify the storage slot constants match UniswapV2Pair layout
-        const TOKEN0_SLOT: U256 = U256::from_limbs([6, 0, 0, 0]);
-        const TOKEN1_SLOT: U256 = U256::from_limbs([7, 0, 0, 0]);
-
-        // Slots should be sequential starting at 6
-        assert_eq!(TOKEN0_SLOT, U256::from(6));
-        assert_eq!(TOKEN1_SLOT, U256::from(7));
-    }
 
     #[test]
     fn test_address_to_u256_conversion() {
@@ -4940,36 +4216,6 @@ mod core_tests {
 
         // Last 20 bytes should be the address
         assert_eq!(&bytes[12..], addr.as_slice());
-    }
-
-    #[test]
-    fn test_v2_metadata_address_values() {
-        // Test specific address encoding
-        let token0 = Address::repeat_byte(0x11);
-        let token1 = Address::repeat_byte(0x22);
-
-        let metadata = V2PoolMetadata {
-            token0,
-            token1,
-            last_block_timestamp: 0,
-        };
-
-        let token0_value = U256::from_be_slice(metadata.token0.as_slice());
-        let token1_value = U256::from_be_slice(metadata.token1.as_slice());
-
-        // Values should be different
-        assert_ne!(token0_value, token1_value);
-
-        // Each should be non-zero
-        assert_ne!(token0_value, U256::ZERO);
-        assert_ne!(token1_value, U256::ZERO);
-
-        // Verify round-trip: extract address bytes back
-        let token0_bytes = token0_value.to_be_bytes::<32>();
-        let token1_bytes = token1_value.to_be_bytes::<32>();
-
-        assert_eq!(&token0_bytes[12..], token0.as_slice());
-        assert_eq!(&token1_bytes[12..], token1.as_slice());
     }
 
     // ==================== block context tests ====================

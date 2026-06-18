@@ -25,8 +25,6 @@ pass **all** of them. Run them locally before pushing:
 ```sh
 cargo fmt --all --check
 cargo clippy --all-targets --no-deps -- -D warnings
-# The generic engine must also build and lint cleanly without the protocols feature:
-cargo clippy --lib --no-default-features --no-deps -- -D warnings
 cargo test
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
 ```
@@ -36,7 +34,6 @@ A convenience one-liner:
 ```sh
 cargo fmt --all --check && \
 cargo clippy --all-targets --no-deps -- -D warnings && \
-cargo clippy --lib --no-default-features --no-deps -- -D warnings && \
 cargo test && \
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
 ```
@@ -48,15 +45,13 @@ dedicated CI job (`cargo check --lib --locked` on 1.88). Do not use std APIs
 newer than 1.88 in the library. Dev-only code (examples, benches, tests) is not
 MSRV-constrained.
 
-### Feature configurations
+### Crate boundary
 
-The `protocols` feature (default on) gates DeFi protocol knowledge. The generic
-simulation engine must compile and lint with `--no-default-features`. Any new
-DeFi-specific surface (protocol storage layouts, pool injection) must be gated
-behind `protocols`; generic machinery stays always-on. When you add a public
-item behind `#[cfg(feature = "protocols")]`, also add
-`#[cfg_attr(docsrs, doc(cfg(feature = "protocols")))]` so docs.rs renders the
-feature badge.
+Keep this crate focused on the generic EVM simulation engine: cache mechanics,
+snapshots/overlays, freshness, access lists, revert decoding, ERC-20 helpers,
+multicall, deployment, and event-pipeline primitives. Protocol-specific storage
+layouts, AMM state, and DeFi adapters belong in `evm-amm-state` or downstream
+applications.
 
 ## Tests, benchmarks, and examples
 

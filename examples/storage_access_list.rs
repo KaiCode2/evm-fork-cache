@@ -16,25 +16,25 @@ use alloy_primitives::{Address, U256};
 use evm_fork_cache::StorageAccessList;
 
 fn main() {
-    let pool = Address::repeat_byte(0xAA);
+    let contract = Address::repeat_byte(0xAA);
     let token = Address::repeat_byte(0xBB);
 
-    // First simulation touches the pool's slot0 and liquidity slots.
+    // First simulation touches two slots on a hot contract.
     let mut first = StorageAccessList::default();
-    first.accounts.insert(pool);
-    first.slots.insert((pool, U256::from(0))); // slot0
-    first.slots.insert((pool, U256::from(4))); // liquidity
+    first.accounts.insert(contract);
+    first.slots.insert((contract, U256::from(0)));
+    first.slots.insert((contract, U256::from(4)));
     println!(
         "first sim: {} accounts, {} slots",
         first.account_count(),
         first.slot_count()
     );
 
-    // Second simulation re-touches the pool and additionally reads a token balance.
+    // Second simulation re-touches the contract and additionally reads a token balance.
     let mut second = StorageAccessList::default();
-    second.accounts.insert(pool);
+    second.accounts.insert(contract);
     second.accounts.insert(token);
-    second.slots.insert((pool, U256::from(0))); // slot0 again (overlaps)
+    second.slots.insert((contract, U256::from(0))); // overlaps with first
     second.slots.insert((token, U256::from(3))); // a balance slot
 
     // If `second` runs after `first` has warmed state, the overlap is cheaper

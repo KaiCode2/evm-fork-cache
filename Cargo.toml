@@ -4,32 +4,16 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT OR Apache-2.0"
-description = "Forked EVM state cache, snapshots, overlays, and simulation utilities for DeFi search"
+description = "Forked EVM state cache, snapshots, overlays, and simulation utilities for EVM search"
 keywords = ["evm", "revm", "defi", "simulation", "ethereum"]
 categories = ["cryptography::cryptocurrencies", "simulation", "caching"]
 readme = "README.md"
 repository = "https://github.com/KaiCode2/evm-fork-cache"
 documentation = "https://docs.rs/evm-fork-cache"
 
-# Build docs.rs with every feature enabled so the `protocols` surface is
-# documented, and pass `--cfg docsrs` so feature-gated items render an
-# "available on crate feature X" badge (see `#![cfg_attr(docsrs, feature(doc_cfg))]`
-# in lib.rs). `docsrs` is only set on docs.rs and never affects local/CI builds.
-[package.metadata.docs.rs]
-all-features = true
-rustdoc-args = ["--cfg", "docsrs"]
-
 # Standalone workspace root: keeps this crate from being absorbed by any
 # ancestor-directory workspace and gives it its own Cargo.lock.
 [workspace]
-
-[features]
-# `protocols` gates DeFi protocol knowledge (Uniswap V2/V3-style storage layouts,
-# V3 tick snapshots, and the `inject_v3_*` / `inject_v2_pool_metadata` helpers).
-# On by default; build with `--no-default-features` for the generic engine alone.
-# This surface is slated to move into the `evm-amm-state` crate.
-default = ["protocols"]
-protocols = []
 
 [dependencies]
 alloy-consensus = "1.1.2"
@@ -65,10 +49,6 @@ tokio = { version = "1.48.0", features = ["macros", "rt-multi-thread"] }
 
 [[bench]]
 name = "revert_decoding"
-harness = false
-
-[[bench]]
-name = "storage_keys"
 harness = false
 
 [[bench]]

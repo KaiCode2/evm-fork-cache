@@ -2,7 +2,7 @@
 //!
 //! This module provides utilities to batch multiple view calls into a single
 //! EVM execution using the Multicall3 contract. This significantly reduces
-//! the number of RPC round-trips needed when loading pool state.
+//! the number of RPC round-trips needed when loading related contract state.
 //!
 //! Multicall3 is deployed at the same address on all EVM chains:
 //! `0xcA11bde05977b3631167028862bE2a173976CA11`

@@ -26,32 +26,35 @@ use mock::{install_default_account, install_mock_erc20, offline_cache};
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
-    let pool = Address::repeat_byte(0x11);
+    let contract = Address::repeat_byte(0x11);
     let holder = Address::repeat_byte(0x22);
 
     let mut cache = offline_cache().await?;
     // A token-like account with overlay storage (so the slot write heals both
     // layers) plus an EOA-style account to patch a balance onto.
-    install_mock_erc20(&mut cache, pool);
+    install_mock_erc20(&mut cache, contract);
     install_default_account(&mut cache, holder);
 
-    // Seed some backend storage on the pool so the purge has something to remove
+    // Seed some backend storage on the contract so the purge has something to remove
     // and the slot write has a recorded `old` value.
     cache.inject_storage_batch(&[
-        (pool, U256::from(0), U256::from(100)), // e.g. a reserve slot
-        (pool, U256::from(7), U256::from(1)),   // a tick/aux slot we'll purge
-        (pool, U256::from(8), U256::from(2)),   // another slot we'll purge
+        (contract, U256::from(0), U256::from(100)),
+        (contract, U256::from(7), U256::from(1)),
+        (contract, U256::from(8), U256::from(2)),
     ]);
 
     println!("Applying a mixed batch of state updates...\n");
 
     let diff = cache.apply_updates(&[
-        // 1. Authoritative slot write (e.g. an event-derived reserve update).
-        StateUpdate::slot(pool, U256::from(0), U256::from(250)),
+        // 1. Authoritative slot write.
+        StateUpdate::slot(contract, U256::from(0), U256::from(250)),
         // 2. Partial account patch: set only the balance, leave nonce/code.
         StateUpdate::balance(holder, U256::from(1_000_000)),
         // 3. Drop two stale storage slots so the next read re-fetches them.
-        StateUpdate::purge(pool, PurgeScope::Slots(vec![U256::from(7), U256::from(8)])),
+        StateUpdate::purge(
+            contract,
+            PurgeScope::Slots(vec![U256::from(7), U256::from(8)]),
+        ),
     ]);
 
     println!("StateDiff: {} changed entr(ies)\n", diff.len());
@@ -87,7 +90,7 @@ async fn main() -> Result<()> {
     }
 
     // Re-applying the same slot value is a no-op — idempotence is observable.
-    let again = cache.apply_update(&StateUpdate::slot(pool, U256::from(0), U256::from(250)));
+    let again = cache.apply_update(&StateUpdate::slot(contract, U256::from(0), U256::from(250)));
     println!(
         "\nRe-applying the same slot value -> empty diff: {}",
         again.is_empty()
@@ -103,7 +106,7 @@ async fn main() -> Result<()> {
     // A hot (seeded) balance slot: +750 relative to the current value.
     let hot_slot = U256::from(0); // we set this to 250 above
     let rel = cache.apply_update(&StateUpdate::slot_delta(
-        pool,
+        contract,
         hot_slot,
         SlotDelta::Add(U256::from(750)),
     ));
@@ -119,7 +122,7 @@ async fn main() -> Result<()> {
     // to fetch+seed the true value and retry.
     let cold_slot = U256::from(4_242);
     let cold = cache.apply_update(&StateUpdate::slot_delta(
-        pool,
+        contract,
         cold_slot,
         SlotDelta::Add(U256::from(100)),
     ));

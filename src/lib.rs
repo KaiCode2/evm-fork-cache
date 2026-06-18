@@ -1,4 +1,4 @@
-//! Forked EVM **simulation engine** for DeFi search, MEV, and backtesting.
+//! Forked EVM **simulation engine** for EVM search, MEV, and backtesting.
 //!
 //! `evm-fork-cache` simulates EVM transactions against recent on-chain state
 //! without re-deriving that state on every call. It builds on [`revm`],
@@ -53,7 +53,7 @@
 //! - [`events`] — the event → state pipeline (Pillar B.2): `EventDecoder` /
 //!   `StateView` / `DecoderRegistry` decode an on-chain `Log` into `StateUpdate`s,
 //!   and `EventPipeline` ingests, reorg-purges, and reconciles a block's logs.
-//!   Ships an ERC-20 `Transfer` decoder and (under `protocols`) a UniswapV3 adapter.
+//!   Ships an ERC-20 `Transfer` decoder plus traits for external decoders.
 //! - [`inspector`] — an [`Inspector`](revm::Inspector) that captures ERC20
 //!   `Transfer` events to reconstruct balance deltas from a simulation.
 //! - [`multicall`] — batched read-only calls through Multicall3.
@@ -99,8 +99,6 @@
 //! The `examples/` directory has runnable, documented walkthroughs of each
 //! module — offline ones that need no network, plus a few that fork real chain
 //! state over RPC. See the crate README for the full list.
-#![cfg_attr(docsrs, feature(doc_cfg))]
-
 pub mod access_list;
 pub mod access_set;
 pub mod cache;
@@ -116,8 +114,6 @@ pub mod state_update;
 
 pub use access_set::StorageAccessList;
 pub use events::erc20::Erc20TransferDecoder;
-#[cfg(feature = "protocols")]
-pub use events::uniswap_v3::{UniswapV3Decoder, UniswapV3Layout};
 pub use events::{
     BlockDigest, DecoderRegistry, EventDecoder, EventPipeline, ReconcileReport, ReorgConfig,
     StateView,

@@ -9,11 +9,11 @@
 //! RPC_URL=https://eth.llamarpc.com cargo bench --bench rpc_mainnet
 //! ```
 //!
-//! They measure warm-cache throughput of view calls against well-known mainnet
-//! contracts (USDC `balanceOf`, a Uniswap V2 pair `getReserves`). The cache is
-//! warmed once before timing so each measured iteration reads from the local
-//! cache rather than re-fetching over RPC — that warm-reuse path is exactly what
-//! a search loop hammers between block updates.
+//! They measure warm-cache throughput of view calls against a well-known mainnet
+//! ERC-20 contract (USDC `balanceOf`, `totalSupply`, and `allowance`). The cache
+//! is warmed once before timing so each measured iteration reads from the local
+//! cache rather than re-fetching over RPC — that warm-reuse path is exactly what a
+//! search loop hammers between block updates.
 //!
 //! RPC-touching calls run inside `rt.block_on(..)` because `EvmCache` fetches
 //! missing state via `tokio::task::block_in_place`, which requires a
@@ -37,15 +37,15 @@ const USDC: Address = address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48");
 /// A consistently USDC-holding address (an exchange hot wallet). The exact
 /// balance is irrelevant to a perf benchmark; `balanceOf` succeeds regardless.
 const HOLDER: Address = address!("28C6c06298d514Db089934071355E5743bf21d60");
-/// The Uniswap V2 USDC/WETH pair.
-const UNIV2_USDC_WETH: Address = address!("B4e16d0168e52d35CaCD2c6185b44281Ec28C9Dc");
+/// Arbitrary spender for an `allowance` view call. A zero allowance is fine for
+/// the benchmark; the call path still exercises contract storage reads.
+const SPENDER: Address = address!("000000000022d473030f116ddee9f6b43ac78ba3");
 
 sol! {
     interface IErc20 {
         function balanceOf(address account) external view returns (uint256);
-    }
-    interface IUniswapV2Pair {
-        function getReserves() external view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast);
+        function totalSupply() external view returns (uint256);
+        function allowance(address owner, address spender) external view returns (uint256);
     }
 }
 
@@ -74,13 +74,21 @@ fn bench_rpc_mainnet(c: &mut Criterion) {
     );
 
     let balance_of = Bytes::from(IErc20::balanceOfCall { account: HOLDER }.abi_encode());
-    let get_reserves = Bytes::from(IUniswapV2Pair::getReservesCall {}.abi_encode());
+    let total_supply = Bytes::from(IErc20::totalSupplyCall {}.abi_encode());
+    let allowance = Bytes::from(
+        IErc20::allowanceCall {
+            owner: HOLDER,
+            spender: SPENDER,
+        }
+        .abi_encode(),
+    );
 
-    // Warm the cache once per target so the timed iterations are warm reads.
+    // Warm the cache once per call shape so the timed iterations are warm reads.
     let warm = rt.block_on(async {
         let a = cache.call_raw(HOLDER, USDC, balance_of.clone(), false);
-        let b = cache.call_raw(Address::ZERO, UNIV2_USDC_WETH, get_reserves.clone(), false);
-        (a, b)
+        let b = cache.call_raw(HOLDER, USDC, total_supply.clone(), false);
+        let c = cache.call_raw(HOLDER, USDC, allowance.clone(), false);
+        (a, b, c)
     });
     assert!(
         matches!(warm.0, Ok(ExecutionResult::Success { .. })),
@@ -89,8 +97,13 @@ fn bench_rpc_mainnet(c: &mut Criterion) {
     );
     assert!(
         matches!(warm.1, Ok(ExecutionResult::Success { .. })),
-        "Uniswap V2 getReserves warm-up should succeed: {:?}",
+        "USDC totalSupply warm-up should succeed: {:?}",
         warm.1
+    );
+    assert!(
+        matches!(warm.2, Ok(ExecutionResult::Success { .. })),
+        "USDC allowance warm-up should succeed: {:?}",
+        warm.2
     );
 
     let mut group = c.benchmark_group("rpc_mainnet_warm");
@@ -102,12 +115,18 @@ fn bench_rpc_mainnet(c: &mut Criterion) {
             black_box(r);
         })
     });
-    group.bench_function("univ2_getReserves", |b| {
+    group.bench_function("usdc_totalSupply", |b| {
         b.iter(|| {
             let r = rt
-                .block_on(async {
-                    cache.call_raw(Address::ZERO, UNIV2_USDC_WETH, get_reserves.clone(), false)
-                })
+                .block_on(async { cache.call_raw(HOLDER, USDC, total_supply.clone(), false) })
+                .unwrap();
+            black_box(r);
+        })
+    });
+    group.bench_function("usdc_allowance", |b| {
+        b.iter(|| {
+            let r = rt
+                .block_on(async { cache.call_raw(HOLDER, USDC, allowance.clone(), false) })
                 .unwrap();
             black_box(r);
         })

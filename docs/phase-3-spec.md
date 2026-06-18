@@ -1,5 +1,12 @@
 # Phase 3 implementation spec — state-update primitives (Pillar B.1)
 
+> **Archival pre-release implementation note:** this file records an internal
+> build contract from before the public crate boundary was finalized. It is not
+> current release documentation or a current acceptance checklist. The old
+> protocol adapter surface, feature-gated protocol APIs, and related
+> no-default-feature validation flow were removed/extracted before public release;
+> protocol-specific state tracking now belongs in `evm-amm-state`.
+
 Implementation contract for the **targeted state-mutation vocabulary** and the
 single apply primitive that writes it correctly across both cache layers,
 returning a structured state diff. Read this **with**
@@ -24,10 +31,9 @@ mechanism that *applies* it, with no protocol or event knowledge in the core.
   `StateDiff` / `apply_update` / `apply_updates` must NOT depend on the
   `protocols` feature. (The *refold* of the `protocols`-gated `inject_v2/v3_*`
   helpers stays behind `protocols`, but it consumes the generic primitive.)
-- **Green bar at every commit, both feature configs:**
+- **Historical green bar at every commit:**
   - `cargo fmt --all --check`
   - `cargo clippy --all-targets --no-deps -- -D warnings`
-  - `cargo clippy --lib --no-default-features --no-deps -- -D warnings`
   - `cargo test`
   - `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`
 - MSRV is 1.88 — no newer-than-1.88 std APIs. Edition 2024.
@@ -49,8 +55,8 @@ Today the crate writes cached state through a scatter of ad-hoc methods with
 | `inject_storage_batch_fresh` | write-through *if present* | write | no |
 | `inject_v2_pool_metadata` / `inject_v3_*` | write (via `insert_account_storage`) | — | **yes** |
 | `purge_account` | remove acct | remove acct + storage | n/a |
-| `purge_pool_storage` | clear storage | remove storage | n/a |
-| `purge_pool_slots` | remove slots | remove slots | n/a |
+| `purge_contract_storage` | clear storage | remove storage | n/a |
+| `purge_contract_slots` | remove slots | remove slots | n/a |
 | `override_account_code*` | insert info | insert info | n/a |
 
 Three different slot-write semantics, no machine-readable record of *what
@@ -90,7 +96,7 @@ offline tests, an example, a benchmark, and docs.
   (`accounts()` / `storage()` `RwLock`s, layer 2); the established write-through
   pattern in `inject_storage_batch_fresh` (the F1 fix — **the** reference for
   correct slot-write layering); `cached_storage_value`; `purge_account` /
-  `purge_pool_storage` / `purge_pool_slots` (the purge layer logic to fold in);
+  `purge_contract_storage` / `purge_contract_slots` (the purge layer logic to fold in);
   `self.db.insert_account_info` / `insert_account_storage` (CacheDB writers).
 - `freshness::SlotChange { address, slot, old, new }` (`src/freshness.rs`,
   re-exported at crate root) — **reuse it** as the slot-diff type; do not define a
@@ -109,7 +115,7 @@ offline tests, an example, a benchmark, and docs.
   in-module unit tests. No `EvmCache` dependency (pure data + logic on itself).
 - **`src/cache/mod.rs`**: `EvmCache::apply_update`, `EvmCache::apply_updates`,
   and the internal per-variant helpers. Refold `inject_storage_batch_fresh`,
-  `purge_account`, `purge_pool_storage`, `purge_pool_slots`,
+  `purge_account`, `purge_contract_storage`, `purge_contract_slots`,
   `override_account_code*`, and (Decision 2) `inject_v2/v3_*` onto them.
 - **`src/freshness.rs`**: route the `FreshnessController::run` `pending` drain
   through `apply_updates` (§9) — behavior-preserving.
@@ -172,9 +178,9 @@ pub enum PurgeScope {
     /// Full account: `AccountInfo` (balance/nonce/code) **and** all storage.
     /// Equivalent to today's `purge_account`.
     Account,
-    /// All storage slots; account info preserved. Equivalent to `purge_pool_storage`.
+    /// All storage slots; account info preserved. Equivalent to `purge_contract_storage`.
     AllStorage,
-    /// Only the listed storage slots. Equivalent to `purge_pool_slots`.
+    /// Only the listed storage slots. Equivalent to `purge_contract_slots`.
     Slots(Vec<U256>),
 }
 ```
@@ -271,9 +277,9 @@ home), returning a `PurgeRecord`:
 - `Account` → `purge_account` logic: remove from overlay accounts, backend
   accounts, backend storage. `account_removed` = removed from any account layer;
   `slots_removed` = backend storage slots removed.
-- `AllStorage` → `purge_pool_storage` logic (clear overlay storage, remove
+- `AllStorage` → `purge_contract_storage` logic (clear overlay storage, remove
   backend storage); `slots_removed` = backend slots removed.
-- `Slots(slots)` → `purge_pool_slots` logic; `slots_removed` = backend slots
+- `Slots(slots)` → `purge_contract_slots` logic; `slots_removed` = backend slots
   removed.
 
 ## 6. Refold map (existing → primitive)
@@ -285,8 +291,8 @@ becomes a wrapper. Existing tests must pass unchanged.
 | --- | --- | --- |
 | `inject_storage_batch_fresh(&[(a,s,v)])` | `apply_updates` of `Slot`s (discard diff) | unchanged (`-> ()`) |
 | `purge_account(a)` | `apply_update(Purge{a, Account})` | unchanged (`-> ()`) |
-| `purge_pool_storage(a) -> usize` | `apply_update(Purge{a, AllStorage})`; return `rec.slots_removed` | unchanged |
-| `purge_pool_slots(a, slots) -> usize` | `apply_update(Purge{a, Slots(..)})`; return `rec.slots_removed` | unchanged |
+| `purge_contract_storage(a) -> usize` | `apply_update(Purge{a, AllStorage})`; return `rec.slots_removed` | unchanged |
+| `purge_contract_slots(a, slots) -> usize` | `apply_update(Purge{a, Slots(..)})`; return `rec.slots_removed` | unchanged |
 | `override_account_code*` | **best-effort**: route its final write through `apply_update(Account{ patch: code })` **only if** behavior-equivalent; it has bespoke target-creation (`MissingTargetBehavior`) + source→target code-copy semantics, so if the refold is not cleanly equivalent, leave the method as-is and only cross-reference the primitive in its doc | unchanged |
 | `inject_v2_pool_metadata`, `inject_v3_*` (`protocols`) | build `Vec<StateUpdate::Slot>`, `apply_updates` | **Decision 2 (§12)** |
 
@@ -365,7 +371,7 @@ in a new `tests/state_update.rs` (reuse `tests/common`).
    counts (`slots_removed`, `account_removed`) correct on both layers.
 9. **`apply_updates` fold + merge:** a mixed batch (Slot, Account, Purge) →
    merged `StateDiff`; later-overrides-earlier ordering for same-key slots.
-10. **Refold equivalence:** `purge_pool_storage` wrapper returns the same `usize`
+10. **Refold equivalence:** `purge_contract_storage` wrapper returns the same `usize`
     as the pre-refold behavior on a seeded cache; `inject_storage_batch_fresh`
     wrapper leaves the cache in the same state as the equivalent `apply_updates`.
 11. **(Decision 2, if "normalize"):** `inject_v3_*` now writes through to the
@@ -420,8 +426,8 @@ The `protocols` pool tests do not pin layer placement, so they stay green.
    tests; `lib.rs` re-exports.
 2. `EvmCache::apply_update` / `apply_updates` (Slot, Account, Purge) + the
    `tests/state_update.rs` integration tests.
-3. Refold `inject_storage_batch_fresh`, `purge_account`, `purge_pool_storage`,
-   `purge_pool_slots`, `override_account_code*`, and (per Decision 2)
+3. Refold `inject_storage_batch_fresh`, `purge_account`, `purge_contract_storage`,
+   `purge_contract_slots`, `override_account_code*`, and (per Decision 2)
    `inject_v2/v3_*`; route the freshness drain through `apply_updates`.
 4. Example + benchmark + README rows.
 5. Docs (module `//!`, item rustdoc, doctest), CHANGELOG, ROADMAP → Done,

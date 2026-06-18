@@ -4,9 +4,8 @@
 //! This module defines the small, generic vocabulary a future event decoder
 //! emits and [`EvmCache::apply_update`](crate::cache::EvmCache::apply_update)
 //! consumes, plus the [`StateDiff`] that records what an apply actually changed.
-//! It is pure data and logic on itself: it carries **no** protocol or event
-//! knowledge and has no dependency on the cache or the `protocols` feature, so
-//! it builds under `--no-default-features`.
+//! It is pure data and logic on itself: it carries no protocol or event
+//! knowledge and has no dependency on the cache implementation.
 //!
 //! # The vocabulary
 //!
@@ -68,10 +67,9 @@
 //!
 //! # Masked writes to packed words
 //!
-//! A storage slot often packs several fields (a UniswapV3 `slot0` holds
-//! `sqrtPriceX96`, `tick`, an observation index, and the `unlocked` flag in one
-//! word). A decoder that learns only some of those fields must update *just* its
-//! bits without clobbering the rest. [`StateUpdate::SlotMasked`] is the
+//! A storage slot often packs several fields into one word. A decoder that
+//! learns only some of those fields must update *just* its bits without
+//! clobbering the rest. [`StateUpdate::SlotMasked`] is the
 //! cold-aware masked read-modify-write for exactly this: it computes
 //! `new = (old & !mask) | (value & mask)`, touching only the `mask` bits. Like
 //! [`SlotDelta`](StateUpdate::SlotDelta) it is cold-aware — the un-masked bits of
@@ -163,20 +161,20 @@ impl SlotDelta {
 /// use alloy_primitives::{Address, U256};
 /// use evm_fork_cache::{AccountPatch, PurgeScope, StateUpdate};
 ///
-/// let pool = Address::repeat_byte(0x01);
+/// let contract = Address::repeat_byte(0x01);
 ///
 /// // A storage-slot write (authoritative across both cache layers).
-/// let slot = StateUpdate::slot(pool, U256::from(0), U256::from(42));
+/// let slot = StateUpdate::slot(contract, U256::from(0), U256::from(42));
 ///
 /// // A balance-only account patch (nonce and code left untouched).
-/// let bal = StateUpdate::balance(pool, U256::from(1_000));
+/// let bal = StateUpdate::balance(contract, U256::from(1_000));
 /// assert_eq!(
 ///     bal,
-///     StateUpdate::Account { address: pool, patch: AccountPatch::default().balance(U256::from(1_000)) },
+///     StateUpdate::Account { address: contract, patch: AccountPatch::default().balance(U256::from(1_000)) },
 /// );
 ///
 /// // Drop just two storage slots so the next read re-fetches them.
-/// let purge = StateUpdate::purge(pool, PurgeScope::Slots(vec![U256::from(0), U256::from(1)]));
+/// let purge = StateUpdate::purge(contract, PurgeScope::Slots(vec![U256::from(0), U256::from(1)]));
 /// # let _ = (slot, purge);
 /// ```
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -224,9 +222,8 @@ pub enum StateUpdate {
     /// `value`, preserving the rest: `new = (old & !mask) | (value & mask)`.
     ///
     /// A *masked* read-modify-write: it lets a pure decoder express a partial
-    /// update to a **packed** storage word (e.g. a UniswapV3 `slot0`, which packs
-    /// `sqrtPriceX96`, `tick`, the observation index, and the `unlocked` flag into
-    /// one slot) without knowing or clobbering the bits it does not own.
+    /// update to a **packed** storage word without knowing or clobbering the bits
+    /// it does not own.
     ///
     /// **Cold-aware** — a masked write to a slot absent from *both* cache layers is
     /// **not** applied (the un-masked bits are unknown, so the result cannot be
@@ -454,10 +451,10 @@ pub enum PurgeScope {
     /// [`EvmCache::purge_account`](crate::cache::EvmCache::purge_account).
     Account,
     /// All storage slots; account info preserved. Equivalent to
-    /// [`EvmCache::purge_pool_storage`](crate::cache::EvmCache::purge_pool_storage).
+    /// [`EvmCache::purge_contract_storage`](crate::cache::EvmCache::purge_contract_storage).
     AllStorage,
     /// Only the listed storage slots. Equivalent to
-    /// [`EvmCache::purge_pool_slots`](crate::cache::EvmCache::purge_pool_slots).
+    /// [`EvmCache::purge_contract_slots`](crate::cache::EvmCache::purge_contract_slots).
     Slots(Vec<U256>),
 }
 
@@ -648,15 +645,6 @@ pub struct SkippedBalanceDelta {
 /// computed, so the write is skipped rather than applied against an assumed value.
 /// It is surfaced here so the caller can fetch+seed the slot and retry; otherwise
 /// the next read lazily fetches the true value.
-///
-/// # The `mask == U256::MAX, value == U256::ZERO` cold-tick convention
-///
-/// The UniswapV3 adapter (`events::uniswap_v3`) reuses this record as a
-/// "could-not-compute" marker for the *absolute* tick-word / global-liquidity
-/// writes it must skip when a needed word is cold: it pushes a `SkippedMask` with
-/// `mask == U256::MAX` and `value == U256::ZERO`. This avoids adding a fourth skip
-/// vector for stateful protocol updates; the count flows through
-/// [`StateDiff::skipped_len`] all the same, and the caller re-seeds the pool.
 ///
 /// Deliberately **not** `#[non_exhaustive]`: it is a stable, fully-determined leaf
 /// record routinely constructed as a struct literal in equality assertions by the

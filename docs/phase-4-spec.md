@@ -1,5 +1,12 @@
 # Phase 4 implementation spec — event pipeline + adapters (Pillar B.2)
 
+> **Archival pre-release implementation note:** this file records an internal
+> build contract from before the public crate boundary was finalized. It is not
+> current release documentation or a current acceptance checklist. The old
+> protocol adapter surface, feature-gated protocol APIs, and related
+> no-default-feature validation flow were removed/extracted before public release;
+> protocol-specific state tracking now belongs in `evm-amm-state`.
+
 Implementation contract for the **reader half** of Pillar B: turn an on-chain
 `Log` into the Phase 3 [`StateUpdate`] vocabulary, apply it through
 `apply_updates`, and keep the cache **reactively fresh** from the event stream —
@@ -26,10 +33,9 @@ the decoder, the protocol adapters, and the orchestration that drives them.
   vocabulary addition are **generic core** — they must compile and lint with
   `--no-default-features`. Only the UniswapV3 adapter (`uniswap_v3`) is gated
   behind the `protocols` feature.
-- **Green bar at every commit, both feature configs:**
+- **Historical green bar at every commit:**
   - `cargo fmt --all --check`
   - `cargo clippy --all-targets --no-deps -- -D warnings`
-  - `cargo clippy --lib --no-default-features --no-deps -- -D warnings`
   - `cargo test`
   - `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`
   - `cargo bench --no-run` (all benches build offline)

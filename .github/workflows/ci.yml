@@ -29,16 +29,8 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets --no-deps -- -D warnings
 
-      # The generic engine must build and lint cleanly without the `protocols`
-      # feature (which gates the DeFi-specific surface).
-      - name: Clippy (no default features)
-        run: cargo clippy --lib --no-default-features --no-deps -- -D warnings
-
       - name: Tests (all targets)
         run: cargo test --all-targets
-
-      - name: Tests (no default features)
-        run: cargo test --no-default-features
 
       - name: Doc tests
         run: cargo test --doc
