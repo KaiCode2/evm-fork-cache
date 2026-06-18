@@ -66,6 +66,8 @@ around three capabilities that target exactly this workload:
   inputs, deduplicates and orders canonical logs, validates pending semantics,
   applies canonical cache mutations through `EvmCache::apply_updates`, and
   dispatches reports to hooks after committed mutation phases. The
+  `ReactiveRegistry` exposes consolidated Alloy log filters for provider
+  subscription setup and exact local log routing with optional route keys. The
   provider-agnostic `EventSubscriber` trait and `AlloySubscriber` scaffold are
   included; live Alloy stream driving is intentionally left to a future transport
   layer.

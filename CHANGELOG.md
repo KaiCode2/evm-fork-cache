@@ -133,10 +133,12 @@ pre-release development phases (see [`docs/ROADMAP.md`](docs/ROADMAP.md)).
   with Alloy `Filter`s and local matchers, validates pending inputs so they
   cannot mutate canonical cache state, detects conflicting absolute writes for a
   single input, applies canonical mutations through `EvmCache::apply_updates`,
-  and dispatches `ReactiveReport`s to hooks after mutation phases. Includes a
-  provider-agnostic `EventSubscriber` trait, an `AlloySubscriber` scaffold for
-  future live transport work, and an adapter from legacy `EventDecoder`s to
-  reactive handlers. Generic core.
+  and dispatches `ReactiveReport`s to hooks after mutation phases.
+  `ReactiveRegistry` exposes consolidated Alloy log filters for provider
+  subscription setup and exact local log routing with optional route keys.
+  Includes a provider-agnostic `EventSubscriber` trait, an `AlloySubscriber`
+  scaffold for future live transport work, and an adapter from legacy
+  `EventDecoder`s to reactive handlers. Generic core.
 - **`StateUpdate::SlotMasked`** (`state_update`, Phase 4) — a cold-aware
   read-modify-write *masked* slot write (`new = (old & !mask) | (value & mask)`)
   with the `StateUpdate::slot_masked` constructor, so a pure decoder can update

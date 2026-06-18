@@ -17,6 +17,7 @@ use std::{
     collections::{HashMap, HashSet},
     fmt,
     future::Future,
+    hash::Hash,
     marker::PhantomData,
     pin::Pin,
     sync::Arc,
@@ -30,7 +31,7 @@ use alloy_network::{
     },
 };
 use alloy_primitives::{Address, B256, Bytes, U256};
-use alloy_rpc_types_eth::{Filter, Log};
+use alloy_rpc_types_eth::{Filter, FilterSet, Log};
 
 use crate::{
     cache::EvmCache,
@@ -482,6 +483,15 @@ pub enum RouteKey {
     Bytes32(B256),
     /// Arbitrary bytes key.
     Bytes(Vec<u8>),
+}
+
+/// Exact log route selected by [`ReactiveRegistry::route_log`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReactiveLogRoute {
+    /// Handler whose log interest matched.
+    pub handler_id: HandlerId,
+    /// Optional route key extracted from the matching log interest.
+    pub route_key: Option<RouteKey>,
 }
 
 /// Interest in block inputs.
@@ -1082,9 +1092,20 @@ enum AbsoluteValue {
 
 /// Reactive runtime.
 pub struct ReactiveRuntime<N: Network = Ethereum> {
-    handlers: Vec<RegisteredHandler<N>>,
+    registry: ReactiveRegistry<N>,
     hooks: Vec<Arc<dyn ReactiveHook<N>>>,
     config: ReactiveConfig,
+}
+
+/// Registry and router for provider-neutral reactive handlers.
+///
+/// The registry stores pure [`ReactiveHandler`]s in registration order, exposes
+/// consolidated provider-side log filters for subscription setup, and routes
+/// provider logs back to the exact matching log interests. Consolidated filters
+/// may be safe supersets; [`Self::route_log`] always re-checks the original
+/// [`LogInterest`] and its local matcher before returning a route.
+pub struct ReactiveRegistry<N: Network = Ethereum> {
+    handlers: Vec<RegisteredHandler<N>>,
 }
 
 struct RegisteredHandler<N: Network = Ethereum> {
@@ -1093,17 +1114,24 @@ struct RegisteredHandler<N: Network = Ethereum> {
     interests: Vec<ReactiveInterest<N>>,
 }
 
-impl<N: Network> ReactiveRuntime<N> {
-    /// Create an empty runtime.
-    pub fn new(config: ReactiveConfig) -> Self {
+impl<N: Network> Default for ReactiveRegistry<N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<N: Network> ReactiveRegistry<N> {
+    /// Create an empty registry.
+    pub fn new() -> Self {
         Self {
             handlers: Vec::new(),
-            hooks: Vec::new(),
-            config,
         }
     }
 
-    /// Register a handler.
+    /// Register a handler, preserving registration order.
+    ///
+    /// Duplicate handler ids are rejected with
+    /// [`RegisterError::DuplicateHandler`].
     pub fn register_handler(
         &mut self,
         handler: Arc<dyn ReactiveHandler<N>>,
@@ -1121,6 +1149,75 @@ impl<N: Network> ReactiveRuntime<N> {
         Ok(())
     }
 
+    /// Return all registered interests in handler registration order.
+    pub fn interests(&self) -> Vec<ReactiveInterest<N>> {
+        self.handlers
+            .iter()
+            .flat_map(|handler| handler.interests.clone())
+            .collect()
+    }
+
+    /// Return consolidated provider-side log filters.
+    ///
+    /// Filters are emitted in deterministic first-registration order by
+    /// compatible block option. Within each returned filter, address and topic
+    /// sets are unioned independently, which can intentionally overfetch. Use
+    /// [`Self::route_log`] to enforce the exact original [`LogInterest`]s.
+    pub fn log_subscription_filters(&self) -> Vec<Filter> {
+        let mut filters = Vec::new();
+        for interest in self.log_interests() {
+            merge_log_subscription_filter(&mut filters, &interest.provider_filter);
+        }
+        filters
+    }
+
+    /// Route a log to exact matching handler interests.
+    ///
+    /// Routes are returned in handler registration order. Each handler appears
+    /// at most once for a log, using the first matching log interest declared by
+    /// that handler.
+    pub fn route_log(&self, log: &Log) -> Vec<ReactiveLogRoute> {
+        self.handlers
+            .iter()
+            .filter_map(|handler| handler.route_log(log))
+            .collect()
+    }
+
+    fn handlers(&self) -> &[RegisteredHandler<N>] {
+        &self.handlers
+    }
+
+    fn log_interests(&self) -> impl Iterator<Item = &LogInterest> {
+        self.handlers.iter().flat_map(|handler| {
+            handler
+                .interests
+                .iter()
+                .filter_map(|interest| match interest {
+                    ReactiveInterest::Logs(interest) => Some(interest),
+                    ReactiveInterest::Blocks(_) | ReactiveInterest::PendingTransactions(_) => None,
+                })
+        })
+    }
+}
+
+impl<N: Network> ReactiveRuntime<N> {
+    /// Create an empty runtime.
+    pub fn new(config: ReactiveConfig) -> Self {
+        Self {
+            registry: ReactiveRegistry::new(),
+            hooks: Vec::new(),
+            config,
+        }
+    }
+
+    /// Register a handler.
+    pub fn register_handler(
+        &mut self,
+        handler: Arc<dyn ReactiveHandler<N>>,
+    ) -> Result<(), RegisterError> {
+        self.registry.register_handler(handler)
+    }
+
     /// Register a hook.
     pub fn register_hook(&mut self, hook: Arc<dyn ReactiveHook<N>>) -> Result<(), RegisterError> {
         self.hooks.push(hook);
@@ -1129,10 +1226,7 @@ impl<N: Network> ReactiveRuntime<N> {
 
     /// Return all registered interests in handler registration order.
     pub fn interests(&self) -> Vec<ReactiveInterest<N>> {
-        self.handlers
-            .iter()
-            .flat_map(|handler| handler.interests.clone())
-            .collect()
+        self.registry.interests()
     }
 
     /// Ingest a batch, apply valid direct state effects, and dispatch reports.
@@ -1216,7 +1310,7 @@ impl<N: Network> ReactiveRuntime<N> {
         input_ref: InputRef,
     ) -> Result<Vec<HandlerExecution>, ReactiveError> {
         let mut executions = Vec::new();
-        for registered in &self.handlers {
+        for registered in self.registry.handlers() {
             if !registered.matches(&record.input) {
                 continue;
             }
@@ -1253,6 +1347,45 @@ impl<N: Network> RegisteredHandler<N> {
         self.interests
             .iter()
             .any(|interest| interest_matches(interest, input))
+    }
+
+    fn route_log(&self, log: &Log) -> Option<ReactiveLogRoute> {
+        self.interests.iter().find_map(|interest| match interest {
+            ReactiveInterest::Logs(interest) if interest.matches(log) => Some(ReactiveLogRoute {
+                handler_id: self.id.clone(),
+                route_key: interest.route_key(log),
+            }),
+            ReactiveInterest::Logs(_)
+            | ReactiveInterest::Blocks(_)
+            | ReactiveInterest::PendingTransactions(_) => None,
+        })
+    }
+}
+
+fn merge_log_subscription_filter(filters: &mut Vec<Filter>, next: &Filter) {
+    if let Some(existing) = filters
+        .iter_mut()
+        .find(|existing| existing.block_option == next.block_option)
+    {
+        merge_filter_set(&mut existing.address, &next.address);
+        for (existing_topic, next_topic) in existing.topics.iter_mut().zip(next.topics.iter()) {
+            merge_filter_set(existing_topic, next_topic);
+        }
+    } else {
+        filters.push(next.clone());
+    }
+}
+
+fn merge_filter_set<T: Clone + Eq + Hash>(target: &mut FilterSet<T>, source: &FilterSet<T>) {
+    if target.is_empty() {
+        return;
+    }
+    if source.is_empty() {
+        *target = FilterSet::default();
+        return;
+    }
+    for value in source.iter() {
+        target.insert(value.clone());
     }
 }
 
