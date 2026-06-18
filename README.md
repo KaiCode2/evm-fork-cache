@@ -38,10 +38,10 @@ around three capabilities that target exactly this workload:
 
 > **Maturity.** This crate is **pre-1.0** and under active development against a
 > [phased roadmap](docs/ROADMAP.md). Capabilities (1) and (3) above are
-> implemented today. Capability (2) has the targeted writer primitives and the
-> event-to-state reader pipeline; a production WebSocket transport remains
-> consumer-provided. The public API still changes between minor versions — see
-> [Stability](#stability).
+> implemented today. Capability (2) has the targeted writer primitives, the
+> event-to-state reader pipeline, and a default-enabled reactive handler runtime;
+> live network subscription driving remains consumer-provided. The public API
+> still changes between minor versions — see [Stability](#stability).
 
 ## What it provides today
 
@@ -60,6 +60,15 @@ around three capabilities that target exactly this workload:
   against RPC. The crate ships the generic driver, the ERC-20 `Transfer` decoder,
   and in-memory examples; production WebSocket subscription/reorg wiring and
   protocol-specific decoders stay with the consumer or companion crates.
+- **Reactive runtime** — register pure handlers for logs, block notifications,
+  and pending transaction signals. Handlers emit `StateUpdate`s, invalidations,
+  resync requests, speculative signals, and hook signals; the runtime routes
+  inputs, deduplicates and orders canonical logs, validates pending semantics,
+  applies canonical cache mutations through `EvmCache::apply_updates`, and
+  dispatches reports to hooks after committed mutation phases. The
+  provider-agnostic `EventSubscriber` trait and `AlloySubscriber` scaffold are
+  included; live Alloy stream driving is intentionally left to a future transport
+  layer.
 - **ERC20 helpers** — balances, allowances, decimals, and controlled balance
   mutation (including automatic balance-slot discovery) for simulations.
 - **Transfer-inspector simulation** that reports per-token balance deltas

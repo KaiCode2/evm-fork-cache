@@ -15,6 +15,10 @@ documentation = "https://docs.rs/evm-fork-cache"
 # ancestor-directory workspace and gives it its own Cargo.lock.
 [workspace]
 
+[features]
+default = ["reactive"]
+reactive = []
+
 [dependencies]
 alloy-consensus = "1.1.2"
 alloy-contract = "1.0.38"
