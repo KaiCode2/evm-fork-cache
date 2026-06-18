@@ -34,9 +34,8 @@
 //! no I/O and emits serializable, replayable [`StateUpdate`] data. Most updates
 //! need no pre-state ([`SlotDelta`](crate::StateUpdate::SlotDelta) and
 //! [`SlotMasked`](crate::StateUpdate::SlotMasked) are read-modify-write *at apply
-//! time*), but stateful adapters — UniswapV3 tick maintenance must read the
-//! current `liquidityGross`/`liquidityNet`/`tick`/bitmap to recompute a packed
-//! word — read the narrow read-only [`StateView`]. The view never touches RPC; a
+//! time*), but stateful external adapters may read the narrow read-only
+//! [`StateView`] to compute a post-state from cached pre-state. The view never touches RPC; a
 //! slot absent from the cache reads `None` (cold), and a decoder that cannot
 //! compute against a cold word surfaces a skip rather than inventing a value.
 //!
@@ -67,9 +66,6 @@
 //! chain (honest freshness).
 
 pub mod erc20;
-#[cfg(feature = "protocols")]
-#[cfg_attr(docsrs, doc(cfg(feature = "protocols")))]
-pub mod uniswap_v3;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -83,10 +79,9 @@ use crate::state_update::{PurgeScope, StateDiff, StateUpdate};
 
 /// Read-only view of current cached state handed to a decoder.
 ///
-/// Decoders that compute post-state from pre-state (e.g. UniswapV3 tick
-/// maintenance) read through this; stateless decoders (ERC-20 `Transfer`, V3
-/// `Swap`) ignore it. The view never touches RPC — a slot absent from the cache
-/// reads `None`.
+/// Decoders that compute post-state from pre-state read through this; stateless
+/// decoders (such as the built-in ERC-20 `Transfer` decoder) ignore it. The view
+/// never touches RPC — a slot absent from the cache reads `None`.
 pub trait StateView {
     /// Current cached value of `(address, slot)` (overlay ▸ backend ▸ `None`),
     /// matching what the EVM would `SLOAD` (`account_state`-aware). `None` means

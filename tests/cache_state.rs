@@ -413,7 +413,7 @@ async fn seed_erc20_balance_slots_skips_scan() -> Result<()> {
 
 /// Regression test: both cache layers (the `CacheDB` overlay and the
 /// `BlockchainDb` backend) must be purged together. Clearing only the backend
-/// leaves stale data in the overlay; `purge_pool_storage` clears both.
+/// leaves stale data in the overlay; `purge_contract_storage` clears both.
 #[tokio::test(flavor = "multi_thread")]
 async fn two_layer_cache_staleness_requires_full_purge() -> Result<()> {
     let mut cache = setup_cache().await?;
@@ -439,7 +439,7 @@ async fn two_layer_cache_staleness_requires_full_purge() -> Result<()> {
     // Seed the BlockchainDb backend (layer 2) directly so both layers hold data.
     cache.inject_storage_batch(&[(token, U256::from(7), U256::from(1))]);
     assert!(
-        cache.pool_storage_slot_count(token) > 0,
+        cache.contract_storage_slot_count(token) > 0,
         "backend should hold the seeded slot"
     );
 
@@ -461,21 +461,21 @@ async fn two_layer_cache_staleness_requires_full_purge() -> Result<()> {
 
     // Re-seed the backend, then purge BOTH layers and confirm each is cleared.
     cache.inject_storage_batch(&[(token, U256::from(7), U256::from(1))]);
-    assert!(cache.pool_storage_slot_count(token) > 0);
-    let backend_cleared = cache.purge_pool_storage(token);
+    assert!(cache.contract_storage_slot_count(token) > 0);
+    let backend_cleared = cache.purge_contract_storage(token);
     assert!(
         backend_cleared > 0,
-        "purge_pool_storage should report cleared backend slots"
+        "purge_contract_storage should report cleared backend slots"
     );
     assert_eq!(
         cache.cache_db_storage_slot_count(token),
         0,
-        "overlay should be empty after purge_pool_storage"
+        "overlay should be empty after purge_contract_storage"
     );
     assert_eq!(
-        cache.pool_storage_slot_count(token),
+        cache.contract_storage_slot_count(token),
         0,
-        "backend should be empty after purge_pool_storage"
+        "backend should be empty after purge_contract_storage"
     );
 
     Ok(())
@@ -511,7 +511,7 @@ async fn purge_all_storage_clears_both_layers() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn purge_pool_slots_is_selective() -> Result<()> {
+async fn purge_contract_slots_is_selective() -> Result<()> {
     let mut cache = setup_cache().await?;
     let contract = Address::repeat_byte(0xCC);
 
@@ -533,7 +533,7 @@ async fn purge_pool_slots_is_selective() -> Result<()> {
     assert_eq!(cache.cache_db_storage_slot_count(contract), 3);
 
     // Purge only slot_a and slot_c.
-    cache.purge_pool_slots(contract, &[slot_a, slot_c]);
+    cache.purge_contract_slots(contract, &[slot_a, slot_c]);
     assert_eq!(cache.cache_db_storage_slot_count(contract), 1);
 
     let remaining = cache

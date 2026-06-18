@@ -218,7 +218,7 @@ async fn purge_account_drops_account_and_storage_from_both_layers() -> Result<()
 
     cache.inject_storage_batch(&[(token, U256::from(99), U256::from(1))]);
     assert!(
-        cache.pool_storage_slot_count(token) > 0,
+        cache.contract_storage_slot_count(token) > 0,
         "backend populated"
     );
 
@@ -242,7 +242,7 @@ async fn purge_account_drops_account_and_storage_from_both_layers() -> Result<()
     );
     // Storage gone from the backend.
     assert_eq!(
-        cache.pool_storage_slot_count(token),
+        cache.contract_storage_slot_count(token),
         0,
         "backend storage gone"
     );

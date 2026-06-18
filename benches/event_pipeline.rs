@@ -1,7 +1,7 @@
 //! Phase 4 benchmarks: the event → state pipeline (Pillar B.2).
 //!
 //! Measures three things, all offline (mocked provider, in-memory logs):
-//! - **decode** cost per event kind (ERC-20 `Transfer`, UniswapV3 `Swap`/`Mint`),
+//! - **decode** cost per decoder kind (ERC-20 `Transfer`, generic slot marker),
 //!   isolating the pure `EventDecoder::decode` work (no apply);
 //! - **ingest** throughput — [`EventPipeline::ingest_logs`] decoding **and**
 //!   applying a block of logs, across batch sizes (1 → 1000);
@@ -11,33 +11,30 @@
 //! A current-thread runtime drives only the async cache constructor; the pipeline
 //! itself is synchronous and never touches the network.
 
-use std::collections::HashMap;
 use std::hint::black_box;
 use std::sync::Arc;
 
-use alloy_primitives::aliases::{I24, U160};
-use alloy_primitives::{Address, Bytes, I256, Log, U256, hex, keccak256};
+use alloy_primitives::{Address, Bytes, Log, U256, hex, keccak256};
 use alloy_provider::RootProvider;
 use alloy_provider::network::AnyNetwork;
 use alloy_rpc_client::RpcClient;
-use alloy_sol_types::{SolEvent, sol};
 use alloy_transport::mock::Asserter;
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use evm_fork_cache::cache::{EvmCache, V3_SLOT0_SLOT, v3_tick_info_storage_keys_with_base};
+use evm_fork_cache::cache::EvmCache;
 use evm_fork_cache::events::{DecoderRegistry, EventDecoder, EventPipeline, StateView};
-use evm_fork_cache::{Erc20TransferDecoder, StateUpdate, UniswapV3Decoder, UniswapV3Layout};
+use evm_fork_cache::{Erc20TransferDecoder, StateUpdate};
 use revm::state::{AccountInfo, Bytecode};
 use tokio::runtime::{Builder, Runtime};
 
 const MOCK_ERC20_RUNTIME_HEX: &str = include_str!("../fixtures/mock_erc20_runtime.hex");
 const TOKEN: Address = Address::repeat_byte(0xAA);
-const POOL: Address = Address::repeat_byte(0xBB);
+const MARKER: Address = Address::repeat_byte(0xBB);
 
 fn current_thread_rt() -> Runtime {
     Builder::new_current_thread().enable_all().build().unwrap()
 }
 
-/// A cache with `TOKEN` and `POOL` installed as storage-cleared accounts (so
+/// A cache with `TOKEN` and `MARKER` installed as storage-cleared accounts (so
 /// unseeded slots read as zero — no RPC fallthrough).
 fn seeded_cache(rt: &Runtime) -> EvmCache {
     let provider = RootProvider::<AnyNetwork>::new(RpcClient::mocked(Asserter::new()));
@@ -46,7 +43,7 @@ fn seeded_cache(rt: &Runtime) -> EvmCache {
         hex::decode(MOCK_ERC20_RUNTIME_HEX.trim()).unwrap(),
     ));
     let code_hash = runtime.hash_slow();
-    for addr in [TOKEN, POOL] {
+    for addr in [TOKEN, MARKER] {
         cache.db_mut().insert_account_info(
             addr,
             AccountInfo {
@@ -65,11 +62,6 @@ fn seeded_cache(rt: &Runtime) -> EvmCache {
     cache
 }
 
-sol! {
-    event Swap(address indexed sender, address indexed recipient, int256 amount0, int256 amount1, uint160 sqrtPriceX96, uint128 liquidity, int24 tick);
-    event Mint(address sender, address indexed owner, int24 indexed tickLower, int24 indexed tickUpper, uint128 amount, uint256 amount0, uint256 amount1);
-}
-
 fn transfer_log(token: Address, from: Address, to: Address, value: U256) -> Log {
     let sig = keccak256(b"Transfer(address,address,uint256)");
     Log::new_unchecked(
@@ -79,44 +71,10 @@ fn transfer_log(token: Address, from: Address, to: Address, value: U256) -> Log 
     )
 }
 
-fn swap_log(pool: Address, sqrt_price: u128, liquidity: u128, tick: i32) -> Log {
-    let ev = Swap {
-        sender: Address::repeat_byte(0x01),
-        recipient: Address::repeat_byte(0x02),
-        amount0: I256::try_from(-1i64).unwrap(),
-        amount1: I256::try_from(1i64).unwrap(),
-        sqrtPriceX96: U160::from(sqrt_price),
-        liquidity,
-        tick: I24::try_from(tick).unwrap(),
-    };
-    Log {
-        address: pool,
-        data: ev.encode_log_data(),
-    }
-}
-
-fn mint_log(pool: Address, lower: i32, upper: i32, amount: u128) -> Log {
-    let ev = Mint {
-        sender: Address::repeat_byte(0x03),
-        owner: Address::repeat_byte(0x04),
-        tickLower: I24::try_from(lower).unwrap(),
-        tickUpper: I24::try_from(upper).unwrap(),
-        amount,
-        amount0: U256::from(1),
-        amount1: U256::from(1),
-    };
-    Log {
-        address: pool,
-        data: ev.encode_log_data(),
-    }
-}
-
-/// A bench-local read-only [`StateView`] over a fixed map (for the V3 `Mint`
-/// decode, which reads the current tick word).
-struct MapView(HashMap<(Address, U256), U256>);
-impl StateView for MapView {
-    fn storage(&self, address: Address, slot: U256) -> Option<U256> {
-        self.0.get(&(address, slot)).copied()
+struct EmptyView;
+impl StateView for EmptyView {
+    fn storage(&self, _address: Address, _slot: U256) -> Option<U256> {
+        None
     }
 }
 
@@ -140,30 +98,15 @@ fn bench_decode(c: &mut Criterion) {
         Address::repeat_byte(0x22),
         U256::from(100),
     );
-    let empty = MapView(HashMap::new());
+    let empty = EmptyView;
     group.bench_function("erc20_transfer", |b| {
         b.iter(|| black_box(erc20.decode(black_box(&tlog), &empty)))
     });
 
-    let v3 = UniswapV3Decoder::new().with_pool(POOL, UniswapV3Layout::uniswap(60));
-    let slog = swap_log(POOL, 2_000_000, 7_500, 120);
-    let mut slot0_view = HashMap::new();
-    slot0_view.insert(
-        (POOL, V3_SLOT0_SLOT),
-        (U256::from(1u64) << 240) | U256::from(1_000_000u64),
-    );
-    // Seed the tick words the Mint reads (lower/upper) so it computes (not skips).
-    let lo = v3_tick_info_storage_keys_with_base(60, evm_fork_cache::cache::V3_TICKS_BASE_SLOT)[0];
-    let hi = v3_tick_info_storage_keys_with_base(120, evm_fork_cache::cache::V3_TICKS_BASE_SLOT)[0];
-    slot0_view.insert((POOL, lo), U256::ZERO);
-    slot0_view.insert((POOL, hi), U256::ZERO);
-    let view = MapView(slot0_view);
-    group.bench_function("v3_swap", |b| {
-        b.iter(|| black_box(v3.decode(black_box(&slog), &view)))
-    });
-    let mlog = mint_log(POOL, 60, 120, 1_000);
-    group.bench_function("v3_mint", |b| {
-        b.iter(|| black_box(v3.decode(black_box(&mlog), &view)))
+    let marker = AbsDecoder;
+    let marker_log = Log::new_unchecked(MARKER, vec![], Bytes::new());
+    group.bench_function("absolute_slot_marker", |b| {
+        b.iter(|| black_box(marker.decode(black_box(&marker_log), &empty)))
     });
 
     group.finish();

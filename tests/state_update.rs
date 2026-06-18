@@ -428,7 +428,7 @@ async fn apply_purge_account_clears_both_layers() -> Result<()> {
         "overlay account removed"
     );
     assert_eq!(
-        cache.pool_storage_slot_count(token),
+        cache.contract_storage_slot_count(token),
         0,
         "backend storage gone"
     );
@@ -459,7 +459,7 @@ async fn apply_purge_all_storage_keeps_account() -> Result<()> {
     let diff = cache.apply_update(&StateUpdate::purge(token, PurgeScope::AllStorage));
 
     assert_eq!(
-        cache.pool_storage_slot_count(token),
+        cache.contract_storage_slot_count(token),
         0,
         "backend storage gone"
     );
@@ -507,16 +507,16 @@ async fn apply_purge_specific_slots() -> Result<()> {
 #[tokio::test]
 async fn apply_updates_merges_mixed_batch() -> Result<()> {
     let acct = Address::repeat_byte(0x66);
-    let pool = Address::repeat_byte(0x77);
+    let contract = Address::repeat_byte(0x77);
 
     let mut cache = setup_cache().await?;
     install_default_account(&mut cache, acct);
-    cache.inject_storage_batch(&[(pool, U256::from(9), U256::from(1))]);
+    cache.inject_storage_batch(&[(contract, U256::from(9), U256::from(1))]);
 
     let diff = cache.apply_updates(&[
-        StateUpdate::slot(pool, U256::from(1), U256::from(100)),
+        StateUpdate::slot(contract, U256::from(1), U256::from(100)),
         StateUpdate::balance(acct, U256::from(500)),
-        StateUpdate::purge(pool, PurgeScope::Slots(vec![U256::from(9)])),
+        StateUpdate::purge(contract, PurgeScope::Slots(vec![U256::from(9)])),
     ]);
 
     assert!(!diff.slots.is_empty(), "slot write recorded");
@@ -564,7 +564,7 @@ async fn apply_updates_same_slot_later_overrides() -> Result<()> {
 // ===========================================================================
 
 #[tokio::test]
-async fn refold_purge_pool_storage_returns_same_count() -> Result<()> {
+async fn refold_purge_contract_storage_returns_same_count() -> Result<()> {
     let token = Address::repeat_byte(0x99);
     let mut cache = setup_cache().await?;
     install_mock_erc20(&mut cache, token);
@@ -574,9 +574,9 @@ async fn refold_purge_pool_storage_returns_same_count() -> Result<()> {
     ]);
 
     // The wrapper still returns the backend slot count it removed.
-    let removed = cache.purge_pool_storage(token);
+    let removed = cache.purge_contract_storage(token);
     assert_eq!(removed, 2);
-    assert_eq!(cache.pool_storage_slot_count(token), 0);
+    assert_eq!(cache.contract_storage_slot_count(token), 0);
     Ok(())
 }
 
@@ -609,35 +609,6 @@ async fn refold_inject_storage_batch_fresh_matches_apply_updates() -> Result<()>
         overlay_slot(&mut b, token, slot)
     );
     assert_eq!(backend_slot(&a, token, slot), backend_slot(&b, token, slot));
-    Ok(())
-}
-
-// ===========================================================================
-// Decision 2 (LOCKED: normalize) — protocols inject_v3_* now writes through to
-// the backend (layer 2). Pre-fix this wrote layer 1 only.
-// ===========================================================================
-
-#[cfg(feature = "protocols")]
-#[tokio::test]
-async fn inject_v3_tick_bitmap_writes_through_to_backend() -> Result<()> {
-    use std::collections::HashMap;
-
-    let pool = Address::repeat_byte(0xb2);
-    let mut cache = setup_cache().await?;
-
-    let mut bitmap = HashMap::new();
-    bitmap.insert(0i16, U256::from(123));
-    bitmap.insert(1i16, U256::from(456));
-
-    let injected = cache.inject_v3_tick_bitmap(pool, &bitmap)?;
-    assert_eq!(injected, 2);
-
-    // Normalized to write-through: the backend (layer 2) now holds the slots.
-    // Before the refold this count was 0 (overlay-only write).
-    assert!(
-        cache.pool_storage_slot_count(pool) > 0,
-        "inject_v3_tick_bitmap must write through to the backend (Decision 2)"
-    );
     Ok(())
 }
 
@@ -1514,59 +1485,6 @@ fn state_update_account_field_constructors() {
 }
 
 // ===========================================================================
-// §16.8 — Decision-2 write-through pins for the remaining protocols injectors.
-// ===========================================================================
-
-#[cfg(feature = "protocols")]
-#[tokio::test]
-async fn inject_v2_pool_metadata_writes_through_to_backend() -> Result<()> {
-    use evm_fork_cache::cache::V2PoolMetadata;
-
-    let pool = Address::repeat_byte(0xb3);
-    let mut cache = setup_cache().await?;
-    let meta = V2PoolMetadata {
-        token0: Address::repeat_byte(0x01),
-        token1: Address::repeat_byte(0x02),
-        last_block_timestamp: 0,
-    };
-
-    cache.inject_v2_pool_metadata(pool, &meta)?;
-
-    assert!(
-        cache.pool_storage_slot_count(pool) > 0,
-        "inject_v2_pool_metadata must write through to the backend (Decision 2)"
-    );
-    Ok(())
-}
-
-#[cfg(feature = "protocols")]
-#[tokio::test]
-async fn inject_v3_ticks_writes_through_to_backend() -> Result<()> {
-    use evm_fork_cache::cache::TickInfo;
-    use std::collections::HashMap;
-
-    let pool = Address::repeat_byte(0xb4);
-    let mut cache = setup_cache().await?;
-    let mut ticks = HashMap::new();
-    ticks.insert(
-        0i32,
-        TickInfo {
-            liquidity_gross: 100,
-            liquidity_net: 50,
-            initialized: true,
-        },
-    );
-
-    let injected = cache.inject_v3_ticks(pool, &ticks)?;
-    assert!(injected > 0);
-    assert!(
-        cache.pool_storage_slot_count(pool) > 0,
-        "inject_v3_ticks must write through to the backend (Decision 2)"
-    );
-    Ok(())
-}
-
-// ===========================================================================
 // §16 fix-review regressions — account_state-awareness on the account axis.
 // ===========================================================================
 
@@ -1717,12 +1635,12 @@ async fn slot_masked_noop_when_masked_bits_already_equal() -> Result<()> {
 async fn slot_masked_cold_slot_is_skipped_and_surfaced() -> Result<()> {
     // Fresh address with no overlay account and no backend value: the slot is
     // cold. A masked write cannot know the un-masked bits, so it is skipped.
-    let pool = Address::repeat_byte(0x13);
+    let contract = Address::repeat_byte(0x13);
     let slot = U256::from(0);
     let mut cache = setup_cache().await?;
 
     let diff = cache.apply_update(&StateUpdate::slot_masked(
-        pool,
+        contract,
         slot,
         U256::from(0xFF),
         U256::from(0x42),
@@ -1732,7 +1650,7 @@ async fn slot_masked_cold_slot_is_skipped_and_surfaced() -> Result<()> {
     assert_eq!(
         diff.skipped_masks,
         vec![SkippedMask {
-            address: pool,
+            address: contract,
             slot,
             mask: U256::from(0xFF),
             value: U256::from(0x42),
@@ -1742,7 +1660,7 @@ async fn slot_masked_cold_slot_is_skipped_and_surfaced() -> Result<()> {
     assert!(!diff.is_fully_applied());
     assert_eq!(diff.skipped_len(), 1);
     // Still cold — nothing was written.
-    assert_eq!(cache.cached_storage_value(pool, slot), None);
+    assert_eq!(cache.cached_storage_value(contract, slot), None);
     Ok(())
 }
 

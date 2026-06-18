@@ -59,9 +59,9 @@ RPC node                     Event-driven sync  ← WS logs · new block
 
 ## Design principles
 
-1. **Generic core, pluggable protocols.** The simulation engine knows nothing
-   about Uniswap. DeFi knowledge (slot layouts, event ABIs) lives behind the
-   `protocols` feature and will eventually move to the `evm-amm-state` crate.
+1. **Generic core, external protocol adapters.** The simulation engine knows
+   nothing about AMM layouts. DeFi knowledge (slot layouts, event ABIs, and AMM
+   state tracking) lives in `evm-amm-state` or downstream crates.
 2. **Honest freshness.** Reuse aggressively where safe; purge loudly where not.
    Never silently serve stale state.
 3. **Correctness is verifiable.** Event-derived state must be reconcilable
@@ -73,14 +73,14 @@ RPC node                     Event-driven sync  ← WS logs · new block
 | Phase | Scope | Status |
 | --- | --- | --- |
 | **0** | API hygiene + correctness: drop `amms`, fix `set_block` divergence + `block_in_place` panic, commit the tree. | **Done** (`p0-oss-prep`) |
-| **1** | Engine seam: typed errors, configurable tx/block env, hot-path benches, builder, `protocols` feature. | **Done** (`phase-1-engine-seam`) |
+| **1** | Engine seam: typed errors, configurable tx/block env, hot-path benches, builder, protocol-adapter extraction path. | **Done** (`phase-1-engine-seam`) |
 | **2** | Freshness core (Pillar C): `Validity` + `FreshnessRegistry`; observation tracker; policies; optimistic verify-and-rerun loop. | **Done** (`phase-2-freshness`) |
 | **3** | State-update primitives (Pillar B.1): `StateUpdate` + targeted writers; refold `inject_*`; surface state-diff output. | **Done** (`phase-3-state-updates`) |
 | **4** | Event pipeline + adapters (Pillar B.2): `EventDecoder` trait, ERC-20 + V3 adapters, ingest/reorg/reconcile pipeline. | **Done** (`phase-4-event-pipeline`) |
 | **5** | COW snapshots (Pillar A): structural sharing; overlay buffer reuse. | **Done** (`phase-5-cow-snapshots`) |
 
 Cross-cutting remaining work: call tracer Inspector, full no-provider build split,
-protocol/metadata extraction, and production event-transport integrations.
+and production event-transport integrations.
 
 ---
 
@@ -88,8 +88,9 @@ protocol/metadata extraction, and production event-transport integrations.
 
 Goal: lift the crate out of read-only-swap simulation into value-bearing
 simulation, give it a typed error contract and a real constructor, isolate
-protocol knowledge behind a feature, and add the benchmarks that will quantify
-the Pillar A rewrite. These are the breaking changes that must precede a 1.0.
+protocol knowledge from the generic engine, and add the benchmarks that will
+quantify the Pillar A rewrite. These are the breaking changes that must precede
+a 1.0.
 
 ### 1a — Typed error model
 
@@ -142,31 +143,21 @@ the Pillar A rewrite. These are the breaking changes that must precede a 1.0.
   speed-mode setter remains as accepted API ergonomics debt (tracked in
   `docs/KNOWN_ISSUES.md`).
 
-### 1e — `protocols` feature
+### 1e — Protocol adapter extraction
 
-- **Change:** add a `[features]` table with `default = ["protocols"]`. Gate the
-  DeFi-specific surface behind `protocols`: the V3 tick-snapshot module
-  (`tick_snapshot`), the `inject_v3_ticks*` / `inject_v2_pool_metadata` methods,
-  and the protocol slot constants in `storage_keys` (V2/V3/Pancake/Slipstream).
-  Generic machinery (errors, create3, access sets, multicall, ERC20 helpers,
-  the cache core, `CacheConfig`, token-decimals cache) stays always-on.
-- **Files:** `Cargo.toml`, `src/lib.rs`, `src/cache/mod.rs`, `src/cache/storage_keys.rs`.
-- **Done:** `mod storage_keys` / `mod tick_snapshot`, their re-exports, the
-  `tick_snapshot_cache` field + its construction/save, the `inject_v2_pool_metadata`
-  / `inject_v3_*` methods, and `CacheConfig::tick_snapshot_cache_path` are all
-  gated behind `protocols` (default on). The library builds and lints cleanly
-  with `--no-default-features` (CI enforces `cargo clippy --lib
-  --no-default-features -- -D warnings`).
-- **Deferred (next, with the `evm-amm-state` move):** pool *metadata* structs
-  (`V2/V3/BalancerPoolMetadata`, entangled with `ImmutableDataCache`) stay
-  always-on for now, as does the full no-provider build (making
-  revm/foundry-fork-db/alloy-provider optional behind an `rpc` feature). The
-  generic no-default library and tests are release gates.
+- **Change:** keep the generic engine focused on cache mechanics, snapshots,
+  freshness, state updates, access lists, ERC-20 helpers, multicall, deploy, and
+  CREATE3. Protocol-specific storage layout helpers, AMM metadata, and
+  concentrated-liquidity adapter state move out to `evm-amm-state`.
+- **Files:** `Cargo.toml`, `src/lib.rs`, `src/cache/mod.rs`, `src/events/mod.rs`,
+  tests, benches, examples, and release docs.
+- **Done:** removed the old in-crate AMM adapter surface, made
+  `ImmutableDataCache` token-decimals-only, bumped its on-disk version, and
+  updated CI/docs/examples/benches to present this crate as the generic engine.
 
 ### Phase 1 acceptance — met
 
-`cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` (default),
-`cargo clippy --lib --no-default-features -- -D warnings`, `cargo test`,
+`cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test`,
 `RUSTDOCFLAGS=-D warnings cargo doc`, and all examples/benches build.
 
 ---
@@ -235,7 +226,7 @@ pub struct FreshnessController<P: FreshnessPolicy, C: FreshnessClock> { /* regis
   tracker — only the background validator observes checked slots.)
 - `purge_account(&mut self, addr)` — remove `addr` from the CacheDB overlay, the
   BlockchainDb accounts map, and its storage, so the next access re-fetches a clean
-  `AccountInfo`. Distinct from storage-only `purge_pool_storage`.
+  `AccountInfo`. Distinct from storage-only `purge_contract_storage`.
 
 ### Optimistic execution loop with deferred validation (`FreshnessController::run`)
 
@@ -280,8 +271,7 @@ list only buys the overlap. This `FreshnessController` is the seed of the eventu
 
 `src/cache/freshness.rs` (child of `cache` → reads private layers for enumeration);
 `slot_observations.rs` revived + made clock-agnostic; `verify_slots`/`purge_account`
-on `EvmCache`. The whole freshness surface lives under the always-on (non-`protocols`)
-core.
+on `EvmCache`. The whole freshness surface lives under the always-on generic core.
 
 ### Tests (offline)
 
@@ -294,8 +284,8 @@ storage on both layers; `ValidThrough` boundary; `WallClock` vs `BlockClock`.
 
 ### Acceptance — met
 
-`cargo fmt --check`, `clippy --all-targets -- -D warnings` (default +
-`--lib --no-default-features`), `cargo test`, `RUSTDOCFLAGS=-D warnings cargo doc`.
+`cargo fmt --check`, `clippy --all-targets -- -D warnings`, `cargo test`,
+`RUSTDOCFLAGS=-D warnings cargo doc`.
 
 Landed on `phase-2-freshness`: `src/freshness.rs` (the generic core — `Validity`
 / `FreshnessRegistry`, `FreshnessClock` + `BlockClock`/`WallClock`,
@@ -321,25 +311,24 @@ ingestion loop, reorg handling, and overlay-side apply.
 1. **`Account` variant is a partial `AccountPatch`** (`balance`/`nonce`/`code`,
    each `Option`), not a full `AccountInfo`: best fit for event-derived writes
    (one field at a time) and keeps revm's type out of the public vocabulary.
-2. **`inject_v2/v3_*` (`protocols`) normalized to write-through.** Refolded onto
-   the write-through `StateUpdate::Slot` primitive (backend + overlay-if-present)
-   instead of the old overlay-only write — a deliberate behavior change recorded
-   in `CHANGELOG.md` (`### Changed`) and `KNOWN_ISSUES.md`, with a test pinning
-   the new placement. The cold-backfill `inject_storage_batch` stays layer-2-only.
+2. **Legacy protocol writers normalized before extraction.** The old protocol
+   writers were refolded onto the write-through `StateUpdate::Slot` primitive
+   before being moved out, keeping the generic write path as the single contract.
+   The cold-backfill `inject_storage_batch` stays layer-2-only.
 
 ### Acceptance — met
 
-`cargo fmt --check`, `clippy --all-targets -- -D warnings` (default +
-`--lib --no-default-features`), `cargo test`, `RUSTDOCFLAGS=-D warnings cargo doc`.
+`cargo fmt --check`, `clippy --all-targets -- -D warnings`, `cargo test`,
+`RUSTDOCFLAGS=-D warnings cargo doc`.
 
 Landed on `phase-3-state-updates`: `src/state_update.rs` (the generic vocabulary
 — `StateUpdate` / `AccountPatch` / `PurgeScope`, the `StateDiff` / `AccountChange`
 / `PurgeRecord` output, reusing `freshness::SlotChange`); `EvmCache::apply_update`
 / `apply_updates` with the dual-layer write-through `Slot`/`Account` and dispatch
 `Purge` semantics; the refold of `inject_storage_batch_fresh` / `purge_account` /
-`purge_pool_storage` / `purge_pool_slots` / `inject_v2_pool_metadata` /
-`inject_v3_*` onto the primitive and the freshness correction-drain routed
-through `apply_updates`; the offline `examples/state_update_apply.rs`;
+`purge_contract_storage` / `purge_contract_slots` onto the primitive and the freshness
+correction-drain routed through `apply_updates`; the offline
+`examples/state_update_apply.rs`;
 `benches/state_update.rs`; and `tests/state_update.rs`. The §15 addendum adds the
 relative / read-modify-write surface — a saturating `SlotDelta`, the
 `StateUpdate::SlotDelta` variant, `EvmCache::modify_slot`, and the cold-aware
@@ -391,19 +380,17 @@ thin convenience). The full build contract is in
 
 ### Acceptance — met
 
-`cargo fmt --check`, `clippy --all-targets -- -D warnings` (default +
-`--lib --no-default-features`), `cargo test` (both feature configs),
+`cargo fmt --check`, `clippy --all-targets -- -D warnings`, `cargo test`,
 `RUSTDOCFLAGS=-D warnings cargo doc`, `cargo bench --no-run`.
 
 Landed on `phase-4-event-pipeline`: `src/events/` (the generic core —
 `EventDecoder`/`StateView`, `DecoderRegistry`, `EventPipeline` with
 `ingest_logs`/`reorg_to`/`reconcile` + `BlockDigest`/`ReconcileReport`/
 `ReorgConfig`, and the async `drive`/`LogSource`), the generic
-`Erc20TransferDecoder` (`events::erc20`), and the `protocols`-gated
-`UniswapV3Decoder`/`UniswapV3Layout` (`events::uniswap_v3`); the cold-aware
-`StateUpdate::SlotMasked` vocabulary + `StateDiff.skipped_masks`/`SkippedMask`
-(`state_update`) and its dual-layer apply arm; `EvmCache::reconcile_slots` and the
-`StateView` impl; the offline `examples/reactive_cache.rs`;
+`Erc20TransferDecoder` (`events::erc20`); the cold-aware `StateUpdate::SlotMasked`
+vocabulary + `StateDiff.skipped_masks`/`SkippedMask` (`state_update`) and its
+dual-layer apply arm; `EvmCache::reconcile_slots` and the `StateView` impl; the
+offline `examples/reactive_cache.rs`;
 `benches/event_pipeline.rs`; and `tests/event_pipeline.rs` (+ the `SlotMasked`
 tests in `tests/state_update.rs`). The §6.4 V3 fee-growth/oracle maintenance gap
 is recorded in `KNOWN_ISSUES.md`.
@@ -438,8 +425,7 @@ the deep clone. The full build contract is in
 
 ### Acceptance — met
 
-`cargo fmt --check`, `clippy --all-targets -- -D warnings` (default +
-`--lib --no-default-features`), `cargo test` (both feature configs),
+`cargo fmt --check`, `clippy --all-targets -- -D warnings`, `cargo test`,
 `RUSTDOCFLAGS=-D warnings cargo doc`, `cargo bench --no-run`; the
 `tests/cow_snapshot.rs` differential-equivalence gate and the existing
 snapshot/overlay/freshness tests pass unchanged.
@@ -470,9 +456,6 @@ fold cost model is recorded in `KNOWN_ISSUES.md`.
 2. **Snapshot consistency point in continuous ingestion.** Applications that run
    a live event loop should snapshot at block boundaries or behind their own
    generation guard so simulations do not observe a partially applied block.
-3. **Protocol/metadata extraction.** `ImmutableDataCache` couples generic
-   token-decimals with V2/V3/Balancer pool metadata. Fully separating them is the
-   precondition for moving protocol knowledge into `evm-amm-state`.
-4. **Full no-provider build split.** `--no-default-features` covers the generic
-   engine and is CI-gated, but the dependency graph still includes provider/RPC
-   crates. A later `rpc` feature can make those optional for pure offline users.
+3. **Full no-provider build split.** The dependency graph still includes
+   provider/RPC crates. A later `rpc` feature can make those optional for pure
+   offline users.

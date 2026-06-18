@@ -20,18 +20,18 @@ use evm_fork_cache::StorageAccessList;
 use evm_fork_cache::prefetch_registry::PrefetchRegistry;
 
 fn main() -> anyhow::Result<()> {
-    let pool = Address::repeat_byte(0xAA);
+    let settlement = Address::repeat_byte(0xAA);
     let vault_a = Address::repeat_byte(0x01);
     let vault_b = Address::repeat_byte(0x02);
 
     let mut registry = PrefetchRegistry::default();
 
     // An aggregated phase: one access list covering a batch of view calls.
-    let mut pool_refresh = StorageAccessList::default();
-    pool_refresh.accounts.insert(pool);
-    pool_refresh.slots.insert((pool, U256::from(0)));
-    pool_refresh.slots.insert((pool, U256::from(4)));
-    registry.record("pool_refresh", pool_refresh);
+    let mut settlement_refresh = StorageAccessList::default();
+    settlement_refresh.accounts.insert(settlement);
+    settlement_refresh.slots.insert((settlement, U256::from(0)));
+    settlement_refresh.slots.insert((settlement, U256::from(4)));
+    registry.record("settlement_refresh", settlement_refresh);
 
     // A keyed phase: per-address lists, so the next cycle can prefetch only the
     // addresses it is about to simulate.
@@ -48,8 +48,8 @@ fn main() -> anyhow::Result<()> {
     registry.save(&path)?;
     let loaded = PrefetchRegistry::load(&path);
 
-    let aggregated = loaded.phase_slots("pool_refresh");
-    println!("pool_refresh phase has {} slots", aggregated.len());
+    let aggregated = loaded.phase_slots("settlement_refresh");
+    println!("settlement_refresh phase has {} slots", aggregated.len());
     for (addr, slot) in &aggregated {
         println!("  {addr} slot {slot}");
     }

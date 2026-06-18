@@ -1,5 +1,12 @@
 # Phase 2 implementation spec — freshness core + optimistic execution
 
+> **Archival pre-release implementation note:** this file records an internal
+> build contract from before the public crate boundary was finalized. It is not
+> current release documentation or a current acceptance checklist. The old
+> protocol adapter surface, feature-gated protocol APIs, and related
+> no-default-feature validation flow were removed/extracted before public release;
+> protocol-specific state tracking now belongs in `evm-amm-state`.
+
 Implementation contract for the freshness control plane and the optimistic
 verify-and-rerun loop with deferred validation. Read this **with**
 [`ROADMAP.md`](ROADMAP.md) (the "Phase 2 — freshness core" section is the design
@@ -15,10 +22,9 @@ prefer this.
   `Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>`
 - **The whole freshness surface is generic core** — it must compile and lint with
   `--no-default-features` (it must NOT depend on the `protocols` feature).
-- **Green bar at every commit, both feature configs:**
+- **Historical green bar at every commit:**
   - `cargo fmt --all --check`
   - `cargo clippy --all-targets --no-deps -- -D warnings`
-  - `cargo clippy --lib --no-default-features --no-deps -- -D warnings`
   - `cargo test`
   - `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`
 - MSRV is 1.88 — no newer-than-1.88 std APIs. Edition 2024.
@@ -52,8 +58,8 @@ evaluation sims only.
 
 - `cache::EvmCache` (`src/cache/mod.rs`): `create_snapshot() -> Arc<EvmSnapshot>`,
   `storage_batch_fetcher() -> Option<&StorageBatchFetchFn>`,
-  `inject_storage_batch(&[(Address,U256,U256)])`, `purge_pool_storage`,
-  `purge_pool_slots`, `call_raw_with`/`TxConfig`, `CallSimulationResult`,
+  `inject_storage_batch(&[(Address,U256,U256)])`, `purge_contract_storage`,
+  `purge_contract_slots`, `call_raw_with`/`TxConfig`, `CallSimulationResult`,
   `unchecked_blockchain_db()`, `db_mut()`.
 - `cache::EvmOverlay` / `cache::EvmSnapshot` (`overlay.rs`/`snapshot.rs`):
   `EvmOverlay::new(Arc<EvmSnapshot>, Option<SharedBackend>)`, `call_raw`,
@@ -197,7 +203,7 @@ pub struct SimRequest {
 - `purge_account(&mut self, addr: Address)`: remove `addr` from the CacheDB overlay
   accounts (`self.db.cache.accounts`), the BlockchainDb accounts map, and the
   BlockchainDb storage map — so the next access re-fetches a clean `AccountInfo`.
-  Distinct from storage-only `purge_pool_storage`. Add a doc comment + a test.
+  Distinct from storage-only `purge_contract_storage`. Add a doc comment + a test.
 - `set_storage_batch_fetcher(&mut self, f: StorageBatchFetchFn)`: test/extensibility
   seam so a stub fetcher can be injected without a provider.
 

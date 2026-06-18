@@ -1,5 +1,12 @@
 # Phase 5 — copy-on-write snapshots (Pillar A)
 
+> **Archival pre-release implementation note:** this file records an internal
+> build contract from before the public crate boundary was finalized. It is not
+> current release documentation or a current acceptance checklist. The old
+> protocol adapter surface, feature-gated protocol APIs, and related
+> no-default-feature validation flow were removed/extracted before public release;
+> protocol-specific state tracking now belongs in `evm-amm-state`.
+
 > Status: **build contract**. Authored by the overseer before implementation; the
 > red acceptance tests in [`../tests/cow_snapshot.rs`](../tests/cow_snapshot.rs)
 > and the extended overlay tests pin this contract and gate the deliverable.
@@ -22,10 +29,9 @@
    the per-account storage maps, not a third-party persistent-map crate (D1).
 4. **Keep the deep-clone reachable** for A/B benchmarking and as the equivalence
    reference (D3). It is retained as `create_snapshot_deep_clone()`.
-5. **Standard bars.** `cargo fmt --check`; `cargo clippy --all-targets -- -D
-   warnings` (default) **and** `cargo clippy --lib --no-default-features -- -D
-   warnings`; `cargo test` (both feature configs); `RUSTDOCFLAGS=-D warnings cargo
-   doc`; `cargo bench --no-run`.
+5. **Historical standard bars.** `cargo fmt --check`;
+   `cargo clippy --all-targets -- -D warnings`; `cargo test`;
+   `RUSTDOCFLAGS=-D warnings cargo doc`; `cargo bench --no-run`.
 
 ## 1. Goal
 

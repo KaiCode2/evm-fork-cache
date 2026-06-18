@@ -23,7 +23,7 @@ sol! {
     #[derive(Debug)]
     error SwapFailed(address router, bytes data);
     #[derive(Debug)]
-    error InvalidUniswapV3Pool();
+    error InvalidSimulationTarget();
     #[derive(Debug)]
     error NotCalm();
     // The IERC6093 standard error decodes through the very same mechanism.
@@ -36,7 +36,7 @@ fn main() {
     // clone and is `Send + Sync`).
     let decoder = RevertDecoder::new()
         .with_error::<SwapFailed>()
-        .with_error::<InvalidUniswapV3Pool>()
+        .with_error::<InvalidSimulationTarget>()
         .with_error::<NotCalm>()
         .with_error::<ERC20InsufficientBalance>();
     println!("decoder knows {} custom errors\n", decoder.len());
@@ -46,8 +46,8 @@ fn main() {
 
     decode(
         &decoder,
-        "InvalidUniswapV3Pool",
-        Bytes::from(InvalidUniswapV3Pool::SELECTOR.to_vec()),
+        "InvalidSimulationTarget",
+        Bytes::from(InvalidSimulationTarget::SELECTOR.to_vec()),
     );
 
     // A custom error carrying parameters — they are decoded and Debug-formatted.

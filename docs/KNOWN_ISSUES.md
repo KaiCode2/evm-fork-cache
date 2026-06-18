@@ -51,10 +51,10 @@ Confidence legend: **[V]** verified against the source during review;
    call, and post-reads.
 
 7. **[FIXED] On-disk cache files carry magic bytes and a version number.**
-   `binary_state`, `bytecode`, `ImmutableDataCache`, `PrefetchRegistry`,
-   `SlotObservationTracker`, and V3 tick snapshots now write a crate-specific
-   magic header plus version `1` before the bincode payload. Unknown
-   magic/version values and legacy raw-bincode files are treated as cache misses.
+   `binary_state`, `bytecode`, `ImmutableDataCache`, `PrefetchRegistry`, and
+   `SlotObservationTracker` now write a crate-specific magic header plus an
+   explicit version before the bincode payload. Unknown magic/version values and
+   legacy raw-bincode files are treated as cache misses.
 
 8. **[FIXED] `call_raw_with_access_list` did not revert its checkpoint on a
    transact error.** Both `EvmCache::call_raw_with_access_list` and
@@ -81,19 +81,8 @@ remaining items below are accepted limitations or code-quality/API nits.
 
 ## Code-quality nits
 
-1. **[V] Dead branch in `i128_to_u256`** (`cache/storage_keys.rs`): both the
-    `value >= 0` and `else` arms evaluate the identical `U256::from(value as u128)`.
-    The two's-complement cast is correct for both signs, so the `if`/`else` can
-    collapse to one line (keep the explanatory comment).
-
-2. **[R] V3 tick-snapshot keys serialize as strings.** `V3PoolTickSnapshot`
-    stringifies `i16`/`i32` tick/word keys for bincode, then `parse()`s them back
-    in `to_tick_bitmap`/`to_ticks`, silently dropping any key that fails to parse.
-    A native integer-keyed encoding would be faster and would not fail silently.
-
-3. **[R] Balancer pool id keyed by `Debug` formatting.** `ImmutableDataCache`
-    keys `balancer_pools` by `format!("{:?}", pool_id)`. `Debug` output is not a
-    stable encoding contract; a hex encoding would be safer for a persisted key.
+No current code-quality nits are tracked here after the protocol-specific cache
+surface was moved out of this crate.
 
 ## API ergonomics
 
@@ -146,7 +135,7 @@ remaining items below are accepted limitations or code-quality/API nits.
 - **Layer-2 unchecked accessors remain an explicit contract boundary (Phase 5).** The
   snapshot base's growth scan is count/absence-based, which is sufficient for the
   supported writers: the crate's own mutators (`apply_update`, `inject_storage_batch`,
-  the `inject_*` helpers, purges, code overrides) explicitly mark the base dirty,
+  purges, code overrides) explicitly mark the base dirty,
   and the `foundry-fork-db` `SharedBackend` lazy fetch is append-only at a fixed
   block (it only inserts on a cache miss, never overwrites in place — a load-bearing
   invariant noted in `refresh_base`). Direct out-of-band writes through the
@@ -167,42 +156,20 @@ remaining items below are accepted limitations or code-quality/API nits.
   `with_blockchain_db_mut_rehonest_after_storage_overwrite`,
   `with_blockchain_db_mut_rehonest_after_account_overwrite`)
   pins it.
-- **`protocols` not yet extracted.** The DeFi surface is feature-gated but still
-  in-crate. The generic core builds and tests with `--no-default-features`, but
-  extraction into `evm-amm-state` is still planned (roadmap), blocked partly by
-  `ImmutableDataCache` coupling generic token-decimals with V2/V3/Balancer pool
-  metadata.
+- **Protocol adapters are intentionally out of scope.** AMM state tracking,
+  protocol-specific storage layouts, and DeFi event adapters now belong in
+  `evm-amm-state` or downstream crates. This crate provides the generic
+  `StateUpdate` writer vocabulary, `EventDecoder`/`DecoderRegistry`, the ERC-20
+  decoder, and `EventPipeline` orchestration.
 - **Event-driven sync (roadmap Pillar B) — reader/writer halves done; live WS
   transport is not.** The Phase 3 **writer half** (`StateUpdate` +
   `apply_update`/`apply_updates`) and the Phase 4 **reader half** (the `events`
-  module: `EventDecoder`/`DecoderRegistry`, the ERC-20 + UniswapV3 adapters, and
-  the `EventPipeline` with `ingest_logs`/`reorg_to`/`reconcile`) are implemented.
+  module: `EventDecoder`/`DecoderRegistry`, the ERC-20 adapter, and the
+  `EventPipeline` with `ingest_logs`/`reorg_to`/`reconcile`) are implemented.
   What is **not** shipped is a concrete production WS transport: the async
   `events::drive`/`LogSource` convenience is generic over a log source and is
   exercised only by the offline example feeding an in-memory source; wiring it to
   a live `subscribe_logs`/WS provider (and detecting reorgs from block-hash
   mismatches) is left to the consumer.
-- **[V] V3 event-derived tick maintenance does not reconstruct fee-growth /
-  oracle state (Phase 4 §6.4).** `UniswapV3Decoder`'s `Mint`/`Burn` handling
-  maintains `liquidityGross`/`liquidityNet` (tick slot +0), the `initialized` flag
-  (+3), the `tickBitmap`, and the in-range global `liquidity`, but **not**
-  `feeGrowthOutside0/1X128` (slots +1/+2), `secondsOutside`, or oracle
-  observations — these are not derivable from the `Mint`/`Burn`/`Swap` events.
-  **Swap price/liquidity quoting is unaffected** (the swap-amount math does not
-  read `feeGrowthOutside`), but fee accounting and `collect`-style reads against
-  event-maintained ticks are not kept current. Sampled
-  `EventPipeline::reconcile` (RPC re-read) and reorg `reorg_to` (purge-and-resync)
-  are the backstop; seed a full tick via `inject_v3_ticks` when fee state matters.
-- **`inject_v2/v3_*` layer behavior changed in Phase 3 (Decision 2).** The
-  `protocols`-gated `inject_v2_pool_metadata` / `inject_v3_tick_bitmap*` /
-  `inject_v3_ticks*` helpers were refolded onto the write-through
-  `StateUpdate::Slot` primitive, so they now write **both** cache layers (backend
-  + overlay-if-present) instead of the previous overlay-only write. This is a
-  deliberate normalization (one consistent write path), not a bug: signatures and
-  return values are unchanged and the visible reads are identical; only the slot
-  *placement* across layers moved. `tests/state_update.rs`
-  (`inject_v3_tick_bitmap_writes_through_to_backend`) pins the new behavior, and
-  it is recorded in `CHANGELOG.md` (`### Changed`). The cold-backfill
-  `inject_storage_batch` deliberately remains layer-2-only.
 - **Recent toolchain.** MSRV 1.88 and edition 2024 are intentional and
   CI-enforced; consumers on older toolchains are not supported.
