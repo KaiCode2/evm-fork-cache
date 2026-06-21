@@ -148,6 +148,15 @@ pre-release development phases (see [`docs/ROADMAP.md`](docs/ROADMAP.md)).
   gives downstream retry policy and metrics a stable failure classification.
   Account-field resyncs remain explicitly unsupported until a provider-neutral
   account fetch callback exists. Generic core.
+- **Reactive block journaling and reorg recovery** — canonical block inputs and
+  applied handler reports are retained in a depth-bounded runtime journal.
+  Removed logs, explicit `ChainStatus::Reorged` inputs, and parent-hash
+  discontinuities now emit `ReactiveReport::Reorg` with dropped blocks, dropped
+  inputs, rollback updates/diffs, purge updates/diffs, and canceled hash-pinned
+  resync requests. Reversible storage-slot changes are rolled back in reverse
+  apply order; account/code changes and prior purge effects conservatively fall
+  back to targeted purge updates because `StateDiff` does not carry enough data
+  to reconstruct those cache entries exactly. Generic core.
 - **`StateUpdate::SlotMasked`** (`state_update`, Phase 4) — a cold-aware
   read-modify-write *masked* slot write (`new = (old & !mask) | (value & mask)`)
   with the `StateUpdate::slot_masked` constructor, so a pure decoder can update
