@@ -24,6 +24,7 @@ use std::{
 };
 
 use alloy_consensus::{BlockHeader as _, Transaction as _};
+use alloy_eips::BlockId;
 use alloy_network::{
     Ethereum, Network,
     primitives::{
@@ -901,10 +902,44 @@ pub struct AppliedReport<N: Network = Ethereum> {
 }
 
 /// Resync reporting scaffold.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ResyncReport {
-    /// Requests surfaced by handlers.
+    /// Requests considered by the resync execution pass.
     pub requested: Vec<ResyncRequest>,
+    /// Authoritative state updates built from successful resync fetches.
+    pub state_updates: Vec<StateUpdate>,
+    /// Diff returned by applying [`state_updates`](Self::state_updates).
+    pub diff: StateDiff,
+    /// Targets that could not be resynced.
+    pub failed: Vec<ResyncFailure>,
+}
+
+/// One resync target that could not be fetched or applied.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResyncFailure {
+    /// Request that produced the failed target.
+    pub request_id: ResyncId,
+    /// Block selection used for the failed target.
+    pub block: ResyncBlock,
+    /// Target that could not be resynced.
+    pub target: ResyncTarget,
+    /// Stable failure classification for retry policy and metrics.
+    pub kind: ResyncFailureKind,
+    /// Human-readable failure reason.
+    pub message: String,
+}
+
+/// Stable classification for a failed resync target.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ResyncFailureKind {
+    /// A storage target could not be fetched because no storage batch fetcher is configured.
+    MissingStorageFetcher,
+    /// The storage batch fetcher returned an error for the requested slot.
+    StorageFetchFailed,
+    /// The storage batch fetcher did not return a result for the requested slot.
+    StorageFetchOmitted,
+    /// Account-field resync is not supported by the current provider-neutral cache seam.
+    UnsupportedAccountTarget,
 }
 
 /// Block processing report.
@@ -938,7 +973,8 @@ pub struct ReactiveErrorReport<N: Network = Ethereum> {
     pub _network: PhantomData<N>,
 }
 
-/// Batch report returned by [`ReactiveRuntime::ingest_batch`].
+/// Batch report returned by [`ReactiveRuntime::ingest_batch`] and
+/// [`ReactiveRuntime::ingest_batch_with_resync`].
 #[derive(Clone, Debug)]
 pub struct ReactiveBatchReport<N: Network = Ethereum> {
     /// Applied reports in commit order.
@@ -1235,6 +1271,46 @@ impl<N: Network> ReactiveRuntime<N> {
         cache: &mut EvmCache,
         batch: ReactiveInputBatch<N>,
     ) -> Result<ReactiveBatchReport<N>, ReactiveError> {
+        let batch_report = self.ingest_batch_direct(cache, batch)?;
+        self.dispatch_reports(&batch_report.reports);
+        let _ = &self.config;
+        Ok(batch_report)
+    }
+
+    /// Ingest a batch, then execute surfaced storage resync requests.
+    ///
+    /// This entrypoint preserves [`ingest_batch`](Self::ingest_batch) behavior for
+    /// direct handler effects, then runs a synchronous resync phase over the
+    /// collected [`ResyncRequest`]s. Storage targets are fetched through
+    /// [`EvmCache::storage_batch_fetcher`] grouped by [`ResyncBlock`], successful
+    /// values are applied as [`StateUpdate::slot`] updates through
+    /// [`EvmCache::apply_updates`], and unsupported or failed targets are reported
+    /// in [`ResyncReport::failed`]. It does not start subscribers, background
+    /// workers, reorg journals, or network transport.
+    pub fn ingest_batch_with_resync(
+        &mut self,
+        cache: &mut EvmCache,
+        batch: ReactiveInputBatch<N>,
+    ) -> Result<ReactiveBatchReport<N>, ReactiveError> {
+        let mut batch_report = self.ingest_batch_direct(cache, batch)?;
+
+        if !batch_report.resyncs.is_empty() {
+            let resync_report = execute_resync_requests(cache, &batch_report.resyncs);
+            batch_report
+                .reports
+                .push(Arc::new(ReactiveReport::Resynced(resync_report)));
+        }
+
+        self.dispatch_reports(&batch_report.reports);
+        let _ = &self.config;
+        Ok(batch_report)
+    }
+
+    fn ingest_batch_direct(
+        &self,
+        cache: &mut EvmCache,
+        batch: ReactiveInputBatch<N>,
+    ) -> Result<ReactiveBatchReport<N>, ReactiveError> {
         let records = sort_records(dedupe_records(batch.into_records()));
 
         let mut batch_report = ReactiveBatchReport::default();
@@ -1297,9 +1373,7 @@ impl<N: Network> ReactiveRuntime<N> {
             }
         }
 
-        self.dispatch_reports(&reports_to_dispatch);
         batch_report.reports = reports_to_dispatch;
-        let _ = &self.config;
         Ok(batch_report)
     }
 
@@ -1339,6 +1413,218 @@ impl<N: Network> ReactiveRuntime<N> {
                 hook.on_report(report.clone());
             }
         }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct StorageFetchSlot {
+    address: Address,
+    slot: U256,
+    origins: Vec<StorageFetchOrigin>,
+}
+
+#[derive(Clone, Debug)]
+struct StorageFetchOrigin {
+    request_id: ResyncId,
+    target: ResyncTarget,
+}
+
+#[derive(Clone, Debug)]
+struct StorageFetchGroup {
+    block: ResyncBlock,
+    slots: Vec<StorageFetchSlot>,
+    seen: HashSet<(Address, U256)>,
+}
+
+fn execute_resync_requests(cache: &mut EvmCache, requests: &[ResyncRequest]) -> ResyncReport {
+    let mut failed = Vec::new();
+    let mut storage_groups: Vec<StorageFetchGroup> = Vec::new();
+
+    for request in requests {
+        for target in &request.targets {
+            match target {
+                ResyncTarget::StorageSlot { address, slot } => {
+                    push_storage_resync_slot(
+                        &mut storage_groups,
+                        &request.id,
+                        &request.block,
+                        *address,
+                        *slot,
+                    );
+                }
+                ResyncTarget::StorageSlots { address, slots } => {
+                    for slot in slots {
+                        push_storage_resync_slot(
+                            &mut storage_groups,
+                            &request.id,
+                            &request.block,
+                            *address,
+                            *slot,
+                        );
+                    }
+                }
+                ResyncTarget::Account { .. } => failed.push(ResyncFailure {
+                    request_id: request.id.clone(),
+                    block: request.block.clone(),
+                    target: target.clone(),
+                    kind: ResyncFailureKind::UnsupportedAccountTarget,
+                    message:
+                        "account resync is unsupported until a provider-neutral account fetcher exists"
+                            .to_string(),
+                }),
+            }
+        }
+    }
+
+    let mut state_updates = Vec::new();
+    if !storage_groups.is_empty() {
+        if let Some(fetcher) = cache.storage_batch_fetcher().cloned() {
+            for group in storage_groups {
+                let block = group.block.clone();
+                let fetches: Vec<(Address, U256)> = group
+                    .slots
+                    .iter()
+                    .map(|slot| (slot.address, slot.slot))
+                    .collect();
+                let results = (fetcher)(fetches, Some(resync_block_to_block_id(&block)));
+                let mut pending: HashMap<(Address, U256), StorageFetchSlot> = group
+                    .slots
+                    .iter()
+                    .cloned()
+                    .map(|slot| ((slot.address, slot.slot), slot))
+                    .collect();
+
+                for (address, slot, fetched) in results {
+                    let Some(requested_slot) = pending.remove(&(address, slot)) else {
+                        continue;
+                    };
+                    match fetched {
+                        Ok(value) => state_updates.push(StateUpdate::slot(address, slot, value)),
+                        Err(error) => {
+                            let message = error.to_string();
+                            push_resync_failures(
+                                &mut failed,
+                                &block,
+                                requested_slot.origins,
+                                ResyncFailureKind::StorageFetchFailed,
+                                message,
+                            );
+                        }
+                    }
+                }
+
+                for requested_slot in group.slots {
+                    if pending
+                        .remove(&(requested_slot.address, requested_slot.slot))
+                        .is_some()
+                    {
+                        push_resync_failures(
+                            &mut failed,
+                            &block,
+                            requested_slot.origins,
+                            ResyncFailureKind::StorageFetchOmitted,
+                            "storage batch fetcher did not return a value for slot".to_string(),
+                        );
+                    }
+                }
+            }
+        } else {
+            for group in storage_groups {
+                let block = group.block.clone();
+                for slot in group.slots {
+                    push_resync_failures(
+                        &mut failed,
+                        &block,
+                        slot.origins,
+                        ResyncFailureKind::MissingStorageFetcher,
+                        "storage resync requires a storage batch fetcher".to_string(),
+                    );
+                }
+            }
+        }
+    }
+
+    let diff = if state_updates.is_empty() {
+        StateDiff::default()
+    } else {
+        cache.apply_updates(&state_updates)
+    };
+
+    ResyncReport {
+        requested: requests.to_vec(),
+        state_updates,
+        diff,
+        failed,
+    }
+}
+
+fn push_resync_failures(
+    failed: &mut Vec<ResyncFailure>,
+    block: &ResyncBlock,
+    origins: Vec<StorageFetchOrigin>,
+    kind: ResyncFailureKind,
+    message: String,
+) {
+    for origin in origins {
+        failed.push(ResyncFailure {
+            request_id: origin.request_id,
+            block: block.clone(),
+            target: origin.target,
+            kind,
+            message: message.clone(),
+        });
+    }
+}
+
+fn push_storage_resync_slot(
+    groups: &mut Vec<StorageFetchGroup>,
+    request_id: &ResyncId,
+    block: &ResyncBlock,
+    address: Address,
+    slot: U256,
+) {
+    let group_index = if let Some(index) = groups.iter().position(|group| group.block == *block) {
+        index
+    } else {
+        groups.push(StorageFetchGroup {
+            block: block.clone(),
+            slots: Vec::new(),
+            seen: HashSet::new(),
+        });
+        groups.len() - 1
+    };
+
+    let group = &mut groups[group_index];
+    let origin = StorageFetchOrigin {
+        request_id: request_id.clone(),
+        target: ResyncTarget::StorageSlot { address, slot },
+    };
+    if group.seen.insert((address, slot)) {
+        group.slots.push(StorageFetchSlot {
+            address,
+            slot,
+            origins: vec![origin],
+        });
+    } else if let Some(existing) = group
+        .slots
+        .iter_mut()
+        .find(|existing| existing.address == address && existing.slot == slot)
+    {
+        existing.origins.push(origin);
+    }
+}
+
+fn resync_block_to_block_id(block: &ResyncBlock) -> BlockId {
+    match block {
+        ResyncBlock::Latest => BlockId::latest(),
+        ResyncBlock::Safe => BlockId::safe(),
+        ResyncBlock::Finalized => BlockId::finalized(),
+        ResyncBlock::Number(number) => BlockId::number(*number),
+        ResyncBlock::Hash {
+            number: _,
+            hash,
+            require_canonical,
+        } => BlockId::from((*hash, Some(*require_canonical))),
     }
 }
 

@@ -65,7 +65,8 @@ around three capabilities that target exactly this workload:
   resync requests, speculative signals, and hook signals; the runtime routes
   inputs, deduplicates and orders canonical logs, validates pending semantics,
   applies canonical cache mutations through `EvmCache::apply_updates`, and
-  dispatches reports to hooks after committed mutation phases. The
+  can optionally execute storage resync requests through the cache's
+  provider-neutral storage batch fetcher before dispatching reports to hooks. The
   `ReactiveRegistry` exposes consolidated Alloy log filters for provider
   subscription setup and exact local log routing with optional route keys. The
   provider-agnostic `EventSubscriber` trait and `AlloySubscriber` scaffold are
