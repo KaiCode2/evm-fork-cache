@@ -54,6 +54,10 @@
 //!   `StateView` / `DecoderRegistry` decode an on-chain `Log` into `StateUpdate`s,
 //!   and `EventPipeline` ingests, reorg-purges, and reconciles a block's logs.
 //!   Ships an ERC-20 `Transfer` decoder plus traits for external decoders.
+//! - `reactive` — default-enabled provider-neutral handler runtime for logs,
+//!   blocks, and pending transaction signals. Pure handlers emit `StateUpdate`s,
+//!   invalidations, resync requests, speculative signals, and hooks; the runtime
+//!   validates and applies canonical cache mutations.
 //! - [`inspector`] — an [`Inspector`](revm::Inspector) that captures ERC20
 //!   `Transfer` events to reconstruct balance deltas from a simulation.
 //! - [`multicall`] — batched read-only calls through Multicall3.
@@ -110,6 +114,8 @@ pub mod freshness;
 pub mod inspector;
 pub mod multicall;
 pub mod prefetch_registry;
+#[cfg(feature = "reactive")]
+pub mod reactive;
 pub mod state_update;
 
 pub use access_set::StorageAccessList;

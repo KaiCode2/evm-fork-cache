@@ -123,6 +123,31 @@ pre-release development phases (see [`docs/ROADMAP.md`](docs/ROADMAP.md)).
     chain truth (correct **and** alarm) via the new `EvmCache::reconcile_slots`. A
     thin async `drive`/`LogSource` convenience layers the synchronous core over a
     stream. Generic core.
+- **Reactive runtime** (`reactive` module, default-enabled) — a provider-neutral
+  handler pipeline for logs, block notifications, and pending transaction
+  signals. `ReactiveHandler`s are pure synchronous functions over
+  `ReactiveInput` + `ReactiveContext` + `StateView`; they emit `StateUpdate`s,
+  invalidations, resync requests, speculative requests, and hook signals. The
+  runtime deduplicates inputs by `InputRef`, orders canonical logs by
+  `(block_number, transaction_index, log_index)`, routes by `ReactiveInterest`
+  with Alloy `Filter`s and local matchers, validates pending inputs so they
+  cannot mutate canonical cache state, detects conflicting absolute writes for a
+  single input, applies canonical mutations through `EvmCache::apply_updates`,
+  and dispatches `ReactiveReport`s to hooks after mutation phases.
+  `ReactiveRegistry` exposes consolidated Alloy log filters for provider
+  subscription setup and exact local log routing with optional route keys.
+  Includes a provider-agnostic `EventSubscriber` trait, an `AlloySubscriber`
+  scaffold for future live transport work, and an adapter from legacy
+  `EventDecoder`s to reactive handlers. Generic core.
+- **Reactive storage resync execution** — `ReactiveRuntime::ingest_batch_with_resync`
+  preserves the direct-effect behavior of `ingest_batch`, then executes surfaced
+  storage resync requests through `EvmCache`'s provider-neutral
+  `StorageBatchFetchFn`, applies successful values as `StateUpdate::slot`
+  updates, and reports requested targets, applied updates, the resulting
+  `StateDiff`, and per-target failures in `ResyncReport`. `ResyncFailureKind`
+  gives downstream retry policy and metrics a stable failure classification.
+  Account-field resyncs remain explicitly unsupported until a provider-neutral
+  account fetch callback exists. Generic core.
 - **`StateUpdate::SlotMasked`** (`state_update`, Phase 4) — a cold-aware
   read-modify-write *masked* slot write (`new = (old & !mask) | (value & mask)`)
   with the `StateUpdate::slot_masked` constructor, so a pure decoder can update
