@@ -137,8 +137,16 @@ pre-release development phases (see [`docs/ROADMAP.md`](docs/ROADMAP.md)).
   `ReactiveRegistry` exposes consolidated Alloy log filters for provider
   subscription setup and exact local log routing with optional route keys.
   Includes a provider-agnostic `EventSubscriber` trait, an `AlloySubscriber`
-  scaffold for future live transport work, and an adapter from legacy
-  `EventDecoder`s to reactive handlers. Generic core.
+  that drives default WebSocket/pubsub Alloy `subscribe_logs`,
+  `subscribe_blocks`, and `subscribe_pending_transactions` streams for live log,
+  block-header, and pending transaction hash inputs, with automatic
+  source-specific reconnect that retries immediately first, attempts three
+  times by default, and performs log gap backfill from the last seen block when
+  a pubsub stream terminates, plus an adapter from legacy `EventDecoder`s to
+  reactive handlers. HTTP polling `watch_logs` / `watch_pending_transactions`
+  support is still exported behind the opt-in `reactive-polling` feature. Full
+  block bodies, full pending transaction hydration, and arbitrary historical
+  backfill remain follow-up transport work. Generic core.
 - **Reactive storage resync execution** — `ReactiveRuntime::ingest_batch_with_resync`
   preserves the direct-effect behavior of `ingest_batch`, then executes surfaced
   storage resync requests through `EvmCache`'s provider-neutral

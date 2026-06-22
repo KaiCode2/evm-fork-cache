@@ -58,8 +58,8 @@ around three capabilities that target exactly this workload:
 - **Event-to-state pipeline** — decode logs into `StateUpdate`s, apply them in
   order, purge touched state on reorg, and reconcile sampled event-derived slots
   against RPC. The crate ships the generic driver, the ERC-20 `Transfer` decoder,
-  and in-memory examples; production WebSocket subscription/reorg wiring and
-  protocol-specific decoders stay with the consumer or companion crates.
+  and in-memory examples; protocol-specific decoders stay with the consumer or
+  companion crates.
 - **Reactive runtime** — register pure handlers for logs, block notifications,
   and pending transaction signals. Handlers emit `StateUpdate`s, invalidations,
   resync requests, speculative signals, and hook signals; the runtime routes
@@ -69,9 +69,19 @@ around three capabilities that target exactly this workload:
   provider-neutral storage batch fetcher before dispatching reports to hooks. The
   `ReactiveRegistry` exposes consolidated Alloy log filters for provider
   subscription setup and exact local log routing with optional route keys. The
-  provider-agnostic `EventSubscriber` trait and `AlloySubscriber` scaffold are
-  included; live Alloy stream driving is intentionally left to a future transport
-  layer.
+  provider-agnostic `EventSubscriber` trait and `AlloySubscriber` are included;
+  the Alloy subscriber uses WebSocket/pubsub `subscribe_logs`,
+  `subscribe_blocks`, and `subscribe_pending_transactions` by default for live
+  log, block-header, and pending-transaction-hash inputs. If an established
+  WebSocket subscription stream terminates, the subscriber recreates that source
+  immediately, retries three times by default with exponential backoff between
+  later attempts, and backfills log subscriptions from the last seen block
+  through `get_logs`, marking recovered records as `InputSource::Backfill` while
+  suppressing recent duplicate canonical inputs. HTTP polling `watch_logs` /
+  `watch_pending_transactions` remains available behind the opt-in
+  `reactive-polling` feature. Full block bodies, full pending transaction
+  hydration, and arbitrary historical backfill remain explicit follow-up
+  transport work.
 - **ERC20 helpers** — balances, allowances, decimals, and controlled balance
   mutation (including automatic balance-slot discovery) for simulations.
 - **Transfer-inspector simulation** that reports per-token balance deltas
@@ -198,11 +208,19 @@ endpoint (they print instructions and exit if it is unset):
 | `multicall_batch` | Intermediate | Batch many view calls through Multicall3 in one pass. |
 | `multicall_with_error_handling` | Intermediate | Batch with `allowFailure`; read partial results when a call reverts. |
 | `fork_override_balance` | Intermediate | Discover a real token's balance slot and override it. |
+| `reactive_alloy_amm_live_probe` | Advanced | Subscribe to live mainnet AMM logs through the WebSocket-backed `AlloySubscriber`. |
 
 ```sh
 cargo run --example revert_decoding
 RPC_URL=https://eth.llamarpc.com cargo run --example fork_token_balance
+WS_RPC_URL=wss://example-mainnet-endpoint cargo run --example reactive_alloy_amm_live_probe
 ```
+
+## Feature Flags
+
+Default features enable the reactive runtime and WebSocket/pubsub subscriber
+support (`reactive`, `reactive-ws`). The HTTP polling subscriber is opt-in:
+consumers that disable defaults can enable `reactive,reactive-polling`.
 
 ## Foundry artifact etching
 

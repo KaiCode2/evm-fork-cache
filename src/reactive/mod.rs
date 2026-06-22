@@ -14,13 +14,14 @@
 use std::{
     any::Any,
     borrow::Cow,
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     fmt,
     future::Future,
     hash::Hash,
     marker::PhantomData,
     pin::Pin,
     sync::Arc,
+    time::Duration,
 };
 
 use alloy_consensus::{BlockHeader as _, Transaction as _};
@@ -28,11 +29,17 @@ use alloy_eips::BlockId;
 use alloy_network::{
     Ethereum, Network,
     primitives::{
-        BlockResponse as _, HeaderResponse as _, TransactionResponse as TransactionResponseTrait,
+        BlockResponse as _, HeaderResponse as HeaderResponseTrait,
+        TransactionResponse as TransactionResponseTrait,
     },
 };
 use alloy_primitives::{Address, B256, Bytes, U256};
+use alloy_provider::Provider;
 use alloy_rpc_types_eth::{Filter, FilterSet, Log};
+use futures::{
+    StreamExt,
+    stream::{self, BoxStream, SelectAll},
+};
 
 use crate::{
     cache::EvmCache,
@@ -2037,13 +2044,19 @@ pub type SubscriberNextBatch<'a, N> = Pin<
     Box<dyn Future<Output = Result<Option<ReactiveInputBatch<N>>, SubscriberError>> + Send + 'a>,
 >;
 
-/// Subscriber mode requested for the Alloy scaffold.
+/// Subscriber mode requested for the Alloy subscriber.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum SubscriberMode {
-    /// Use provider pubsub streams when available.
+    /// Prefer the default compiled transport.
+    ///
+    /// With the default `reactive-ws` feature this resolves to pubsub/WebSocket
+    /// subscriptions. Without `reactive-ws`, it resolves to polling only when
+    /// the opt-in `reactive-polling` feature is enabled.
     #[default]
+    Auto,
+    /// Use provider pubsub streams.
     PubSub,
-    /// Use polling/watch APIs.
+    /// Use polling/watch APIs. Requires the `reactive-polling` feature.
     Polling,
 }
 
@@ -2054,6 +2067,8 @@ pub struct SubscriberConfig {
     pub hydrate_pending_transactions: bool,
     /// Maximum records to emit per batch.
     pub max_batch_size: usize,
+    /// Reconnect policy for WebSocket/pubsub streams.
+    pub reconnect: SubscriberReconnectConfig,
 }
 
 impl Default for SubscriberConfig {
@@ -2061,31 +2076,84 @@ impl Default for SubscriberConfig {
         Self {
             hydrate_pending_transactions: false,
             max_batch_size: 1024,
+            reconnect: SubscriberReconnectConfig::default(),
         }
     }
 }
 
-/// Documented Alloy subscriber scaffold.
+/// WebSocket/pubsub reconnect policy.
 ///
-/// This type records interests and configuration but does not yet drive live
-/// provider streams. Use it as the integration point for a future
-/// `reactive-alloy` transport implementation.
+/// Reconnects are applied after an established subscription stream terminates.
+/// Initial subscription failures are still returned immediately so deployment
+/// mistakes, unsupported transports, and bad endpoints fail fast.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SubscriberReconnectConfig {
+    /// Whether pubsub streams should be recreated after termination.
+    pub enabled: bool,
+    /// Delay before the first reconnect attempt.
+    pub initial_delay: Duration,
+    /// Delay before the second reconnect attempt. Later retries double this
+    /// delay up to [`Self::max_delay`].
+    pub retry_delay: Duration,
+    /// Maximum delay between reconnect attempts.
+    pub max_delay: Duration,
+    /// Maximum reconnect attempts per terminated stream. `None` retries forever.
+    pub max_attempts: Option<usize>,
+    /// Number of recently emitted canonical input refs remembered to suppress
+    /// duplicates across reconnect backfill and subscription replay.
+    pub dedupe_window: usize,
+}
+
+impl Default for SubscriberReconnectConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            initial_delay: Duration::ZERO,
+            retry_delay: Duration::from_millis(250),
+            max_delay: Duration::from_secs(30),
+            max_attempts: Some(3),
+            dedupe_window: 4096,
+        }
+    }
+}
+
+/// Alloy-backed event subscriber.
+///
+/// The default transport slice drives Alloy pubsub subscriptions for logs,
+/// block headers, and pending transaction hashes. The HTTP polling `watch_*`
+/// transport remains available behind the opt-in `reactive-polling` feature.
+/// Pubsub streams reconnect automatically after termination, and log
+/// subscriptions are backfilled from the last seen block. Full pending
+/// transaction hydration, full block bodies, and arbitrary historical backfill
+/// remain explicit follow-up work.
+/// With no registered interests, [`EventSubscriber::next_batch`] returns
+/// `Ok(None)`.
 pub struct AlloySubscriber<P, N: Network = Ethereum> {
     provider: P,
     mode: SubscriberMode,
     config: SubscriberConfig,
     interests: Vec<ReactiveInterest<N>>,
+    state: AlloySubscriberState<N>,
+    pending_records: VecDeque<ReactiveInputRecord<N>>,
+    last_seen_log_blocks: HashMap<usize, u64>,
+    recent_input_refs: VecDeque<InputRef>,
+    recent_input_ref_set: HashSet<InputRef>,
     _network: PhantomData<N>,
 }
 
 impl<P, N: Network> AlloySubscriber<P, N> {
-    /// Create a new Alloy subscriber scaffold.
+    /// Create a new Alloy subscriber.
     pub fn new(provider: P, mode: SubscriberMode, config: SubscriberConfig) -> Self {
         Self {
             provider,
             mode,
             config,
             interests: Vec::new(),
+            state: AlloySubscriberState::Uninitialized,
+            pending_records: VecDeque::new(),
+            last_seen_log_blocks: HashMap::new(),
+            recent_input_refs: VecDeque::new(),
+            recent_input_ref_set: HashSet::new(),
             _network: PhantomData,
         }
     }
@@ -2109,29 +2177,1035 @@ impl<P, N: Network> AlloySubscriber<P, N> {
     pub fn registered_interests(&self) -> &[ReactiveInterest<N>] {
         &self.interests
     }
+
+    fn drain_next_batch(&mut self) -> Option<ReactiveInputBatch<N>> {
+        if self.pending_records.is_empty() {
+            return None;
+        }
+
+        let len = self.config.max_batch_size.min(self.pending_records.len());
+        let records = self.pending_records.drain(..len).collect();
+        Some(ReactiveInputBatch::new(records))
+    }
+
+    fn reset_delivery_state(&mut self) {
+        self.pending_records.clear();
+        self.last_seen_log_blocks.clear();
+        self.recent_input_refs.clear();
+        self.recent_input_ref_set.clear();
+    }
 }
 
-impl<P: Send, N: Network> EventSubscriber<N> for AlloySubscriber<P, N> {
+enum AlloySubscriberState<N: Network> {
+    Uninitialized,
+    Active(SubscriberStreams<N>),
+    Empty,
+}
+
+struct SubscriberStreams<N: Network> {
+    streams: SelectAll<BoxStream<'static, SubscriberEvent<N>>>,
+}
+
+impl<N: Network> SubscriberStreams<N> {
+    fn new() -> Self {
+        Self {
+            streams: SelectAll::new(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.streams.is_empty()
+    }
+
+    fn push(&mut self, stream: BoxStream<'static, SubscriberEvent<N>>) {
+        self.streams.push(stream);
+    }
+
+    async fn next(&mut self) -> Option<SubscriberEvent<N>> {
+        self.streams.next().await
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+enum SubscriberTransport {
+    PubSub,
+    Polling,
+}
+
+#[derive(Clone, Debug)]
+enum SubscriberStreamSource {
+    PubSubLog { id: usize, filter: Filter },
+    PubSubPendingHashes,
+    PubSubBlockHeaders,
+    PollingLog { filter: Filter },
+    PollingPendingHashes,
+}
+
+impl SubscriberStreamSource {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::PubSubLog { .. } => "pubsub log",
+            Self::PubSubPendingHashes => "pubsub pending transaction hash",
+            Self::PubSubBlockHeaders => "pubsub block header",
+            Self::PollingLog { .. } => "polling log",
+            Self::PollingPendingHashes => "polling pending transaction hash",
+        }
+    }
+
+    fn is_pubsub(&self) -> bool {
+        matches!(
+            self,
+            Self::PubSubLog { .. } | Self::PubSubPendingHashes | Self::PubSubBlockHeaders
+        )
+    }
+}
+
+#[allow(dead_code)]
+enum SubscriberEvent<N: Network> {
+    Log { source_id: usize, log: Log },
+    BackfilledLogs { source_id: usize, logs: Vec<Log> },
+    Logs(Vec<Log>),
+    BlockHeader(N::HeaderResponse),
+    PendingHash(B256),
+    PendingHashes(Vec<B256>),
+    StreamTerminated(SubscriberStreamSource),
+}
+
+impl<P, N> EventSubscriber<N> for AlloySubscriber<P, N>
+where
+    P: Provider<N> + Send + Sync,
+    N: Network + 'static,
+    N::HeaderResponse: Send + 'static,
+{
     fn register_interests(
         &mut self,
         interests: &[ReactiveInterest<N>],
     ) -> Result<(), SubscriberError> {
+        validate_subscriber_config(&self.config)?;
+        validate_supported_interests(self.mode, &self.config, interests)?;
+
         self.interests = interests.to_vec();
+        self.reset_delivery_state();
+        self.state = AlloySubscriberState::Uninitialized;
         Ok(())
     }
 
     fn next_batch(&mut self) -> SubscriberNextBatch<'_, N> {
         Box::pin(async {
-            Err(SubscriberError::Unsupported(
-                "AlloySubscriber is a scaffold; live stream driving is not implemented in this feature slice",
-            ))
+            if let Some(batch) = self.drain_next_batch() {
+                return Ok(Some(batch));
+            }
+
+            if self.interests.is_empty() {
+                return Ok(None);
+            }
+
+            if matches!(self.state, AlloySubscriberState::Uninitialized) {
+                let streams = self.init_streams().await?;
+                self.state = if streams.is_empty() {
+                    AlloySubscriberState::Empty
+                } else {
+                    AlloySubscriberState::Active(streams)
+                };
+            }
+
+            loop {
+                let Some(event) = self.next_event().await? else {
+                    return Ok(None);
+                };
+
+                self.enqueue_event(event);
+                if let Some(batch) = self.drain_next_batch() {
+                    return Ok(Some(batch));
+                }
+            }
         })
     }
+}
+
+impl<P, N> AlloySubscriber<P, N>
+where
+    P: Provider<N> + Send + Sync,
+    N: Network + 'static,
+    N::HeaderResponse: Send + 'static,
+{
+    async fn init_streams(&mut self) -> Result<SubscriberStreams<N>, SubscriberError> {
+        let mut streams = SubscriberStreams::new();
+        for source in self.stream_sources()? {
+            streams.push(self.connect_source_stream(source).await?);
+        }
+        Ok(streams)
+    }
+
+    fn stream_sources(&self) -> Result<Vec<SubscriberStreamSource>, SubscriberError> {
+        match resolve_subscriber_transport(self.mode)? {
+            SubscriberTransport::PubSub => Ok(pubsub_stream_sources(&self.interests)),
+            SubscriberTransport::Polling => Ok(polling_stream_sources(&self.interests)),
+        }
+    }
+
+    async fn connect_source_stream(
+        &mut self,
+        source: SubscriberStreamSource,
+    ) -> Result<BoxStream<'static, SubscriberEvent<N>>, SubscriberError> {
+        match source {
+            SubscriberStreamSource::PubSubLog { id, filter } => {
+                self.connect_pubsub_log_stream(id, filter).await
+            }
+            SubscriberStreamSource::PubSubPendingHashes => {
+                self.connect_pubsub_pending_hash_stream().await
+            }
+            SubscriberStreamSource::PubSubBlockHeaders => {
+                self.connect_pubsub_block_header_stream().await
+            }
+            SubscriberStreamSource::PollingLog { filter } => {
+                self.connect_polling_log_stream(filter).await
+            }
+            SubscriberStreamSource::PollingPendingHashes => {
+                self.connect_polling_pending_hash_stream().await
+            }
+        }
+    }
+
+    async fn connect_pubsub_log_stream(
+        &mut self,
+        id: usize,
+        filter: Filter,
+    ) -> Result<BoxStream<'static, SubscriberEvent<N>>, SubscriberError> {
+        #[cfg(feature = "reactive-ws")]
+        {
+            let source = SubscriberStreamSource::PubSubLog {
+                id,
+                filter: filter.clone(),
+            };
+            let stream = self
+                .provider
+                .subscribe_logs(&filter)
+                .channel_size(self.config.max_batch_size.max(1))
+                .await
+                .map_err(provider_error)?
+                .into_stream()
+                .map(move |log| SubscriberEvent::Log { source_id: id, log });
+            Ok(stream_with_termination(stream, source))
+        }
+
+        #[cfg(not(feature = "reactive-ws"))]
+        {
+            let _ = (id, filter);
+            Err(SubscriberError::Unsupported(
+                "AlloySubscriber pubsub mode requires the reactive-ws feature",
+            ))
+        }
+    }
+
+    async fn connect_pubsub_pending_hash_stream(
+        &mut self,
+    ) -> Result<BoxStream<'static, SubscriberEvent<N>>, SubscriberError> {
+        #[cfg(feature = "reactive-ws")]
+        {
+            let stream = self
+                .provider
+                .subscribe_pending_transactions()
+                .channel_size(self.config.max_batch_size.max(1))
+                .await
+                .map_err(provider_error)?
+                .into_stream()
+                .map(SubscriberEvent::PendingHash);
+            Ok(stream_with_termination(
+                stream,
+                SubscriberStreamSource::PubSubPendingHashes,
+            ))
+        }
+
+        #[cfg(not(feature = "reactive-ws"))]
+        {
+            Err(SubscriberError::Unsupported(
+                "AlloySubscriber pubsub mode requires the reactive-ws feature",
+            ))
+        }
+    }
+
+    async fn connect_pubsub_block_header_stream(
+        &mut self,
+    ) -> Result<BoxStream<'static, SubscriberEvent<N>>, SubscriberError> {
+        #[cfg(feature = "reactive-ws")]
+        {
+            let stream = self
+                .provider
+                .subscribe_blocks()
+                .channel_size(self.config.max_batch_size.max(1))
+                .await
+                .map_err(provider_error)?
+                .into_stream()
+                .map(SubscriberEvent::BlockHeader);
+            Ok(stream_with_termination(
+                stream,
+                SubscriberStreamSource::PubSubBlockHeaders,
+            ))
+        }
+
+        #[cfg(not(feature = "reactive-ws"))]
+        {
+            Err(SubscriberError::Unsupported(
+                "AlloySubscriber pubsub mode requires the reactive-ws feature",
+            ))
+        }
+    }
+
+    async fn connect_polling_log_stream(
+        &mut self,
+        filter: Filter,
+    ) -> Result<BoxStream<'static, SubscriberEvent<N>>, SubscriberError> {
+        #[cfg(feature = "reactive-polling")]
+        {
+            let source = SubscriberStreamSource::PollingLog {
+                filter: filter.clone(),
+            };
+            let stream = self
+                .provider
+                .watch_logs(&filter)
+                .await
+                .map_err(provider_error)?
+                .with_channel_size(self.config.max_batch_size.max(1))
+                .into_stream()
+                .map(SubscriberEvent::Logs);
+            Ok(stream_with_termination(stream, source))
+        }
+
+        #[cfg(not(feature = "reactive-polling"))]
+        {
+            let _ = filter;
+            Err(SubscriberError::Unsupported(
+                "AlloySubscriber polling mode requires the reactive-polling feature",
+            ))
+        }
+    }
+
+    async fn connect_polling_pending_hash_stream(
+        &mut self,
+    ) -> Result<BoxStream<'static, SubscriberEvent<N>>, SubscriberError> {
+        #[cfg(feature = "reactive-polling")]
+        {
+            let stream = self
+                .provider
+                .watch_pending_transactions()
+                .await
+                .map_err(provider_error)?
+                .with_channel_size(self.config.max_batch_size.max(1))
+                .into_stream()
+                .map(SubscriberEvent::PendingHashes);
+            Ok(stream_with_termination(
+                stream,
+                SubscriberStreamSource::PollingPendingHashes,
+            ))
+        }
+
+        #[cfg(not(feature = "reactive-polling"))]
+        {
+            Err(SubscriberError::Unsupported(
+                "AlloySubscriber polling mode requires the reactive-polling feature",
+            ))
+        }
+    }
+
+    async fn next_event(&mut self) -> Result<Option<SubscriberEvent<N>>, SubscriberError> {
+        loop {
+            let event = match &mut self.state {
+                AlloySubscriberState::Active(streams) => streams.next().await,
+                AlloySubscriberState::Uninitialized | AlloySubscriberState::Empty => {
+                    return Ok(None);
+                }
+            };
+
+            let Some(event) = event else {
+                return Err(SubscriberError::Provider(
+                    "Alloy subscriber streams terminated before the subscriber was stopped"
+                        .to_owned(),
+                ));
+            };
+
+            match event {
+                SubscriberEvent::StreamTerminated(source) => {
+                    if let Some(backfill_event) = self.reconnect_source_stream(source).await? {
+                        return Ok(Some(backfill_event));
+                    }
+                }
+                event => return Ok(Some(event)),
+            }
+        }
+    }
+
+    fn enqueue_event(&mut self, event: SubscriberEvent<N>) {
+        match event {
+            SubscriberEvent::Log { source_id, log } => {
+                if log_matches_any_interest(&log, &self.interests) {
+                    let record = log_input_record(log, InputSource::Subscription);
+                    self.note_log_block(source_id, &record);
+                    self.enqueue_record(record);
+                }
+            }
+            SubscriberEvent::BackfilledLogs { source_id, logs } => {
+                for log in logs {
+                    if log_matches_any_interest(&log, &self.interests) {
+                        let record = log_input_record(log, InputSource::Backfill);
+                        self.note_log_block(source_id, &record);
+                        self.enqueue_record(record);
+                    }
+                }
+            }
+            SubscriberEvent::Logs(logs) => self.pending_records.extend(
+                logs.into_iter()
+                    .filter(|log| log_matches_any_interest(log, &self.interests))
+                    .map(|log| log_input_record(log, InputSource::Poll)),
+            ),
+            SubscriberEvent::BlockHeader(header) => {
+                if needs_header_block_stream(&self.interests) {
+                    let record = block_header_input_record::<N>(header);
+                    self.enqueue_record(record);
+                }
+            }
+            SubscriberEvent::PendingHash(hash) => {
+                let record = pending_hash_input_record::<N>(hash, InputSource::Subscription);
+                self.enqueue_record(record);
+            }
+            SubscriberEvent::PendingHashes(hashes) => self.pending_records.extend(
+                hashes
+                    .into_iter()
+                    .map(|hash| pending_hash_input_record::<N>(hash, InputSource::Poll)),
+            ),
+            SubscriberEvent::StreamTerminated(_) => {}
+        }
+    }
+
+    async fn reconnect_source_stream(
+        &mut self,
+        source: SubscriberStreamSource,
+    ) -> Result<Option<SubscriberEvent<N>>, SubscriberError> {
+        if !source.is_pubsub() {
+            return Err(stream_terminated_error(&source));
+        }
+
+        if !self.config.reconnect.enabled {
+            return Err(SubscriberError::Provider(format!(
+                "Alloy subscriber {} stream terminated and reconnect is disabled",
+                source.label()
+            )));
+        }
+
+        let mut attempts = 0usize;
+        let mut delay = self.config.reconnect.initial_delay;
+        let mut retry_delay = self.config.reconnect.retry_delay;
+
+        loop {
+            attempts = attempts.saturating_add(1);
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
+
+            match self.reconnect_source_once(source.clone()).await {
+                Ok(backfill_event) => return Ok(backfill_event),
+                Err(error) if reconnect_attempts_exhausted(attempts, &self.config.reconnect) => {
+                    return Err(SubscriberError::Provider(format!(
+                        "Alloy subscriber {} stream terminated and reconnect failed after {attempts} attempt(s): {error}",
+                        source.label()
+                    )));
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        stream = source.label(),
+                        attempts,
+                        error = %error,
+                        "Alloy subscriber reconnect attempt failed"
+                    );
+                    delay = retry_delay;
+                    retry_delay =
+                        next_reconnect_delay(retry_delay, self.config.reconnect.max_delay);
+                }
+            }
+        }
+    }
+
+    async fn reconnect_source_once(
+        &mut self,
+        source: SubscriberStreamSource,
+    ) -> Result<Option<SubscriberEvent<N>>, SubscriberError> {
+        let stream = self.connect_source_stream(source.clone()).await?;
+        let backfill_event = self.backfill_reconnected_source(&source).await?;
+
+        match &mut self.state {
+            AlloySubscriberState::Active(streams) => streams.push(stream),
+            AlloySubscriberState::Uninitialized | AlloySubscriberState::Empty => {
+                return Err(SubscriberError::Provider(
+                    "Alloy subscriber state changed before reconnect completed".to_owned(),
+                ));
+            }
+        }
+
+        Ok(backfill_event)
+    }
+
+    async fn backfill_reconnected_source(
+        &mut self,
+        source: &SubscriberStreamSource,
+    ) -> Result<Option<SubscriberEvent<N>>, SubscriberError> {
+        let SubscriberStreamSource::PubSubLog { id, filter } = source else {
+            return Ok(None);
+        };
+        let Some(from_block) = self.last_seen_log_blocks.get(id).copied() else {
+            return Ok(None);
+        };
+
+        let latest = self
+            .provider
+            .get_block_number()
+            .await
+            .map_err(provider_error)?;
+        if latest < from_block {
+            return Ok(None);
+        }
+
+        let logs = self
+            .provider
+            .get_logs(&filter.clone().from_block(from_block).to_block(latest))
+            .await
+            .map_err(provider_error)?;
+        Ok(Some(SubscriberEvent::BackfilledLogs {
+            source_id: *id,
+            logs,
+        }))
+    }
+
+    fn note_log_block(&mut self, source_id: usize, record: &ReactiveInputRecord<N>) {
+        if let Some(block) = record.context.block.as_ref() {
+            self.last_seen_log_blocks.insert(source_id, block.number);
+        }
+    }
+
+    fn enqueue_record(&mut self, record: ReactiveInputRecord<N>) {
+        if self.should_skip_recent_duplicate(&record) {
+            return;
+        }
+        self.remember_record(&record);
+        self.pending_records.push_back(record);
+    }
+
+    fn should_skip_recent_duplicate(&self, record: &ReactiveInputRecord<N>) -> bool {
+        if !should_dedupe_record(record) {
+            return false;
+        }
+        self.recent_input_ref_set.contains(&record.input_ref())
+    }
+
+    fn remember_record(&mut self, record: &ReactiveInputRecord<N>) {
+        if !should_dedupe_record(record) || self.config.reconnect.dedupe_window == 0 {
+            return;
+        }
+
+        let input_ref = record.input_ref();
+        if !self.recent_input_ref_set.insert(input_ref) {
+            return;
+        }
+        self.recent_input_refs.push_back(input_ref);
+
+        while self.recent_input_refs.len() > self.config.reconnect.dedupe_window {
+            if let Some(evicted) = self.recent_input_refs.pop_front() {
+                self.recent_input_ref_set.remove(&evicted);
+            }
+        }
+    }
+}
+
+fn stream_with_termination<N, S>(
+    stream: S,
+    source: SubscriberStreamSource,
+) -> BoxStream<'static, SubscriberEvent<N>>
+where
+    N: Network + 'static,
+    S: futures::Stream<Item = SubscriberEvent<N>> + Send + 'static,
+{
+    stream
+        .chain(stream::once(async move {
+            SubscriberEvent::StreamTerminated(source)
+        }))
+        .boxed()
+}
+
+fn pubsub_stream_sources<N: Network>(
+    interests: &[ReactiveInterest<N>],
+) -> Vec<SubscriberStreamSource> {
+    let mut sources = Vec::new();
+
+    for (id, filter) in log_filters(interests).into_iter().enumerate() {
+        sources.push(SubscriberStreamSource::PubSubLog { id, filter });
+    }
+
+    if needs_pending_hash_stream(interests) {
+        sources.push(SubscriberStreamSource::PubSubPendingHashes);
+    }
+
+    if needs_header_block_stream(interests) {
+        sources.push(SubscriberStreamSource::PubSubBlockHeaders);
+    }
+
+    sources
+}
+
+fn polling_stream_sources<N: Network>(
+    interests: &[ReactiveInterest<N>],
+) -> Vec<SubscriberStreamSource> {
+    let mut sources = Vec::new();
+
+    for filter in log_filters(interests) {
+        sources.push(SubscriberStreamSource::PollingLog { filter });
+    }
+
+    if needs_pending_hash_stream(interests) {
+        sources.push(SubscriberStreamSource::PollingPendingHashes);
+    }
+
+    sources
+}
+
+fn stream_terminated_error(source: &SubscriberStreamSource) -> SubscriberError {
+    SubscriberError::Provider(format!(
+        "Alloy subscriber {} stream terminated before the subscriber was stopped",
+        source.label()
+    ))
+}
+
+fn reconnect_attempts_exhausted(attempts: usize, config: &SubscriberReconnectConfig) -> bool {
+    config
+        .max_attempts
+        .is_some_and(|max_attempts| attempts >= max_attempts)
+}
+
+fn next_reconnect_delay(current: Duration, max: Duration) -> Duration {
+    if current.is_zero() {
+        return current;
+    }
+    current.checked_mul(2).unwrap_or(max).min(max)
+}
+
+fn should_dedupe_record<N: Network>(record: &ReactiveInputRecord<N>) -> bool {
+    match &record.input {
+        ReactiveInput::Log(log) => {
+            is_canonical_status(&record.context.chain_status) && !log.removed
+        }
+        ReactiveInput::BlockHeader(_) | ReactiveInput::PendingTxHash(_) => true,
+        ReactiveInput::FullBlock(_) | ReactiveInput::PendingTx(_) => false,
+    }
+}
+
+#[cfg(test)]
+mod subscriber_helper_tests {
+    use super::*;
+    use alloy_provider::ProviderBuilder;
+    use alloy_transport::mock::Asserter;
+
+    fn rpc_log(removed: bool) -> Log {
+        Log {
+            inner: alloy_primitives::Log::new_unchecked(
+                Address::repeat_byte(0x42),
+                vec![B256::repeat_byte(0x01)],
+                Bytes::new(),
+            ),
+            block_hash: Some(B256::repeat_byte(0x02)),
+            block_number: Some(7),
+            block_timestamp: Some(1_700_000_000),
+            transaction_hash: Some(B256::repeat_byte(0x03)),
+            transaction_index: Some(4),
+            log_index: Some(5),
+            removed,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stream_with_termination_yields_terminal_source_marker() {
+        let mut stream = stream_with_termination::<Ethereum, _>(
+            stream::iter([SubscriberEvent::<Ethereum>::PendingHash(B256::repeat_byte(
+                0xaa,
+            ))]),
+            SubscriberStreamSource::PubSubPendingHashes,
+        );
+
+        assert!(matches!(
+            stream.next().await,
+            Some(SubscriberEvent::PendingHash(hash)) if hash == B256::repeat_byte(0xaa)
+        ));
+        assert!(matches!(
+            stream.next().await,
+            Some(SubscriberEvent::StreamTerminated(source)) if source.is_pubsub()
+        ));
+        assert!(stream.next().await.is_none());
+    }
+
+    #[test]
+    fn reconnect_delay_doubles_until_capped() {
+        assert_eq!(
+            next_reconnect_delay(Duration::from_millis(250), Duration::from_secs(1)),
+            Duration::from_millis(500)
+        );
+        assert_eq!(
+            next_reconnect_delay(Duration::from_millis(750), Duration::from_secs(1)),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            next_reconnect_delay(Duration::ZERO, Duration::from_secs(1)),
+            Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn canonical_logs_are_deduped_but_removed_logs_are_not() {
+        let included = log_input_record::<Ethereum>(rpc_log(false), InputSource::Subscription);
+        let removed = log_input_record::<Ethereum>(rpc_log(true), InputSource::Subscription);
+
+        assert!(should_dedupe_record(&included));
+        assert!(!should_dedupe_record(&removed));
+    }
+
+    #[test]
+    fn pubsub_sources_assign_stable_log_ids_before_shared_streams() {
+        let sources = pubsub_stream_sources::<Ethereum>(&[
+            ReactiveInterest::Logs(LogInterest {
+                provider_filter: Filter::new().address(Address::repeat_byte(0x01)),
+                local_matcher: None,
+                route_key: None,
+            }),
+            ReactiveInterest::Logs(LogInterest {
+                provider_filter: Filter::new().address(Address::repeat_byte(0x02)),
+                local_matcher: None,
+                route_key: None,
+            }),
+            ReactiveInterest::PendingTransactions(PendingTxInterest::default()),
+        ]);
+
+        assert!(matches!(
+            &sources[0],
+            SubscriberStreamSource::PubSubLog { id: 0, .. }
+        ));
+        assert!(matches!(
+            sources[1],
+            SubscriberStreamSource::PubSubPendingHashes
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[cfg(feature = "reactive-ws")]
+    async fn pubsub_stream_termination_attempts_reconnect_before_error() {
+        let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
+        let mut subscriber = AlloySubscriber::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig {
+                reconnect: SubscriberReconnectConfig {
+                    initial_delay: Duration::ZERO,
+                    retry_delay: Duration::ZERO,
+                    max_delay: Duration::ZERO,
+                    max_attempts: Some(1),
+                    ..SubscriberReconnectConfig::default()
+                },
+                ..SubscriberConfig::default()
+            },
+        );
+        subscriber.interests = vec![ReactiveInterest::PendingTransactions(
+            PendingTxInterest::default(),
+        )];
+
+        let mut streams = SubscriberStreams::new();
+        streams.push(
+            stream::once(async {
+                SubscriberEvent::<Ethereum>::StreamTerminated(
+                    SubscriberStreamSource::PubSubPendingHashes,
+                )
+            })
+            .boxed(),
+        );
+        subscriber.state = AlloySubscriberState::Active(streams);
+
+        let result = subscriber.next_batch().await;
+        assert!(
+            matches!(result, Err(SubscriberError::Provider(ref message)) if message.contains("reconnect failed after 1 attempt")),
+            "terminated pubsub streams should attempt reconnect before surfacing failure: {result:?}"
+        );
+    }
+
+    #[test]
+    fn backfilled_logs_skip_recent_subscription_duplicates() {
+        let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig::default(),
+        );
+        subscriber.interests = vec![ReactiveInterest::Logs(LogInterest {
+            provider_filter: Filter::new()
+                .address(Address::repeat_byte(0x42))
+                .event_signature(B256::repeat_byte(0x01)),
+            local_matcher: None,
+            route_key: None,
+        })];
+
+        let log = rpc_log(false);
+        subscriber.enqueue_event(SubscriberEvent::Log {
+            source_id: 0,
+            log: log.clone(),
+        });
+        subscriber.enqueue_event(SubscriberEvent::BackfilledLogs {
+            source_id: 0,
+            logs: vec![log],
+        });
+
+        assert_eq!(subscriber.pending_records.len(), 1);
+        assert_eq!(subscriber.last_seen_log_blocks.get(&0), Some(&7));
+        assert_eq!(
+            subscriber.pending_records[0].context.source,
+            InputSource::Subscription
+        );
+    }
+}
+
+fn resolve_subscriber_transport(
+    mode: SubscriberMode,
+) -> Result<SubscriberTransport, SubscriberError> {
+    match mode {
+        SubscriberMode::PubSub => {
+            #[cfg(feature = "reactive-ws")]
+            {
+                Ok(SubscriberTransport::PubSub)
+            }
+            #[cfg(not(feature = "reactive-ws"))]
+            {
+                Err(SubscriberError::Unsupported(
+                    "AlloySubscriber pubsub mode requires the reactive-ws feature",
+                ))
+            }
+        }
+        SubscriberMode::Polling => {
+            #[cfg(feature = "reactive-polling")]
+            {
+                Ok(SubscriberTransport::Polling)
+            }
+            #[cfg(not(feature = "reactive-polling"))]
+            {
+                Err(SubscriberError::Unsupported(
+                    "AlloySubscriber polling mode requires the reactive-polling feature",
+                ))
+            }
+        }
+        SubscriberMode::Auto => resolve_auto_subscriber_transport(),
+    }
+}
+
+fn resolve_auto_subscriber_transport() -> Result<SubscriberTransport, SubscriberError> {
+    #[cfg(feature = "reactive-ws")]
+    {
+        Ok(SubscriberTransport::PubSub)
+    }
+
+    #[cfg(all(not(feature = "reactive-ws"), feature = "reactive-polling"))]
+    {
+        Ok(SubscriberTransport::Polling)
+    }
+
+    #[cfg(not(any(feature = "reactive-ws", feature = "reactive-polling")))]
+    {
+        Err(SubscriberError::Unsupported(
+            "AlloySubscriber requires either reactive-ws or reactive-polling",
+        ))
+    }
+}
+
+fn validate_subscriber_config(config: &SubscriberConfig) -> Result<(), SubscriberError> {
+    if config.max_batch_size == 0 {
+        return Err(SubscriberError::InvalidConfig(
+            "SubscriberConfig::max_batch_size must be greater than zero",
+        ));
+    }
+    if config.reconnect.enabled {
+        if config.reconnect.retry_delay > config.reconnect.max_delay {
+            return Err(SubscriberError::InvalidConfig(
+                "SubscriberReconnectConfig::retry_delay must be less than or equal to max_delay",
+            ));
+        }
+        if matches!(config.reconnect.max_attempts, Some(0)) {
+            return Err(SubscriberError::InvalidConfig(
+                "SubscriberReconnectConfig::max_attempts must be greater than zero when set",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_supported_interests<N: Network>(
+    mode: SubscriberMode,
+    config: &SubscriberConfig,
+    interests: &[ReactiveInterest<N>],
+) -> Result<(), SubscriberError> {
+    let transport = resolve_subscriber_transport(mode)?;
+
+    for interest in interests {
+        match interest {
+            ReactiveInterest::Logs(_) => {}
+            ReactiveInterest::PendingTransactions(interest)
+                if !config.hydrate_pending_transactions && interest.matches_hash_only() => {}
+            ReactiveInterest::PendingTransactions(_) => {
+                return Err(SubscriberError::Unsupported(
+                    "AlloySubscriber polling mode currently supports pending transaction hash interests only",
+                ));
+            }
+            ReactiveInterest::Blocks(interest) => match (transport, interest.mode) {
+                (SubscriberTransport::PubSub, BlockInterestMode::Header) => {}
+                (_, BlockInterestMode::FullBlock) => {
+                    return Err(SubscriberError::Unsupported(
+                        "AlloySubscriber full block streams are not implemented in this transport slice",
+                    ));
+                }
+                (SubscriberTransport::Polling, BlockInterestMode::Header) => {
+                    return Err(SubscriberError::Unsupported(
+                        "AlloySubscriber polling block streams are not implemented in this transport slice",
+                    ));
+                }
+            },
+        }
+    }
+
+    Ok(())
+}
+
+fn log_filters<N: Network>(interests: &[ReactiveInterest<N>]) -> Vec<Filter> {
+    let mut filters = Vec::new();
+    for interest in interests {
+        if let ReactiveInterest::Logs(interest) = interest {
+            merge_log_subscription_filter(&mut filters, &interest.provider_filter);
+        }
+    }
+    filters
+}
+
+fn needs_header_block_stream<N: Network>(interests: &[ReactiveInterest<N>]) -> bool {
+    interests.iter().any(|interest| {
+        matches!(
+            interest,
+            ReactiveInterest::Blocks(BlockInterest {
+                mode: BlockInterestMode::Header,
+            })
+        )
+    })
+}
+
+fn needs_pending_hash_stream<N: Network>(interests: &[ReactiveInterest<N>]) -> bool {
+    interests.iter().any(|interest| {
+        matches!(
+            interest,
+            ReactiveInterest::PendingTransactions(interest) if interest.matches_hash_only()
+        )
+    })
+}
+
+fn log_matches_any_interest<N: Network>(log: &Log, interests: &[ReactiveInterest<N>]) -> bool {
+    interests.iter().any(|interest| {
+        matches!(
+            interest,
+            ReactiveInterest::Logs(interest) if interest.matches(log)
+        )
+    })
+}
+
+fn log_input_record<N: Network>(log: Log, source: InputSource) -> ReactiveInputRecord<N> {
+    let context = log_reactive_context(&log);
+    ReactiveInputRecord::new(
+        ReactiveInput::Log(log),
+        ReactiveContext { source, ..context },
+    )
+}
+
+fn log_reactive_context(log: &Log) -> ReactiveContext {
+    let block = match (log.block_hash, log.block_number) {
+        (Some(hash), Some(number)) => Some(BlockRef {
+            number,
+            hash,
+            parent_hash: None,
+            timestamp: log.block_timestamp,
+        }),
+        _ => None,
+    };
+
+    let chain_status = match (&block, log.removed) {
+        (Some(block), true) => ChainStatus::Reorged {
+            dropped_from: block.clone(),
+        },
+        (Some(block), false) => ChainStatus::Included {
+            block: block.clone(),
+            confirmations: 0,
+        },
+        (None, _) => ChainStatus::Pending,
+    };
+
+    ReactiveContext {
+        chain_id: None,
+        source: InputSource::Poll,
+        chain_status,
+        block,
+        transaction_index: log.transaction_index,
+        log_index: log.log_index,
+    }
+}
+
+fn block_header_input_record<N>(header: N::HeaderResponse) -> ReactiveInputRecord<N>
+where
+    N: Network,
+{
+    let block = BlockRef {
+        number: header.number(),
+        hash: HeaderResponseTrait::hash(&header),
+        parent_hash: Some(header.parent_hash()),
+        timestamp: Some(header.timestamp()),
+    };
+    ReactiveInputRecord::new(
+        ReactiveInput::BlockHeader(header),
+        ReactiveContext {
+            chain_id: None,
+            source: InputSource::Subscription,
+            chain_status: ChainStatus::Included {
+                block: block.clone(),
+                confirmations: 0,
+            },
+            block: Some(block),
+            transaction_index: None,
+            log_index: None,
+        },
+    )
+}
+
+fn pending_hash_input_record<N: Network>(
+    hash: B256,
+    source: InputSource,
+) -> ReactiveInputRecord<N> {
+    ReactiveInputRecord::new(
+        ReactiveInput::PendingTxHash(hash),
+        ReactiveContext {
+            chain_id: None,
+            source,
+            chain_status: ChainStatus::Pending,
+            block: None,
+            transaction_index: None,
+            log_index: None,
+        },
+    )
+}
+
+fn provider_error(error: impl fmt::Display) -> SubscriberError {
+    SubscriberError::Provider(error.to_string())
 }
 
 /// Subscriber error.
 #[derive(Debug, thiserror::Error)]
 pub enum SubscriberError {
+    /// Invalid subscriber configuration.
+    #[error("{0}")]
+    InvalidConfig(&'static str),
     /// Requested subscriber behavior is not implemented.
     #[error("{0}")]
     Unsupported(&'static str),
