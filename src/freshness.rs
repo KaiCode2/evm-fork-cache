@@ -457,6 +457,53 @@ pub struct SlotChange {
     pub new: U256,
 }
 
+/// The classified outcome of fetching a single storage slot.
+///
+/// Where a [`SlotChange`] records only slots whose value *differed* from the
+/// cache, a [`SlotOutcome`] is produced for **every** requested slot — including
+/// ones that did not change and ones the fetcher could not return. This closes
+/// the "archive-miss" gap: a transient fetch failure is surfaced explicitly as
+/// [`SlotFetch::FetchFailed`] rather than collapsing into the same "no value"
+/// signal as a genuine on-chain zero ([`SlotFetch::Zero`]).
+///
+/// The fetch classification ([`SlotFetch`]) and change detection ([`SlotChange`])
+/// are independent reads of the same fetched value: a genuine `Ok(0)` on a slot
+/// whose cached value was also `0` yields [`SlotFetch::Zero`] **and** no
+/// `SlotChange`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SlotOutcome {
+    /// Contract whose storage slot was fetched.
+    pub address: Address,
+    /// Storage slot key.
+    pub slot: U256,
+    /// The classified result of fetching this slot.
+    pub fetch: SlotFetch,
+}
+
+/// The classified result of an individual slot fetch.
+///
+/// A fetcher `Ok(value)` is classified into [`Value`](SlotFetch::Value) (non-zero)
+/// or [`Zero`](SlotFetch::Zero) (a genuine on-chain zero); a fetcher `Err`
+/// becomes [`FetchFailed`](SlotFetch::FetchFailed), carrying the error string.
+/// [`NotAttempted`](SlotFetch::NotAttempted) marks a declared slot that a
+/// short-circuited round never reached (produced only by the accounts/discover
+/// phases of a cold-start round, never by verify).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SlotFetch {
+    /// The slot was fetched and holds a non-zero value.
+    Value(U256),
+    /// The slot was fetched and holds a genuine on-chain zero.
+    Zero,
+    /// The fetcher returned an error for this slot; `reason` is its description.
+    FetchFailed {
+        /// Human-readable description of why the fetch failed.
+        reason: String,
+    },
+    /// The slot was declared but never reached because the round
+    /// short-circuited on an earlier-phase hard error.
+    NotAttempted,
+}
+
 /// The deferred verdict on a [`SpeculativeSim`]'s optimistic results.
 pub enum Validation {
     /// Nothing the sims read had changed; the optimistic results are correct.
