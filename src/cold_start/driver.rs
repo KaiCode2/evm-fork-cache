@@ -187,7 +187,10 @@ impl EvmCache {
     /// yields [`RoundBudgetExceeded`](ColdStartError::RoundBudgetExceeded). Each
     /// round's results are absorbed into the report **before** its `error` is
     /// checked; a round error propagates after restoring the pin and **without**
-    /// calling `on_results`.
+    /// calling `on_results`. Note the absorbed report is returned only on the
+    /// `Ok` path — on error it is dropped and the `Err` carries only the cause;
+    /// use [`execute_cold_start_round`](Self::execute_cold_start_round) directly
+    /// to observe a failed round's partial outcomes.
     pub fn run_cold_start(
         &mut self,
         planner: &mut dyn ColdStartPlanner,

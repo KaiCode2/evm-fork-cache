@@ -19,6 +19,9 @@ use revm::context::result::ExecutionResult;
 /// than as absence. `verified` carries only the slots whose value actually changed
 /// (and were injected). `discovered` carries one [`ColdStartCallResult`] per
 /// discover call.
+///
+/// The order of entries in `fetched` / `probed` is unspecified — look up a slot
+/// by `(address, slot)` rather than relying on it matching the plan's order.
 #[derive(Clone, Debug, Default)]
 pub struct ColdStartResults {
     /// Slots whose value changed and were injected (one per change).

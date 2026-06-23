@@ -51,11 +51,16 @@ pub enum ColdStartPin {
     },
 }
 
-/// Summary of a completed (or partially-completed) cold-start run.
+/// Summary of a completed cold-start run, returned by
+/// [`run_cold_start`](crate::cache::EvmCache::run_cold_start) on success.
 ///
-/// Accumulated round-by-round as the run progresses; on a mid-round hard error
-/// the partial round is absorbed before the error propagates, so the report
-/// reflects work already done.
+/// Accumulated round-by-round as the run progresses. Note `run_cold_start`
+/// returns this report **only on the `Ok` path**: on a hard error the partial
+/// round is folded in before the error is returned, but the report itself is
+/// then dropped (the `Err` carries only the cause). To observe partial progress
+/// on failure, drive rounds yourself via
+/// [`execute_cold_start_round`](crate::cache::EvmCache::execute_cold_start_round),
+/// which always returns a [`RoundOutcome`](crate::cold_start::RoundOutcome).
 #[derive(Clone, Debug, Default)]
 pub struct ColdStartRunReport {
     /// Number of rounds executed.
@@ -64,9 +69,11 @@ pub struct ColdStartRunReport {
     pub verified_slots: usize,
     /// Total slots that changed and were injected.
     pub changed_slots: usize,
-    /// Total distinct accounts touched by discover calls.
+    /// Total accounts touched by discover calls, summed across calls and rounds
+    /// (not de-duplicated — the same account touched twice counts twice).
     pub discovered_accounts: usize,
-    /// Total distinct slots touched by discover calls.
+    /// Total slots touched by discover calls, summed across calls and rounds
+    /// (not de-duplicated — the same slot touched twice counts twice).
     pub discovered_slots: usize,
     /// Total verify + probe slots whose fetch failed.
     pub failed_slots: usize,
