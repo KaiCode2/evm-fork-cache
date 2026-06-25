@@ -297,6 +297,13 @@ impl EventPipeline {
                 touched_addrs.insert(skip.address);
                 self.note_touched_slot(&mut digest, skip.address, skip.slot);
             }
+            // Skipped (cold) `Account` patches carry an address but no slot, so
+            // track the address only — mirroring `skipped_balances`. A third-party
+            // decoder emitting `StateUpdate::Account` against a cold account would
+            // otherwise be invisible to reorg purge and freshness tracking.
+            for skip in &diff.skipped_accounts {
+                touched_addrs.insert(skip.address);
+            }
 
             digest.applied.merge(diff);
         }

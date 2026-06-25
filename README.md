@@ -255,6 +255,46 @@ println!("installed {} bytes at {}", etched.code_size, etched.target_address);
 # }
 ```
 
+## Performance
+
+The headline is **Pillar A**: `create_snapshot()` is a copy-on-write view whose
+cost tracks *changed* state, not *total* state — so the deeper the fork, the
+larger the win over the retained `create_snapshot_deep_clone()` baseline.
+
+> [!NOTE]
+> **Methodology.** Offline Criterion benchmark (`benches/simulation.rs`), median
+> of the run, on an Apple M1 Pro (`aarch64-apple-darwin`). State is injected
+> directly into the cache over a mocked provider — no network, no RPC. Absolute
+> numbers vary by machine; the **ratio** is the point. "Deep clone" is the
+> retained `create_snapshot_deep_clone()` (the legacy O(total state) flatten);
+> "COW" is the current `create_snapshot()`.
+
+| Cache size (accounts × slots) | Deep clone | COW `create_snapshot` | Speedup |
+|:-----------------------------:|:----------:|:---------------------:|:-------:|
+| 100 × 8                       | 53 µs      | 2.1 µs                | **~25×** |
+| 1,000 × 8                     | 791 µs     | 19 µs                 | **~41×** |
+| 2,000 × 16                    | 3.2 ms     | 52 µs                 | **~61×** |
+| 5,000 × 16                    | 9.5 ms     | 113 µs                | **~84×** |
+| 10,000 × 16                   | 16.5 ms    | 214 µs                | **~77×** |
+
+The deep clone copies every account and slot on every snapshot (O(total state));
+the COW snapshot folds only the hot delta over an `Arc`-shared, memoized base, so
+its cost scales with *what changed* since the last snapshot. At a 10k-account fork
+that is the difference between ~16 ms and ~0.2 ms per snapshot — the per-candidate
+tax a search loop pays before every fan-out.
+
+Overlay buffer reuse (`EvmOverlay::reset()` recycling the shared-memory buffer
+across simulations) trims a further slice of per-sim allocation overhead:
+
+| Concurrent overlays | Fresh per sim | Recycled (`reset`) | Speedup |
+|:-------------------:|:-------------:|:------------------:|:-------:|
+| 1                   | 4.7 µs        | 4.1 µs             | ~1.15×  |
+| 8                   | 35 µs         | 32 µs              | ~1.09×  |
+| 32                  | 119 µs        | 111 µs             | ~1.07×  |
+
+> Reproduce locally: `cargo bench --bench simulation` (groups
+> `create_snapshot` and `overlay_fanout`).
+
 ## Benchmarks
 
 Criterion benchmarks live in [`benches/`](benches). The offline benches exercise
@@ -269,7 +309,7 @@ useful for A/B comparison:
 | `state_update` | `apply_updates` throughput across batch sizes (1 → 1000 `Slot`s) and per-variant apply cost (`Slot` vs `Account` vs `Purge`). |
 | `event_pipeline` | Per-decoder cost (ERC-20 `Transfer`, generic slot marker), `ingest_logs` decode+apply throughput (1 → 1000 logs), and `reorg_to` purge cost. |
 | `access_list` | Touch-set merge and EIP-2930 list construction. |
-| `revert_decoding` | Built-in and custom revert decoding, including decoder dispatch with many registered errors. |
+| `revert_decoding` | Built-in (`Error`/`Panic`) and custom-error revert decoding, and decoder dispatch over a registered custom error. |
 | `create3` | CREATE3 address derivation. |
 
 ```sh

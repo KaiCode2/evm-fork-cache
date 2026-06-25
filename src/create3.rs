@@ -9,13 +9,20 @@
 
 use alloy_primitives::{Address, B256, address, b256, keccak256};
 
-/// Address of the widely deployed universal CREATE3 factory (the CreateX /
-/// CREATE3 factory implementation).
+/// Address of the widely deployed `CREATE3Factory` (the ZeframLou / Solmate-style
+/// implementation, deterministically deployed cross-chain — e.g. by LiFi).
 ///
-/// This is the canonical cross-chain address at which the CreateX-style
-/// CREATE3 factory has been deterministically deployed on many EVM networks.
-/// The derivation in this module assumes the factory at this address uses the
-/// CREATE3 proxy init code whose hash is `CREATE3_PROXY_INITCODE_HASH`.
+/// This is the canonical cross-chain address at which this factory has been
+/// deployed on many EVM networks. Its derivation salts as
+/// `keccak256(abi.encodePacked(deployer, salt))` over the standard Solady/Solmate
+/// CREATE3 proxy init code whose hash is `CREATE3_PROXY_INITCODE_HASH`, which is
+/// what [`derive_universal_create3_address`] reproduces.
+///
+/// **This is not pcaversaccio's CreateX** (`0xba5Ed0...28ba5Ed`). CreateX applies
+/// a guarded-salt transformation (permissioned-deploy / cross-chain-redeploy
+/// protection, chain-ID mixing) that differs from the plain
+/// `keccak256(deployer, salt)` used here, so this module does **not** predict
+/// CreateX deployment addresses.
 ///
 /// Callers must verify the factory is actually deployed at this address on
 /// their target chain before relying on a derived address: if the factory is
@@ -23,7 +30,7 @@ use alloy_primitives::{Address, B256, address, b256, keccak256};
 /// address will not correspond to any real deployment.
 pub const UNIVERSAL_CREATE3_FACTORY: Address = address!("93FEC2C00BfE902F733B57c5a6CeeD7CD1384AE1");
 
-// CREATE3 proxy initcode used by the universal factory implementation.
+// Standard Solady/Solmate CREATE3 proxy initcode used by this factory.
 // keccak256(0x67363d3d37363d34f03d5260086018f3)
 const CREATE3_PROXY_INITCODE_HASH: B256 =
     b256!("21c35dbe1b344a2488cf3321d6ce542f8e9f305544ff09e4993a62319a497c1f");

@@ -137,8 +137,12 @@ async fn main() -> Result<()> {
         mock::balance_of(&mut cache, token, bob)?
     );
 
+    // `EventPipeline::new` uses the default `ReorgConfig`, whose
+    // `PurgeScope::AllStorage` clears the storage of every address touched after
+    // the new head — so bob's balance slot reads back as uncached (`None`) and the
+    // next access would re-fetch it from RPC.
     let purge = pipeline.reorg_to(&mut cache, 99);
-    println!("\n=== reorg to block 99 ===");
+    println!("\n=== reorg to block 99 (default scope: AllStorage) ===");
     println!(
         "  purged {} address(es); bob balance slot now cached as {:?}",
         purge.purged.len(),

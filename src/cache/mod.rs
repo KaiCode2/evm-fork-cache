@@ -294,6 +294,7 @@ pub struct EvmCacheBuilder<P> {
     cache_config: Option<CacheConfig>,
     spec_id: SpecId,
     shared_memory_capacity: SharedMemoryCapacity,
+    chain_id: Option<u64>,
 }
 
 impl<P> EvmCacheBuilder<P>
@@ -308,6 +309,7 @@ where
             cache_config: None,
             spec_id: SpecId::CANCUN,
             shared_memory_capacity: SharedMemoryCapacity::default(),
+            chain_id: None,
         }
     }
 
@@ -337,6 +339,20 @@ where
         self
     }
 
+    /// Set the chain ID reported to simulations via the `CHAINID` opcode.
+    ///
+    /// **Recommended.** This is the explicit, authoritative way to set the chain
+    /// ID. If left unset, [`build`](Self::build) infers it from the provider
+    /// (`eth_chainId`), falling back to `1` (Ethereum mainnet) only if that query
+    /// fails. A disk [`cache_config`](Self::cache_config) also carries a
+    /// `chain_id` (which additionally namespaces the on-disk cache directory);
+    /// when both are set, the value passed here wins for the `CHAINID` opcode, so
+    /// keep them consistent.
+    pub fn chain_id(mut self, chain_id: u64) -> Self {
+        self.chain_id = Some(chain_id);
+        self
+    }
+
     /// Enable disk-backed caching with the given configuration.
     ///
     /// Supplying a [`CacheConfig`] turns on persistence of EVM state, bytecodes,
@@ -362,15 +378,26 @@ where
     }
 
     /// Build the [`EvmCache`], fetching the pinned block's header for context.
+    ///
+    /// If a chain ID was not set via [`chain_id`](Self::chain_id), it is inferred
+    /// from the provider (`eth_chainId`); see [`chain_id`](Self::chain_id) for the
+    /// full resolution order.
     pub async fn build(self) -> EvmCache {
-        EvmCache::with_cache_capacity(
+        let explicit_chain_id = self.chain_id;
+        let mut cache = EvmCache::with_cache_capacity(
             self.provider,
             self.block,
             self.cache_config,
             self.spec_id,
             self.shared_memory_capacity,
         )
-        .await
+        .await;
+        // An explicit builder value is authoritative for the `CHAINID` opcode and
+        // overrides both the inferred value and any `cache_config` chain id.
+        if let Some(chain_id) = explicit_chain_id {
+            cache.set_chain_id(chain_id);
+        }
+        cache
     }
 }
 
@@ -985,14 +1012,31 @@ impl EvmCache {
             },
         );
 
+        // Resolve the chain ID reported to simulations (the `CHAINID` opcode). A
+        // disk `CacheConfig` is authoritative (its `chain_id` also namespaces the
+        // on-disk cache directory); otherwise infer it from the provider via
+        // `eth_chainId`, falling back to 1 (Ethereum mainnet) only if that query
+        // fails. Resolved before `provider` is moved into the backend below.
+        // Prefer setting it explicitly through `EvmCacheBuilder::chain_id`.
+        let chain_id = match cache_config.as_ref() {
+            Some(cfg) => cfg.chain_id,
+            None => match provider.get_chain_id().await {
+                Ok(id) => id,
+                Err(e) => {
+                    debug!(
+                        error = %e,
+                        "Failed to infer chain ID from provider; defaulting to 1 (Ethereum mainnet). Set it explicitly via EvmCacheBuilder::chain_id."
+                    );
+                    1
+                }
+            },
+        };
+
         // Spawn the backend handler on a background task
         let backend =
             SharedBackend::spawn_backend(provider, blockchain_db.clone(), Some(block_id)).await;
 
         let db = CacheDB::new(backend.clone());
-
-        // Extract chain_id from cache config if available, default to Arbitrum
-        let chain_id = cache_config.as_ref().map(|c| c.chain_id).unwrap_or(42161);
 
         // Resolve the shared-memory pre-allocation. For `Auto` we size from the
         // amount of layer-2 chain state actually loaded (post-filter), so a large
@@ -1073,6 +1117,13 @@ impl EvmCache {
     ///
     /// Useful when you want to share a backend between multiple caches
     /// (e.g. parallel simulation threads).
+    ///
+    /// **Shared pinned block.** A `SharedBackend` owns a single pinned fork
+    /// height. Calling [`set_block`](Self::set_block) / `repin_to_block` on *any*
+    /// cache built from the same backend re-pins the RPC fork height for **all**
+    /// of them. Sibling caches sharing one backend should agree on a block and not
+    /// re-pin independently; build separate backends if they must fork at
+    /// different heights.
     pub fn from_backend(
         backend: SharedBackend,
         blockchain_db: BlockchainDb,
@@ -2234,6 +2285,17 @@ impl EvmCache {
     /// Get the chain ID used for EVM simulations (the `CHAINID` opcode).
     pub fn chain_id(&self) -> u64 {
         self.chain_id
+    }
+
+    /// Set the chain ID reported to simulations via the `CHAINID` opcode.
+    ///
+    /// Prefer setting this at construction through
+    /// [`EvmCacheBuilder::chain_id`]. This setter exists for cases where the
+    /// chain ID must change after construction. It takes effect on the next
+    /// [`create_snapshot`](Self::create_snapshot) / `build_evm`; existing
+    /// snapshots and overlays keep the chain ID captured when they were created.
+    pub fn set_chain_id(&mut self, chain_id: u64) {
+        self.chain_id = chain_id;
     }
 
     /// Take a low-level, same-thread snapshot of the CacheDB overlay for

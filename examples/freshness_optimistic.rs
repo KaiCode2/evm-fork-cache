@@ -74,10 +74,19 @@ async fn main() -> Result<()> {
     );
     cache.set_storage_batch_fetcher(fetcher);
 
-    // Classification: the balance slot is volatile (default), and slot 6 (a
-    // would-be immutable like `token0`) is pinned so it is never re-verified.
+    // Classification: by default every slot is volatile (re-verified); we pin
+    // slot 6 (a would-be immutable, constructor-set config value) so it is never
+    // re-verified.
     let mut registry = FreshnessRegistry::new();
     registry.pin_slot(token, U256::from(6));
+
+    // Show the classification before the registry is moved into the controller:
+    // an unpinned slot is volatile, the pinned one is not (so it is skipped).
+    println!(
+        "classification — slot 0 volatile? {} | slot 6 (pinned) volatile? {}",
+        registry.is_volatile(token, U256::from(0), 0),
+        registry.is_volatile(token, U256::from(6), 0),
+    );
 
     let mut controller = FreshnessController::new(registry, AlwaysVerify);
 
