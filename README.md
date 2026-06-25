@@ -125,16 +125,20 @@ println!(
 ## Core concepts
 
 The state stack flows bottom-to-top; reads flow up and the fork DB lazily fetches
-misses from RPC:
+misses from RPC. The event-log path writes hot state in with **no RPC** (the
+reactive-sync control plane):
 
-```
-EvmOverlay × N      isolated, Send simulations (cheap Arc clones)
-     ▲ clone × N
-EvmSnapshot         immutable, point-in-time, Send + Sync
-     ▲ create_snapshot()
-EvmCache            lazy RPC fetch + local state cache + targeted writes/purge
-     ▲ lazy fetch
-RPC provider
+```mermaid
+flowchart BT
+    RPC["RPC provider"] -->|"lazy fetch · once"| CACHE
+    LOGS["on-chain event logs"] -.->|"decode → write · 0 RPC"| CACHE
+    CACHE["<b>EvmCache</b> · !Send<br/>fetch · cache · targeted writes/purge"] -->|"create_snapshot()"| SNAP
+    SNAP["<b>EvmSnapshot</b> · Send + Sync<br/>immutable · Arc · point-in-time"] -->|"cheap Arc clone × N"| OV
+    OV["<b>EvmOverlay × N</b> · Send<br/>isolated parallel simulations"]
+    classDef hot fill:#102a17,stroke:#3fb950,color:#e6edf3;
+    classDef cool fill:#0d1f2d,stroke:#388bfd,color:#e6edf3;
+    class SNAP,OV hot;
+    class RPC,CACHE,LOGS cool;
 ```
 
 - **`EvmCache`** owns the mutable fork: it fetches, caches, persists, and applies
@@ -149,7 +153,30 @@ The [`freshness`](src/freshness.rs) module layers a freshness controller on top:
 classify each address/slot (`Pinned` / `Volatile` / `ValidThrough`), observe how
 often slots change, pick what to verify each cycle with a `FreshnessPolicy`, and
 run the optimistic loop that returns speculative results immediately and a
-`Confirmed`/`Corrected`/`Unverified` verdict asynchronously.
+`Confirmed`/`Corrected`/`Unverified` verdict asynchronously. Time-to-actionable-result
+is gated on local simulation, not on the RPC validation that runs behind it:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant S as Search loop
+    participant C as FreshnessController
+    participant V as Background validator
+    participant R as RPC
+    S->>C: run(candidate sims)
+    C->>C: snapshot + run optimistic sims
+    C-->>S: SpeculativeSim — optimistic results (~µs)
+    Note over S: act on speculative results now
+    C->>V: spawn (Send data only)
+    V->>R: verify volatile read-set (~L ms)
+    R-->>V: fresh values
+    alt nothing the sims read changed
+        V-->>S: validate().await → Confirmed
+    else a read slot changed
+        V->>V: re-run only the affected sims
+        V-->>S: Corrected { results, changed }
+    end
+```
 
 ## Examples
 
@@ -253,6 +280,11 @@ set; for fully *disjoint* per-candidate reads it is 1× (no win — stated hones
 This count is machine-independent and CI-pinned. See
 [`fetch_minimization_counted`](examples/fetch_minimization_counted.rs).
 
+<p align="center">
+  <img alt="RPC slot fetches: evm-fork-cache stays flat at 8 while fork-per-candidate grows linearly to 4,000 over 500 candidates" width="660"
+       src="https://raw.githubusercontent.com/KaiCode2/evm-fork-cache/main/assets/fetch_amplification.svg">
+</p>
+
 **② Candidate throughput (wall-clock ratio — CPU/isolation cost only).**
 One `create_snapshot()` amortized across N cheap `EvmOverlay` clones vs a full
 independent fork (a deep clone) per candidate. **Both sides run warm with no RPC**,
@@ -271,6 +303,11 @@ fork-per-candidate stays flat:
 → ~250k candidates/sec vs ~460/sec at N=128. Overlays are `Send` and parallelize;
 the live fork is not. (At N=1 there is little win — one snapshot is not yet
 amortized.) See [`parallel_overlays`](examples/parallel_overlays.rs).
+
+<p align="center">
+  <img alt="Per-candidate cost on a log scale: evm-fork-cache falls from 41 to 4 microseconds as N grows while fork-per-candidate stays flat near 2.1 milliseconds" width="660"
+       src="https://raw.githubusercontent.com/KaiCode2/evm-fork-cache/main/assets/fanout_throughput.svg">
+</p>
 
 **③ Reactive sync — staying fresh without polling (exact integer).**
 Decoding a block's ERC-20 `Transfer` logs into targeted writes keeps the touched
