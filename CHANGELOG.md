@@ -42,6 +42,14 @@ pre-release development phases (see [`docs/ROADMAP.md`](docs/ROADMAP.md)).
 
 ### Added
 
+- **Value-prop benchmarks & showcase.** The README "Performance" section now
+  leads with the searcher-facing outcomes vs a fork-per-candidate baseline:
+  data-fetch minimization (an exact, CI-pinned `~500x`-fewer-RPC-reads count via
+  the new `fetch_minimization_counted` example and `tests/fetch_minimization.rs`),
+  candidate-fan-out throughput (the new `benches/fanout.rs`), reactive event sync
+  (zero fetches per block, pinned in `tests/event_pipeline.rs`), and optimistic
+  latency-hiding (`benches/freshness.rs`). The internal copy-on-write snapshot
+  cost model moved to [`docs/INTERNALS.md`](docs/INTERNALS.md).
 - **Forked EVM cache** (`cache::EvmCache`) backed by `foundry-fork-db` with lazy
   RPC loading and on-disk persistence for accounts, storage, bytecode, and
   immutable metadata.
