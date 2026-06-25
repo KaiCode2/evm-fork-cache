@@ -258,15 +258,20 @@ println!("installed {} bytes at {}", etched.code_size, etched.target_address);
 ## Performance
 
 A searcher evaluates many candidate transactions against the *same* recent block.
-The naive build — a fresh revm fork/cache per candidate over an RPC node —
-re-forks and cold-fetches the same hot state for every candidate, and blocks on
-RPC to validate. `evm-fork-cache` **snapshots once, fans out cheaply, fetches each
-slot at most once, and lets you act before validation returns.** The four results
-below each compare against that naive loop.
+The naive build — a fresh revm fork/cache per candidate over an RPC node — pays
+twice per candidate: it **re-fetches** the same hot state *and* **re-builds** an
+independent fork to isolate the candidate, then **blocks on RPC** to validate.
+`evm-fork-cache` fetches each slot once, snapshots once, clones cheaply per
+candidate, and lets you act before validation returns. The results below isolate
+each of those costs against the naive loop — the **fetch** win (①) and the
+per-candidate **isolation/CPU** win (②) are *separate and not double-counted*.
 
 > **Fair baseline.** "Vanilla" / "fork-per-candidate" = the loop a searcher writes
-> without this crate: a fresh independent fork (revm cache) per candidate that
-> cold-fetches the slots it touches. Each result names how it is measured.
+> without this crate. ① measures the **fetch** cost: a fresh cold cache per
+> candidate that re-fetches the slots it touches. ② measures the **isolation/CPU**
+> cost: a full independent fork (a deep clone of the warm, in-memory state) per
+> candidate — it does *no* RPC, so ②'s speedup is snapshot-construction cost, not
+> network. Each result names how it is measured.
 
 **① Data fetched — the headline (exact, deterministic integer).**
 Evaluating **500 candidates** that share an 8-slot hot working set, the crate
@@ -283,10 +288,13 @@ set; for fully *disjoint* per-candidate reads it is 1× (no win — stated hones
 This count is machine-independent and CI-pinned. See
 [`fetch_minimization_counted`](examples/fetch_minimization_counted.rs).
 
-**② Candidate throughput (wall-clock ratio).**
+**② Candidate throughput (wall-clock ratio — CPU/isolation cost only).**
 One `create_snapshot()` amortized across N cheap `EvmOverlay` clones vs a full
-independent fork per candidate. Over a fork holding ~32k cold slots, per-candidate
-cost *falls* as N grows while fork-per-candidate stays flat:
+independent fork (a deep clone) per candidate. **Both sides run warm with no RPC**,
+so this isolates the *snapshot-once-and-share vs full-clone-per-candidate* cost —
+it is **not** the fetch win in ① (which is counted separately). Over a fork
+holding ~32k cold slots, per-candidate cost *falls* as N grows while
+fork-per-candidate stays flat:
 
 | Candidates (N) | evm-fork-cache (per candidate) | Fork-per-candidate | Speedup |
 |:---:|:---:|:---:|:---:|
