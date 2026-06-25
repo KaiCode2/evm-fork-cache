@@ -21,6 +21,7 @@ mod mock;
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use alloy_eips::BlockId;
 use alloy_primitives::{Address, Bytes, Log, U256, keccak256};
@@ -77,6 +78,25 @@ async fn main() -> Result<()> {
 
     let mut controller = FreshnessController::new(FreshnessRegistry::new(), AlwaysVerify);
 
+    // Install a counting fetcher up front so we can show that *ingest* performs no
+    // RPC reads (it decodes logs into writes), while *reconcile* below samples a
+    // few slots on purpose. It returns the (deliberately drifted) chain value for
+    // bob so the reconcile step has something to correct.
+    let fetches = Arc::new(AtomicUsize::new(0));
+    let counter = fetches.clone();
+    let fresh: HashMap<(Address, U256), U256> =
+        HashMap::from([((token, bob_slot), U256::from(260))]);
+    let fetcher: StorageBatchFetchFn = Arc::new(
+        move |requests: Vec<(Address, U256)>, _block: Option<BlockId>| {
+            counter.fetch_add(requests.len(), Ordering::Relaxed);
+            requests
+                .into_iter()
+                .map(|(a, s)| (a, s, Ok(fresh.get(&(a, s)).copied().unwrap_or(U256::ZERO))))
+                .collect()
+        },
+    );
+    cache.set_storage_batch_fetcher(fetcher);
+
     let block = 100u64;
     let digest = pipeline.ingest_logs(
         &mut cache,
@@ -85,6 +105,11 @@ async fn main() -> Result<()> {
     );
 
     println!("=== ingested block {} ===", digest.block);
+    println!(
+        "  RPC slot fetches during ingest: {}  <- a poller would refetch {} touched slot(s)/block",
+        fetches.load(Ordering::Relaxed),
+        digest.touched_slots.len(),
+    );
     println!(
         "  decoded {} log(s) -> {} slot change(s), {} skipped",
         digest.decoded_logs,
@@ -108,20 +133,13 @@ async fn main() -> Result<()> {
         digest.touched_slots.len()
     );
 
-    let fresh: HashMap<(Address, U256), U256> =
-        HashMap::from([((token, bob_slot), U256::from(260))]);
-    let fetcher: StorageBatchFetchFn = Arc::new(
-        move |requests: Vec<(Address, U256)>, _block: Option<BlockId>| {
-            requests
-                .into_iter()
-                .map(|(a, s)| (a, s, Ok(fresh.get(&(a, s)).copied().unwrap_or(U256::ZERO))))
-                .collect()
-        },
-    );
-    cache.set_storage_batch_fetcher(fetcher);
-
+    fetches.store(0, Ordering::Relaxed); // measure reconcile's sampling cost
     let report = pipeline.reconcile(&mut cache, &[(token, bob_slot)])?;
     println!("\n=== reconcile (sampled {} slot) ===", report.checked);
+    println!(
+        "  RPC slot fetches during reconcile: {}  <- the sampled honesty backstop",
+        fetches.load(Ordering::Relaxed),
+    );
     if report.mismatched.is_empty() {
         println!("  no drift: event-derived state matches chain");
     } else {

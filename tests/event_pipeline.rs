@@ -532,3 +532,79 @@ async fn reconcile_errors_without_fetcher() -> Result<()> {
     );
     Ok(())
 }
+
+/// Pillar 3 (reactive sync): ingesting a block's `Transfer` logs keeps the hot
+/// balance slots correct with **zero** RPC fetches — the decode→write pipeline
+/// never touches the fetcher, unlike a poller that re-reads every changed slot
+/// each block. Sampled `reconcile` (which *does* fetch) is the honesty backstop.
+#[tokio::test(flavor = "multi_thread")]
+async fn ingest_keeps_state_fresh_with_zero_fetches() -> Result<()> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use alloy_eips::BlockId;
+    use common::{balance_of, install_default_account};
+    use evm_fork_cache::cache::StorageBatchFetchFn;
+
+    let token = Address::repeat_byte(0x33);
+    let owners: Vec<Address> = (0..8u8).map(|i| Address::repeat_byte(0x40 + i)).collect();
+
+    let mut cache = setup_cache().await?;
+    install_mock_erc20(&mut cache, token);
+    install_default_account(&mut cache, Address::ZERO); // fee beneficiary
+    for o in &owners {
+        // Install each owner as an account (so it can be the balanceOf caller
+        // without a lazy RPC load) and seed its balance (layer 1, readable) so the
+        // deltas apply hot.
+        install_default_account(&mut cache, *o);
+        cache
+            .db_mut()
+            .insert_account_storage(token, mapping_slot(*o, 3), U256::from(1_000))?;
+    }
+
+    // A counting fetcher: `ingest_logs` must never invoke it.
+    let fetches = Arc::new(AtomicUsize::new(0));
+    let counter = fetches.clone();
+    let f: StorageBatchFetchFn =
+        Arc::new(move |reqs: Vec<(Address, U256)>, _b: Option<BlockId>| {
+            counter.fetch_add(reqs.len(), Ordering::Relaxed);
+            reqs.into_iter()
+                .map(|(a, s)| (a, s, Ok(U256::from(1_000))))
+                .collect()
+        });
+    cache.set_storage_batch_fetcher(f);
+
+    let mut registry = DecoderRegistry::new();
+    registry.register(Arc::new(Erc20TransferDecoder::new(U256::from(3))));
+    let mut pipeline = EventPipeline::new(registry);
+
+    // A block of transfers around a ring (each owner sends 10 and receives 10 →
+    // balances net back to 1000), touching every owner's balance slot.
+    let logs: Vec<Log> = (0..owners.len())
+        .map(|i| {
+            transfer_log(
+                token,
+                owners[i],
+                owners[(i + 1) % owners.len()],
+                U256::from(10),
+            )
+        })
+        .collect();
+
+    let digest = pipeline.ingest_logs(&mut cache, 100, &logs);
+
+    assert_eq!(
+        fetches.load(Ordering::Relaxed),
+        0,
+        "ingest decodes logs into writes and performs ZERO RPC fetches"
+    );
+    assert_eq!(digest.decoded_logs, owners.len());
+    assert!(
+        !digest.applied.has_skipped(),
+        "all hot balance deltas applied"
+    );
+    // Correctness: state kept fresh from the logs alone equals the true post-state.
+    for o in &owners {
+        assert_eq!(balance_of(&mut cache, token, *o)?, U256::from(1_000));
+    }
+    Ok(())
+}

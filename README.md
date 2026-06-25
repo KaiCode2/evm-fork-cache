@@ -222,64 +222,95 @@ println!("installed {} bytes at {}", etched.code_size, etched.target_address);
 
 ## Performance
 
-The headline is **Pillar A**: `create_snapshot()` is a copy-on-write view whose
-cost tracks *changed* state, not *total* state — so the deeper the fork, the
-larger the win over the retained `create_snapshot_deep_clone()` baseline.
+A searcher evaluates many candidate transactions against the *same* recent block.
+The naive build — a fresh revm fork/cache per candidate over an RPC node —
+re-forks and cold-fetches the same hot state for every candidate, and blocks on
+RPC to validate. `evm-fork-cache` **snapshots once, fans out cheaply, fetches each
+slot at most once, and lets you act before validation returns.** The four results
+below each compare against that naive loop.
+
+> **Fair baseline.** "Vanilla" / "fork-per-candidate" = the loop a searcher writes
+> without this crate: a fresh independent fork (revm cache) per candidate that
+> cold-fetches the slots it touches. Each result names how it is measured.
+
+**① Data fetched — the headline (exact, deterministic integer).**
+Evaluating **500 candidates** that share an 8-slot hot working set, the crate
+fetches each slot **once** and every candidate reads the frozen snapshot from
+memory; the fan-out adds **zero** fetches:
+
+| | Slots fetched from RPC |
+|---|---|
+| **evm-fork-cache** (fetch once, fan out 500) | **8** |
+| Vanilla (fresh fork per candidate) | **4,000** (500 × 8) |
+
+→ **~500× fewer RPC reads** (3,992 avoided). The ratio is `N` for a shared working
+set; for fully *disjoint* per-candidate reads it is 1× (no win — stated honestly).
+This count is machine-independent and CI-pinned. See
+[`fetch_minimization_counted`](examples/fetch_minimization_counted.rs).
+
+**② Candidate throughput (wall-clock ratio).**
+One `create_snapshot()` amortized across N cheap `EvmOverlay` clones vs a full
+independent fork per candidate. Over a fork holding ~32k cold slots, per-candidate
+cost *falls* as N grows while fork-per-candidate stays flat:
+
+| Candidates (N) | evm-fork-cache (per candidate) | Fork-per-candidate | Speedup |
+|:---:|:---:|:---:|:---:|
+| 1   | 41 µs  | 2.1 ms | ~51×  |
+| 8   | 8.3 µs | 2.2 ms | ~260× |
+| 32  | 4.9 µs | 2.2 ms | ~450× |
+| 128 | 4.0 µs | 2.2 ms | **~545×** |
+
+→ ~250k candidates/sec vs ~460/sec at N=128. Overlays are `Send` and parallelize;
+the live fork is not. (At N=1 there is little win — one snapshot is not yet
+amortized.) See [`parallel_overlays`](examples/parallel_overlays.rs).
+
+**③ Reactive sync — staying fresh without polling (exact integer).**
+Decoding a block's ERC-20 `Transfer` logs into targeted writes keeps the touched
+balance slots correct with **0 RPC fetches/block**, where a poller would re-fetch
+every changed slot. Sampled `reconcile()` re-reads a fraction to catch drift (the
+honesty backstop). Holds only for slots the event stream covers. See
+[`reactive_cache`](examples/reactive_cache.rs).
+
+**④ Optimistic execution — hiding validation latency (structural).**
+Time-to-actionable-result is gated on local simulation, not RPC validation. With a
+*modeled* 50 ms RPC round-trip, the optimistic result returns in **~14 µs** while
+validation runs in the background (~53 ms); the naive fetch-then-act path pays
+~54 ms before it can act. Only sims whose read set changed re-run (`rerun_count`).
+The win is latency *hiding*, not elimination. See
+[`freshness_optimistic`](examples/freshness_optimistic.rs).
 
 > [!NOTE]
-> **Methodology.** Offline Criterion benchmark (`benches/simulation.rs`), median
-> of the run, on an Apple M1 Pro (`aarch64-apple-darwin`). State is injected
-> directly into the cache over a mocked provider — no network, no RPC. Absolute
-> numbers vary by machine; the **ratio** is the point. "Deep clone" is the
-> retained `create_snapshot_deep_clone()` (the legacy O(total state) flatten);
-> "COW" is the current `create_snapshot()`.
-
-| Cache size (accounts × slots) | Deep clone | COW `create_snapshot` | Speedup |
-|:-----------------------------:|:----------:|:---------------------:|:-------:|
-| 100 × 8                       | 53 µs      | 2.1 µs                | **~25×** |
-| 1,000 × 8                     | 791 µs     | 19 µs                 | **~41×** |
-| 2,000 × 16                    | 3.2 ms     | 52 µs                 | **~61×** |
-| 5,000 × 16                    | 9.5 ms     | 113 µs                | **~84×** |
-| 10,000 × 16                   | 16.5 ms    | 214 µs                | **~77×** |
-
-The deep clone copies every account and slot on every snapshot (O(total state));
-the COW snapshot folds only the hot delta over an `Arc`-shared, memoized base, so
-its cost scales with *what changed* since the last snapshot. At a 10k-account fork
-that is the difference between ~16 ms and ~0.2 ms per snapshot — the per-candidate
-tax a search loop pays before every fan-out.
-
-Overlay buffer reuse (`EvmOverlay::reset()` recycling the shared-memory buffer
-across simulations) trims a further slice of per-sim allocation overhead:
-
-| Concurrent overlays | Fresh per sim | Recycled (`reset`) | Speedup |
-|:-------------------:|:-------------:|:------------------:|:-------:|
-| 1                   | 4.7 µs        | 4.1 µs             | ~1.15×  |
-| 8                   | 35 µs         | 32 µs              | ~1.09×  |
-| 32                  | 119 µs        | 111 µs             | ~1.07×  |
-
-> Reproduce locally: `cargo bench --bench simulation` (groups
-> `create_snapshot` and `overlay_fanout`).
+> **Methodology.** All numbers are offline (mocked provider, state injected
+> directly — no network). **Exact integer metrics** (slots fetched, fetches
+> avoided/block) are deterministic and machine-independent; they are pinned by
+> tests. **Wall-clock ratios** (throughput, latency) are Criterion medians on an
+> Apple M1 Pro (`aarch64-apple-darwin`) — read the ratio, not the absolute. The
+> 50 ms RPC latency in ④ is a modeled/injected delay, not a real network
+> measurement. Live-RPC checks live behind the `RPC_URL` gate.
+>
+> Reproduce: `cargo run --example fetch_minimization_counted` (the deterministic
+> headline), `cargo bench --bench fanout` (②), `cargo bench --bench freshness`
+> (④).
 
 ## Benchmarks
 
-Criterion benchmarks live in [`benches/`](benches). The offline benches exercise
-the current hot paths at a range of cache sizes, including the Phase 5
-copy-on-write snapshot implementation and retained deep-clone baselines where
-useful for A/B comparison:
+Criterion benchmarks live in [`benches/`](benches) and run fully offline (mocked
+provider) so they are reproducible:
 
 | Bench | Measures |
 | --- | --- |
-| `simulation` | `create_snapshot` across cache sizes (100 → 10k accounts), overlay fan-out, `call_raw` throughput, sequential bundle execution, batched storage injection. |
-| `freshness` | The optimistic loop end-to-end (CPU and latency-hiding), `verify_slots` at scale (1 → 1000 slots), and multi-sim fan-out. |
+| `fanout` | **Pillar 1.** Amortized per-candidate throughput: `create_snapshot` + N overlays vs a full independent fork per candidate. |
+| `freshness` | **Pillar 4.** The optimistic loop end-to-end (CPU and latency-hiding vs fetch-then-sim), `verify_slots` at scale (1 → 1000 slots), and multi-sim fan-out. |
+| `event_pipeline` | **Pillar 3.** Per-decoder cost (ERC-20 `Transfer`), `ingest_logs` decode+apply throughput (1 → 1000 logs), and `reorg_to` purge cost. |
 | `state_update` | `apply_updates` throughput across batch sizes (1 → 1000 `Slot`s) and per-variant apply cost (`Slot` vs `Account` vs `Purge`). |
-| `event_pipeline` | Per-decoder cost (ERC-20 `Transfer`, generic slot marker), `ingest_logs` decode+apply throughput (1 → 1000 logs), and `reorg_to` purge cost. |
+| `simulation` | Hot-path micro-benches and snapshot-implementation regression guards (`create_snapshot` vs the deep-clone reference — an internal cost model, see [`docs/INTERNALS.md`](docs/INTERNALS.md)). |
 | `access_list` | Touch-set merge and EIP-2930 list construction. |
 | `revert_decoding` | Built-in (`Error`/`Panic`) and custom-error revert decoding, and decoder dispatch over a registered custom error. |
 | `create3` | CREATE3 address derivation. |
 
 ```sh
 cargo bench                      # all offline benches
-cargo bench --bench simulation   # one suite
+cargo bench --bench fanout       # one suite
 ```
 
 The `rpc_mainnet` bench runs against **live mainnet state** to validate

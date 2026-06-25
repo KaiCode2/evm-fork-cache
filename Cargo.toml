@@ -70,6 +70,10 @@ name = "simulation"
 harness = false
 
 [[bench]]
+name = "fanout"
+harness = false
+
+[[bench]]
 name = "freshness"
 harness = false
 
