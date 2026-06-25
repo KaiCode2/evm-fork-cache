@@ -106,6 +106,18 @@ surface was moved out of this crate.
 
 ## Limitations by design / roadmap
 
+- **Freshness reconciles storage slots only, not account-level state.** The
+  optimistic verify-and-rerun loop (`FreshnessController::run`) builds its verify
+  set exclusively from the volatile storage *slots* in each sim's read set; it
+  never re-fetches or diffs an account's native balance, nonce, or bytecode.
+  Consequently `Validation::Confirmed` guarantees only that *no volatile storage
+  slot the sims read had changed* — a sim whose result depends on a
+  `BALANCE`/`SELFBALANCE` (or nonce/code) that moved on-chain without a
+  co-changing storage slot can still be reported `Confirmed`. If account-level
+  state matters to a sim, classify the account `Pinned` and keep it fresh via
+  event-driven writes (`apply_update`/`apply_updates`), or reconcile it out of
+  band. The verdict types and the `freshness` module docs state this scope; a
+  future revision may extend reconcile to touched accounts.
 - **Solidity `Panic(uint256)` codes above `u64::MAX` decode as `Unknown`.**
   `decode_solidity_panic` drops out-of-range codes rather than exposing a lossy
   `u64`. Real compiler-emitted panic codes are single-byte constants, so this is
@@ -114,7 +126,27 @@ surface was moved out of this crate.
   reads `from`/`to` from indexed topics and `value` from the first 32 data bytes.
   Non-standard or packed `Transfer` encodings may parse incorrectly or be skipped.
   A self-transfer where `from == to` nets to zero for that owner; this is
-  documented at the call site.
+  documented at the call site. Transfer **values ≥ 2^255** are reinterpreted as
+  negative when accumulated as a signed `I256` delta (`I256::from_raw`), so a
+  token emitting such a value would corrupt the reconstructed delta. Real ERC-20
+  supplies are far below 2^255, so this is unreachable for honest tokens; a
+  malicious token can misreport balances by other means regardless.
+- **`BLOCKHASH` resolves to ZERO in ext-db-less overlays.** Snapshots do not track
+  block hashes (`block_hashes` is always empty — the live cache does not track
+  them either), so an `EvmOverlay` built without an `ext_db` (e.g. the freshness
+  validator's internal overlays) returns `B256::ZERO` for the `BLOCKHASH` opcode.
+  A simulation of a contract that reads `BLOCKHASH` through such an overlay sees
+  ZERO rather than the real historical hash.
+- **`EventPipeline::derived_slots` grows unbounded without reorgs.** Every
+  event-derived `(address, slot)` is retained for sampled reconciliation and is
+  only pruned by `reorg_to`. In long-running steady-state ingestion (no reorgs)
+  the set grows monotonically (~52 bytes/slot). The field doc says "seen so far";
+  a future revision may bound it to the reorg ring's horizon.
+- **Reorgs deeper than `ReorgConfig::depth` cannot fully purge.** The touched-
+  address ring is bounded to `depth` blocks; `reorg_to(n)` only purges addresses
+  still in the ring, so state touched solely in blocks that have already aged out
+  of the horizon is silently left un-purged (no error). Size `depth` above the
+  deepest reorg you expect to handle.
 - **Copy-on-write snapshots (Phase 5, Pillar A) — done.** `create_snapshot()` is
   no longer an O(total state) deep clone. The cold `BlockchainDb` index (layer 2)
   is flattened once into an internal, immutable, `Arc`-shared base (per-account

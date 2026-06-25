@@ -43,3 +43,19 @@ jq -r '.deployedBytecode.object' out/MockERC20.sol/MockERC20.json \
 jq -r '.bytecode.object' out/MockERC20.sol/MockERC20.json \
   | sed 's/^0x//' > fixtures/mock_erc20_creation.hex
 ```
+
+## `Multicall3`
+
+- `multicall3_runtime.hex` — the canonical [Multicall3](https://github.com/mds1/multicall)
+  deployed (runtime) bytecode. Multicall3 lives at the same address
+  (`0xcA11bde05977b3631167028862bE2a173976CA11`) on virtually every EVM chain, so
+  etching this bytecode there lets the offline [`../tests/multicall.rs`](../tests/multicall.rs)
+  suite exercise the real `aggregate3` build/execute/decode path (input-order
+  results and `allowFailure` semantics) with no network.
+
+### Regenerating
+
+```sh
+cast code 0xcA11bde05977b3631167028862bE2a173976CA11 --rpc-url "$RPC_URL" \
+  | sed 's/^0x//' > fixtures/multicall3_runtime.hex
+```

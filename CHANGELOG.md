@@ -12,11 +12,20 @@ surface freezes at 1.0.
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [0.1.0] - 2026-06-25
+
 This is the first release line. It captures the work done across the
 pre-release development phases (see [`docs/ROADMAP.md`](docs/ROADMAP.md)).
 
 ### Changed
 
+- **Breaking:** the in-memory chain ID is no longer hard-defaulted to Arbitrum
+  (`42161`). When no chain ID is set explicitly and no disk `CacheConfig` is
+  supplied, the cache now infers it from the provider (`eth_chainId`) and falls
+  back to `1` (Ethereum mainnet) only if that query fails. Set it explicitly with
+  the new `EvmCacheBuilder::chain_id` / `EvmCache::set_chain_id`.
 - **Breaking:** extracted the old in-crate AMM adapter surface before public
   release. Protocol-specific storage layouts, protocol metadata, injector
   helpers, tick snapshots, and protocol log decoders belong in `evm-amm-state`;
@@ -38,7 +47,9 @@ pre-release development phases (see [`docs/ROADMAP.md`](docs/ROADMAP.md)).
   immutable metadata.
 - **`EvmCacheBuilder`** — a fluent constructor (`EvmCache::builder(provider)`)
   subsuming the positional `with_cache` / `from_backend` constructors, with
-  block pin, EVM spec, cache-config, and shared-memory-capacity configuration.
+  block pin, EVM spec, cache-config, chain-ID, and shared-memory-capacity
+  configuration. `EvmCacheBuilder::chain_id` sets the `CHAINID` opcode value
+  explicitly (recommended); `EvmCache::set_chain_id` sets it post-construction.
 - **Snapshots and overlays** — `create_snapshot()` produces an immutable,
   `Send + Sync` `EvmSnapshot`; `EvmOverlay` is a cheap per-simulation clone for
   isolated parallel evaluation.
@@ -235,7 +246,7 @@ pre-release development phases (see [`docs/ROADMAP.md`](docs/ROADMAP.md)).
   layouts.
 - Simulation entry points that distinguish failure modes return
   `SimulationResult<T>` (`Result<T, SimError>`), separating decoded reverts,
-  EVM halts, and host errors. `SimulationErrorKind` remains as a deprecated alias.
+  EVM halts, and host errors.
 
 ### Fixed
 
@@ -327,4 +338,5 @@ pre-release development phases (see [`docs/ROADMAP.md`](docs/ROADMAP.md)).
 - `EvmCache` requires a multi-thread tokio runtime for any RPC-touching path.
 - See [`docs/KNOWN_ISSUES.md`](docs/KNOWN_ISSUES.md) for current limitations.
 
-[Unreleased]: https://github.com/KaiCode2/evm-fork-cache/commits/main
+[Unreleased]: https://github.com/KaiCode2/evm-fork-cache/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/KaiCode2/evm-fork-cache/releases/tag/v0.1.0

@@ -29,7 +29,7 @@ use alloy_eips::BlockId;
 use alloy_primitives::{Address, Bytes, U256, keccak256};
 use alloy_sol_types::{SolCall, SolValue};
 use anyhow::Result;
-use evm_fork_cache::cache::StorageBatchFetchFn;
+use evm_fork_cache::cache::{SimStatus, StorageBatchFetchFn};
 use evm_fork_cache::freshness::{
     AlwaysVerify, FreshnessController, FreshnessRegistry, SimRequest, Validation, Validity,
 };
@@ -133,7 +133,7 @@ async fn main() -> Result<()> {
     let optimistic_ok: Vec<bool> = sim
         .optimistic()
         .iter()
-        .map(|r| !r.logs.is_empty())
+        .map(|r| matches!(r.status, SimStatus::Success))
         .collect();
     println!("optimistic (against the snapshot): {optimistic_ok:?} (all succeed)");
 
@@ -146,7 +146,10 @@ async fn main() -> Result<()> {
             for c in &changed {
                 println!("  sender slot {} : {} -> {}", c.slot, c.old, c.new);
             }
-            let corrected_ok: Vec<bool> = results.iter().map(|r| !r.logs.is_empty()).collect();
+            let corrected_ok: Vec<bool> = results
+                .iter()
+                .map(|r| matches!(r.status, SimStatus::Success))
+                .collect();
             println!("corrected results: {corrected_ok:?}");
 
             // Exactly the second sim flipped success -> revert; the others are

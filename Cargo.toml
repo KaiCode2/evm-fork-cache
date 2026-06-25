@@ -11,6 +11,12 @@ readme = "README.md"
 repository = "https://github.com/KaiCode2/evm-fork-cache"
 documentation = "https://docs.rs/evm-fork-cache"
 
+# Keep the published crate lean: the per-phase development specs are internal
+# planning artifacts (they reference an adapter surface extracted before release),
+# and the CI workflow has no consumer value. The consumer-facing ROADMAP.md and
+# KNOWN_ISSUES.md under docs/ are still shipped.
+exclude = ["docs/phase-*-spec.md", ".github/"]
+
 # Standalone workspace root: keeps this crate from being absorbed by any
 # ancestor-directory workspace and gives it its own Cargo.lock.
 [workspace]

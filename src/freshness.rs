@@ -21,6 +21,18 @@
 //! `clock.now()` as `now: u64` through the tracker, the policy, and
 //! [`FreshnessRegistry::is_volatile`].
 //!
+//! # Reconciliation scope
+//!
+//! The optimistic loop verifies only **volatile storage slots** in each sim's
+//! read set. Account-level state — native balance, nonce, and bytecode — is
+//! **not** re-fetched or diffed, so [`Validation::Confirmed`] means *"no volatile
+//! storage slot the sims read had changed"*, not *"no account state changed"*. A
+//! sim whose result depends on a `BALANCE`/`SELFBALANCE` (or nonce/code) that
+//! moved on-chain without a co-changing storage slot in its read set can still be
+//! reported `Confirmed`. If account-level state matters to a sim, mark the
+//! account [`Validity::Pinned`] and keep it fresh via event-driven writes, or
+//! reconcile it out of band. See [`Validation`] for the per-verdict note.
+//!
 //! # Example
 //!
 //! Classification + policy selection, no network required:
@@ -32,22 +44,25 @@
 //! };
 //! use evm_fork_cache::cache::SlotObservationTracker;
 //!
-//! let pool = Address::repeat_byte(0x01);
-//! let slot0 = U256::from(0);
-//! let immutable = U256::from(6); // e.g. token0
+//! let contract = Address::repeat_byte(0x01);
+//! let volatile_slot = U256::from(0);
+//! let immutable_slot = U256::from(6); // e.g. a constructor-set config value
 //!
 //! let mut registry = FreshnessRegistry::new(); // default: Volatile
-//! registry.pin_slot(pool, immutable); // never re-verified
+//! registry.pin_slot(contract, immutable_slot); // never re-verified
 //!
 //! // `now` is in clock units (block number for the default BlockClock).
 //! let now = 100;
-//! assert!(registry.is_volatile(pool, slot0, now));
-//! assert!(!registry.is_volatile(pool, immutable, now));
+//! assert!(registry.is_volatile(contract, volatile_slot, now));
+//! assert!(!registry.is_volatile(contract, immutable_slot, now));
 //!
 //! // Policies pick which volatile candidates to verify this cycle.
 //! let obs = SlotObservationTracker::new();
-//! let candidates = [(pool, slot0)];
-//! assert_eq!(AlwaysVerify.select(&candidates, &obs, now), vec![(pool, slot0)]);
+//! let candidates = [(contract, volatile_slot)];
+//! assert_eq!(
+//!     AlwaysVerify.select(&candidates, &obs, now),
+//!     vec![(contract, volatile_slot)]
+//! );
 //! assert!(NeverVerify.select(&candidates, &obs, now).is_empty());
 //! ```
 
@@ -458,12 +473,27 @@ pub struct SlotChange {
 }
 
 /// The deferred verdict on a [`SpeculativeSim`]'s optimistic results.
+///
+/// # Reconciliation scope
+///
+/// The verdict reflects only **volatile storage slots** in each sim's read set.
+/// Account-level state — native balance, nonce, and bytecode — is **not**
+/// re-verified, so a sim whose result depends on a `BALANCE`/`SELFBALANCE` (or
+/// nonce/code) that changed on-chain *without* a co-changing storage slot in its
+/// read set can still be reported [`Confirmed`](Validation::Confirmed). Classify
+/// such accounts as [`Validity::Pinned`] and keep them fresh via event-driven
+/// writes if their account-level state matters to your sims. See the module-level
+/// docs for the full freshness contract.
 pub enum Validation {
-    /// Nothing the sims read had changed; the optimistic results are correct.
+    /// No **volatile storage slot** in the sims' read sets had changed, so the
+    /// optimistic results are trusted. Note this does *not* cover account-level
+    /// balance/nonce/code changes — see the [type-level scope](Validation).
     Confirmed,
-    /// At least one read slot changed. `results` is the optimistic set with the
-    /// affected sims re-run against the fresh values; `changed` lists the slots
-    /// that differed (also queued for flow-back into the cache).
+    /// At least one read storage slot changed. `results` is the optimistic set
+    /// with the affected sims re-run against the fresh values; `changed` lists the
+    /// slots that differed (also queued for flow-back into the cache). Only
+    /// storage slots are reconciled — account-level state is not (see the
+    /// [type-level scope](Validation)).
     Corrected {
         /// Optimistic results with the affected sims replaced by re-runs.
         results: Vec<CallSimulationResult>,
@@ -558,12 +588,16 @@ impl SimRequest {
 /// cancel flag and aborts the background task. Cancellation is **cooperative and
 /// best-effort, not instantaneous**: `run_validator` is synchronous, so an abort
 /// cannot preempt it once it is running. Instead the validator checks the flag at
-/// a few checkpoints — before fetching, and before recording observations or
-/// queuing a correction — so a cancel observed at a checkpoint prevents the
-/// remaining side effects. A validator already executing a synchronous step (e.g.
-/// mid-fetch) completes that step before reaching the next checkpoint. The intent
-/// is that a dropped speculation does not flow its corrections back into the
-/// cache; it does not guarantee that an in-flight fetch is interrupted.
+/// several checkpoints — before each fetch, and (on the first pass) after a fetch
+/// returns but before it records observations or queues corrections — so a cancel
+/// observed at a checkpoint skips the side effects downstream of it. A validator
+/// already executing a synchronous step (e.g. mid-fetch) completes that step
+/// before reaching the next checkpoint, and corrections accumulated up to a fetch
+/// that completed in the *final* loop iteration may still be queued for flow-back
+/// (the post-loop queue is not guarded by an immediately-preceding checkpoint).
+/// The intent is that a dropped speculation stops doing further work and, in the
+/// common case, does not flow corrections back into the cache; it does not
+/// guarantee that an in-flight or just-completed fetch's correction is withheld.
 pub struct SpeculativeSim {
     optimistic: Vec<CallSimulationResult>,
     /// `Option` so `validate`/`into_optimistic` can take the handle and skip the
@@ -577,6 +611,11 @@ pub struct SpeculativeSim {
 
 impl SpeculativeSim {
     /// The optimistic results, readable before validation completes.
+    ///
+    /// These (and the re-run results in [`Validation::Corrected`]) carry an
+    /// **empty `token_deltas`** map: the optimistic loop does not run transfer
+    /// tracking, so the signed per-token balance deltas populated by the
+    /// committing `simulate_call_with_balance_deltas` path are not available here.
     pub fn optimistic(&self) -> &[CallSimulationResult] {
         &self.optimistic
     }
@@ -765,11 +804,13 @@ impl<P: FreshnessPolicy, C: FreshnessClock> FreshnessController<P, C> {
     ///    [`SpeculativeSim`] immediately.
     ///
     /// # Panics
-    /// Spawns a background task whose (synchronous) fetcher uses
-    /// `tokio::task::block_in_place` internally, so it must run on a
-    /// **multi-thread** tokio runtime (`#[tokio::main(flavor = "multi_thread")]`
-    /// or `Builder::new_multi_thread()`). On a current-thread runtime
-    /// `block_in_place` panics, mirroring the [`EvmCache`] constructor note.
+    /// Must be called from within a tokio runtime: it calls `tokio::spawn` to
+    /// launch the background validator, which panics (`there is no reactor
+    /// running`) if no runtime is active. The spawned (synchronous) fetcher
+    /// additionally uses `tokio::task::block_in_place` internally, so the runtime
+    /// must be **multi-thread** (`#[tokio::main(flavor = "multi_thread")]` or
+    /// `Builder::new_multi_thread()`); on a current-thread runtime `block_in_place`
+    /// panics, mirroring the [`EvmCache`] constructor note.
     ///
     /// # Errors
     /// Returns an error if any optimistic simulation fails to execute against the

@@ -8,6 +8,7 @@
 
 mod common;
 
+use alloy_eips::eip2930::{AccessList, AccessListItem};
 use alloy_primitives::{Address, B256, Bytes, I256, U256, keccak256};
 use alloy_sol_types::{SolCall, SolValue};
 use anyhow::{Context, Result};
@@ -114,6 +115,74 @@ async fn call_raw_with_carries_native_value() -> Result<()> {
     assert_eq!(
         recipient_balance, value,
         "recipient should receive the value"
+    );
+
+    Ok(())
+}
+
+/// `TxConfig.access_list` is wired into EIP-2929/EIP-2930 gas accounting: declaring
+/// the touched account + slot warms them for the call but adds the EIP-2930
+/// intrinsic cost (2400/address + 1900/key). For a `balanceOf` that reads the slot
+/// once, the intrinsic outweighs the ~2000-gas warm SLOAD saving, so the declared
+/// run costs *more* — what matters is that the field measurably changes gas, i.e.
+/// it is not silently ignored.
+#[tokio::test(flavor = "multi_thread")]
+async fn tx_config_access_list_changes_eip2929_gas_accounting() -> Result<()> {
+    let mut cache = setup_cache().await?;
+    let token = Address::repeat_byte(0x11);
+    let owner = Address::repeat_byte(0x22);
+    install_default_account(&mut cache, Address::ZERO);
+    install_mock_erc20(&mut cache, token);
+
+    // Layer-1 CacheDB balance seed so `balanceOf` reads a real (non-zero) value.
+    let slot =
+        U256::from_be_bytes(keccak256((owner, U256::from(MOCK_ERC20_BALANCE_SLOT)).abi_encode()).0);
+    cache
+        .db_mut()
+        .insert_account_storage(token, slot, U256::from(123u64))?;
+
+    let calldata = Bytes::from(MockERC20::balanceOfCall { account: owner }.abi_encode());
+
+    let gas_of = |result: ExecutionResult| match result {
+        ExecutionResult::Success { gas_used, .. } => gas_used,
+        other => panic!("balanceOf did not succeed: {other:?}"),
+    };
+
+    // No access list: the `balanceOf` SLOAD pays the cold (2100-gas) cost.
+    let gas_plain = gas_of(cache.call_raw_with(
+        Address::ZERO,
+        token,
+        calldata.clone(),
+        false,
+        &TxConfig::default(),
+    )?);
+
+    // Declare (token, slot): the SLOAD is warmed, but the access list carries its
+    // own EIP-2930 intrinsic cost.
+    let tx = TxConfig {
+        access_list: Some(AccessList(vec![AccessListItem {
+            address: token,
+            storage_keys: vec![B256::from(slot)],
+        }])),
+        ..Default::default()
+    };
+    let gas_with_list = gas_of(cache.call_raw_with(Address::ZERO, token, calldata, false, &tx)?);
+
+    assert_ne!(
+        gas_plain, gas_with_list,
+        "TxConfig.access_list must affect gas accounting, not be ignored"
+    );
+    // Net for a single warmed-once slot: +2400 (addr) + 1900 (key) − 2000 (warm
+    // SLOAD) = +2300. The access list raises gas for this single-access call.
+    assert!(
+        gas_with_list > gas_plain,
+        "single-access declaration costs more intrinsic than it saves: \
+         with_list {gas_with_list} vs plain {gas_plain}"
+    );
+    assert_eq!(
+        gas_with_list - gas_plain,
+        2_300,
+        "expected the exact EIP-2930 intrinsic minus single warm-SLOAD saving"
     );
 
     Ok(())

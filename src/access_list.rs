@@ -1,9 +1,14 @@
-//! Selective EIP-2930 access list builder.
+//! EIP-2930 access list builder with L2 profitability accounting.
 //!
-//! Builds an access list containing only well-known, low-entropy storage slots
-//! (V3 slot0/liquidity, V2 reserves) whose serialized form is mostly zero bytes
-//! and cheap to post as L1 data. Skips keccak-derived mapping keys (tick bitmap,
-//! tick info) which are 32 random bytes and expensive on L1.
+//! The caller supplies the addresses and storage slots to include; this module
+//! decides *whether attaching the list is profitable*, not *which slots are
+//! interesting* (it carries no protocol-specific slot knowledge). The trade-off
+//! is purely economic: pre-declaring an account/slot warms it (cheaper EIP-2929
+//! execution) but costs L1 data to post the list. Slots whose serialized form is
+//! mostly zero bytes (e.g. small, low-entropy values) are cheap to post; dense,
+//! high-entropy 32-byte keys are expensive on L1 — so the value of a given entry
+//! depends on its bytes, which is why the include/exclude decision is left to the
+//! caller and the profitability check below.
 //!
 //! On L2, automatically disables itself when L1 fees rise high enough that the
 //! L1 data cost exceeds the L2 execution savings. Arbitrum uses `ArbGasInfo`
@@ -89,10 +94,13 @@ sol! {
     }
 }
 
-/// A selective EIP-2930 access list built from the execution plan.
+/// An EIP-2930 access list builder with L2 profitability accounting.
 ///
-/// Only includes entries where the L2 execution savings (100 gas each)
-/// are likely to exceed the L1 data posting cost of the serialized entry.
+/// The caller decides which addresses/slots to add (via
+/// [`add_address`](Self::add_address) / [`add_storage_key`](Self::add_storage_key));
+/// the builder itself applies no per-entry selection. The `into_access_list_*`
+/// finalizers decide whether attaching the *whole* list is profitable, comparing
+/// its L1 data-posting cost against the L2 warm-access savings.
 pub struct SmartAccessList {
     items: Vec<AccessListItem>,
 }

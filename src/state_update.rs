@@ -207,9 +207,11 @@ pub enum StateUpdate {
     ///
     /// Read-modify-write: the current `AccountInfo::balance` is read, the
     /// [`SlotDelta`] applied, and the result written back through both layers
-    /// (nonce and code preserved). **Cold-aware** — "cold" here means the account
-    /// is absent from *both* layers (its balance is unknown). A `BalanceDelta` on a
-    /// cold account is not applied; it is surfaced in
+    /// (nonce and code preserved). **Cold-aware** — "cold" here means the
+    /// account's info is unknown to the EVM: absent from *both* layers, **or**
+    /// present in the overlay as revm `NotExisting` (which the internal account
+    /// read also treats as cold, mirroring `DbAccount::info()`). A `BalanceDelta`
+    /// on a cold account is not applied; it is surfaced in
     /// [`StateDiff::skipped_balances`] instead (so no default account is
     /// materialized to mask the real on-chain one — see the module docs).
     BalanceDelta {
@@ -246,8 +248,9 @@ pub enum StateUpdate {
     /// Patch an already-known account's balance/nonce/code (partial — see
     /// [`AccountPatch`]).
     ///
-    /// Cold-aware: if the account is absent from **both** layers, the patch is not
-    /// applied and is surfaced in [`StateDiff::skipped_accounts`] as a
+    /// Cold-aware: if the account's info is unknown to the EVM (absent from
+    /// **both** layers, or present in the overlay as revm `NotExisting`), the patch
+    /// is not applied and is surfaced in [`StateDiff::skipped_accounts`] as a
     /// [`SkippedAccountPatch`]. Use [`StateUpdate::AccountUpsert`] when
     /// materializing a cold/default account is intentional.
     Account {
@@ -474,7 +477,8 @@ pub enum PurgeScope {
 ///
 /// [`is_empty`](Self::is_empty) / [`len`](Self::len) are **changes-only**, so a
 /// cold-skipped update ([`SlotDelta`](StateUpdate::SlotDelta) /
-/// [`BalanceDelta`](StateUpdate::BalanceDelta) / [`Account`](StateUpdate::Account))
+/// [`BalanceDelta`](StateUpdate::BalanceDelta) /
+/// [`SlotMasked`](StateUpdate::SlotMasked) / [`Account`](StateUpdate::Account))
 /// is invisible to them. After applying cold-aware updates, check
 /// [`has_skipped`](Self::has_skipped) (or inspect the `skipped_*` fields) — a cold
 /// target was dropped, not applied.
@@ -511,28 +515,32 @@ pub struct StateDiff {
 impl StateDiff {
     /// Whether the diff recorded no change at all.
     ///
-    /// Changes-only: counts `slots` + `accounts` + `purged`. A skipped relative
-    /// update ([`skipped`](Self::skipped) / [`skipped_balances`](Self::skipped_balances))
-    /// is informational metadata, not a change, so it does not affect this.
+    /// Changes-only: counts `slots` + `accounts` + `purged`. Any skipped update
+    /// (any of the `skipped_*` fields) is informational metadata, not a change, so
+    /// it does not affect this.
     pub fn is_empty(&self) -> bool {
         self.slots.is_empty() && self.accounts.is_empty() && self.purged.is_empty()
     }
 
     /// Total number of changed entries (slots + accounts + purges).
     ///
-    /// Changes-only: skipped relative updates are not counted (a skip is not a
-    /// change). See [`skipped_len`](Self::skipped_len) for the skip count.
+    /// Changes-only: skipped updates (any `skipped_*` field) are not counted (a
+    /// skip is not a change). See [`skipped_len`](Self::skipped_len) for the skip
+    /// count.
     pub fn len(&self) -> usize {
         self.slots.len() + self.accounts.len() + self.purged.len()
     }
 
-    /// Whether any relative update was skipped (slot **or** balance).
+    /// Whether any cold-aware update was skipped (relative slot, balance, masked
+    /// slot, **or** cold account patch).
     ///
-    /// `true` iff [`skipped`](Self::skipped) or
-    /// [`skipped_balances`](Self::skipped_balances) is non-empty. A cold-skipped
+    /// `true` iff any of [`skipped`](Self::skipped),
+    /// [`skipped_balances`](Self::skipped_balances),
+    /// [`skipped_masks`](Self::skipped_masks), or
+    /// [`skipped_accounts`](Self::skipped_accounts) is non-empty. A cold-skipped
     /// update produces no change, so it is invisible to
-    /// [`is_empty`](Self::is_empty) — callers applying relative updates should
-    /// check this to avoid silently dropping a balance update.
+    /// [`is_empty`](Self::is_empty) — callers applying cold-aware updates should
+    /// check this to avoid silently dropping an update.
     pub fn has_skipped(&self) -> bool {
         !self.skipped.is_empty()
             || !self.skipped_balances.is_empty()
@@ -618,8 +626,9 @@ pub struct SkippedDelta {
 }
 
 /// A relative balance update ([`StateUpdate::BalanceDelta`]) that could not be
-/// applied because the account is absent from **both** cache layers (its native
-/// balance is unknown).
+/// applied because the account's info is unknown to the EVM — absent from
+/// **both** cache layers, or present in the overlay as revm `NotExisting` (so its
+/// native balance is unknown).
 ///
 /// A delta against a cold account is skipped rather than applied (applying it
 /// against an assumed-zero balance would corrupt an unknown value, and
@@ -662,7 +671,8 @@ pub struct SkippedMask {
 }
 
 /// An account patch ([`StateUpdate::Account`]) that could not be applied because
-/// the account is absent from **both** cache layers.
+/// the account's info is unknown to the EVM — absent from **both** cache layers,
+/// or present in the overlay as revm `NotExisting`.
 ///
 /// A partial patch against a cold account is skipped rather than applied against
 /// [`AccountInfo::default`](revm::state::AccountInfo::default), because default

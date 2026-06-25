@@ -745,6 +745,11 @@ impl Database for EvmOverlay {
         if let Some(ref ext_db) = self.ext_db {
             return ext_db.block_hash_ref(number);
         }
+        // Snapshots never populate `block_hashes` (the live cache does not track
+        // block hashes), so without an `ext_db` the `BLOCKHASH` opcode resolves to
+        // ZERO. Overlays built internally (e.g. the freshness validator) pass
+        // `ext_db = None`; a contract that reads `BLOCKHASH` through such an
+        // overlay sees ZERO. Documented in docs/KNOWN_ISSUES.md.
         Ok(B256::ZERO)
     }
 }

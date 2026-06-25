@@ -114,13 +114,22 @@ pub fn save_binary_state(blockchain_db: &BlockchainDb, path: &Path) -> Result<()
 ///
 /// Returns `false` (rather than erroring) when `path` cannot be read or its
 /// contents fail the magic/version check or fail to decode as the expected
-/// bincode layout; failures are logged at `warn` level.
+/// bincode layout. A missing file (the normal cold-start case) is logged at
+/// `debug`; an actual read error (e.g. permission denied) and any
+/// magic/version/decode failure are logged at `warn`.
 pub fn load_binary_state(blockchain_db: &BlockchainDb, path: &Path) -> bool {
     let start = Instant::now();
 
     let data = match std::fs::read(path) {
         Ok(d) => d,
-        Err(_) => return false,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            debug!("No binary EVM state file found, starting fresh");
+            return false;
+        }
+        Err(e) => {
+            warn!(error = %e, "Failed to read binary EVM state, starting fresh");
+            return false;
+        }
     };
 
     let Some(state) = versioned::decode::<BinaryEvmState>(

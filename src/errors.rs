@@ -654,13 +654,6 @@ impl From<SimulationError> for SimError {
     }
 }
 
-/// Deprecated alias for [`SimError`].
-#[deprecated(
-    since = "0.2.0",
-    note = "renamed to `SimError`; `Halt` is now a distinct variant"
-)]
-pub type SimulationErrorKind = SimError;
-
 #[cfg(test)]
 mod tests {
     use super::*;
