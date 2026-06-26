@@ -963,10 +963,37 @@ pub struct BlockReport<N: Network = Ethereum> {
 /// Reorg reporting scaffold.
 #[derive(Clone, Debug)]
 pub struct ReorgReport<N: Network = Ethereum> {
-    /// Dropped block, when known.
+    /// First dropped block, when known.
     pub dropped: Option<BlockRef>,
+    /// Blocks dropped from the journal, in ascending journal order.
+    pub dropped_blocks: Vec<BlockRef>,
+    /// Input references that belonged to dropped blocks.
+    pub dropped_inputs: Vec<InputRef>,
+    /// Exact rollback updates applied for reversible dropped effects.
+    pub rollback_updates: Vec<StateUpdate>,
+    /// Diff returned by applying [`rollback_updates`](Self::rollback_updates).
+    pub rollback_diff: StateDiff,
+    /// Conservative purge updates applied for irreversible dropped effects.
+    pub purge_updates: Vec<StateUpdate>,
+    /// Diff returned by applying [`purge_updates`](Self::purge_updates).
+    pub purge_diff: StateDiff,
+    /// Hash-pinned pending resync requests canceled because their block was dropped.
+    pub canceled_resyncs: Vec<ResyncRequest>,
+    /// Reorg trigger.
+    pub reason: ReorgReason,
     /// Network marker.
     pub _network: PhantomData<N>,
+}
+
+/// Reason reorg recovery ran.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ReorgReason {
+    /// A provider emitted an Alloy removed log.
+    RemovedLog,
+    /// The input context explicitly marked an input as reorged.
+    ReorgedInput,
+    /// A canonical block did not connect to the journaled head.
+    ParentMismatch,
 }
 
 /// Error report scaffold.
@@ -1138,6 +1165,16 @@ pub struct ReactiveRuntime<N: Network = Ethereum> {
     registry: ReactiveRegistry<N>,
     hooks: Vec<Arc<dyn ReactiveHook<N>>>,
     config: ReactiveConfig,
+    journal: VecDeque<BlockJournal<N>>,
+    pending_resyncs: Vec<ResyncRequest>,
+}
+
+#[derive(Clone, Debug)]
+struct BlockJournal<N: Network = Ethereum> {
+    block: BlockRef,
+    inputs: Vec<InputRef>,
+    applied: Vec<AppliedReport<N>>,
+    resynced: Vec<ResyncReport>,
 }
 
 /// Registry and router for provider-neutral reactive handlers.
@@ -1250,6 +1287,8 @@ impl<N: Network> ReactiveRuntime<N> {
             registry: ReactiveRegistry::new(),
             hooks: Vec::new(),
             config,
+            journal: VecDeque::new(),
+            pending_resyncs: Vec::new(),
         }
     }
 
@@ -1293,7 +1332,7 @@ impl<N: Network> ReactiveRuntime<N> {
     /// values are applied as [`StateUpdate::slot`] updates through
     /// [`EvmCache::apply_updates`], and unsupported or failed targets are reported
     /// in [`ResyncReport::failed`]. It does not start subscribers, background
-    /// workers, reorg journals, or network transport.
+    /// workers, or network transport.
     pub fn ingest_batch_with_resync(
         &mut self,
         cache: &mut EvmCache,
@@ -1303,6 +1342,8 @@ impl<N: Network> ReactiveRuntime<N> {
 
         if !batch_report.resyncs.is_empty() {
             let resync_report = execute_resync_requests(cache, &batch_report.resyncs);
+            self.remove_pending_resyncs(batch_report.resyncs.iter().map(|request| &request.id));
+            self.record_journal_resync(&resync_report);
             batch_report
                 .reports
                 .push(Arc::new(ReactiveReport::Resynced(resync_report)));
@@ -1314,7 +1355,7 @@ impl<N: Network> ReactiveRuntime<N> {
     }
 
     fn ingest_batch_direct(
-        &self,
+        &mut self,
         cache: &mut EvmCache,
         batch: ReactiveInputBatch<N>,
     ) -> Result<ReactiveBatchReport<N>, ReactiveError> {
@@ -1330,6 +1371,27 @@ impl<N: Network> ReactiveRuntime<N> {
                 context: record.context.clone(),
                 _network: PhantomData,
             })));
+
+            if let Some(reorg_report) = self.recover_for_canonical_input(cache, &record) {
+                remove_canceled_resyncs_from_batch(
+                    &mut batch_report.resyncs,
+                    &reorg_report.canceled_resyncs,
+                );
+                reports_to_dispatch.push(Arc::new(ReactiveReport::Reorg(reorg_report)));
+            }
+
+            if let Some(reorg_report) = self.recover_for_reorged_input(cache, &record) {
+                remove_canceled_resyncs_from_batch(
+                    &mut batch_report.resyncs,
+                    &reorg_report.canceled_resyncs,
+                );
+                reports_to_dispatch.push(Arc::new(ReactiveReport::Reorg(reorg_report)));
+                continue;
+            }
+
+            if let Some(block) = canonical_record_block(&record) {
+                self.record_journal_input(block, input_ref);
+            }
 
             let executions = self.execute_handlers(cache, &record, input_ref)?;
             if executions.is_empty() {
@@ -1357,6 +1419,8 @@ impl<N: Network> ReactiveRuntime<N> {
                 batch_report
                     .resyncs
                     .extend(execution.resyncs.iter().cloned());
+                self.pending_resyncs
+                    .extend(execution.resyncs.iter().cloned());
                 batch_report
                     .speculative
                     .extend(execution.speculative.iter().cloned());
@@ -1376,6 +1440,9 @@ impl<N: Network> ReactiveRuntime<N> {
                 };
                 let report = Arc::new(ReactiveReport::Applied(applied.clone()));
                 reports_to_dispatch.push(report);
+                if let Some(block) = canonical_record_block(&record) {
+                    self.record_journal_applied(block, applied.clone());
+                }
                 batch_report.applied.push(applied);
             }
         }
@@ -1419,6 +1486,419 @@ impl<N: Network> ReactiveRuntime<N> {
             for hook in &self.hooks {
                 hook.on_report(report.clone());
             }
+        }
+    }
+
+    fn recover_for_canonical_input(
+        &mut self,
+        cache: &mut EvmCache,
+        record: &ReactiveInputRecord<N>,
+    ) -> Option<ReorgReport<N>> {
+        let block = canonical_record_block(record)?;
+        let latest = self.journal.back()?.block.clone();
+
+        if self
+            .journal
+            .iter()
+            .any(|entry| entry.block.hash == block.hash && entry.block.number == block.number)
+        {
+            return None;
+        }
+
+        if block.number == latest.number.saturating_add(1) && block.parent_hash == Some(latest.hash)
+        {
+            return None;
+        }
+
+        if block.number > latest.number.saturating_add(1) {
+            return None;
+        }
+
+        let dropped = if let Some(parent_hash) = block.parent_hash {
+            if let Some(parent_index) = self
+                .journal
+                .iter()
+                .rposition(|entry| entry.block.hash == parent_hash)
+            {
+                self.drain_journal_after(parent_index)
+            } else {
+                self.drain_journal_from_number(block.number)
+            }
+        } else {
+            self.drain_journal_from_number(block.number)
+        };
+
+        self.recover_dropped_journals(cache, dropped, ReorgReason::ParentMismatch)
+    }
+
+    fn recover_for_reorged_input(
+        &mut self,
+        cache: &mut EvmCache,
+        record: &ReactiveInputRecord<N>,
+    ) -> Option<ReorgReport<N>> {
+        let (dropped_block, reason) = reorg_signal_block(record)?;
+        let dropped = if let Some(index) = self
+            .journal
+            .iter()
+            .position(|entry| entry.block.hash == dropped_block.hash)
+        {
+            self.drain_journal_from(index)
+        } else {
+            self.drain_journal_from_number(dropped_block.number)
+        };
+
+        if dropped.is_empty() {
+            let canceled_resyncs =
+                self.cancel_resyncs_for_dropped_blocks(std::slice::from_ref(&dropped_block));
+            if canceled_resyncs.is_empty() {
+                return None;
+            }
+            return Some(ReorgReport {
+                dropped: Some(dropped_block.clone()),
+                dropped_blocks: vec![dropped_block],
+                dropped_inputs: Vec::new(),
+                rollback_updates: Vec::new(),
+                rollback_diff: StateDiff::default(),
+                purge_updates: Vec::new(),
+                purge_diff: StateDiff::default(),
+                canceled_resyncs,
+                reason,
+                _network: PhantomData,
+            });
+        }
+
+        self.recover_dropped_journals(cache, dropped, reason)
+    }
+
+    fn record_journal_input(&mut self, block: &BlockRef, input_ref: InputRef) {
+        let entry = self.journal_entry_mut(block);
+        if !entry.inputs.contains(&input_ref) {
+            entry.inputs.push(input_ref);
+        }
+        self.trim_journal();
+    }
+
+    fn record_journal_applied(&mut self, block: &BlockRef, applied: AppliedReport<N>) {
+        self.journal_entry_mut(block).applied.push(applied);
+        self.trim_journal();
+    }
+
+    fn record_journal_resync(&mut self, report: &ResyncReport) {
+        if report.diff.is_empty() {
+            return;
+        }
+        let Some(block) = single_hash_pinned_resync_block(report) else {
+            return;
+        };
+        self.journal_entry_mut(&block).resynced.push(report.clone());
+        self.trim_journal();
+    }
+
+    fn journal_entry_mut(&mut self, block: &BlockRef) -> &mut BlockJournal<N> {
+        if let Some(index) = self
+            .journal
+            .iter()
+            .position(|entry| entry.block.hash == block.hash && entry.block.number == block.number)
+        {
+            return &mut self.journal[index];
+        }
+
+        self.journal.push_back(BlockJournal {
+            block: block.clone(),
+            inputs: Vec::new(),
+            applied: Vec::new(),
+            resynced: Vec::new(),
+        });
+        let index = self.journal.len() - 1;
+        &mut self.journal[index]
+    }
+
+    fn trim_journal(&mut self) {
+        if self.config.journal_depth == 0 {
+            self.journal.clear();
+            return;
+        }
+        while self.journal.len() > self.config.journal_depth {
+            self.journal.pop_front();
+        }
+    }
+
+    fn drain_journal_after(&mut self, index: usize) -> Vec<BlockJournal<N>> {
+        self.journal.drain((index + 1)..).collect()
+    }
+
+    fn drain_journal_from(&mut self, index: usize) -> Vec<BlockJournal<N>> {
+        self.journal.drain(index..).collect()
+    }
+
+    fn drain_journal_from_number(&mut self, number: u64) -> Vec<BlockJournal<N>> {
+        let Some(index) = self
+            .journal
+            .iter()
+            .position(|entry| entry.block.number >= number)
+        else {
+            return Vec::new();
+        };
+        self.drain_journal_from(index)
+    }
+
+    fn recover_dropped_journals(
+        &mut self,
+        cache: &mut EvmCache,
+        dropped: Vec<BlockJournal<N>>,
+        reason: ReorgReason,
+    ) -> Option<ReorgReport<N>> {
+        if dropped.is_empty() {
+            return None;
+        }
+
+        let dropped_blocks: Vec<_> = dropped.iter().map(|entry| entry.block.clone()).collect();
+        let dropped_inputs: Vec<_> = dropped
+            .iter()
+            .flat_map(|entry| entry.inputs.iter().copied())
+            .collect();
+        let canceled_resyncs = self.cancel_resyncs_for_dropped_blocks(&dropped_blocks);
+        let purge_scopes = purge_scopes_for_dropped_journals(&dropped);
+        let rollback_updates = rollback_updates_for_dropped_journals(&dropped, &purge_scopes);
+        let purge_updates: Vec<_> = purge_scopes
+            .iter()
+            .map(|(address, scope)| StateUpdate::purge(*address, scope.clone()))
+            .collect();
+
+        let rollback_diff = if rollback_updates.is_empty() {
+            StateDiff::default()
+        } else {
+            cache.apply_updates(&rollback_updates)
+        };
+        let purge_diff = if purge_updates.is_empty() {
+            StateDiff::default()
+        } else {
+            cache.apply_updates(&purge_updates)
+        };
+
+        Some(ReorgReport {
+            dropped: dropped_blocks.first().cloned(),
+            dropped_blocks,
+            dropped_inputs,
+            rollback_updates,
+            rollback_diff,
+            purge_updates,
+            purge_diff,
+            canceled_resyncs,
+            reason,
+            _network: PhantomData,
+        })
+    }
+
+    fn cancel_resyncs_for_dropped_blocks(
+        &mut self,
+        dropped_blocks: &[BlockRef],
+    ) -> Vec<ResyncRequest> {
+        let mut canceled = Vec::new();
+        self.pending_resyncs.retain(|request| {
+            let should_cancel = resync_request_targets_dropped_block(request, dropped_blocks);
+            if should_cancel {
+                canceled.push(request.clone());
+            }
+            !should_cancel
+        });
+        canceled
+    }
+
+    fn remove_pending_resyncs<'a>(&mut self, ids: impl IntoIterator<Item = &'a ResyncId>) {
+        let ids: HashSet<_> = ids.into_iter().cloned().collect();
+        self.pending_resyncs
+            .retain(|request| !ids.contains(&request.id));
+    }
+}
+
+fn canonical_record_block<N: Network>(record: &ReactiveInputRecord<N>) -> Option<&BlockRef> {
+    if matches!(&record.input, ReactiveInput::Log(log) if log.removed) {
+        return None;
+    }
+    if is_canonical_status(&record.context.chain_status) {
+        return context_block_ref(&record.context);
+    }
+    None
+}
+
+fn context_block_ref(ctx: &ReactiveContext) -> Option<&BlockRef> {
+    match &ctx.chain_status {
+        ChainStatus::Included { block, .. }
+        | ChainStatus::Safe { block }
+        | ChainStatus::Finalized { block } => Some(block),
+        ChainStatus::Reorged { dropped_from } => Some(dropped_from),
+        ChainStatus::Pending => ctx.block.as_ref(),
+    }
+}
+
+fn reorg_signal_block<N: Network>(
+    record: &ReactiveInputRecord<N>,
+) -> Option<(BlockRef, ReorgReason)> {
+    if matches!(&record.input, ReactiveInput::Log(log) if log.removed) {
+        return block_ref_from_record(record).map(|block| (block, ReorgReason::RemovedLog));
+    }
+
+    if let ChainStatus::Reorged { dropped_from } = &record.context.chain_status {
+        return Some((dropped_from.clone(), ReorgReason::ReorgedInput));
+    }
+
+    None
+}
+
+fn block_ref_from_record<N: Network>(record: &ReactiveInputRecord<N>) -> Option<BlockRef> {
+    context_block_ref(&record.context)
+        .cloned()
+        .or_else(|| match &record.input {
+            ReactiveInput::Log(log) => Some(BlockRef {
+                number: log.block_number?,
+                hash: log.block_hash?,
+                parent_hash: None,
+                timestamp: log.block_timestamp,
+            }),
+            ReactiveInput::BlockHeader(header) => Some(BlockRef {
+                number: header.number(),
+                hash: header.hash(),
+                parent_hash: Some(header.parent_hash()),
+                timestamp: Some(header.timestamp()),
+            }),
+            ReactiveInput::FullBlock(block) => {
+                let header = block.header();
+                Some(BlockRef {
+                    number: header.number(),
+                    hash: header.hash(),
+                    parent_hash: Some(header.parent_hash()),
+                    timestamp: Some(header.timestamp()),
+                })
+            }
+            ReactiveInput::PendingTxHash(_) | ReactiveInput::PendingTx(_) => None,
+        })
+}
+
+fn remove_canceled_resyncs_from_batch(
+    resyncs: &mut Vec<ResyncRequest>,
+    canceled: &[ResyncRequest],
+) {
+    if canceled.is_empty() {
+        return;
+    }
+    let canceled_ids: HashSet<_> = canceled.iter().map(|request| request.id.clone()).collect();
+    resyncs.retain(|request| !canceled_ids.contains(&request.id));
+}
+
+fn resync_request_targets_dropped_block(
+    request: &ResyncRequest,
+    dropped_blocks: &[BlockRef],
+) -> bool {
+    let ResyncBlock::Hash { number, hash, .. } = &request.block else {
+        return false;
+    };
+    dropped_blocks
+        .iter()
+        .any(|block| block.hash == *hash && block.number == *number)
+}
+
+fn single_hash_pinned_resync_block(report: &ResyncReport) -> Option<BlockRef> {
+    let first = report.requested.first()?.block.clone();
+    if !report
+        .requested
+        .iter()
+        .all(|request| request.block == first)
+    {
+        return None;
+    }
+
+    let ResyncBlock::Hash { number, hash, .. } = first else {
+        return None;
+    };
+
+    Some(BlockRef {
+        number,
+        hash,
+        parent_hash: None,
+        timestamp: None,
+    })
+}
+
+fn purge_scopes_for_dropped_journals<N: Network>(
+    dropped: &[BlockJournal<N>],
+) -> Vec<(Address, PurgeScope)> {
+    let mut scopes: Vec<(Address, PurgeScope)> = Vec::new();
+    for entry in dropped.iter().rev() {
+        for resynced in entry.resynced.iter().rev() {
+            merge_purge_scopes_for_diff(&mut scopes, &resynced.diff);
+        }
+        for applied in entry.applied.iter().rev() {
+            merge_purge_scopes_for_diff(&mut scopes, &applied.diff);
+        }
+    }
+    scopes
+}
+
+fn rollback_updates_for_dropped_journals<N: Network>(
+    dropped: &[BlockJournal<N>],
+    purge_scopes: &[(Address, PurgeScope)],
+) -> Vec<StateUpdate> {
+    let purge_addresses: HashSet<_> = purge_scopes
+        .iter()
+        .map(|(address, _scope)| *address)
+        .collect();
+    let mut updates = Vec::new();
+    for entry in dropped.iter().rev() {
+        for resynced in entry.resynced.iter().rev() {
+            push_rollback_updates_for_diff(&mut updates, &resynced.diff, &purge_addresses);
+        }
+        for applied in entry.applied.iter().rev() {
+            push_rollback_updates_for_diff(&mut updates, &applied.diff, &purge_addresses);
+        }
+    }
+    updates
+}
+
+fn merge_purge_scopes_for_diff(scopes: &mut Vec<(Address, PurgeScope)>, diff: &StateDiff) {
+    for change in &diff.accounts {
+        merge_purge_scope(scopes, change.address, PurgeScope::Account);
+    }
+    for record in &diff.purged {
+        merge_purge_scope(scopes, record.address, record.scope.clone());
+    }
+}
+
+fn push_rollback_updates_for_diff(
+    updates: &mut Vec<StateUpdate>,
+    diff: &StateDiff,
+    purge_addresses: &HashSet<Address>,
+) {
+    for change in diff.slots.iter().rev() {
+        if purge_addresses.contains(&change.address) {
+            continue;
+        }
+        updates.push(StateUpdate::slot(change.address, change.slot, change.old));
+    }
+}
+
+fn merge_purge_scope(scopes: &mut Vec<(Address, PurgeScope)>, address: Address, scope: PurgeScope) {
+    if let Some((_existing_address, existing_scope)) = scopes
+        .iter_mut()
+        .find(|(existing_address, _scope)| *existing_address == address)
+    {
+        *existing_scope = merged_purge_scope(existing_scope.clone(), scope);
+    } else {
+        scopes.push((address, scope));
+    }
+}
+
+fn merged_purge_scope(left: PurgeScope, right: PurgeScope) -> PurgeScope {
+    match (left, right) {
+        (PurgeScope::Account, _) | (_, PurgeScope::Account) => PurgeScope::Account,
+        (PurgeScope::AllStorage, _) | (_, PurgeScope::AllStorage) => PurgeScope::AllStorage,
+        (PurgeScope::Slots(mut left), PurgeScope::Slots(right)) => {
+            for slot in right {
+                if !left.contains(&slot) {
+                    left.push(slot);
+                }
+            }
+            PurgeScope::Slots(left)
         }
     }
 }

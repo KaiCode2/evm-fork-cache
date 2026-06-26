@@ -47,7 +47,7 @@ use tracing::{debug, instrument, trace, warn};
 
 use crate::access_set::StorageAccessList;
 use crate::errors::{SimError, SimulationError, SimulationResult};
-use crate::freshness::SlotChange;
+use crate::freshness::{SlotChange, SlotFetch, SlotOutcome};
 use crate::inspector::TransferInspector;
 use crate::state_update::{
     AccountChange, AccountPatch, PurgeRecord, PurgeScope, SkippedAccountPatch, SkippedBalanceDelta,
@@ -98,7 +98,7 @@ pub type StorageBatchFetchFn = Arc<
 /// degrade to a typed error instead.
 ///
 /// Requires a **multi-thread** tokio runtime.
-fn block_in_place_handle() -> Result<tokio::runtime::Handle> {
+pub(crate) fn block_in_place_handle() -> Result<tokio::runtime::Handle> {
     match tokio::runtime::Handle::try_current() {
         Ok(handle) => match handle.runtime_flavor() {
             tokio::runtime::RuntimeFlavor::CurrentThread => Err(anyhow!(
@@ -2003,9 +2003,9 @@ impl EvmCache {
     ///
     /// For each slot whose freshly-fetched value differs from the cached value,
     /// the fresh value is written into the cache via
-    /// [`inject_storage_batch`](Self::inject_storage_batch) and a [`SlotChange`]
-    /// is recorded. Slots that are unchanged, or that the fetcher fails to
-    /// return, are left as-is. Returns the set of changed slots.
+    /// [`inject_storage_batch_fresh`](Self::inject_storage_batch_fresh) and a
+    /// [`SlotChange`] is recorded. Slots that are unchanged, or that the fetcher
+    /// fails to return, are left as-is. Returns the set of changed slots.
     ///
     /// Requires a batch fetcher (set at construction or via
     /// [`set_storage_batch_fetcher`](Self::set_storage_batch_fetcher)); errors if
@@ -2024,8 +2024,60 @@ impl EvmCache {
         &mut self,
         slots: &[(Address, U256)],
     ) -> Result<(Vec<SlotChange>, usize)> {
+        let (changed, outcomes) = self.verify_slots_core(slots)?;
+        let fetched_ok = outcomes
+            .iter()
+            .filter(|o| matches!(o.fetch, SlotFetch::Value(_) | SlotFetch::Zero))
+            .count();
+        Ok((changed, fetched_ok))
+    }
+
+    /// Classify a single fetched slot value into a [`SlotFetch`].
+    ///
+    /// This is purely the *fetch* classification (`Value` / `Zero` /
+    /// `FetchFailed`); it is independent of change detection, which compares the
+    /// fetched value to the cached baseline separately. A non-zero `Ok` is
+    /// [`SlotFetch::Value`], a genuine `Ok(0)` is [`SlotFetch::Zero`], and an
+    /// `Err` is [`SlotFetch::FetchFailed`] carrying the error string.
+    ///
+    /// Shared with the cold-start probe phase
+    /// ([`execute_cold_start_round`](Self::execute_cold_start_round)) so the
+    /// single classification is reused rather than duplicated.
+    pub(crate) fn classify(fetched: Result<U256>) -> SlotFetch {
+        match fetched {
+            Ok(v) if v != U256::ZERO => SlotFetch::Value(v),
+            Ok(_) => SlotFetch::Zero,
+            Err(e) => SlotFetch::FetchFailed {
+                reason: e.to_string(),
+            },
+        }
+    }
+
+    /// Core slot-verification loop shared by [`verify_slots_inner`](Self::verify_slots_inner)
+    /// and [`verify_slots_with_outcomes`](Self::verify_slots_with_outcomes).
+    ///
+    /// Fetches every slot via the batch fetcher and, for each slot, performs two
+    /// **independent** reads of the same fetched value:
+    ///
+    /// 1. *Fetch classification* — every slot (including failed ones) produces one
+    ///    [`SlotOutcome`] via [`classify`](Self::classify): `Value` / `Zero` /
+    ///    `FetchFailed`.
+    /// 2. *Change detection* — a successfully-fetched value that differs from the
+    ///    cached baseline (`old`, defaulting to `ZERO` for an unseen slot) is
+    ///    injected via [`inject_storage_batch_fresh`](Self::inject_storage_batch_fresh)
+    ///    and recorded as a [`SlotChange`].
+    ///
+    /// These two reads are deliberately not collapsed: a genuine `Ok(0)` on a slot
+    /// whose cached value was also `0` yields [`SlotFetch::Zero`] **and** no
+    /// `SlotChange`. The returned `outcomes` vec has exactly one entry per
+    /// requested slot. An empty `slots` input short-circuits to empty results
+    /// without requiring a fetcher; otherwise a missing fetcher is an error.
+    fn verify_slots_core(
+        &mut self,
+        slots: &[(Address, U256)],
+    ) -> Result<(Vec<SlotChange>, Vec<SlotOutcome>)> {
         if slots.is_empty() {
-            return Ok((Vec::new(), 0));
+            return Ok((Vec::new(), Vec::new()));
         }
         let fetcher = self
             .storage_batch_fetcher
@@ -2043,9 +2095,21 @@ impl EvmCache {
         let results = (fetcher)(slots.to_vec(), Some(self.block));
 
         let mut changed = Vec::new();
+        let mut outcomes = Vec::with_capacity(results.len());
         let mut to_inject = Vec::new();
-        let mut fetched_ok = 0usize;
         for (addr, slot, fetched) in results {
+            // Read 1: classify the fetch outcome for every slot, failed or not.
+            let fetch = Self::classify(match &fetched {
+                Ok(v) => Ok(*v),
+                Err(e) => Err(anyhow!("{e}")),
+            });
+            outcomes.push(SlotOutcome {
+                address: addr,
+                slot,
+                fetch,
+            });
+
+            // Read 2: change detection, independent of the classification above.
             let fresh = match fetched {
                 Ok(value) => value,
                 Err(e) => {
@@ -2053,7 +2117,6 @@ impl EvmCache {
                     continue;
                 }
             };
-            fetched_ok += 1;
             // A slot the cache never saw is treated as old = ZERO (the value a
             // sim would have read), so a non-zero fresh value counts as a change.
             let old = cached
@@ -2075,7 +2138,24 @@ impl EvmCache {
         if !to_inject.is_empty() {
             self.inject_storage_batch_fresh(&to_inject);
         }
-        Ok((changed, fetched_ok))
+        Ok((changed, outcomes))
+    }
+
+    /// Like [`verify_slots`](Self::verify_slots), but additionally returns one
+    /// [`SlotOutcome`] per requested slot (including slots the fetcher failed to
+    /// return), classified as `Value` / `Zero` / `FetchFailed`.
+    ///
+    /// This is the per-slot surface the cold-start driver consumes: it
+    /// distinguishes a genuine on-chain zero from a fetch failure for every slot,
+    /// closing the archive-miss gap. It is a pure alias of
+    /// [`verify_slots_core`](Self::verify_slots_core) and shares its injection
+    /// behaviour with [`verify_slots`](Self::verify_slots).
+    #[cfg(feature = "reactive")]
+    pub(crate) fn verify_slots_with_outcomes(
+        &mut self,
+        slots: &[(Address, U256)],
+    ) -> Result<(Vec<SlotChange>, Vec<SlotOutcome>)> {
+        self.verify_slots_core(slots)
     }
 
     /// Reconciliation re-read used by [`EventPipeline::reconcile`](crate::events::EventPipeline::reconcile).

@@ -54,6 +54,18 @@ pub async fn setup_cache() -> Result<EvmCache> {
     Ok(EvmCache::new(Arc::new(provider)).await)
 }
 
+/// Build an `EvmCache` over a mocked provider, also returning the [`Asserter`]
+/// so a test can (a) queue mock responses/failures to drive an offline fetch
+/// down a specific path and (b) assert no RPC was issued via
+/// `asserter.read_q().is_empty()` after the run. The asserter is cloned, so the
+/// returned handle observes the same queue the cache's provider consumes.
+pub async fn setup_cache_with_asserter() -> Result<(EvmCache, Asserter)> {
+    let asserter = Asserter::new();
+    let client = RpcClient::mocked(asserter.clone());
+    let provider = RootProvider::<AnyNetwork>::new(client);
+    Ok((EvmCache::new(Arc::new(provider)).await, asserter))
+}
+
 /// Insert a `MockERC20` account (with runtime bytecode) at `token`.
 ///
 /// The account's storage is marked as fully local, so any slot that is not

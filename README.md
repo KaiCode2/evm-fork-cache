@@ -66,7 +66,12 @@ around three capabilities that target exactly this workload:
   inputs, deduplicates and orders canonical logs, validates pending semantics,
   applies canonical cache mutations through `EvmCache::apply_updates`, and
   can optionally execute storage resync requests through the cache's
-  provider-neutral storage batch fetcher before dispatching reports to hooks. The
+  provider-neutral storage batch fetcher before dispatching reports to hooks.
+  Canonical block effects are journaled for depth-bounded reorg recovery:
+  removed logs, explicit reorged inputs, and parent-hash discontinuities emit
+  `ReactiveReport::Reorg`, roll back reversible storage writes, fall back to
+  targeted purges for irreversible effects, and cancel stale hash-pinned
+  resyncs. The
   `ReactiveRegistry` exposes consolidated Alloy log filters for provider
   subscription setup and exact local log routing with optional route keys. The
   provider-agnostic `EventSubscriber` trait and `AlloySubscriber` are included;

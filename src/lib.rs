@@ -106,6 +106,8 @@
 pub mod access_list;
 pub mod access_set;
 pub mod cache;
+#[cfg(feature = "reactive")]
+pub mod cold_start;
 pub mod create3;
 pub mod deploy;
 pub mod errors;
@@ -119,6 +121,12 @@ pub mod reactive;
 pub mod state_update;
 
 pub use access_set::StorageAccessList;
+#[cfg(feature = "reactive")]
+pub use cold_start::{
+    ColdStartCall, ColdStartCallResult, ColdStartConfig, ColdStartError, ColdStartPin,
+    ColdStartPlan, ColdStartPlanner, ColdStartResults, ColdStartRoundSummary, ColdStartRunReport,
+    ColdStartStep, RoundOutcome,
+};
 pub use events::erc20::Erc20TransferDecoder;
 pub use events::{
     BlockDigest, DecoderRegistry, EventDecoder, EventPipeline, ReconcileReport, ReorgConfig,
@@ -127,7 +135,7 @@ pub use events::{
 pub use freshness::{
     AlwaysVerify, BlockClock, FreshnessClock, FreshnessController, FreshnessParams,
     FreshnessPolicy, FreshnessRegistry, NeverVerify, ObservationDriven, SimRequest, SlotChange,
-    SpeculativeSim, Validation, Validity, WallClock,
+    SlotFetch, SlotOutcome, SpeculativeSim, Validation, Validity, WallClock,
 };
 pub use state_update::{
     AccountChange, AccountPatch, PurgeRecord, PurgeScope, SkippedAccountPatch, SkippedBalanceDelta,
