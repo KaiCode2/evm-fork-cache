@@ -42,14 +42,19 @@ pre-release development phases (see [`docs/ROADMAP.md`](docs/ROADMAP.md)).
 
 ### Added
 
-- **Value-prop benchmarks & showcase.** The README "Performance" section now
-  leads with the searcher-facing outcomes vs a fork-per-candidate baseline:
-  data-fetch minimization (an exact, CI-pinned `~500x`-fewer-RPC-reads count via
-  the new `fetch_minimization_counted` example and `tests/fetch_minimization.rs`),
-  candidate-fan-out throughput (the new `benches/fanout.rs`), reactive event sync
-  (zero fetches per block, pinned in `tests/event_pipeline.rs`), and optimistic
-  latency-hiding (`benches/freshness.rs`). The internal copy-on-write snapshot
-  cost model moved to [`docs/INTERNALS.md`](docs/INTERNALS.md).
+- **Honest performance section & benchmarks.** The README "Performance" section
+  is framed against a *competent* baseline (a shared `foundry-fork-db`
+  `SharedBackend` + `checkpoint`/`revert` isolation), not a naive
+  fork-per-candidate strawman. It states plainly that within-block fetch count,
+  single-threaded CPU, and time-to-result are ~1× against that baseline, and
+  leads with the genuinely-unique wins: cross-block freshness (0 RPC fetches/block,
+  pinned in `tests/event_pipeline.rs` — `foundry-fork-db`'s cache is not
+  block-keyed), parallel `Send` fan-out (`benches/fanout.rs`, a modest measured
+  ~1.2× on micro-sims), point-in-time consistency, and the act-then-validate
+  control plane (`benches/freshness.rs`). Adds `examples/fetch_minimization_counted.rs`
+  and `tests/fetch_minimization.rs` (the fetch-once mechanic, with the
+  shared-backend caveat stated). The internal copy-on-write snapshot cost model
+  moved to [`docs/INTERNALS.md`](docs/INTERNALS.md).
 - **Forked EVM cache** (`cache::EvmCache`) backed by `foundry-fork-db` with lazy
   RPC loading and on-disk persistence for accounts, storage, bytecode, and
   immutable metadata.

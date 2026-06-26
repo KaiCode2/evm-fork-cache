@@ -282,95 +282,76 @@ println!("installed {} bytes at {}", etched.code_size, etched.target_address);
 # }
 ```
 
-## Performance
+## Performance &amp; honest trade-offs
 
-A searcher evaluates many candidate transactions against the *same* recent block.
-The naive build — a fresh revm fork/cache per candidate over an RPC node — pays
-twice per candidate: it **re-fetches** the same hot state *and* **re-builds** an
-independent fork to isolate the candidate, then **blocks on RPC** to validate.
-`evm-fork-cache` fetches each slot once, snapshots once, clones cheaply per
-candidate, and lets you act before validation returns. The results below isolate
-each of those costs against the naive loop — the **fetch** win (①) and the
-per-candidate **isolation/CPU** win (②) are *separate and not double-counted*.
+It is easy to post huge multipliers against a *naive* loop (a fresh cold fork per
+candidate that re-fetches everything and deep-clones to isolate). That is **not**
+the loop a competent revm user writes. Measured against a **competent baseline** —
+one shared [`foundry-fork-db`] `SharedBackend` (which caches and deduplicates
+fetches) plus `checkpoint`/`revert` isolation on a single fork — this crate is
+**roughly at parity on raw within-block speed**, and we say so plainly:
 
-> **Fair baseline.** "Vanilla" / "fork-per-candidate" = the loop a searcher writes
-> without this crate. ① measures the **fetch** cost: a fresh cold cache per
-> candidate that re-fetches the slots it touches. ② measures the **isolation/CPU**
-> cost: a full independent fork (a deep clone of the warm, in-memory state) per
-> candidate — it does *no* RPC, so ②'s speedup is snapshot-construction cost, not
-> network. Each result names how it is measured.
-
-**① Data fetched — the headline (exact, deterministic integer).**
-Evaluating **500 candidates** that share an 8-slot hot working set, the crate
-fetches each slot **once** and every candidate reads the frozen snapshot from
-memory; the fan-out adds **zero** fetches:
-
-| | Slots fetched from RPC |
+| Axis | vs a competent shared-backend / checkpoint-revert loop |
 |---|---|
-| **evm-fork-cache** (fetch once, fan out 500) | **8** |
-| Vanilla (fresh fork per candidate) | **4,000** (500 × 8) |
+| RPC reads **within one block** | **~1×** — a shared `SharedBackend` also fetches each hot slot once |
+| Single-threaded per-candidate CPU | **~1×** — `checkpoint`/`revert` isolation is as cheap as an overlay |
+| Time-to-result vs *blocking* validation | not a fair comparison — a competent loop doesn't block on a fetch before acting |
 
-→ **~500× fewer RPC reads** (3,992 avoided). The ratio is `N` for a shared working
-set; for fully *disjoint* per-candidate reads it is 1× (no win — stated honestly).
-This count is machine-independent and CI-pinned. See
-[`fetch_minimization_counted`](examples/fetch_minimization_counted.rs).
+The value of this crate is **not** a within-block speed multiplier. It is
+correctness, cross-block freshness, and a structured control plane the bare
+primitives don't give you:
 
-<p align="center">
-  <img alt="RPC slot fetches: evm-fork-cache stays flat at 8 while fork-per-candidate grows linearly to 4,000 over 500 candidates" width="660"
-       src="https://raw.githubusercontent.com/KaiCode2/evm-fork-cache/main/assets/fetch_amplification.svg">
-</p>
-
-**② Candidate throughput (wall-clock ratio — CPU/isolation cost only).**
-One `create_snapshot()` amortized across N cheap `EvmOverlay` clones vs a full
-independent fork (a deep clone) per candidate. **Both sides run warm with no RPC**,
-so this isolates the *snapshot-once-and-share vs full-clone-per-candidate* cost —
-it is **not** the fetch win in ① (which is counted separately). Over a fork
-holding ~32k cold slots, per-candidate cost *falls* as N grows while
-fork-per-candidate stays flat:
-
-| Candidates (N) | evm-fork-cache (per candidate) | Fork-per-candidate | Speedup |
-|:---:|:---:|:---:|:---:|
-| 1   | 41 µs  | 2.1 ms | ~51×  |
-| 8   | 8.3 µs | 2.2 ms | ~260× |
-| 32  | 4.9 µs | 2.2 ms | ~450× |
-| 128 | 4.0 µs | 2.2 ms | **~545×** |
-
-→ ~250k candidates/sec vs ~460/sec at N=128. Overlays are `Send` and parallelize;
-the live fork is not. (At N=1 there is little win — one snapshot is not yet
-amortized.) See [`parallel_overlays`](examples/parallel_overlays.rs).
-
-<p align="center">
-  <img alt="Per-candidate cost on a log scale: evm-fork-cache falls from 41 to 4 microseconds as N grows while fork-per-candidate stays flat near 2.1 milliseconds" width="660"
-       src="https://raw.githubusercontent.com/KaiCode2/evm-fork-cache/main/assets/fanout_throughput.svg">
-</p>
-
-**③ Reactive sync — staying fresh without polling (exact integer).**
-Decoding a block's ERC-20 `Transfer` logs into targeted writes keeps the touched
-balance slots correct with **0 RPC fetches/block**, where a poller would re-fetch
-every changed slot. Sampled `reconcile()` re-reads a fraction to catch drift (the
-honesty backstop). Holds only for slots the event stream covers. See
+**① Cross-block freshness — the one quantitative win (exact, CI-pinned integer).**
+`foundry-fork-db`'s cache is **not block-keyed**: re-pinning to a new block does
+not invalidate cached slots, so a refresh-by-refetch loop must re-read every slot
+that changed *each block* to stay correct. Decoding the block's logs into targeted
+writes keeps that hot state correct with **0 RPC fetches/block** — pinned in
+[`tests/event_pipeline.rs`](tests/event_pipeline.rs). Sampled `reconcile()`
+re-reads a fraction to catch drift (the honesty backstop). See
 [`reactive_cache`](examples/reactive_cache.rs).
 
-**④ Optimistic execution — hiding validation latency (structural).**
-Time-to-actionable-result is gated on local simulation, not RPC validation. With a
-*modeled* 50 ms RPC round-trip, the optimistic result returns in **~14 µs** while
-validation runs in the background (~53 ms); the naive fetch-then-act path pays
-~54 ms before it can act. Only sims whose read set changed re-run (`rerun_count`).
-The win is latency *hiding*, not elimination. See
+<p align="center">
+  <img alt="Cumulative RPC slot reads over 8 blocks: refresh-by-refetch climbs linearly to 64 while event-driven writes stay flat at 8 (warmed once, then 0 per block)" width="660"
+       src="https://raw.githubusercontent.com/KaiCode2/evm-fork-cache/main/assets/cross_block_freshness.svg">
+</p>
+
+> Honest caveat: an equally sophisticated peer running their *own* log
+> subscription + delta applier also reaches 0 fetches/block. The crate's
+> contribution is the packaged, cold-aware, reorg-safe, reconcilable vocabulary —
+> not an unreachable number.
+
+**② Parallel fan-out — available, modest, workload-dependent.**
+`create_snapshot()` is an immutable `Send + Sync` view; cloning the `Arc` hands
+each thread its own overlay, so candidates fan out across cores — which a single
+mutable fork cannot do. The measured speedup is honest and modest: **~1.2×** over a
+4,096-candidate batch on a 10-core M1 Pro, because these micro-sims are bound by
+per-candidate allocation, not EVM compute. Heavier candidates (real txs doing
+substantial execution) parallelize better; trivial ones barely. We don't headline a
+core-count multiplier we can't reproduce. `cargo bench --bench fanout`;
+[`parallel_overlays`](examples/parallel_overlays.rs).
+
+**③ Point-in-time consistency.** Every overlay reads one frozen, consistent block
+state. A lazily-filled shared backend can interleave reads taken at slightly
+different moments unless carefully pinned; the snapshot removes that class of bug.
+
+**④ Act-then-validate control plane (structure, not speed).** Run optimistically
+against current state, return immediately, and validate the volatile read-set in
+the background — re-running *only* the sims whose slots changed (`rerun_count`),
+with `Confirmed`/`Corrected`/`Unverified` verdicts and block-pinned validation. A
+searcher who simply acts on warm state is equally fast; the value is the **safe,
+selective re-run**, not a latency multiplier. See
 [`freshness_optimistic`](examples/freshness_optimistic.rs).
 
 > [!NOTE]
-> **Methodology.** All numbers are offline (mocked provider, state injected
-> directly — no network). **Exact integer metrics** (slots fetched, fetches
-> avoided/block) are deterministic and machine-independent; they are pinned by
-> tests. **Wall-clock ratios** (throughput, latency) are Criterion medians on an
-> Apple M1 Pro (`aarch64-apple-darwin`) — read the ratio, not the absolute. The
-> 50 ms RPC latency in ④ is a modeled/injected delay, not a real network
-> measurement. Live-RPC checks live behind the `RPC_URL` gate.
->
-> Reproduce: `cargo run --example fetch_minimization_counted` (the deterministic
-> headline), `cargo bench --bench fanout` (②), `cargo bench --bench freshness`
-> (④).
+> **Methodology &amp; candor.** Offline (mocked provider, state injected — no
+> network). We deliberately do **not** lead with the headline multipliers a naive
+> baseline would produce (~500× fewer reads, ~545× throughput, ~3,800× latency):
+> all three collapse toward ~1× against a competent `SharedBackend` +
+> `checkpoint`/`revert` loop — which is the very primitive this crate wraps. The
+> "0 fetches/block" integer is real and CI-pinned (`cargo test --test
+> event_pipeline`); the parallel-fan-out ratio is a Criterion median on an Apple
+> M1 Pro, read as a ratio not an absolute. Live-RPC checks live behind the
+> `RPC_URL` gate.
 
 ## Benchmarks
 
@@ -379,9 +360,9 @@ provider) so they are reproducible:
 
 | Bench | Measures |
 | --- | --- |
-| `fanout` | **Pillar 1.** Amortized per-candidate throughput: `create_snapshot` + N overlays vs a full independent fork per candidate. |
-| `freshness` | **Pillar 4.** The optimistic loop end-to-end (CPU and latency-hiding vs fetch-then-sim), `verify_slots` at scale (1 → 1000 slots), and multi-sim fan-out. |
-| `event_pipeline` | **Pillar 3.** Per-decoder cost (ERC-20 `Transfer`), `ingest_logs` decode+apply throughput (1 → 1000 logs), and `reorg_to` purge cost. |
+| `fanout` | **Parallel fan-out (②).** N candidates **sequential vs across cores** over one shared snapshot — the parallelism a live mutable fork can't do. |
+| `freshness` | **Act-then-validate (④).** The optimistic loop CPU cost, selective re-run, and the latency-hiding shape (vs a baseline that elects to block). `verify_slots` at scale; multi-sim fan-out. |
+| `event_pipeline` | **Cross-block freshness (①).** `ingest_logs` decode+apply throughput (1 → 1000 logs), `reorg_to` purge; the 0-fetch/block property is pinned in `tests/event_pipeline.rs`. |
 | `state_update` | `apply_updates` throughput across batch sizes (1 → 1000 `Slot`s) and per-variant apply cost (`Slot` vs `Account` vs `Purge`). |
 | `simulation` | Hot-path micro-benches and snapshot-implementation regression guards (`create_snapshot` vs the deep-clone reference — an internal cost model, see [`docs/INTERNALS.md`](docs/INTERNALS.md)). |
 | `access_list` | Touch-set merge and EIP-2930 list construction. |

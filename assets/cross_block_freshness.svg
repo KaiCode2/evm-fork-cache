@@ -1,0 +1,62 @@
+<svg viewBox="0 0 760 400" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="t d" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif">
+  <title id="t">Cumulative RPC slot reads as blocks advance</title>
+  <desc id="d">When a hot set of ~8 slots mutates each block, a refresh-by-refetch loop re-reads them every block (cumulative reads climb linearly), while event-driven writes keep state fresh with zero re-fetches after the first block (flat at 8).</desc>
+
+  <rect x="0" y="0" width="760" height="400" rx="14" fill="#0d1117" stroke="#30363d" stroke-width="1"/>
+
+  <text x="32" y="40" fill="#e6edf3" font-size="19" font-weight="700">Cross-block freshness — cumulative RPC slot reads</text>
+  <text x="32" y="62" fill="#8b949e" font-size="12.5">a ~8-slot hot set mutates each block; foundry-fork-db's cache is not block-keyed, so staying correct means re-reading</text>
+
+  <line x1="92" y1="92" x2="92" y2="330" stroke="#30363d" stroke-width="1.5"/>
+  <line x1="92" y1="330" x2="706" y2="330" stroke="#30363d" stroke-width="1.5"/>
+
+  <g stroke="#21262d" stroke-width="1">
+    <line x1="92" y1="270.5" x2="706" y2="270.5"/>
+    <line x1="92" y1="211" x2="706" y2="211"/>
+    <line x1="92" y1="151.5" x2="706" y2="151.5"/>
+    <line x1="92" y1="92" x2="706" y2="92"/>
+  </g>
+  <g fill="#6e7681" font-size="11" text-anchor="end">
+    <text x="84" y="334">0</text>
+    <text x="84" y="274">16</text>
+    <text x="84" y="215">32</text>
+    <text x="84" y="155">48</text>
+    <text x="84" y="96">64</text>
+  </g>
+  <text x="30" y="211" fill="#8b949e" font-size="11" text-anchor="middle" transform="rotate(-90 30 211)">cumulative RPC slot reads</text>
+
+  <g fill="#6e7681" font-size="11" text-anchor="middle">
+    <text x="92" y="348">1</text>
+    <text x="179.7" y="348">2</text>
+    <text x="267.4" y="348">3</text>
+    <text x="355.1" y="348">4</text>
+    <text x="442.9" y="348">5</text>
+    <text x="530.6" y="348">6</text>
+    <text x="618.3" y="348">7</text>
+    <text x="706" y="348">8</text>
+  </g>
+  <text x="399" y="372" fill="#8b949e" font-size="11.5" text-anchor="middle">block</text>
+
+  <!-- refresh-by-refetch: 8 per block -->
+  <polyline points="92,300.25 179.7,270.5 267.4,240.75 355.1,211 442.9,181.25 530.6,151.5 618.3,121.75 706,92" fill="none" stroke="#f0883e" stroke-width="2.5"/>
+  <circle cx="706" cy="92" r="4.5" fill="#f0883e"/>
+  <text x="700" y="86" fill="#f0883e" font-size="13" font-weight="700" text-anchor="end">64</text>
+
+  <!-- event-driven writes: warm once, then 0/block -->
+  <polyline points="92,300.25 706,300.25" fill="none" stroke="#3fb950" stroke-width="2.5"/>
+  <circle cx="92" cy="300.25" r="4.5" fill="#3fb950"/>
+  <circle cx="706" cy="300.25" r="4.5" fill="#3fb950"/>
+  <text x="716" y="304" fill="#3fb950" font-size="13" font-weight="700">8</text>
+
+  <g font-size="12">
+    <line x1="120" y1="112" x2="146" y2="112" stroke="#f0883e" stroke-width="2.5"/>
+    <text x="154" y="116" fill="#c9d1d9">refresh by re-fetch  =  ~8 reads / block</text>
+    <line x1="120" y1="132" x2="146" y2="132" stroke="#3fb950" stroke-width="2.5"/>
+    <text x="154" y="136" fill="#c9d1d9">event-driven writes  =  0 reads / block (warm once)</text>
+  </g>
+
+  <text x="470" y="178" fill="#3fb950" font-size="20" font-weight="800" text-anchor="middle">0 re-fetches / block</text>
+  <text x="470" y="198" fill="#8b949e" font-size="12" text-anchor="middle">decode the block's logs → targeted writes</text>
+
+  <text x="32" y="390" fill="#6e7681" font-size="10">Within ONE block a shared backend also fetches once (~1×); this is the cross-block win. A peer subscribing to logs themselves also reaches 0.</text>
+</svg>

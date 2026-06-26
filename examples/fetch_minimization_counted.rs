@@ -143,14 +143,19 @@ async fn main() -> Result<()> {
         "  TOTAL slots fetched:         {vanilla_total}  ({N_CANDIDATES} x {per_candidate_fetches})"
     );
     println!(
-        "\n=> {}x fewer RPC reads ({} slots avoided)",
+        "\n=> {}x fewer reads than a NAIVE un-shared loop ({} slots avoided)",
         vanilla_total / crate_total.max(1),
         vanilla_total - crate_total
     );
     println!(
-        "\nNote: this is the shared-hot-set case. If every candidate read a DISJOINT\n\
-         slot set, the union the crate fetches would equal the vanilla total and there\n\
-         would be no fetch saving — the win comes from reuse across overlapping reads."
+        "\nHonest caveat: this beats only the *naive* baseline that builds a fresh cold\n\
+         cache per candidate. A competent searcher sharing ONE foundry-fork-db\n\
+         SharedBackend across candidates ALSO fetches each slot once within a block\n\
+         (its cache dedups) — so within a single block this is ~1x, not {}x.\n\
+         The durable win is CROSS-block: as blocks advance and the hot set mutates,\n\
+         event-driven writes (see the reactive_cache example) keep it fresh with 0\n\
+         re-fetches, where a refetch loop must re-read the changed slots every block.",
+        vanilla_total / crate_total.max(1),
     );
 
     assert_eq!(
