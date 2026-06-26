@@ -193,15 +193,28 @@ surface was moved out of this crate.
   `evm-amm-state` or downstream crates. This crate provides the generic
   `StateUpdate` writer vocabulary, `EventDecoder`/`DecoderRegistry`, the ERC-20
   decoder, and `EventPipeline` orchestration.
-- **Event-driven sync (roadmap Pillar B) — reader/writer halves done; live WS
-  transport is not.** The Phase 3 **writer half** (`StateUpdate` +
-  `apply_update`/`apply_updates`) and the Phase 4 **reader half** (the `events`
-  module: `EventDecoder`/`DecoderRegistry`, the ERC-20 adapter, and the
-  `EventPipeline` with `ingest_logs`/`reorg_to`/`reconcile`) are implemented.
-  What is **not** shipped is a concrete production WS transport: the async
-  `events::drive`/`LogSource` convenience is generic over a log source and is
-  exercised only by the offline example feeding an in-memory source; wiring it to
-  a live `subscribe_logs`/WS provider (and detecting reorgs from block-hash
-  mismatches) is left to the consumer.
+- **Event-driven sync (roadmap Pillar B) — shipped, with bounded live transport.**
+  The Phase 3 **writer half** (`StateUpdate` + `apply_update`/`apply_updates`), the
+  Phase 4 **reader half** (the `events` module), the **reactive runtime**
+  (`reactive`: handler routing, canonical dedup/ordering, resync-through-fetcher,
+  depth-bounded journaled reorg recovery), and a **live `AlloySubscriber`**
+  (WebSocket `subscribe_logs`/`subscribe_blocks`/`subscribe_pending_transactions`
+  with exponential-backoff reconnect and `get_logs` backfill) all ship. Honest
+  remaining transport limits: **full block bodies**, **full pending-transaction
+  hydration**, and **arbitrary historical backfill** are not implemented (the
+  subscriber returns a typed `SubscriberError::Unsupported` for non-hash pending
+  interests); reconnect backfills inclusively from the last-seen block and relies
+  on the bounded `dedupe_window` to suppress overlap, so a reconnect after more
+  than `dedupe_window` matching logs can re-emit already-processed logs as
+  `Backfill` records (the runtime's canonical dedup catches most). Account-field
+  resync is unsupported until a provider-neutral account fetch callback exists.
+- **Reactive integration-test coverage is partial.** The reactive runtime, the
+  subscriber, and reorg recovery are well covered individually (reorg rollback is
+  pinned by state-equivalence assertions; reconnect/backfill/dedup by inline unit
+  tests), but several public paths lack dedicated/integration coverage: composing
+  `AlloySubscriber` output into `ReactiveRuntime::ingest_batch` end-to-end, the
+  block-header ingest path, the `ReactiveReport::Decoded` shape, the
+  `EventDecoderHandler` adapter, and custom pending-tx matcher/route-key routing.
+  These are tracked follow-ups, not known defects.
 - **Recent toolchain.** MSRV 1.88 and edition 2024 are intentional and
   CI-enforced; consumers on older toolchains are not supported.

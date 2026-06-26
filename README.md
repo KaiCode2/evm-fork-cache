@@ -28,20 +28,26 @@ around three capabilities that target exactly this workload:
 1. **Cheap parallel fan-out** — freeze state once into an immutable snapshot,
    hand a cheap `Arc` clone to each task, and run many isolated simulations in
    parallel. No task can observe another's writes.
-2. **Targeted state sync** — refresh or purge *specific* accounts and storage
-   slots in place (no RPC on the hot path), so hot contract state stays correct
-   without re-forking.
+2. **Reactive, event-driven state sync** — keep hot state correct *from the
+   chain's own logs* with no RPC on the hot path: a default-enabled reactive
+   runtime decodes events into targeted writes, invalidates/resyncs what it can't
+   derive, and recovers from reorgs — driven **out of the box** by a live
+   WebSocket subscriber (or your own transport), and seeded by protocol-neutral
+   **cold-start** that warms a working set into the cache in one batched pass.
 3. **Freshness as a first-class concept** — the engine tracks what it can trust,
    for how long, and verifies the rest. The optimistic verify-and-rerun loop
    hides RPC latency: act on speculative results immediately, get a `Confirmed`
    or `Corrected` verdict when the background validation lands.
 
 > **Maturity.** This crate is **pre-1.0** and under active development against a
-> [phased roadmap](docs/ROADMAP.md). Capabilities (1) and (3) above are
-> implemented today. Capability (2) has the targeted writer primitives, the
-> event-to-state reader pipeline, and a default-enabled reactive handler runtime;
-> live network subscription driving remains consumer-provided. The public API
-> still changes between minor versions — see [Stability](#stability).
+> [phased roadmap](docs/ROADMAP.md). All three capabilities ship today: copy-on-write
+> snapshots + overlays (1); a default-enabled reactive runtime with a live
+> `AlloySubscriber` (WebSocket `subscribe_logs`/`subscribe_blocks`/`subscribe_pending_transactions`,
+> exponential-backoff reconnect, and `get_logs` backfill) plus protocol-neutral
+> cold-start (2); and the optimistic verify-and-rerun loop (3). Honest remaining
+> transport work: full block bodies, full pending-transaction hydration, and
+> arbitrary historical backfill are follow-ups. The public API still changes
+> between minor versions — see [Stability](#stability).
 
 ## What it provides today
 
@@ -87,6 +93,11 @@ around three capabilities that target exactly this workload:
   `reactive-polling` feature. Full block bodies, full pending transaction
   hydration, and arbitrary historical backfill remain explicit follow-up
   transport work.
+- **Cold-start** — declaratively warm a working set of accounts and storage slots
+  into the cache in one batched pass via `EvmCache::run_cold_start` and a
+  `ColdStartPlanner` (discover slots via a view-call, then verify them), returning
+  a structured `ColdStartRunReport`. This is how a consumer adopts a working set
+  (pools, feeds) into the fork before going reactive. (Reactive-gated.)
 - **ERC20 helpers** — balances, allowances, decimals, and controlled balance
   mutation (including automatic balance-slot discovery) for simulations.
 - **Transfer-inspector simulation** that reports per-token balance deltas

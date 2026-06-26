@@ -57,7 +57,13 @@
 //! - `reactive` — default-enabled provider-neutral handler runtime for logs,
 //!   blocks, and pending transaction signals. Pure handlers emit `StateUpdate`s,
 //!   invalidations, resync requests, speculative signals, and hooks; the runtime
-//!   validates and applies canonical cache mutations.
+//!   validates and applies canonical cache mutations, journals canonical block
+//!   effects for depth-bounded reorg recovery, and includes a live
+//!   `AlloySubscriber` (WebSocket) transport.
+//! - `cold_start` — default-enabled (reactive-gated) declarative warming of a
+//!   working set of accounts/slots into the cache in one batched pass
+//!   (`EvmCache::run_cold_start` + `ColdStartPlanner`), returning a structured
+//!   `ColdStartRunReport`.
 //! - [`inspector`] — an [`Inspector`](revm::Inspector) that captures ERC20
 //!   `Transfer` events to reconstruct balance deltas from a simulation.
 //! - [`multicall`] — batched read-only calls through Multicall3.

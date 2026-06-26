@@ -812,9 +812,16 @@ impl SpeculativeId {
 /// Configuration for [`ReactiveRuntime`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReactiveConfig {
-    /// Hook backpressure policy for future async dispatchers.
+    /// Hook backpressure policy. **Reserved — currently has no effect.** Hook
+    /// dispatch is synchronous today (every report is delivered to every hook in
+    /// order), so this field is a no-op placeholder for a future async dispatcher.
+    /// Setting it to anything other than the default does not change behavior.
     pub hook_backpressure: HookBackpressure,
-    /// Reorg journal depth reserved for future rollback support.
+    /// Reorg journal depth: the number of recent canonical blocks whose effects
+    /// are journaled for rollback. This is **load-bearing** for reorg recovery —
+    /// a reorg deeper than `journal_depth` cannot roll back reversible writes for
+    /// the aged-out blocks and degrades to a targeted purge. `0` disables
+    /// journaling entirely (every reorg falls back to purge).
     pub journal_depth: usize,
 }
 
@@ -908,7 +915,9 @@ pub struct AppliedReport<N: Network = Ethereum> {
     pub _network: PhantomData<N>,
 }
 
-/// Resync reporting scaffold.
+/// Report of the storage resync requests executed during an ingest cycle: the
+/// requests considered, the authoritative updates built from successful fetches
+/// (and their applied diff), and any targets that could not be resynced.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ResyncReport {
     /// Requests considered by the resync execution pass.
@@ -960,7 +969,10 @@ pub struct BlockReport<N: Network = Ethereum> {
     pub _network: PhantomData<N>,
 }
 
-/// Reorg reporting scaffold.
+/// Report of a detected reorg and the recovery it performed: the dropped
+/// block(s) and inputs, the exact rollback updates applied for reversible dropped
+/// effects, the conservative purge updates for irreversible ones, the canceled
+/// hash-pinned resyncs, and why recovery ran.
 #[derive(Clone, Debug)]
 pub struct ReorgReport<N: Network = Ethereum> {
     /// First dropped block, when known.
@@ -996,7 +1008,8 @@ pub enum ReorgReason {
     ParentMismatch,
 }
 
-/// Error report scaffold.
+/// Report of a non-fatal error surfaced during an ingest cycle, with the
+/// associated input (when known) and a human-readable message.
 #[derive(Clone, Debug)]
 pub struct ReactiveErrorReport<N: Network = Ethereum> {
     /// Input associated with the error, when known.
@@ -2621,9 +2634,25 @@ pub struct AlloySubscriber<P, N: Network = Ethereum> {
     _network: PhantomData<N>,
 }
 
+/// Best-effort installation of rustls' `ring` crypto provider as the process
+/// default, so an `wss://` TLS handshake under `reactive-ws` does not panic with
+/// "no process-level CryptoProvider available". Runs at most once and ignores the
+/// error if a default provider is already installed (the host app may have set
+/// its own).
+#[cfg(feature = "reactive-ws")]
+fn ensure_ring_crypto_provider() {
+    use std::sync::Once;
+    static INSTALL: Once = Once::new();
+    INSTALL.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
+
 impl<P, N: Network> AlloySubscriber<P, N> {
     /// Create a new Alloy subscriber.
     pub fn new(provider: P, mode: SubscriberMode, config: SubscriberConfig) -> Self {
+        #[cfg(feature = "reactive-ws")]
+        ensure_ring_crypto_provider();
         Self {
             provider,
             mode,
@@ -3444,6 +3473,39 @@ mod subscriber_helper_tests {
             InputSource::Subscription
         );
     }
+
+    #[test]
+    fn backfilled_logs_surface_with_backfill_source() {
+        // A backfilled log with no prior subscription duplicate is delivered as
+        // an `InputSource::Backfill` record (the positive side of the dedup test,
+        // pinning the README's "marking recovered records as InputSource::Backfill"
+        // claim — the only place that source is produced).
+        let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig::default(),
+        );
+        subscriber.interests = vec![ReactiveInterest::Logs(LogInterest {
+            provider_filter: Filter::new()
+                .address(Address::repeat_byte(0x42))
+                .event_signature(B256::repeat_byte(0x01)),
+            local_matcher: None,
+            route_key: None,
+        })];
+
+        subscriber.enqueue_event(SubscriberEvent::BackfilledLogs {
+            source_id: 0,
+            logs: vec![rpc_log(false)],
+        });
+
+        assert_eq!(subscriber.pending_records.len(), 1);
+        assert_eq!(
+            subscriber.pending_records[0].context.source,
+            InputSource::Backfill
+        );
+        assert_eq!(subscriber.last_seen_log_blocks.get(&0), Some(&7));
+    }
 }
 
 fn resolve_subscriber_transport(
@@ -3532,7 +3594,7 @@ fn validate_supported_interests<N: Network>(
                 if !config.hydrate_pending_transactions && interest.matches_hash_only() => {}
             ReactiveInterest::PendingTransactions(_) => {
                 return Err(SubscriberError::Unsupported(
-                    "AlloySubscriber polling mode currently supports pending transaction hash interests only",
+                    "AlloySubscriber currently supports pending transaction hash interests only (full pending-tx hydration is unimplemented)",
                 ));
             }
             ReactiveInterest::Blocks(interest) => match (transport, interest.mode) {

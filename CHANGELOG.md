@@ -189,6 +189,15 @@ pre-release development phases (see [`docs/ROADMAP.md`](docs/ROADMAP.md)).
   apply order; account/code changes and prior purge effects conservatively fall
   back to targeted purge updates because `StateDiff` does not carry enough data
   to reconstruct those cache entries exactly. Generic core.
+- **Cold-start** (`cold_start` module, default-enabled / reactive-gated) —
+  declarative warming of a working set of accounts and storage slots into the
+  cache in one batched pass via `EvmCache::run_cold_start` /
+  `execute_cold_start_round` and a `ColdStartPlanner` (discover slots through a
+  view-call, then verify them through the `StorageBatchFetchFn`), returning a
+  structured `ColdStartRunReport` (`ColdStartConfig`/`Plan`/`Results`/
+  `RoundSummary`/`Step`/`RoundOutcome`/`Error`, with per-slot `SlotOutcome`s). The
+  account-warming phase is serial (one fetch per declared account) and aborts the
+  round on the first account failure; storage verify/probe are batched. Generic core.
 - **`StateUpdate::SlotMasked`** (`state_update`, Phase 4) — a cold-aware
   read-modify-write *masked* slot write (`new = (old & !mask) | (value & mask)`)
   with the `StateUpdate::slot_masked` constructor, so a pure decoder can update

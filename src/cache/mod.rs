@@ -82,6 +82,13 @@ pub type RpcCallFn = Arc<dyn Fn(Address, Bytes) -> Result<Bytes> + Send + Sync>;
 /// snapshot was built from, so a concurrent [`EvmCache::set_block`] cannot make
 /// the deferred fetch read a *different* block than the snapshot it is compared
 /// against.
+///
+/// **Contract:** an implementation must return **exactly one** result tuple per
+/// requested `(address, slot)` (order does not matter). Callers — `verify_slots`,
+/// `reconcile_slots`, and the cold-start verify/probe paths — derive their
+/// per-slot outcomes from the returned tuples, so a fetcher that drops, dedups,
+/// reorders-and-truncates, or duplicates entries breaks the "one outcome per
+/// requested slot" guarantee those APIs document.
 pub type StorageBatchFetchFn = Arc<
     dyn Fn(Vec<(Address, U256)>, Option<BlockId>) -> Vec<(Address, U256, Result<U256>)>
         + Send

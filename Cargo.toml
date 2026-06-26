@@ -44,6 +44,12 @@ anyhow = "1.0.98"
 bincode = "1.3"
 foundry-fork-db = "0.22"
 revm = { version = "34.0", features = ["std", "serde", "optional_eip3607", "optional_no_base_fee", "optional_balance_check"] }
+# Pulled by `reactive-ws` only to select rustls' `ring` crypto provider for the
+# alloy WebSocket (wss://) TLS path. If a transitive dep also enabled aws-lc-rs,
+# rustls 0.23 would have no unambiguous process default and a wss:// connection
+# would panic ("no process-level CryptoProvider available"); the AlloySubscriber
+# installs the ring provider best-effort at WS init. Do not remove without
+# re-checking the TLS provider story.
 rustls = { version = "0.23", default-features = false, optional = true }
 serde = { version = "1.0.228", features = ["derive"] }
 thiserror = "2.0"
