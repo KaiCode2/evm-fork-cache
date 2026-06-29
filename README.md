@@ -122,8 +122,13 @@ use std::sync::Arc;
 use alloy_eips::BlockId;
 use alloy_provider::{ProviderBuilder, network::AnyNetwork};
 use alloy_primitives::{Address, Bytes};
+use alloy_sol_types::sol;
 use evm_fork_cache::cache::EvmCache;
 use revm::primitives::hardfork::SpecId;
+
+sol! {
+    function balanceOf(address account) external view returns (uint256);
+}
 
 # async fn example() -> anyhow::Result<()> {
 let provider = ProviderBuilder::new()
@@ -137,6 +142,11 @@ let mut cache = EvmCache::builder(Arc::new(provider))
     .spec(SpecId::CANCUN)
     .build()
     .await;
+
+let token = Address::repeat_byte(0x22);
+let owner = Address::repeat_byte(0x33);
+let balance = cache.call_sol(token, balanceOfCall { account: owner })?;
+println!("owner balance: {balance}");
 
 let from = Address::ZERO;
 let to = Address::repeat_byte(0x11);

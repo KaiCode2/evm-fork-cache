@@ -3095,6 +3095,79 @@ impl EvmCache {
         self.call_raw_with(from, to, calldata, commit, &TxConfig::default())
     }
 
+    /// Execute a non-committing typed Solidity call from [`Address::ZERO`].
+    ///
+    /// This is the typed equivalent of encoding a [`SolCall`], passing it to
+    /// [`call_raw`](Self::call_raw) with `commit = false`, and decoding the
+    /// successful return data with [`SolCall::abi_decode_returns`].
+    ///
+    /// ```no_run
+    /// # use alloy_primitives::Address;
+    /// # use alloy_sol_types::sol;
+    /// # use evm_fork_cache::cache::EvmCache;
+    /// # fn example(cache: &mut EvmCache, token: Address, owner: Address) -> anyhow::Result<()> {
+    /// sol! {
+    ///     function balanceOf(address account) external view returns (uint256);
+    /// }
+    ///
+    /// let balance = cache.call_sol(token, balanceOfCall { account: owner })?;
+    /// # let _ = balance;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn call_sol<C>(&mut self, to: Address, call: C) -> Result<C::Return>
+    where
+        C: SolCall,
+    {
+        self.call_sol_from(Address::ZERO, to, call)
+    }
+
+    /// Execute a non-committing typed Solidity call from an explicit sender.
+    ///
+    /// Uses the default [`TxConfig`], so native value, gas limit/price, nonce,
+    /// and access list are left at the same defaults as [`call_raw`](Self::call_raw).
+    pub fn call_sol_from<C>(&mut self, from: Address, to: Address, call: C) -> Result<C::Return>
+    where
+        C: SolCall,
+    {
+        self.call_sol_with_commit(from, to, call, &TxConfig::default(), false)
+    }
+
+    /// Execute a non-committing typed Solidity call with explicit tx overrides.
+    ///
+    /// This is the typed equivalent of [`call_raw_with`](Self::call_raw_with)
+    /// with `commit = false`.
+    pub fn call_sol_with<C>(
+        &mut self,
+        from: Address,
+        to: Address,
+        call: C,
+        tx: &TxConfig,
+    ) -> Result<C::Return>
+    where
+        C: SolCall,
+    {
+        self.call_sol_with_commit(from, to, call, tx, false)
+    }
+
+    /// Execute a typed Solidity call and commit its state changes.
+    ///
+    /// This is the typed equivalent of [`call_raw_with`](Self::call_raw_with)
+    /// with `commit = true`; the call's state changes are persisted through the
+    /// same path as the raw committing API before the return data is decoded.
+    pub fn transact_sol<C>(
+        &mut self,
+        from: Address,
+        to: Address,
+        call: C,
+        tx: &TxConfig,
+    ) -> Result<C::Return>
+    where
+        C: SolCall,
+    {
+        self.call_sol_with_commit(from, to, call, tx, true)
+    }
+
     /// Execute a call with explicit transaction-environment overrides
     /// ([`TxConfig`]): native `value`, gas limit/price, nonce, and an input
     /// access list. This is the entry point for value-bearing and gas-bounded
@@ -4187,6 +4260,57 @@ impl EvmCache {
         builder
             .build()
             .map_err(|e| anyhow!("Failed to build tx env: {:?}", e))
+    }
+
+    fn call_sol_with_commit<C>(
+        &mut self,
+        from: Address,
+        to: Address,
+        call: C,
+        tx: &TxConfig,
+        commit: bool,
+    ) -> Result<C::Return>
+    where
+        C: SolCall,
+    {
+        let calldata = Bytes::from(call.abi_encode());
+        let result = self
+            .call_raw_with(from, to, calldata, commit, tx)
+            .with_context(|| {
+                format!(
+                    "failed to execute Solidity call {} from {from:?} to {to:?}",
+                    C::SIGNATURE
+                )
+            })?;
+        Self::decode_sol_call_result::<C>(from, to, result)
+    }
+
+    fn decode_sol_call_result<C>(
+        from: Address,
+        to: Address,
+        result: ExecutionResult,
+    ) -> Result<C::Return>
+    where
+        C: SolCall,
+    {
+        match result {
+            ExecutionResult::Success { output, .. } => {
+                let output = output.into_data();
+                C::abi_decode_returns(&output).map_err(|error| {
+                    anyhow!(
+                        "failed to decode Solidity call {} return data from {from:?} to {to:?}: output_len={}, error: {:?}",
+                        C::SIGNATURE,
+                        output.len(),
+                        error
+                    )
+                })
+            }
+            other => Err(anyhow!(
+                "Solidity call {} from {from:?} to {to:?} did not succeed: {:?}",
+                C::SIGNATURE,
+                other
+            )),
+        }
     }
 
     fn erc20_balance_of_in_evm(
