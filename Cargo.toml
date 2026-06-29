@@ -103,6 +103,10 @@ harness = false
 name = "reactive_alloy_amm_live_probe"
 required-features = ["reactive"]
 
+[[example]]
+name = "reactive_runtime"
+required-features = ["reactive"]
+
 # RPC-gated real-contract benchmarks. Skipped (not failed) when RPC_URL is unset,
 # so `cargo bench` stays offline by default.
 [[bench]]

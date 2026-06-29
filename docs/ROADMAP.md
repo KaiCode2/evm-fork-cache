@@ -1,7 +1,8 @@
 # evm-fork-cache — engineering roadmap
 
-> Status: living document. Last updated during Phase 1 public-release hardening
-> after Phases 0-5 landed.
+> Status: living document. Last updated after Phase 6 — the provider-neutral
+> reactive runtime, the live `AlloySubscriber` transport, and cold-start — landed
+> on top of the Phase 0-5 core.
 
 ## Vision
 
@@ -15,11 +16,14 @@ backtesting. The moat is three capabilities working together:
 3. **Freshness as a first-class concept** — the engine knows what it can trust,
    for how long, and purges the rest.
 
-Today the crate implements the Phase 0-5 core: copy-on-write snapshots and
-overlays, the freshness control plane, targeted state-update writers, and the
-event-to-state reader pipeline. The remaining gap is operational integration
-around that pipeline, especially a production WebSocket/log subscription
-transport and application-specific reorg policy wiring.
+Today the crate implements all three pillars end-to-end: copy-on-write snapshots
+and overlays, the freshness control plane, targeted state-update writers, the
+event-to-state reader pipeline, and — as of Phase 6 — a provider-neutral reactive
+runtime with journaled reorg recovery, a live WebSocket `AlloySubscriber`
+transport, and declarative cold-start warming. The remaining work toward 1.0 is
+breadth (multi-transaction / bundle simulation, a call tracer) and transport depth
+(full block bodies, full pending-tx hydration, arbitrary historical backfill), not
+the core control plane.
 
 ## Target architecture
 
@@ -39,8 +43,9 @@ RPC node                     Event-driven sync  ← WS logs · new block
   the fork DB lazily fetches misses from RPC.
 - **Control plane (right):** decoded logs drive event-derived targeted writes
   (e.g. a V3 `Swap` → `slot0`) and purges stale state directly into the fork DB,
-  without RPC on the hot path. The reader/writer pipeline is shipped; production
-  WS subscription and block-hash reorg detection are consumer-provided.
+  without RPC on the hot path. The reader/writer pipeline, the reactive runtime
+  that drives it (journaled parent-hash reorg detection and recovery), and a live
+  WebSocket subscription transport (`AlloySubscriber`) all ship in-crate.
 
 ### The three pillars
 
@@ -76,11 +81,13 @@ RPC node                     Event-driven sync  ← WS logs · new block
 | **1** | Engine seam: typed errors, configurable tx/block env, hot-path benches, builder, protocol-adapter extraction path. | **Done** (`phase-1-engine-seam`) |
 | **2** | Freshness core (Pillar C): `Validity` + `FreshnessRegistry`; observation tracker; policies; optimistic verify-and-rerun loop. | **Done** (`phase-2-freshness`) |
 | **3** | State-update primitives (Pillar B.1): `StateUpdate` + targeted writers; refold `inject_*`; surface state-diff output. | **Done** (`phase-3-state-updates`) |
-| **4** | Event pipeline + adapters (Pillar B.2): `EventDecoder` trait, ERC-20 + V3 adapters, ingest/reorg/reconcile pipeline. | **Done** (`phase-4-event-pipeline`) |
+| **4** | Event pipeline + adapters (Pillar B.2): `EventDecoder` trait, ERC-20 decoder, ingest/reorg/reconcile pipeline. (The in-crate V3 adapter built here was later extracted to `evm-amm-state`; the core stays protocol-neutral.) | **Done** (`phase-4-event-pipeline`) |
 | **5** | COW snapshots (Pillar A): structural sharing; overlay buffer reuse. | **Done** (`phase-5-cow-snapshots`) |
+| **6** | Reactive runtime + live transport: provider-neutral `ReactiveRuntime` / `ReactiveHandler`, journaled depth-bounded reorg recovery, the WebSocket `AlloySubscriber`, and declarative `cold_start` warming. | **Done** (`cold-start-sync`) |
 
-Cross-cutting remaining work: call tracer Inspector, full no-provider build split,
-and production event-transport integrations.
+Cross-cutting remaining work: multi-transaction / bundle simulation (ordered txs
+on cumulative block state with coinbase-payment accounting), a call-tracer
+Inspector, and a full no-provider build split.
 
 ---
 
@@ -446,16 +453,88 @@ fold cost model is recorded in `KNOWN_ISSUES.md`.
 
 ---
 
+## Phase 6 — reactive runtime + live transport (detailed)
+
+Builds the operational layer that drives Pillar B and closes the "consumer wires
+the transport themselves" gap from the original roadmap: a provider-neutral
+runtime that turns subscription inputs into validated cache mutations, a live
+WebSocket transport, and a declarative cold-start warmer. Landed on
+`cold-start-sync`.
+
+### Locked decisions
+
+1. **Pure handlers, runtime-owned mutation.** `ReactiveHandler::handle` is a pure
+   function of `(context, input, &dyn StateView)` returning a `HandlerOutcome` of
+   declarative `ReactiveEffect`s (`StateUpdate`, `Invalidate`, `Resync`,
+   `Speculative`, `Hook`). The runtime — never the handler — validates the effect
+   set (rejecting conflicting writes and canonical mutations from pending inputs)
+   and applies canonical cache mutations. This keeps the `!Send` cache discipline
+   intact: handlers carry no cache handle and dispatch is synchronous.
+2. **Journaled, depth-bounded reorg recovery.** The runtime journals each
+   canonical block's applied effects in a `VecDeque` capped at
+   `ReactiveConfig::journal_depth` (default 64). A removed log or a parent-hash
+   discontinuity drains the dropped blocks and recovers them: reversible
+   slot writes are rolled back to their exact prior values (LIFO), while accounts
+   whose balance/nonce/code moved are promoted to a `PurgeScope::Account` so the
+   next read re-fetches clean state. Hash-pinned resyncs from dropped blocks are
+   canceled. A `ReactiveReport::Reorg` describes precisely what was rolled back
+   and purged. See the runnable [`reactive_runtime`](../examples/reactive_runtime.rs)
+   example.
+3. **Live transport behind a trait.** `EventSubscriber` is the transport seam;
+   `AlloySubscriber` is the in-crate implementation over Alloy pubsub —
+   `subscribe_logs` / `subscribe_blocks` / `subscribe_pending_transactions`,
+   exponential-backoff reconnect with a bounded dedupe window, and `get_logs`
+   backfill from the last-seen block on reconnect. WebSocket TLS uses rustls' ring
+   provider (`reactive-ws`, default); an HTTP polling transport is opt-in
+   (`reactive-polling`).
+4. **Declarative cold-start.** `EvmCache::run_cold_start` drives a
+   `ColdStartPlanner` (a bounded discover-then-verify loop) to warm a working set
+   of accounts/slots into the cache in batched passes before going reactive,
+   returning a structured `ColdStartRunReport`.
+
+### Known limitations (tracked in `docs/KNOWN_ISSUES.md`)
+
+- Reorgs deeper than `journal_depth` (or any depth when `journal_depth = 0`)
+  recover only the blocks still resident in the journal; effects from aged-out
+  blocks are neither rolled back nor purged, and the freshness/validation loop is
+  the backstop. `journal_depth` must exceed the deepest reorg you intend to
+  recover from.
+- The subscriber surfaces pending-transaction **hashes** only (no full pending-tx
+  hydration), no full block bodies, and backfill is anchored at the last-seen
+  block (no arbitrary historical backfill). Account-field resync targets return a
+  typed `Unsupported` error. Hook dispatch is synchronous on the ingest thread;
+  `hook_backpressure` is reserved for a future async dispatcher.
+
+### Acceptance — met
+
+`cargo fmt --check`, `clippy --all-targets -- -D warnings`, `cargo test`,
+`RUSTDOCFLAGS=-D warnings cargo doc`, `cargo bench --no-run`. Landed: `src/reactive/`
+(runtime, registry/router, journaling + reorg recovery, `EventSubscriber` +
+`AlloySubscriber`), `src/cold_start/` (planner/driver/plan/results), the
+`reactive_cache` / `reactive_runtime` / `reactive_alloy_amm_live_probe` examples,
+`benches/event_pipeline.rs`, and `tests/reactive_*` + `tests/cold_start.rs`.
+
+---
+
 ## Remaining work toward 1.0
 
-1. **Production event transport.** The crate ships the generic `events::drive`
-   convenience, `LogSource` trait, synchronous `EventPipeline`, reorg purge, and
-   sampled reconciliation. It does not ship a concrete production WS provider,
-   block-hash reorg detector, or backfill/resubscribe strategy; consumers wire
-   those pieces to their provider stack.
-2. **Snapshot consistency point in continuous ingestion.** Applications that run
+1. **Multi-transaction / bundle simulation.** The engine evaluates isolated
+   candidate calls well, but an MEV bundle is an *ordered sequence* of txs over
+   cumulative block state (victim + backrun, sandwich front/back). Add a bundle
+   primitive that applies an ordered `Vec` of txs against one overlay with
+   cumulative state, surfaces per-tx results, and accounts for coinbase payment —
+   plus a call-tracer Inspector. This is the largest capability gap between a fast
+   candidate-call evaluator and a full MEV simulation engine.
+2. **Transport depth.** The live `AlloySubscriber` ships log/block/pending-hash
+   subscriptions, exponential-backoff reconnect, `get_logs` backfill, and
+   journaled parent-hash reorg recovery. The remaining transport gaps are full
+   block bodies, full pending-transaction hydration (today only pending-tx
+   hashes), arbitrary historical backfill beyond the last-seen-block anchor, and
+   account-field (balance/nonce/code) resync — all tracked in
+   `docs/KNOWN_ISSUES.md`.
+3. **Snapshot consistency point in continuous ingestion.** Applications that run
    a live event loop should snapshot at block boundaries or behind their own
    generation guard so simulations do not observe a partially applied block.
-3. **Full no-provider build split.** The dependency graph still includes
+4. **Full no-provider build split.** The dependency graph still includes
    provider/RPC crates. A later `rpc` feature can make those optional for pure
    offline users.

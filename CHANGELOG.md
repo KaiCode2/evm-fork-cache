@@ -188,7 +188,12 @@ pre-release development phases (see [`docs/ROADMAP.md`](docs/ROADMAP.md)).
   resync requests. Reversible storage-slot changes are rolled back in reverse
   apply order; account/code changes and prior purge effects conservatively fall
   back to targeted purge updates because `StateDiff` does not carry enough data
-  to reconstruct those cache entries exactly. Generic core.
+  to reconstruct those cache entries exactly. Recovery is bounded to the
+  configured `ReactiveConfig::journal_depth` (default 64): a reorg deeper than
+  that — or any reorg when `journal_depth = 0` — recovers only the blocks still
+  resident in the journal and emits a `tracing::warn!` for the under-recovered
+  span (the freshness loop is the backstop; see `docs/KNOWN_ISSUES.md`).
+  Demonstrated offline in `examples/reactive_runtime.rs`. Generic core.
 - **Cold-start** (`cold_start` module, default-enabled / reactive-gated) —
   declarative warming of a working set of accounts and storage slots into the
   cache in one batched pass via `EvmCache::run_cold_start` /

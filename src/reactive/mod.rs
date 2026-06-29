@@ -818,10 +818,17 @@ pub struct ReactiveConfig {
     /// Setting it to anything other than the default does not change behavior.
     pub hook_backpressure: HookBackpressure,
     /// Reorg journal depth: the number of recent canonical blocks whose effects
-    /// are journaled for rollback. This is **load-bearing** for reorg recovery —
-    /// a reorg deeper than `journal_depth` cannot roll back reversible writes for
-    /// the aged-out blocks and degrades to a targeted purge. `0` disables
-    /// journaling entirely (every reorg falls back to purge).
+    /// are journaled for rollback. This is **load-bearing** for reorg recovery:
+    /// only blocks still resident in the journal can be recovered. A reorg deeper
+    /// than `journal_depth` recovers the blocks still in the journal and leaves
+    /// the aged-out blocks' effects in place — they are **neither rolled back nor
+    /// purged**, so the freshness/validation loop is the only backstop for that
+    /// span. `0` disables journaling entirely: no reorg is rolled back or purged.
+    ///
+    /// Set `journal_depth` to exceed the deepest reorg you intend to recover
+    /// precisely. When a reorg references a block that is no longer in the journal,
+    /// the runtime emits a `tracing::warn!` so the under-recovery is observable
+    /// rather than silent.
     pub journal_depth: usize,
 }
 
@@ -973,6 +980,12 @@ pub struct BlockReport<N: Network = Ethereum> {
 /// block(s) and inputs, the exact rollback updates applied for reversible dropped
 /// effects, the conservative purge updates for irreversible ones, the canceled
 /// hash-pinned resyncs, and why recovery ran.
+///
+/// Recovery only covers blocks still resident in the journal. If a reorg runs
+/// deeper than [`ReactiveConfig::journal_depth`], the aged-out blocks do not
+/// appear here and their effects are neither rolled back nor purged (the runtime
+/// logs a `tracing::warn!` in that case); the freshness/validation loop is the
+/// backstop for that span.
 #[derive(Clone, Debug)]
 pub struct ReorgReport<N: Network = Ethereum> {
     /// First dropped block, when known.
@@ -1535,9 +1548,11 @@ impl<N: Network> ReactiveRuntime<N> {
             {
                 self.drain_journal_after(parent_index)
             } else {
+                self.warn_under_recovery(block.number);
                 self.drain_journal_from_number(block.number)
             }
         } else {
+            self.warn_under_recovery(block.number);
             self.drain_journal_from_number(block.number)
         };
 
@@ -1557,6 +1572,7 @@ impl<N: Network> ReactiveRuntime<N> {
         {
             self.drain_journal_from(index)
         } else {
+            self.warn_under_recovery(dropped_block.number);
             self.drain_journal_from_number(dropped_block.number)
         };
 
@@ -1581,6 +1597,24 @@ impl<N: Network> ReactiveRuntime<N> {
         }
 
         self.recover_dropped_journals(cache, dropped, reason)
+    }
+
+    /// Warn that a reorg references a block no longer resident in the journal, so
+    /// recovery is limited to the blocks still journaled — effects from aged-out
+    /// blocks are neither rolled back nor purged (the freshness/validation loop is
+    /// the backstop). Makes the under-recovery observable instead of silent.
+    fn warn_under_recovery(&self, reorg_number: u64) {
+        let oldest_journaled = self.journal.front().map(|entry| entry.block.number);
+        tracing::warn!(
+            reorg_block = reorg_number,
+            oldest_journaled = ?oldest_journaled,
+            journal_depth = self.config.journal_depth,
+            "reactive reorg recovery is incomplete: the reorged block is no longer \
+             in the journal, so effects from blocks aged out of the journal are \
+             neither rolled back nor purged (the freshness/validation loop is the \
+             backstop). Increase ReactiveConfig::journal_depth to recover deeper \
+             reorgs precisely."
+        );
     }
 
     fn record_journal_input(&mut self, block: &BlockRef, input_ref: InputRef) {

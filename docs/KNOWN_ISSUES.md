@@ -147,6 +147,16 @@ surface was moved out of this crate.
   still in the ring, so state touched solely in blocks that have already aged out
   of the horizon is silently left un-purged (no error). Size `depth` above the
   deepest reorg you expect to handle.
+- **Reactive runtime reorgs deeper than `ReactiveConfig::journal_depth` recover
+  only the resident span.** The runtime journals each canonical block's effects in
+  a ring capped at `journal_depth` (default 64). A reorg deeper than that — or any
+  reorg when `journal_depth = 0` — rolls back / purges only the blocks still in the
+  journal; effects from aged-out blocks are **neither rolled back nor purged**, and
+  the freshness/validation loop is the backstop for that span. This is not silent:
+  the runtime emits a `tracing::warn!` when a reorg references a block no longer in
+  the journal. Set `journal_depth` above the deepest reorg you intend to recover
+  precisely. (The full conservative-purge fallback for aged-out blocks is a tracked
+  follow-up, not a known defect.)
 - **Copy-on-write snapshots (Phase 5, Pillar A) — done.** `create_snapshot()` is
   no longer an O(total state) deep clone. The cold `BlockchainDb` index (layer 2)
   is flattened once into an internal, immutable, `Arc`-shared base (per-account

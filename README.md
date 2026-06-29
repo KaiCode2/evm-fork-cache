@@ -241,6 +241,8 @@ and inject all state directly:
 | `freshness_multi_sim` | Advanced | Many sims with selective re-run, plus classification and `ValidThrough` aging. |
 | `state_update_apply` | Advanced | Apply a mixed `StateUpdate` batch (`Slot`/`Account`/`Purge`) and inspect the returned `StateDiff`. |
 | `reactive_cache` | Advanced | Decode ERC-20 `Transfer` logs into `StateUpdate`s, ingest a block, reconcile drift, and purge on a reorg. |
+| `reactive_runtime` | Advanced | Drive the `ReactiveRuntime`: a handler turns a log into a `StateUpdate` (0 RPC), then a reorg triggers automatic journaled rollback. |
+| `fetch_minimization_counted` | Advanced | Count real RPC fetches to show the fetch-once-then-0-per-block mechanic across a fan-out. |
 
 **RPC examples** fork real mainnet state. Set `RPC_URL` to an Ethereum RPC
 endpoint (they print instructions and exit if it is unset):
@@ -334,9 +336,11 @@ re-reads a fraction to catch drift (the honesty backstop). See
 **② Parallel fan-out — available, modest, workload-dependent.**
 `create_snapshot()` is an immutable `Send + Sync` view; cloning the `Arc` hands
 each thread its own overlay, so candidates fan out across cores — which a single
-mutable fork cannot do. The measured speedup is honest and modest: **~1.2×** over a
-4,096-candidate batch on a 10-core M1 Pro, because these micro-sims are bound by
-per-candidate allocation, not EVM compute. Heavier candidates (real txs doing
+mutable fork cannot do. The measured speedup is honest and modest: **~1.2×** across
+the 64–1,024-candidate sweep (`cargo bench --bench fanout`) on a 10-core M1 Pro,
+because these micro-sims are bound by per-candidate allocation, not EVM compute.
+The ratio scales with both core count and per-candidate compute weight. Heavier
+candidates (real txs doing
 substantial execution) parallelize better; trivial ones barely. We don't headline a
 core-count multiplier we can't reproduce. `cargo bench --bench fanout`;
 [`parallel_overlays`](examples/parallel_overlays.rs).
