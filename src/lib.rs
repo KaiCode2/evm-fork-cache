@@ -64,6 +64,10 @@
 //!   working set of accounts/slots into the cache in one batched pass
 //!   (`EvmCache::run_cold_start` + `ColdStartPlanner`), returning a structured
 //!   `ColdStartRunReport`.
+//! - [`bundle`] — multi-transaction bundle execution over cumulative block state
+//!   ([`EvmOverlay::simulate_bundle`](cache::EvmOverlay::simulate_bundle)): ordered
+//!   txs, an `Atomic`/`AllowReverts` revert policy, and coinbase/miner-payment
+//!   accounting.
 //! - [`inspector`] — an [`Inspector`](revm::Inspector) that captures ERC20
 //!   `Transfer` events to reconstruct balance deltas from a simulation.
 //! - [`tracing`] — a call-frame [`Inspector`](revm::Inspector)

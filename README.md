@@ -56,6 +56,12 @@ around three capabilities that target exactly this workload:
 - **Snapshots and overlays** — `create_snapshot()` produces an immutable,
   `Send + Sync` point-in-time view; each `EvmOverlay` is a cheap clone that
   simulates in isolation, ideal for parallel candidate evaluation.
+- **Bundle simulation** — `simulate_bundle` applies an ordered sequence of
+  transactions over cumulative block state (each transaction sees the previous
+  one's writes), with an `Atomic` / `AllowReverts(indices)` revert policy and
+  coinbase/miner-payment accounting (the beneficiary balance delta — priority fee
+  plus direct tips; the base fee is burned in-EVM per EIP-1559). This is the shape
+  a searcher evaluates a candidate set (victim + backrun, sandwich) with.
 - **Freshness control plane** — a four-layer model (classification, observation,
   policy, mechanism) plus an optimistic verify-and-rerun execution loop with
   deferred validation. See the [`freshness`](src/freshness.rs) module.
@@ -102,6 +108,10 @@ around three capabilities that target exactly this workload:
   mutation (including automatic balance-slot discovery) for simulations.
 - **Transfer-inspector simulation** that reports per-token balance deltas
   straight from the `Transfer` event stream, no extra pre/post balance queries.
+- **Call-frame tracing** — `CallTracer` reconstructs the nested `CALL`/`CREATE`
+  frame tree of a simulation (from/to/value/gas/status/subcalls); `InspectorStack`
+  composes it with transfer capture (or any `revm::Inspector`) in a single pass,
+  driven through `EvmOverlay::call_raw_with_inspector`.
 - **Access-list tooling** — `StorageAccessList` captures the EIP-2929 warm-access
   touch set; helpers build an EIP-2930 access list and estimate whether attaching
   one is profitable on an L2.
