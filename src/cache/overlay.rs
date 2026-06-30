@@ -494,6 +494,137 @@ impl EvmOverlay {
         outcome
     }
 
+    /// Run a single call with a caller-supplied [`Inspector`](revm::Inspector),
+    /// returning the raw [`ExecutionResult`] and handing the inspector back for the
+    /// caller to read.
+    ///
+    /// This is the inspector-generic public seam: where
+    /// [`Self::simulate_with_transfer_tracking`] hard-wires the
+    /// [`TransferInspector`], this accepts any
+    /// [`revm::Inspector`] — a [`CallTracer`](crate::tracing::CallTracer), an
+    /// [`InspectorStack`](crate::tracing::InspectorStack) composing several, or a
+    /// caller-defined one. It honors a full [`TxConfig`] (value/gas/nonce/access
+    /// list) exactly like [`Self::call_raw_with_access_list_with`] and recycles the
+    /// reusable shared-memory buffer like the other call methods.
+    ///
+    /// Unlike `simulate_with_transfer_tracking`, a revert or halt is **not** an
+    /// error: the raw [`ExecutionResult`] variant
+    /// ([`Success`](ExecutionResult::Success) /
+    /// [`Revert`](ExecutionResult::Revert) / [`Halt`](ExecutionResult::Halt)) is
+    /// returned as `Ok` so the inspector's captured frames (e.g. a reverted call
+    /// tree) remain observable. Only a tx-env build failure or a transact/database
+    /// error yields `Err`.
+    ///
+    /// On a successful transact the journaled changes are either committed into the
+    /// overlay's dirty layer (`commit == true`) or reverted (`commit == false`),
+    /// matching [`Self::simulate_with_transfer_tracking`]. On a revert/halt the
+    /// checkpoint is always reverted regardless of `commit`, so a failed call never
+    /// mutates this overlay. On a transact error the checkpoint is reverted too.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the [`TxEnv`] cannot be built from `from`/`to`/`tx`, or
+    /// if revm fails to transact the call (e.g. a database error while loading
+    /// state).
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use std::sync::Arc;
+    /// # use alloy_primitives::{Address, Bytes};
+    /// # use evm_fork_cache::cache::{EvmOverlay, EvmSnapshot, TxConfig};
+    /// # use evm_fork_cache::CallTracer;
+    /// # fn run(snapshot: Arc<EvmSnapshot>, to: Address) -> anyhow::Result<()> {
+    /// let mut overlay = EvmOverlay::new(snapshot, None);
+    /// let (result, tracer) = overlay.call_raw_with_inspector(
+    ///     Address::ZERO,
+    ///     to,
+    ///     Bytes::new(),
+    ///     &TxConfig::default(),
+    ///     CallTracer::new(),
+    ///     false,
+    /// )?;
+    /// let _ = result;
+    /// let _trace = tracer.into_trace();
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn call_raw_with_inspector<I>(
+        &mut self,
+        from: Address,
+        to: Address,
+        calldata: Bytes,
+        tx: &TxConfig,
+        inspector: I,
+        commit: bool,
+    ) -> SimulationResult<(ExecutionResult, I)>
+    where
+        I: for<'a> revm::Inspector<
+                Context<
+                    BlockEnv,
+                    TxEnv,
+                    CfgEnv,
+                    &'a mut EvmOverlay,
+                    Journal<&'a mut EvmOverlay>,
+                    (),
+                >,
+            >,
+    {
+        let mut builder = TxEnv::builder()
+            .caller(from)
+            .kind(TxKind::Call(to))
+            .data(calldata)
+            .value(tx.value);
+        if let Some(gas_limit) = tx.gas_limit {
+            builder = builder.gas_limit(gas_limit);
+        }
+        if let Some(gas_price) = tx.gas_price {
+            builder = builder.gas_price(gas_price);
+        }
+        if let Some(nonce) = tx.nonce {
+            builder = builder.nonce(nonce);
+        }
+        if let Some(access_list) = &tx.access_list {
+            builder = builder.access_list(access_list.clone());
+        }
+        let tx_env = builder
+            .build()
+            .map_err(|e| SimError::Other(anyhow!("Failed to build tx env: {:?}", e)))?;
+
+        // Recycle the reusable buffer (Pillar A.2); reclaimed after the EVM drops.
+        let buffer = Rc::new(RefCell::new(std::mem::take(&mut self.reusable_buffer)));
+        let local = LocalContext {
+            shared_memory_buffer: Rc::clone(&buffer),
+            precompile_error_message: None,
+        };
+
+        let outcome = {
+            let mut evm = self.build_evm_with_inspector_local(inspector, local);
+
+            use revm::context_interface::JournalTr;
+            let checkpoint = evm.journaled_state.checkpoint();
+
+            match evm.inspect_one_tx(tx_env) {
+                Ok(result) => {
+                    if commit && matches!(result, ExecutionResult::Success { .. }) {
+                        evm.commit_inner();
+                    } else {
+                        evm.journaled_state.checkpoint_revert(checkpoint);
+                    }
+                    // Hand the inspector back to the caller.
+                    Ok((result, evm.inspector))
+                }
+                Err(e) => {
+                    evm.journaled_state.checkpoint_revert(checkpoint);
+                    Err(SimError::Other(anyhow!("Failed to transact: {:?}", e)))
+                }
+            }
+        };
+
+        self.reclaim_buffer(buffer);
+        outcome
+    }
+
     /// Execute a non-committing call and return the result plus the touched
     /// [`StorageAccessList`].
     ///

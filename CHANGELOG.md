@@ -12,7 +12,22 @@ surface freezes at 1.0.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Added
+
+- Call-frame tracing (`tracing` module): `CallTracer`, a `revm::Inspector` that
+  reconstructs the call-frame tree (`CallTrace`) of a simulation — top-level call
+  plus nested `CALL`/`STATICCALL`/`DELEGATECALL`/`CALLCODE` and `CREATE`/`CREATE2`
+  frames, each with from/to/value/input/gas/output/`CallStatus`/depth/subcalls.
+  Implemented via the `call`/`call_end`/`create`/`create_end` hooks (no
+  opcode/step or `SLOAD`/`SSTORE` tracing). Re-exported at the crate root as
+  `CallTracer`, `CallTrace`, `CallKind`, `CallStatus`.
+- `InspectorStack<A, B>`, a composing `revm::Inspector` that fans out every hook
+  to two inner inspectors so, e.g., a `CallTracer` and a `TransferInspector`
+  capture independently in one pass. Re-exported at the crate root.
+- `EvmOverlay::call_raw_with_inspector`: a public, inspector-generic single-call
+  seam that attaches any `revm::Inspector` (honoring `TxConfig` and `commit`) and
+  returns the raw `ExecutionResult` (a revert/halt is `Ok`, not `Err`) alongside
+  the inspector for the caller to read.
 
 ## [0.1.0] - 2026-06-25
 

@@ -66,6 +66,10 @@
 //!   `ColdStartRunReport`.
 //! - [`inspector`] — an [`Inspector`](revm::Inspector) that captures ERC20
 //!   `Transfer` events to reconstruct balance deltas from a simulation.
+//! - [`tracing`] — a call-frame [`Inspector`](revm::Inspector)
+//!   ([`CallTracer`] building a [`CallTrace`] tree) plus [`InspectorStack`] for
+//!   composing several inspectors over one pass, driven through
+//!   [`EvmOverlay::call_raw_with_inspector`](cache::EvmOverlay::call_raw_with_inspector).
 //! - [`multicall`] — batched read-only calls through Multicall3.
 //! - [`deploy`] / [`create3`] — contract deployment and CREATE3 address math.
 //! - [`prefetch_registry`] — two-stage storage-slot pre-warming.
@@ -125,6 +129,7 @@ pub mod prefetch_registry;
 #[cfg(feature = "reactive")]
 pub mod reactive;
 pub mod state_update;
+pub mod tracing;
 
 pub use access_set::StorageAccessList;
 // Primary entry points, hoisted to the crate root for discoverability. The
@@ -155,3 +160,4 @@ pub use state_update::{
     AccountChange, AccountPatch, PurgeRecord, PurgeScope, SkippedAccountPatch, SkippedBalanceDelta,
     SkippedDelta, SkippedMask, SlotDelta, StateDiff, StateUpdate,
 };
+pub use tracing::{CallKind, CallStatus, CallTrace, CallTracer, InspectorStack};
