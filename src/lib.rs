@@ -127,6 +127,12 @@ pub mod reactive;
 pub mod state_update;
 
 pub use access_set::StorageAccessList;
+// Primary entry points, hoisted to the crate root for discoverability. The
+// fully-qualified module paths (`cache::EvmCache`, `reactive::ReactiveRuntime`,
+// …) remain valid, so this is purely additive.
+pub use cache::{
+    CallSimulationResult, EvmCache, EvmCacheBuilder, EvmOverlay, EvmSnapshot, TxConfig,
+};
 #[cfg(feature = "reactive")]
 pub use cold_start::{
     ColdStartCall, ColdStartCallResult, ColdStartConfig, ColdStartError, ColdStartPin,
@@ -143,6 +149,8 @@ pub use freshness::{
     FreshnessPolicy, FreshnessRegistry, NeverVerify, ObservationDriven, SimRequest, SlotChange,
     SlotFetch, SlotOutcome, SpeculativeSim, Validation, Validity, WallClock,
 };
+#[cfg(feature = "reactive")]
+pub use reactive::{ReactiveConfig, ReactiveHandler, ReactiveRuntime};
 pub use state_update::{
     AccountChange, AccountPatch, PurgeRecord, PurgeScope, SkippedAccountPatch, SkippedBalanceDelta,
     SkippedDelta, SkippedMask, SlotDelta, StateDiff, StateUpdate,

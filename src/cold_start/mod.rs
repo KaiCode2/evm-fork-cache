@@ -27,6 +27,44 @@
 //!
 //! Like the rest of the crate's RPC seams, cold-start fetching drives async work
 //! synchronously and must run on a **multi-thread** tokio runtime.
+//!
+//! # Example
+//!
+//! A planner that authoritatively warms a fixed working set of slots in one round.
+//! (See `examples/cold_start.rs` for the runnable discover-then-verify version.)
+//!
+//! ```
+//! use alloy_primitives::{Address, U256};
+//! use evm_fork_cache::cache::EvmCache;
+//! use evm_fork_cache::events::StateView;
+//! use evm_fork_cache::{
+//!     ColdStartConfig, ColdStartError, ColdStartPlan, ColdStartPlanner, ColdStartResults,
+//!     ColdStartStep,
+//! };
+//!
+//! struct WarmSlots {
+//!     slots: Vec<(Address, U256)>,
+//! }
+//!
+//! impl ColdStartPlanner for WarmSlots {
+//!     fn initial_plan(&mut self, _state: &dyn StateView) -> ColdStartPlan {
+//!         // Round 1: re-fetch these slots authoritatively and inject the fresh values.
+//!         ColdStartPlan { verify: self.slots.clone(), ..Default::default() }
+//!     }
+//!     fn on_results(&mut self, _r: &ColdStartResults, _s: &dyn StateView) -> ColdStartStep {
+//!         ColdStartStep::Done
+//!     }
+//! }
+//!
+//! // `run_cold_start` needs a live cache on a multi-thread runtime; this helper
+//! // shows the call shape (it is never invoked, so the doctest needs no runtime).
+//! # fn warm(cache: &mut EvmCache, slots: Vec<(Address, U256)>) -> Result<(), ColdStartError> {
+//! let mut planner = WarmSlots { slots };
+//! let report = cache.run_cold_start(&mut planner, ColdStartConfig::default())?;
+//! assert_eq!(report.rounds, 1);
+//! # Ok(())
+//! # }
+//! ```
 
 mod config;
 mod driver;

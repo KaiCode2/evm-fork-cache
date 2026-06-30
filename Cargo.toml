@@ -107,6 +107,10 @@ required-features = ["reactive"]
 name = "reactive_runtime"
 required-features = ["reactive"]
 
+[[example]]
+name = "cold_start"
+required-features = ["reactive"]
+
 # RPC-gated real-contract benchmarks. Skipped (not failed) when RPC_URL is unset,
 # so `cargo bench` stays offline by default.
 [[bench]]

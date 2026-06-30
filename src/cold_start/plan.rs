@@ -18,6 +18,25 @@ use alloy_primitives::{Address, Bytes, U256};
 /// - `accounts` are pre-seeded into the cache before discovery runs.
 /// - `discover` view-calls capture the `(address, slot)` pairs and accounts they
 ///   touch.
+///
+/// ```
+/// use alloy_primitives::{Address, Bytes, U256};
+/// use evm_fork_cache::{ColdStartCall, ColdStartPlan};
+///
+/// // Verify one known slot and discover more via a read-only view-call.
+/// let plan = ColdStartPlan {
+///     verify: vec![(Address::repeat_byte(0x11), U256::from(0))],
+///     discover: vec![ColdStartCall {
+///         from: Address::ZERO,
+///         to: Address::repeat_byte(0x11),
+///         calldata: Bytes::new(),
+///         restrict_to: None,
+///     }],
+///     ..Default::default()
+/// };
+/// assert_eq!(plan.verify.len(), 1);
+/// assert_eq!(plan.discover.len(), 1);
+/// ```
 #[derive(Clone, Debug, Default)]
 pub struct ColdStartPlan {
     /// Slots to authoritatively re-fetch, classify, and inject when changed.
