@@ -17,9 +17,7 @@ use revm::{
 use super::snapshot::EvmSnapshot;
 use super::{CallSimulationResult, SimStatus, TxConfig, unix_timestamp_secs_saturating};
 use crate::access_set::StorageAccessList;
-use crate::bundle::{
-    BundleOptions, BundleResult, BundleTx, GasAccounting, RevertPolicy, TxOutcome,
-};
+use crate::bundle::{BundleOptions, BundleResult, BundleTx, RevertPolicy, TxOutcome};
 use crate::errors::{SimError, SimulationError, SimulationResult};
 use crate::inspector::TransferInspector;
 
@@ -637,7 +635,7 @@ impl EvmOverlay {
     /// per-transaction inner checkpoint, so it does **not** rebuild a fresh
     /// overlay per transaction. See the [`bundle`](crate::bundle) module for the
     /// public vocabulary ([`BundleTx`], [`BundleOptions`], [`RevertPolicy`],
-    /// [`GasAccounting`], [`TxOutcome`], [`BundleResult`]).
+    /// [`TxOutcome`], [`BundleResult`]).
     ///
     /// # Revert policy
     ///
@@ -651,11 +649,11 @@ impl EvmOverlay {
     ///
     /// # Coinbase accounting
     ///
-    /// Because the simulator disables the base fee, revm credits the full
-    /// `gas_price × gas_used` to the beneficiary. [`GasAccounting::Mainnet`]
-    /// subtracts the burned base fee (`Σ gas_usedᵢ × basefee` over the committed
-    /// transactions) so the figure is the honest payment; [`GasAccounting::Raw`]
-    /// returns the bare beneficiary delta. All arithmetic is saturating.
+    /// `coinbase_payment` is the block beneficiary's balance delta across the kept
+    /// transactions. Under EIP-1559 revm credits the beneficiary only the priority
+    /// fee (`(effective_gas_price − basefee) × gas_used`) and burns the base fee
+    /// in-EVM, so the delta is the honest miner payment (plus any direct coinbase
+    /// tips). Saturating.
     ///
     /// # Commit semantics
     ///
@@ -703,10 +701,9 @@ impl EvmOverlay {
             })
             .collect::<Result<_, _>>()?;
 
-        // Snapshot block base fee (0 if unset) for the Mainnet burned-fee
-        // subtraction, and the beneficiary's pre-bundle balance, before the
-        // mutable borrow of `self` by the EVM.
-        let basefee = U256::from(self.snapshot.basefee.unwrap_or(0));
+        // Resolve the beneficiary and read its pre-bundle balance before the
+        // mutable borrow of `self` by the EVM (the post-bundle delta is the miner
+        // payment; revm already burns the base fee per EIP-1559).
         let beneficiary = self
             .snapshot
             .coinbase
@@ -733,10 +730,6 @@ impl EvmOverlay {
 
             let mut per_tx: Vec<TxOutcome> = Vec::with_capacity(tx_envs.len());
             let mut total_gas: u64 = 0;
-            // Gas of the transactions whose effects (and beneficiary credit) are
-            // kept; used for the Mainnet burned-base-fee subtraction so it tracks
-            // exactly the beneficiary delta we observe.
-            let mut committed_gas: u64 = 0;
             let mut aborted = false;
 
             'bundle: for (idx, tx_env) in tx_envs.into_iter().enumerate() {
@@ -783,9 +776,7 @@ impl EvmOverlay {
                         break 'bundle;
                     }
                 }
-
-                // Successful tx: its effects accumulate for the next tx.
-                committed_gas = committed_gas.saturating_add(gas_used);
+                // Successful tx: its effects stay journaled for the next tx.
             }
 
             if aborted {
@@ -808,13 +799,10 @@ impl EvmOverlay {
                     .get(&beneficiary)
                     .map(|acct| acct.info.balance)
                     .unwrap_or(pre_beneficiary_balance);
-                let delta = post_beneficiary_balance.saturating_sub(pre_beneficiary_balance);
-                let coinbase_payment = match opts.gas_accounting {
-                    GasAccounting::Raw => delta,
-                    GasAccounting::Mainnet => {
-                        delta.saturating_sub(U256::from(committed_gas).saturating_mul(basefee))
-                    }
-                };
+                // revm already excludes the base fee from the beneficiary credit
+                // (EIP-1559), so the delta is the honest miner payment.
+                let coinbase_payment =
+                    post_beneficiary_balance.saturating_sub(pre_beneficiary_balance);
 
                 if opts.commit {
                     evm.commit_inner();

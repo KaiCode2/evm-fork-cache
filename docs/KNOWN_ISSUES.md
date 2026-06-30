@@ -157,6 +157,16 @@ surface was moved out of this crate.
   the journal. Set `journal_depth` above the deepest reorg you intend to recover
   precisely. (The full conservative-purge fallback for aged-out blocks is a tracked
   follow-up, not a known defect.)
+- **Bundle `coinbase_payment` excludes the gas of `AllowReverts` transactions that
+  actually revert.** `simulate_bundle` rolls a reverting whitelisted tx back to its
+  inner checkpoint, which also undoes the gas that tx charged to the beneficiary. So
+  `coinbase_payment` reflects only the kept (successful) txs' priority fees + direct
+  tips — the honest miner *receipt* for those txs. On real mainnet a reverted bundle
+  tx still consumes gas and pays the miner, so for precise searcher *cost* accounting
+  (miner payment minus the gas you spend on failed attempts) you must add the
+  reverted txs' gas yourself (it is in `per_tx[i].gas_used`). Only relevant under
+  `AllowReverts` with a tx that actually reverts; the `Atomic` path is unaffected.
+  A future revision may surface reverted-tx gas cost directly.
 - **Copy-on-write snapshots (Phase 5, Pillar A) — done.** `create_snapshot()` is
   no longer an O(total state) deep clone. The cold `BlockchainDb` index (layer 2)
   is flattened once into an internal, immutable, `Arc`-shared base (per-account

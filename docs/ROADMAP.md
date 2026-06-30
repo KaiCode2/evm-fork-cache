@@ -20,10 +20,11 @@ Today the crate implements all three pillars end-to-end: copy-on-write snapshots
 and overlays, the freshness control plane, targeted state-update writers, the
 event-to-state reader pipeline, and — as of Phase 6 — a provider-neutral reactive
 runtime with journaled reorg recovery, a live WebSocket `AlloySubscriber`
-transport, and declarative cold-start warming. The remaining work toward 1.0 is
-breadth (multi-transaction / bundle simulation, a call tracer) and transport depth
-(full block bodies, full pending-tx hydration, arbitrary historical backfill), not
-the core control plane.
+transport, declarative cold-start warming, and — as of Phase 7 — multi-transaction
+bundle simulation with coinbase accounting and a call-frame tracer. The remaining
+work toward 1.0 is breadth on those primitives (`Create`-kind bundle txs, opcode
+tracing) and transport depth (full block bodies, full pending-tx hydration,
+arbitrary historical backfill), not the core control plane.
 
 ## Target architecture
 
@@ -84,10 +85,10 @@ RPC node                     Event-driven sync  ← WS logs · new block
 | **4** | Event pipeline + adapters (Pillar B.2): `EventDecoder` trait, ERC-20 decoder, ingest/reorg/reconcile pipeline. (The in-crate V3 adapter built here was later extracted to `evm-amm-state`; the core stays protocol-neutral.) | **Done** (`phase-4-event-pipeline`) |
 | **5** | COW snapshots (Pillar A): structural sharing; overlay buffer reuse. | **Done** (`phase-5-cow-snapshots`) |
 | **6** | Reactive runtime + live transport: provider-neutral `ReactiveRuntime` / `ReactiveHandler`, journaled depth-bounded reorg recovery, the WebSocket `AlloySubscriber`, and declarative `cold_start` warming. | **Done** (`cold-start-sync`) |
+| **7** | Bundle simulation + call tracing: `EvmOverlay::simulate_bundle` (ordered cumulative-state txs, `RevertPolicy`, coinbase-payment accounting) and a `CallTracer` (call-frame tree) + composable `InspectorStack`. | **Done** (`phase-6-bundle-sim`) |
 
-Cross-cutting remaining work: multi-transaction / bundle simulation (ordered txs
-on cumulative block state with coinbase-payment accounting), a call-tracer
-Inspector, and a full no-provider build split.
+Cross-cutting remaining work: `Create`-kind / state-override bundles, opcode-level
+tracing, and a full no-provider build split.
 
 ---
 
@@ -518,13 +519,14 @@ WebSocket transport, and a declarative cold-start warmer. Landed on
 
 ## Remaining work toward 1.0
 
-1. **Multi-transaction / bundle simulation.** The engine evaluates isolated
-   candidate calls well, but an MEV bundle is an *ordered sequence* of txs over
-   cumulative block state (victim + backrun, sandwich front/back). Add a bundle
-   primitive that applies an ordered `Vec` of txs against one overlay with
-   cumulative state, surfaces per-tx results, and accounts for coinbase payment —
-   plus a call-tracer Inspector. This is the largest capability gap between a fast
-   candidate-call evaluator and a full MEV simulation engine.
+1. **Bundle-simulation breadth (Phase 7 — core shipped).** `EvmOverlay::simulate_bundle`
+   now evaluates an ordered tx sequence over cumulative state with a revert policy
+   and coinbase-payment accounting, and a `CallTracer` reconstructs the call-frame
+   tree (see Phase 7 below). The remaining breadth: `Create`-kind bundle txs, a
+   builder-style state-override bundle, opcode/step-level tracing, and tightening
+   reverted-tx gas accounting under `AllowReverts` (a reverted tx's gas is rolled
+   back with its checkpoint, so it is not counted toward the searcher's cost —
+   tracked in `docs/KNOWN_ISSUES.md`).
 2. **Transport depth.** The live `AlloySubscriber` ships log/block/pending-hash
    subscriptions, exponential-backoff reconnect, `get_logs` backfill, and
    journaled parent-hash reorg recovery. The remaining transport gaps are full

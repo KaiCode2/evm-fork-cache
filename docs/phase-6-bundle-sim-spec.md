@@ -37,6 +37,16 @@ The crate must remain **protocol-neutral**: no AMM/protocol-specific logic in `s
 
 ## Track A + B — bundle execution + coinbase accounting
 
+> **Correction (post-implementation).** This spec assumed `disable_base_fee = true`
+> makes revm credit the *full* `gas_price × gas_used` to the beneficiary, requiring
+> a `GasAccounting::{Mainnet, Raw}` knob to subtract the burned base fee. That is
+> wrong: revm's `reward_beneficiary` already credits only the priority fee
+> (`(effective_gas_price − basefee) × gas_used`) under EIP-1559 and burns the base
+> fee in-EVM (`disable_base_fee` only affects tx validation, not the reward). The
+> shipped implementation therefore drops `GasAccounting` entirely and reports
+> `coinbase_payment` as the bare beneficiary delta (the honest payment). The
+> `GasAccounting` parts of the API sketch below are superseded.
+
 ### Public API (new module `src/bundle.rs`, re-exported at crate root)
 
 ```rust

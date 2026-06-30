@@ -2859,9 +2859,9 @@ impl EvmCache {
     ///
     /// Offline caches built over a mocked provider have no fetched block header,
     /// so the base fee is unset (and the `BASEFEE` opcode reads `0`). Use this to
-    /// install one explicitly — required for honest
-    /// [`GasAccounting::Mainnet`](crate::bundle::GasAccounting::Mainnet) bundle
-    /// accounting, which subtracts the burned base fee.
+    /// install one explicitly — it determines the priority fee
+    /// (`gas_price − basefee`) credited to the beneficiary, and thus the
+    /// `coinbase_payment` a [`simulate_bundle`](Self::simulate_bundle) reports.
     ///
     /// The cache stores the base fee as a `u64` (matching the block header and the
     /// `EvmSnapshot` field), so a `U256` larger than `u64::MAX` is saturated.
@@ -3956,8 +3956,7 @@ impl EvmCache {
     /// on a fresh transient [`EvmOverlay`] via
     /// [`EvmOverlay::simulate_bundle`](crate::cache::EvmOverlay::simulate_bundle),
     /// which carries the full semantics (ordered cumulative state, the
-    /// [`RevertPolicy`](crate::bundle::RevertPolicy), and
-    /// [`GasAccounting`](crate::bundle::GasAccounting)).
+    /// [`RevertPolicy`](crate::bundle::RevertPolicy), and coinbase accounting).
     ///
     /// The cache itself is **never** mutated — even when `opts.commit` is `true`.
     /// `commit` controls only whether the bundle's cumulative state is folded

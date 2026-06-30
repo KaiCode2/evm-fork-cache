@@ -253,6 +253,8 @@ and inject all state directly:
 | `reactive_cache` | Advanced | Decode ERC-20 `Transfer` logs into `StateUpdate`s, ingest a block, reconcile drift, and purge on a reorg. |
 | `reactive_runtime` | Advanced | Drive the `ReactiveRuntime`: a handler turns a log into a `StateUpdate` (0 RPC), then a reorg triggers automatic journaled rollback. |
 | `cold_start` | Advanced | Warm a working set with `run_cold_start`: discover the slots a view-call touches, then authoritatively verify + inject them. |
+| `bundle_simulation` | Advanced | `simulate_bundle`: ordered txs over cumulative state, `Atomic` vs `AllowReverts`, and coinbase-payment accounting. |
+| `call_tracer` | Advanced | `CallTracer` reconstructs a nested call-frame tree; `InspectorStack` composes it with transfer capture in one pass. |
 | `fetch_minimization_counted` | Advanced | Count real RPC fetches to show the fetch-once-then-0-per-block mechanic across a fan-out. |
 
 **RPC examples** fork real mainnet state. Set `RPC_URL` to an Ethereum RPC

@@ -21,12 +21,12 @@ surface freezes at 1.0.
   block state on a single overlay — transaction `i` observes the committed writes
   of `0..i`. A `RevertPolicy` chooses between `Atomic` (any revert rolls the whole
   bundle back) and `AllowReverts(indices)` (whitelisted reverts roll back only
-  their own transaction and execution continues). Miner payment is reported via
-  `GasAccounting`: `Mainnet` (default) subtracts the burned base fee
-  (`Σ gas_usedᵢ × basefee`) for honest builder profit, `Raw` returns the bare
-  beneficiary delta. New public types live in the `bundle` module and are
-  re-exported at the crate root: `BundleTx`, `BundleOptions`, `RevertPolicy`,
-  `GasAccounting`, `TxOutcome`, `BundleResult`.
+  their own transaction and execution continues). `BundleResult.coinbase_payment`
+  reports the miner payment as the block beneficiary's balance delta — the honest
+  priority fee plus any direct coinbase tips; revm already burns the base-fee
+  portion in-EVM (EIP-1559), so no base-fee correction is applied. New public types
+  live in the `bundle` module and are re-exported at the crate root: `BundleTx`,
+  `BundleOptions`, `RevertPolicy`, `TxOutcome`, `BundleResult`.
 - **`EvmCache::set_basefee(U256)`** installs a block base fee (the `BASEFEE`
   opcode) that propagates into the next `create_snapshot()`, so offline caches
   with no fetched header can exercise base-fee-aware (`Mainnet`) bundle accounting.

@@ -134,7 +134,7 @@ pub mod tracing;
 
 pub use access_set::StorageAccessList;
 // Phase 6 Track A+B: bundle simulation + coinbase accounting public vocabulary.
-pub use bundle::{BundleOptions, BundleResult, BundleTx, GasAccounting, RevertPolicy, TxOutcome};
+pub use bundle::{BundleOptions, BundleResult, BundleTx, RevertPolicy, TxOutcome};
 // Primary entry points, hoisted to the crate root for discoverability. The
 // fully-qualified module paths (`cache::EvmCache`, `reactive::ReactiveRuntime`,
 // …) remain valid, so this is purely additive.

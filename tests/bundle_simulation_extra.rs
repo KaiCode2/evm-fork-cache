@@ -91,7 +91,6 @@ async fn allow_reverts_non_whitelisted_index_aborts_atomically() -> Result<()> {
         &BundleOptions {
             revert_policy: RevertPolicy::AllowReverts(vec![0]),
             commit: true,
-            ..Default::default()
         },
     )?;
 
@@ -123,7 +122,6 @@ async fn allow_reverts_commit_false_is_isolated() -> Result<()> {
         &BundleOptions {
             revert_policy: RevertPolicy::AllowReverts(vec![1]),
             commit: false,
-            ..Default::default()
         },
     )?;
 

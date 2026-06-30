@@ -22,7 +22,7 @@ use revm::state::AccountInfo;
 use common::{
     MOCK_ERC20_BALANCE_SLOT, MockERC20, install_default_account, install_mock_erc20, setup_cache,
 };
-use evm_fork_cache::{BundleOptions, BundleTx, EvmOverlay, GasAccounting, RevertPolicy, TxConfig};
+use evm_fork_cache::{BundleOptions, BundleTx, EvmOverlay, RevertPolicy, TxConfig};
 
 /// transfer(to, amount) calldata.
 fn transfer_calldata(to: Address, amount: u64) -> Bytes {
@@ -125,7 +125,6 @@ async fn atomic_bundle_reverts_whole_on_failure() -> Result<()> {
         &BundleOptions {
             revert_policy: RevertPolicy::Atomic,
             commit: true,
-            ..Default::default()
         },
     )?;
 
@@ -159,7 +158,6 @@ async fn allow_reverts_keeps_prior_effects() -> Result<()> {
         &BundleOptions {
             revert_policy: RevertPolicy::AllowReverts(vec![1]),
             commit: true,
-            ..Default::default()
         },
     )?;
 
@@ -182,8 +180,7 @@ async fn allow_reverts_keeps_prior_effects() -> Result<()> {
 }
 
 /// AB4 — direct coinbase payment: a native-value transfer to the beneficiary
-/// (Address::ZERO by default) with gas_price = 0 is captured as `coinbase_payment`,
-/// identical under Raw and Mainnet (no gas credit to subtract).
+/// (Address::ZERO by default) with gas_price = 0 is captured as `coinbase_payment`.
 #[tokio::test(flavor = "multi_thread")]
 async fn direct_coinbase_payment_is_captured() -> Result<()> {
     let mut cache = setup_cache().await?;
@@ -210,28 +207,25 @@ async fn direct_coinbase_payment_is_captured() -> Result<()> {
         },
     );
 
-    let snapshot = cache.create_snapshot();
-    for accounting in [GasAccounting::Raw, GasAccounting::Mainnet] {
-        let mut overlay = EvmOverlay::new(snapshot.clone(), None);
-        let result = overlay.simulate_bundle(
-            std::slice::from_ref(&tx),
-            &BundleOptions {
-                gas_accounting: accounting,
-                commit: true,
-                ..Default::default()
-            },
-        )?;
-        assert!(result.succeeded);
-        assert_eq!(result.coinbase_payment, pay, "accounting={accounting:?}");
-    }
+    let mut overlay = EvmOverlay::new(cache.create_snapshot(), None);
+    let result = overlay.simulate_bundle(
+        std::slice::from_ref(&tx),
+        &BundleOptions {
+            commit: true,
+            ..Default::default()
+        },
+    )?;
+    assert!(result.succeeded);
+    assert_eq!(result.coinbase_payment, pay);
     Ok(())
 }
 
-/// AB5 — Mainnet vs Raw gas accounting: with a base fee set and a tx priced above
-/// it, Mainnet payment equals Raw minus the burned base fee (gas_used × basefee),
-/// and is strictly smaller than Raw.
+/// AB5 — base-fee-aware payment: with a base fee set and a tx priced above it,
+/// `coinbase_payment` is the priority fee only (`gas_used × (gas_price − basefee)`).
+/// revm burns the base-fee portion of the beneficiary credit (EIP-1559), so the
+/// base fee is never paid to the miner — the delta already reflects that.
 #[tokio::test(flavor = "multi_thread")]
-async fn mainnet_accounting_subtracts_burned_basefee() -> Result<()> {
+async fn coinbase_payment_is_priority_fee_only() -> Result<()> {
     let mut cache = setup_cache().await?;
     let token = Address::repeat_byte(0x11);
     let caller = Address::repeat_byte(0x22);
@@ -246,8 +240,8 @@ async fn mainnet_accounting_subtracts_burned_basefee() -> Result<()> {
         },
     );
 
-    let basefee: u128 = 1_000_000_000; // 1 gwei
-    let priority: u128 = 2_000_000_000; // 2 gwei
+    let basefee: u128 = 1_000_000_000; // 1 gwei, burned
+    let priority: u128 = 2_000_000_000; // 2 gwei, the miner's cut
     cache.set_basefee(U256::from(basefee));
 
     let tx = BundleTx::with_config(
@@ -260,28 +254,16 @@ async fn mainnet_accounting_subtracts_burned_basefee() -> Result<()> {
         },
     );
 
-    let snapshot = cache.create_snapshot();
-    let run = |accounting| -> Result<evm_fork_cache::BundleResult> {
-        let mut overlay = EvmOverlay::new(snapshot.clone(), None);
-        Ok(overlay.simulate_bundle(
-            std::slice::from_ref(&tx),
-            &BundleOptions {
-                gas_accounting: accounting,
-                ..Default::default()
-            },
-        )?)
-    };
-    let raw = run(GasAccounting::Raw)?;
-    let mainnet = run(GasAccounting::Mainnet)?;
+    let mut overlay = EvmOverlay::new(cache.create_snapshot(), None);
+    let result = overlay.simulate_bundle(std::slice::from_ref(&tx), &BundleOptions::default())?;
 
-    assert!(raw.gas_used > 0);
-    let burned = U256::from(raw.gas_used) * U256::from(basefee);
+    assert!(result.gas_used > 0);
+    // Payment is the priority fee only; the base fee is burned, not paid.
     assert_eq!(
-        mainnet.coinbase_payment,
-        raw.coinbase_payment.saturating_sub(burned),
-        "Mainnet = Raw - gas_used*basefee"
+        result.coinbase_payment,
+        U256::from(result.gas_used) * U256::from(priority),
+        "coinbase payment must be gas_used * priority_fee (base fee excluded)"
     );
-    assert!(mainnet.coinbase_payment < raw.coinbase_payment);
     Ok(())
 }
 

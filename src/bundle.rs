@@ -14,18 +14,17 @@
 //!
 //! # Coinbase accounting
 //!
-//! The simulator runs with `disable_base_fee = true`, so revm credits the
-//! **full** `gas_price × gas_used` to the block beneficiary rather than burning
-//! the base-fee portion as mainnet does. A naive beneficiary-balance delta
-//! therefore *over-states* what a builder actually nets. [`GasAccounting`]
-//! selects how the raw delta is corrected:
-//!
-//! - [`GasAccounting::Mainnet`] (default) subtracts the burned base fee
-//!   (`Σ gas_usedᵢ × basefee` over the committed transactions) so the figure is
-//!   the honest priority-fee + direct-coinbase-transfer payment.
-//! - [`GasAccounting::Raw`] returns the bare beneficiary delta, for diagnostics.
-//!
-//! All arithmetic is saturating.
+//! [`BundleResult::coinbase_payment`] is the block beneficiary's balance delta
+//! across the bundle — the honest miner payment. Under EIP-1559 (London+, which
+//! this engine runs by default) revm credits the beneficiary only the **priority
+//! fee** (`(effective_gas_price − basefee) × gas_used`) and burns the base-fee
+//! portion in-EVM, so the delta already excludes the base fee. It also captures
+//! any **direct value transfers to the beneficiary** (an explicit coinbase tip).
+//! So `coinbase_payment = Σ priority_feeᵢ × gas_usedᵢ + direct coinbase tips`,
+//! over the transactions whose effects are kept. Set the base fee with
+//! [`EvmCache::set_basefee`](crate::cache::EvmCache::set_basefee) to model a
+//! non-zero base fee (a higher base fee lowers the priority fee, and thus the
+//! payment, for a fixed `gas_price`). All arithmetic is saturating.
 //!
 //! [`EvmCache::simulate_bundle`]: crate::cache::EvmCache::simulate_bundle
 //! [`EvmOverlay::simulate_bundle`]: crate::cache::EvmOverlay::simulate_bundle
@@ -81,22 +80,6 @@ impl BundleTx {
     }
 }
 
-/// How miner (coinbase) payment is computed from the beneficiary balance delta.
-///
-/// See the [module docs](self#coinbase-accounting) for why the raw delta
-/// over-states builder profit under `disable_base_fee`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub enum GasAccounting {
-    /// Base-fee-aware (honest profit): `payment = beneficiary_delta − Σ(gas_usedᵢ × basefee)`,
-    /// over the committed transactions. Mirrors what a builder actually nets,
-    /// since the base fee is burned on mainnet. Saturating.
-    #[default]
-    Mainnet,
-    /// Raw beneficiary balance delta (base fee **not** subtracted). For
-    /// diagnostics / parity checks.
-    Raw,
-}
-
 /// What happens when a bundle transaction reverts (or halts).
 ///
 /// Defaults to [`Atomic`](RevertPolicy::Atomic).
@@ -120,9 +103,6 @@ pub struct BundleOptions {
     /// Revert handling for individual transactions. Default
     /// [`Atomic`](RevertPolicy::Atomic).
     pub revert_policy: RevertPolicy,
-    /// How [`BundleResult::coinbase_payment`] is computed. Default
-    /// [`Mainnet`](GasAccounting::Mainnet).
-    pub gas_accounting: GasAccounting,
     /// Whether the bundle's cumulative state is folded into the overlay's dirty
     /// layer (`true`) or reverted so the overlay is left unchanged (`false`).
     /// Default `false` (evaluate, don't persist).
@@ -149,8 +129,10 @@ pub struct BundleResult {
     /// unless an [`Atomic`](RevertPolicy::Atomic) bundle aborted early, in which
     /// case it ends at the failing transaction.
     pub per_tx: Vec<TxOutcome>,
-    /// Miner payment, computed per [`BundleOptions::gas_accounting`]. Saturating;
-    /// `0` for an [`Atomic`](RevertPolicy::Atomic) bundle that aborted.
+    /// Miner payment: the block beneficiary's balance delta across the kept
+    /// transactions (priority fee + direct coinbase tips; the base fee is already
+    /// excluded by revm — see the [module docs](self#coinbase-accounting)).
+    /// Saturating; `0` for an [`Atomic`](RevertPolicy::Atomic) bundle that aborted.
     pub coinbase_payment: U256,
     /// Total gas used across the executed transactions.
     pub gas_used: u64,
@@ -170,15 +152,9 @@ mod tests {
     }
 
     #[test]
-    fn gas_accounting_defaults_to_mainnet() {
-        assert_eq!(GasAccounting::default(), GasAccounting::Mainnet);
-    }
-
-    #[test]
-    fn bundle_options_default_is_evaluate_only_atomic_mainnet() {
+    fn bundle_options_default_is_evaluate_only_atomic() {
         let opts = BundleOptions::default();
         assert!(matches!(opts.revert_policy, RevertPolicy::Atomic));
-        assert_eq!(opts.gas_accounting, GasAccounting::Mainnet);
         assert!(!opts.commit, "default must not persist");
     }
 
