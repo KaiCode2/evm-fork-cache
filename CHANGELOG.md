@@ -14,6 +14,22 @@ surface freezes at 1.0.
 
 ### Added
 
+- **Bundle simulation + coinbase accounting (Phase 6 Track A+B).** New
+  `EvmOverlay::simulate_bundle` (and the cache-side convenience
+  `EvmCache::simulate_bundle`, which snapshots internally and never mutates the
+  cache) apply an ordered sequence of `Call`-kind transactions over **cumulative**
+  block state on a single overlay — transaction `i` observes the committed writes
+  of `0..i`. A `RevertPolicy` chooses between `Atomic` (any revert rolls the whole
+  bundle back) and `AllowReverts(indices)` (whitelisted reverts roll back only
+  their own transaction and execution continues). Miner payment is reported via
+  `GasAccounting`: `Mainnet` (default) subtracts the burned base fee
+  (`Σ gas_usedᵢ × basefee`) for honest builder profit, `Raw` returns the bare
+  beneficiary delta. New public types live in the `bundle` module and are
+  re-exported at the crate root: `BundleTx`, `BundleOptions`, `RevertPolicy`,
+  `GasAccounting`, `TxOutcome`, `BundleResult`.
+- **`EvmCache::set_basefee(U256)`** installs a block base fee (the `BASEFEE`
+  opcode) that propagates into the next `create_snapshot()`, so offline caches
+  with no fetched header can exercise base-fee-aware (`Mainnet`) bundle accounting.
 - Call-frame tracing (`tracing` module): `CallTracer`, a `revm::Inspector` that
   reconstructs the call-frame tree (`CallTrace`) of a simulation — top-level call
   plus nested `CALL`/`STATICCALL`/`DELEGATECALL`/`CALLCODE` and `CREATE`/`CREATE2`

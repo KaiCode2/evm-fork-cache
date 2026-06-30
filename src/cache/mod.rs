@@ -2854,6 +2854,21 @@ impl EvmCache {
         self.basefee = basefee;
     }
 
+    /// Set the block base fee (the `BASEFEE` opcode) for subsequent simulations,
+    /// propagated into the next [`create_snapshot`](Self::create_snapshot).
+    ///
+    /// Offline caches built over a mocked provider have no fetched block header,
+    /// so the base fee is unset (and the `BASEFEE` opcode reads `0`). Use this to
+    /// install one explicitly — required for honest
+    /// [`GasAccounting::Mainnet`](crate::bundle::GasAccounting::Mainnet) bundle
+    /// accounting, which subtracts the burned base fee.
+    ///
+    /// The cache stores the base fee as a `u64` (matching the block header and the
+    /// `EvmSnapshot` field), so a `U256` larger than `u64::MAX` is saturated.
+    pub fn set_basefee(&mut self, basefee: U256) {
+        self.basefee = Some(basefee.saturating_to::<u64>());
+    }
+
     /// Override the block beneficiary (the `COINBASE` opcode) for subsequent
     /// simulations.
     ///
@@ -3931,6 +3946,39 @@ impl EvmCache {
         commit: bool,
     ) -> SimulationResult<CallSimulationResult> {
         self.simulate_with_transfer_tracking(from, to, calldata, owner, tokens, commit)
+    }
+
+    /// Simulate an ordered transaction **bundle** over cumulative block state,
+    /// with a revert policy and coinbase/miner-payment accounting (Phase 6
+    /// Track A+B).
+    ///
+    /// This is a convenience wrapper: it snapshots the cache and runs the bundle
+    /// on a fresh transient [`EvmOverlay`] via
+    /// [`EvmOverlay::simulate_bundle`](crate::cache::EvmOverlay::simulate_bundle),
+    /// which carries the full semantics (ordered cumulative state, the
+    /// [`RevertPolicy`](crate::bundle::RevertPolicy), and
+    /// [`GasAccounting`](crate::bundle::GasAccounting)).
+    ///
+    /// The cache itself is **never** mutated — even when `opts.commit` is `true`.
+    /// `commit` controls only whether the bundle's cumulative state is folded
+    /// into the transient overlay (and is therefore moot here, since that overlay
+    /// is dropped when this call returns). Snapshot the cache yourself and drive
+    /// [`EvmOverlay::simulate_bundle`] directly when you need the committed
+    /// overlay state to outlive the call (e.g. to chain a follow-up read).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SimError`] if a transaction environment cannot be built or revm
+    /// fails to transact. A transaction reverting is reported through the
+    /// per-transaction outcome and the revert policy, not as an error.
+    pub fn simulate_bundle(
+        &mut self,
+        txs: &[crate::bundle::BundleTx],
+        opts: &crate::bundle::BundleOptions,
+    ) -> SimulationResult<crate::bundle::BundleResult> {
+        let snapshot = self.create_snapshot();
+        let mut overlay = EvmOverlay::new(snapshot, None);
+        overlay.simulate_bundle(txs, opts)
     }
 
     /// Deploy a contract via CREATE transaction and return the deployed address.

@@ -17,6 +17,9 @@ use revm::{
 use super::snapshot::EvmSnapshot;
 use super::{CallSimulationResult, SimStatus, TxConfig, unix_timestamp_secs_saturating};
 use crate::access_set::StorageAccessList;
+use crate::bundle::{
+    BundleOptions, BundleResult, BundleTx, GasAccounting, RevertPolicy, TxOutcome,
+};
 use crate::errors::{SimError, SimulationError, SimulationResult};
 use crate::inspector::TransferInspector;
 
@@ -623,6 +626,213 @@ impl EvmOverlay {
 
         self.reclaim_buffer(buffer);
         outcome
+    }
+
+    /// Apply `txs` in order against this overlay over **cumulative** block state,
+    /// with a revert policy and coinbase/miner-payment accounting (Phase 6
+    /// Track A+B).
+    ///
+    /// Each transaction observes the committed writes of the ones before it:
+    /// the bundle runs on a single overlay/EVM with one outer checkpoint plus a
+    /// per-transaction inner checkpoint, so it does **not** rebuild a fresh
+    /// overlay per transaction. See the [`bundle`](crate::bundle) module for the
+    /// public vocabulary ([`BundleTx`], [`BundleOptions`], [`RevertPolicy`],
+    /// [`GasAccounting`], [`TxOutcome`], [`BundleResult`]).
+    ///
+    /// # Revert policy
+    ///
+    /// - [`RevertPolicy::Atomic`]: the first transaction that reverts/halts
+    ///   rolls the whole bundle back to the outer checkpoint, sets
+    ///   `succeeded = false`, and stops (`per_tx` ends at the failing
+    ///   transaction). `coinbase_payment` is `0` and the overlay is unchanged.
+    /// - [`RevertPolicy::AllowReverts`]: a revert at a whitelisted index rolls
+    ///   back only that transaction (inner checkpoint) and execution continues;
+    ///   a revert at a non-whitelisted index behaves like `Atomic`.
+    ///
+    /// # Coinbase accounting
+    ///
+    /// Because the simulator disables the base fee, revm credits the full
+    /// `gas_price × gas_used` to the beneficiary. [`GasAccounting::Mainnet`]
+    /// subtracts the burned base fee (`Σ gas_usedᵢ × basefee` over the committed
+    /// transactions) so the figure is the honest payment; [`GasAccounting::Raw`]
+    /// returns the bare beneficiary delta. All arithmetic is saturating.
+    ///
+    /// # Commit semantics
+    ///
+    /// `opts.commit == true` folds the bundle's cumulative state into this
+    /// overlay's dirty layer (observable by subsequent overlay calls);
+    /// `false` reverts the outer checkpoint so the overlay is unchanged. A
+    /// failed atomic bundle never leaves partial state regardless of `commit`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SimError`] if a transaction environment cannot be built or revm
+    /// fails to transact (e.g. a database error). A transaction *reverting* is
+    /// not an error — it is reported through the per-transaction
+    /// [`TxOutcome`] and the revert policy.
+    pub fn simulate_bundle(
+        &mut self,
+        txs: &[BundleTx],
+        opts: &BundleOptions,
+    ) -> SimulationResult<BundleResult> {
+        // Build every TxEnv up front so a build failure surfaces as an error
+        // before we touch the EVM/journal (and the borrow of `self` is clean).
+        let tx_envs: Vec<TxEnv> = txs
+            .iter()
+            .map(|bt| {
+                let mut builder = TxEnv::builder()
+                    .caller(bt.from)
+                    .kind(TxKind::Call(bt.to))
+                    .data(bt.calldata.clone())
+                    .value(bt.tx.value);
+                if let Some(gas_limit) = bt.tx.gas_limit {
+                    builder = builder.gas_limit(gas_limit);
+                }
+                if let Some(gas_price) = bt.tx.gas_price {
+                    builder = builder.gas_price(gas_price);
+                }
+                if let Some(nonce) = bt.tx.nonce {
+                    builder = builder.nonce(nonce);
+                }
+                if let Some(access_list) = &bt.tx.access_list {
+                    builder = builder.access_list(access_list.clone());
+                }
+                builder
+                    .build()
+                    .map_err(|e| SimError::Other(anyhow!("Failed to build tx env: {:?}", e)))
+            })
+            .collect::<Result<_, _>>()?;
+
+        // Snapshot block base fee (0 if unset) for the Mainnet burned-fee
+        // subtraction, and the beneficiary's pre-bundle balance, before the
+        // mutable borrow of `self` by the EVM.
+        let basefee = U256::from(self.snapshot.basefee.unwrap_or(0));
+        let beneficiary = self
+            .snapshot
+            .coinbase
+            .unwrap_or_else(|| revm::context::BlockEnv::default().beneficiary);
+        let pre_beneficiary_balance = self
+            .basic(beneficiary)
+            .map_err(|e| SimError::Other(anyhow!("Failed to load beneficiary: {:?}", e)))?
+            .map(|info| info.balance)
+            .unwrap_or(U256::ZERO);
+
+        // Recycle the reusable buffer (Pillar A.2); reclaimed after the EVM drops.
+        let buffer = Rc::new(RefCell::new(std::mem::take(&mut self.reusable_buffer)));
+        let local = LocalContext {
+            shared_memory_buffer: Rc::clone(&buffer),
+            precompile_error_message: None,
+        };
+
+        let outcome = {
+            use revm::context_interface::JournalTr;
+            let mut evm = self.build_evm_with_local(local);
+
+            // Outer checkpoint: the whole-bundle savepoint.
+            let outer = evm.journaled_state.checkpoint();
+
+            let mut per_tx: Vec<TxOutcome> = Vec::with_capacity(tx_envs.len());
+            let mut total_gas: u64 = 0;
+            // Gas of the transactions whose effects (and beneficiary credit) are
+            // kept; used for the Mainnet burned-base-fee subtraction so it tracks
+            // exactly the beneficiary delta we observe.
+            let mut committed_gas: u64 = 0;
+            let mut aborted = false;
+
+            'bundle: for (idx, tx_env) in tx_envs.into_iter().enumerate() {
+                // Inner checkpoint: this transaction's savepoint.
+                let inner = evm.journaled_state.checkpoint();
+                let result = match evm.transact_one(tx_env) {
+                    Ok(result) => result,
+                    Err(e) => {
+                        // Host/transact error: undo this tx and the whole bundle,
+                        // reclaim the buffer, and surface as SimError.
+                        evm.journaled_state.checkpoint_revert(inner);
+                        evm.journaled_state.checkpoint_revert(outer);
+                        drop(evm);
+                        self.reclaim_buffer(buffer);
+                        return Err(SimError::Other(anyhow!("Failed to transact: {:?}", e)));
+                    }
+                };
+
+                let gas_used = result.gas_used();
+                let reverted = !result.is_success();
+                let logs = result.logs().to_vec();
+                total_gas = total_gas.saturating_add(gas_used);
+
+                per_tx.push(TxOutcome {
+                    result,
+                    gas_used,
+                    reverted,
+                    logs,
+                });
+
+                if reverted {
+                    let allowed = match &opts.revert_policy {
+                        RevertPolicy::Atomic => false,
+                        RevertPolicy::AllowReverts(idxs) => idxs.contains(&idx),
+                    };
+                    if allowed {
+                        // Roll back only this transaction; later txs still run.
+                        evm.journaled_state.checkpoint_revert(inner);
+                        continue 'bundle;
+                    } else {
+                        // Atomic abort: roll the whole bundle back and stop.
+                        evm.journaled_state.checkpoint_revert(outer);
+                        aborted = true;
+                        break 'bundle;
+                    }
+                }
+
+                // Successful tx: its effects accumulate for the next tx.
+                committed_gas = committed_gas.saturating_add(gas_used);
+            }
+
+            if aborted {
+                // State is reverted to the pre-bundle outer checkpoint regardless
+                // of `commit`; no payment.
+                BundleResult {
+                    per_tx,
+                    coinbase_payment: U256::ZERO,
+                    gas_used: total_gas,
+                    succeeded: false,
+                }
+            } else {
+                // Read the beneficiary's post-bundle balance from the journaled
+                // state (present iff it was touched) BEFORE commit/revert, since
+                // `commit_inner` finalizes (drains) the journal and an outer
+                // revert would undo the credit.
+                let post_beneficiary_balance = evm
+                    .journaled_state
+                    .state
+                    .get(&beneficiary)
+                    .map(|acct| acct.info.balance)
+                    .unwrap_or(pre_beneficiary_balance);
+                let delta = post_beneficiary_balance.saturating_sub(pre_beneficiary_balance);
+                let coinbase_payment = match opts.gas_accounting {
+                    GasAccounting::Raw => delta,
+                    GasAccounting::Mainnet => {
+                        delta.saturating_sub(U256::from(committed_gas).saturating_mul(basefee))
+                    }
+                };
+
+                if opts.commit {
+                    evm.commit_inner();
+                } else {
+                    evm.journaled_state.checkpoint_revert(outer);
+                }
+
+                BundleResult {
+                    per_tx,
+                    coinbase_payment,
+                    gas_used: total_gas,
+                    succeeded: true,
+                }
+            }
+        };
+
+        self.reclaim_buffer(buffer);
+        Ok(outcome)
     }
 
     /// Execute a non-committing call and return the result plus the touched

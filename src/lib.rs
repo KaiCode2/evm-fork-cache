@@ -115,6 +115,7 @@
 //! state over RPC. See the crate README for the full list.
 pub mod access_list;
 pub mod access_set;
+pub mod bundle;
 pub mod cache;
 #[cfg(feature = "reactive")]
 pub mod cold_start;
@@ -132,6 +133,8 @@ pub mod state_update;
 pub mod tracing;
 
 pub use access_set::StorageAccessList;
+// Phase 6 Track A+B: bundle simulation + coinbase accounting public vocabulary.
+pub use bundle::{BundleOptions, BundleResult, BundleTx, GasAccounting, RevertPolicy, TxOutcome};
 // Primary entry points, hoisted to the crate root for discoverability. The
 // fully-qualified module paths (`cache::EvmCache`, `reactive::ReactiveRuntime`,
 // …) remain valid, so this is purely additive.
