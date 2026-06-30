@@ -1,0 +1,240 @@
+# Known issues & limitations
+
+A living triage list of bugs, smells, and limitations surfaced during the
+publication-readiness review. Items here are either **remaining limitations** or
+**recently-fixed issues kept for auditability**; behavior-changing fixes should
+carry red/green tests and a `CHANGELOG.md` entry.
+
+Confidence legend: **[V]** verified against the source during review;
+**[R]** reported by the review and worth confirming before acting.
+
+## Recently fixed before public release
+
+1. **[FIXED] Cold absolute `Account` patches no longer materialize unknown
+   accounts.** `StateUpdate::Account` is cold-aware: a partial patch against an
+   address absent from both layers is skipped, does not write a default backend
+   account, and is surfaced through `StateDiff.skipped_accounts`. Intentional
+   cold materialization is now explicit via `StateUpdate::AccountUpsert` /
+   `StateUpdate::account_upsert(...)`.
+
+2. **[FIXED] Block-context drift and default/latest block-pin ambiguity.**
+   `EvmCache::new(provider)` now pins to `BlockId::latest()` instead of a
+   "no block pin" state; explicit construction uses
+   `EvmCache::at_block(provider, block)`. `set_block` takes a concrete
+   `BlockId`, sets `block_number` only for numeric pins, and clears it for
+   tag/hash pins. Every block change clears stale `basefee`; callers refresh
+   `NUMBER`/`BASEFEE` together with `set_block_context` after fetching the new
+   header. Freshness validation captures the cache's concrete snapshot pin and
+   passes it through to storage fetchers.
+
+3. **[FIXED] Synchronous layer-2 escape hatches have an invalidating wrapper.**
+   Raw handles are now visibly named `unchecked_blockchain_db()` /
+   `unchecked_backend()`, and `EvmCache::with_blockchain_db_mut(...)` runs a
+   synchronous `BlockchainDb` mutation and invalidates the COW snapshot base
+   automatically.
+
+4. **[FIXED] Explicit persistence failures are observable.**
+   `cache::save_binary_state`, `PrefetchRegistry::save`, and
+   `EvmCache::flush` now return `anyhow::Result<()>`. `Drop` remains best-effort
+   and logs flush errors.
+
+5. **[FIXED] Access-list profitability uses exact EIP-2930 RLP bytes.**
+   Arbitrum profitability now centralizes data-gas accounting in
+   `access_list_rlp_data_gas(...)` and provider/pricing failures propagate as
+   `Err`, leaving `Ok(None)` for empty/zero-priced/unprofitable lists.
+
+6. **[FIXED] `simulate_call_with_balance_deltas` isolates balance reads and
+   returns the touched access list.** Pre/post `balanceOf` reads run in isolated
+   checkpoints so malicious/non-view token reads cannot affect target-call gas or
+   committed state. The method commits only the target call when `commit=true`
+   and returns the deduplicated EIP-2930 access list from the pre-reads, target
+   call, and post-reads.
+
+7. **[FIXED] On-disk cache files carry magic bytes and a version number.**
+   `binary_state`, `bytecode`, `ImmutableDataCache`, `PrefetchRegistry`, and
+   `SlotObservationTracker` now write a crate-specific magic header plus an
+   explicit version before the bincode payload. Unknown magic/version values and
+   legacy raw-bincode files are treated as cache misses.
+
+8. **[FIXED] `call_raw_with_access_list` did not revert its checkpoint on a
+   transact error.** Both `EvmCache::call_raw_with_access_list` and
+   `EvmOverlay::call_raw_with_access_list_with` now match on the `transact_one`
+   result and `checkpoint_revert` on **every** path (success and host error),
+   matching `call_raw` / `simulate_with_transfer_tracking`. A host-level transact
+   error no longer leaves the overlay checkpoint un-reverted.
+
+9. **[FIXED] Duplicate custom-error selectors no longer shadow silently.**
+   `RevertDecoder::try_register` and `try_register_raw` return a
+   `DuplicateSelectorError` when a selector is already registered. The ergonomic
+   `register` / `register_raw` / `with_error` path keeps the first registration
+   and emits a warning instead of replacing it.
+
+10. **[FIXED] EVM timestamp construction no longer panics on pre-epoch clocks.**
+    EVM builders use a shared saturating helper for implicit wall-clock
+    timestamps, returning `0` when the system clock is before the Unix epoch
+    instead of panicking. Explicit timestamp overrides are unchanged.
+
+## Remaining open issues ranked by unexpected-result risk
+
+No release-blocking unexpected-result issues remain open from this audit. The
+remaining items below are accepted limitations or code-quality/API nits.
+
+## Code-quality nits
+
+No current code-quality nits are tracked here after the protocol-specific cache
+surface was moved out of this crate.
+
+## API ergonomics
+
+1. **[R] `snapshot()` vs `create_snapshot()`.** `snapshot()` returns a low-level
+    `revm::database::Cache` for in-place `restore()`; `create_snapshot()` returns
+    an `Arc<EvmSnapshot>` for cross-thread fan-out. The names don't convey the
+    difference. Docs now cross-reference them (see the rustdoc), but a rename
+    could be considered pre-1.0.
+
+2. **[R] Process-global cache speed mode.** `set_cache_speed_mode` /
+    `cache_speed_mode` are a process-wide `static`, so two caches in one process
+    cannot tune concurrency independently. Phase 1 moved configuration toward
+    per-instance (`EvmCacheBuilder::cache_config`); the global setter remains.
+
+3. **[V] `SpeculativeSim` consumption contract.** Both `validate()` and
+    `into_optimistic()` take `self` by value, so double-consumption is unreachable
+    under normal ownership. Internally `validate()` uses `.expect("validation
+    handle taken twice")` (defensive) while `into_optimistic()` no-ops if the
+    handle was already taken; this is now documented with a `# Panics` note on
+    `validate`. A `Result`-returning variant could remove the residual foot-gun.
+
+## Limitations by design / roadmap
+
+- **Freshness reconciles storage slots only, not account-level state.** The
+  optimistic verify-and-rerun loop (`FreshnessController::run`) builds its verify
+  set exclusively from the volatile storage *slots* in each sim's read set; it
+  never re-fetches or diffs an account's native balance, nonce, or bytecode.
+  Consequently `Validation::Confirmed` guarantees only that *no volatile storage
+  slot the sims read had changed* — a sim whose result depends on a
+  `BALANCE`/`SELFBALANCE` (or nonce/code) that moved on-chain without a
+  co-changing storage slot can still be reported `Confirmed`. If account-level
+  state matters to a sim, classify the account `Pinned` and keep it fresh via
+  event-driven writes (`apply_update`/`apply_updates`), or reconcile it out of
+  band. The verdict types and the `freshness` module docs state this scope; a
+  future revision may extend reconcile to touched accounts.
+- **Solidity `Panic(uint256)` codes above `u64::MAX` decode as `Unknown`.**
+  `decode_solidity_panic` drops out-of-range codes rather than exposing a lossy
+  `u64`. Real compiler-emitted panic codes are single-byte constants, so this is
+  an accepted limitation and is documented in the error module.
+- **ERC20 `Transfer` decoding assumes the standard event layout.** `inspector.rs`
+  reads `from`/`to` from indexed topics and `value` from the first 32 data bytes.
+  Non-standard or packed `Transfer` encodings may parse incorrectly or be skipped.
+  A self-transfer where `from == to` nets to zero for that owner; this is
+  documented at the call site. Transfer **values ≥ 2^255** are reinterpreted as
+  negative when accumulated as a signed `I256` delta (`I256::from_raw`), so a
+  token emitting such a value would corrupt the reconstructed delta. Real ERC-20
+  supplies are far below 2^255, so this is unreachable for honest tokens; a
+  malicious token can misreport balances by other means regardless.
+- **`BLOCKHASH` resolves to ZERO in ext-db-less overlays.** Snapshots do not track
+  block hashes (`block_hashes` is always empty — the live cache does not track
+  them either), so an `EvmOverlay` built without an `ext_db` (e.g. the freshness
+  validator's internal overlays) returns `B256::ZERO` for the `BLOCKHASH` opcode.
+  A simulation of a contract that reads `BLOCKHASH` through such an overlay sees
+  ZERO rather than the real historical hash.
+- **`EventPipeline::derived_slots` grows unbounded without reorgs.** Every
+  event-derived `(address, slot)` is retained for sampled reconciliation and is
+  only pruned by `reorg_to`. In long-running steady-state ingestion (no reorgs)
+  the set grows monotonically (~52 bytes/slot). The field doc says "seen so far";
+  a future revision may bound it to the reorg ring's horizon.
+- **Reorgs deeper than `ReorgConfig::depth` cannot fully purge.** The touched-
+  address ring is bounded to `depth` blocks; `reorg_to(n)` only purges addresses
+  still in the ring, so state touched solely in blocks that have already aged out
+  of the horizon is silently left un-purged (no error). Size `depth` above the
+  deepest reorg you expect to handle.
+- **Reactive runtime reorgs deeper than `ReactiveConfig::journal_depth` recover
+  only the resident span.** The runtime journals each canonical block's effects in
+  a ring capped at `journal_depth` (default 64). A reorg deeper than that — or any
+  reorg when `journal_depth = 0` — rolls back / purges only the blocks still in the
+  journal; effects from aged-out blocks are **neither rolled back nor purged**, and
+  the freshness/validation loop is the backstop for that span. This is not silent:
+  the runtime emits a `tracing::warn!` when a reorg references a block no longer in
+  the journal. Set `journal_depth` above the deepest reorg you intend to recover
+  precisely. (The full conservative-purge fallback for aged-out blocks is a tracked
+  follow-up, not a known defect.)
+- **Bundle `coinbase_payment` excludes the gas of `AllowReverts` transactions that
+  actually revert.** `simulate_bundle` rolls a reverting whitelisted tx back to its
+  inner checkpoint, which also undoes the gas that tx charged to the beneficiary. So
+  `coinbase_payment` reflects only the kept (successful) txs' priority fees + direct
+  tips — the honest miner *receipt* for those txs. On real mainnet a reverted bundle
+  tx still consumes gas and pays the miner, so for precise searcher *cost* accounting
+  (miner payment minus the gas you spend on failed attempts) you must add the
+  reverted txs' gas yourself (it is in `per_tx[i].gas_used`). Only relevant under
+  `AllowReverts` with a tx that actually reverts; the `Atomic` path is unaffected.
+  A future revision may surface reverted-tx gas cost directly.
+- **Copy-on-write snapshots (Phase 5, Pillar A) — done.** `create_snapshot()` is
+  no longer an O(total state) deep clone. The cold `BlockchainDb` index (layer 2)
+  is flattened once into an internal, immutable, `Arc`-shared base (per-account
+  storage shared by `Arc`), memoized across snapshots and rebuilt copy-on-write
+  only for the addresses that changed; each snapshot folds just the hot CacheDB
+  delta (layer 1) over a cheap `Arc::clone`. **Residual cost model (honest):** a
+  snapshot is no longer free. When layer 2 is unchanged since the last snapshot
+  it still pays an **O(accounts) length-scan** of the layer-2 storage/account
+  maps (to catch uncontrolled lazy-fetch growth that bypasses the write funnel,
+  since `foundry-fork-db` cannot be hooked) plus an **O(layer-1) fold** of the hot
+  delta — so the cost tracks `accounts + changed state`, not total slots. A
+  full rebuild (first snapshot, or after `set_block`/re-pin) is still O(total
+  state). `create_snapshot` is now `&mut self` (it memoizes the base, Decision
+  D5). The retained `create_snapshot_deep_clone()` (the legacy full flatten) is
+  kept as the A/B benchmark baseline and the read-equivalence reference; the
+  `create_snapshot` group in `benches/simulation.rs` measures both. Decisions and
+  the cost model are summarized in `ROADMAP.md` and `docs/INTERNALS.md`.
+- **Layer-2 unchecked accessors remain an explicit contract boundary (Phase 5).** The
+  snapshot base's growth scan is count/absence-based, which is sufficient for the
+  supported writers: the crate's own mutators (`apply_update`, `inject_storage_batch`,
+  purges, code overrides) explicitly mark the base dirty,
+  and the `foundry-fork-db` `SharedBackend` lazy fetch is append-only at a fixed
+  block (it only inserts on a cache miss, never overwrites in place — a load-bearing
+  invariant noted in `refresh_base`). Direct out-of-band writes through the
+  `unchecked_blockchain_db()` / `unchecked_backend()` handles still bypass the
+  normal write funnel by design. For synchronous `BlockchainDb` map writes, prefer
+  [`EvmCache::with_blockchain_db_mut`], which invalidates the base automatically
+  after the closure returns. If using the unchecked handle directly, call
+  [`EvmCache::invalidate_snapshot_base`] after the write lands and before the next
+  snapshot (or re-pin via `set_block`). For
+  `SharedBackend::insert_or_update_storage` / `insert_or_update_address`, the call
+  only enqueues work on the backend handler; `invalidate_snapshot_base()` does not
+  wait for that queued update. First synchronize or read back until the expected
+  value is visible in `BlockchainDb` / through the backend, then invalidate before
+  creating the snapshot. The rustdoc on both accessors and the hook carries this
+  warning, and `tests/cow_snapshot.rs`
+  (`invalidate_snapshot_base_rehonest_after_escape_hatch_write`,
+  `invalidate_snapshot_base_rehonest_after_existing_account_write`,
+  `with_blockchain_db_mut_rehonest_after_storage_overwrite`,
+  `with_blockchain_db_mut_rehonest_after_account_overwrite`)
+  pins it.
+- **Protocol adapters are intentionally out of scope.** AMM state tracking,
+  protocol-specific storage layouts, and DeFi event adapters now belong in
+  `evm-amm-state` or downstream crates. This crate provides the generic
+  `StateUpdate` writer vocabulary, `EventDecoder`/`DecoderRegistry`, the ERC-20
+  decoder, and `EventPipeline` orchestration.
+- **Event-driven sync (roadmap Pillar B) — shipped, with bounded live transport.**
+  The Phase 3 **writer half** (`StateUpdate` + `apply_update`/`apply_updates`), the
+  Phase 4 **reader half** (the `events` module), the **reactive runtime**
+  (`reactive`: handler routing, canonical dedup/ordering, resync-through-fetcher,
+  depth-bounded journaled reorg recovery), and a **live `AlloySubscriber`**
+  (WebSocket `subscribe_logs`/`subscribe_blocks`/`subscribe_pending_transactions`
+  with exponential-backoff reconnect and `get_logs` backfill) all ship. Honest
+  remaining transport limits: **full block bodies**, **full pending-transaction
+  hydration**, and **arbitrary historical backfill** are not implemented (the
+  subscriber returns a typed `SubscriberError::Unsupported` for non-hash pending
+  interests); reconnect backfills inclusively from the last-seen block and relies
+  on the bounded `dedupe_window` to suppress overlap, so a reconnect after more
+  than `dedupe_window` matching logs can re-emit already-processed logs as
+  `Backfill` records (the runtime's canonical dedup catches most). Account-field
+  resync is unsupported until a provider-neutral account fetch callback exists.
+- **Reactive integration-test coverage is partial.** The reactive runtime, the
+  subscriber, and reorg recovery are well covered individually (reorg rollback is
+  pinned by state-equivalence assertions; reconnect/backfill/dedup by inline unit
+  tests), but several public paths lack dedicated/integration coverage: composing
+  `AlloySubscriber` output into `ReactiveRuntime::ingest_batch` end-to-end, the
+  block-header ingest path, the `ReactiveReport::Decoded` shape, the
+  `EventDecoderHandler` adapter, and custom pending-tx matcher/route-key routing.
+  These are tracked follow-ups, not known defects.
+- **Recent toolchain.** MSRV 1.88 and edition 2024 are intentional and
+  CI-enforced; consumers on older toolchains are not supported.
