@@ -19,10 +19,10 @@ use anyhow::Result;
 use revm::context::result::ExecutionResult;
 use revm::state::AccountInfo;
 
-use common::{MOCK_ERC20_BALANCE_SLOT, MockERC20, install_default_account, install_mock_erc20, setup_cache};
-use evm_fork_cache::{
-    BundleOptions, BundleTx, EvmOverlay, GasAccounting, RevertPolicy, TxConfig,
+use common::{
+    MOCK_ERC20_BALANCE_SLOT, MockERC20, install_default_account, install_mock_erc20, setup_cache,
 };
+use evm_fork_cache::{BundleOptions, BundleTx, EvmOverlay, GasAccounting, RevertPolicy, TxConfig};
 
 /// transfer(to, amount) calldata.
 fn transfer_calldata(to: Address, amount: u64) -> Bytes {
@@ -40,15 +40,16 @@ fn transfer_calldata(to: Address, amount: u64) -> Bytes {
 fn overlay_balance(overlay: &mut EvmOverlay, token: Address, owner: Address) -> Result<U256> {
     let calldata = Bytes::from(MockERC20::balanceOfCall { account: owner }.abi_encode());
     match overlay.call_raw(owner, token, calldata)? {
-        ExecutionResult::Success { output, .. } => {
-            Ok(MockERC20::balanceOfCall::abi_decode_returns(&output.into_data())?)
-        }
+        ExecutionResult::Success { output, .. } => Ok(
+            MockERC20::balanceOfCall::abi_decode_returns(&output.into_data())?,
+        ),
         other => anyhow::bail!("balanceOf failed: {other:?}"),
     }
 }
 
 /// A token with `alice` funded; returns (token, alice, bob, carol).
-async fn token_with_funded_alice() -> Result<(evm_fork_cache::EvmCache, Address, Address, Address, Address)> {
+async fn token_with_funded_alice()
+-> Result<(evm_fork_cache::EvmCache, Address, Address, Address, Address)> {
     let mut cache = setup_cache().await?;
     let token = Address::repeat_byte(0x11);
     let alice = Address::repeat_byte(0x22);
@@ -59,7 +60,12 @@ async fn token_with_funded_alice() -> Result<(evm_fork_cache::EvmCache, Address,
     install_default_account(&mut cache, bob);
     install_default_account(&mut cache, carol);
     install_mock_erc20(&mut cache, token);
-    cache.insert_mapping_storage_slot(token, U256::from(MOCK_ERC20_BALANCE_SLOT), alice, U256::from(1_000u64))?;
+    cache.insert_mapping_storage_slot(
+        token,
+        U256::from(MOCK_ERC20_BALANCE_SLOT),
+        alice,
+        U256::from(1_000u64),
+    )?;
     Ok((cache, token, alice, bob, carol))
 }
 
@@ -87,9 +93,18 @@ async fn bundle_applies_txs_over_cumulative_state() -> Result<()> {
     assert!(result.per_tx.iter().all(|o| !o.reverted));
 
     // Cumulative: alice 1000-100=900, bob 0+100-30=70, carol 0+30=30.
-    assert_eq!(overlay_balance(&mut overlay, token, alice)?, U256::from(900u64));
-    assert_eq!(overlay_balance(&mut overlay, token, bob)?, U256::from(70u64));
-    assert_eq!(overlay_balance(&mut overlay, token, carol)?, U256::from(30u64));
+    assert_eq!(
+        overlay_balance(&mut overlay, token, alice)?,
+        U256::from(900u64)
+    );
+    assert_eq!(
+        overlay_balance(&mut overlay, token, bob)?,
+        U256::from(70u64)
+    );
+    assert_eq!(
+        overlay_balance(&mut overlay, token, carol)?,
+        U256::from(30u64)
+    );
     Ok(())
 }
 
@@ -114,10 +129,16 @@ async fn atomic_bundle_reverts_whole_on_failure() -> Result<()> {
         },
     )?;
 
-    assert!(!result.succeeded, "atomic bundle must fail when a tx reverts");
+    assert!(
+        !result.succeeded,
+        "atomic bundle must fail when a tx reverts"
+    );
     assert!(result.per_tx.last().map(|o| o.reverted).unwrap_or(false));
     // The whole bundle rolled back: alice keeps her full balance.
-    assert_eq!(overlay_balance(&mut overlay, token, alice)?, U256::from(1_000u64));
+    assert_eq!(
+        overlay_balance(&mut overlay, token, alice)?,
+        U256::from(1_000u64)
+    );
     assert_eq!(overlay_balance(&mut overlay, token, bob)?, U256::ZERO);
     Ok(())
 }
@@ -142,12 +163,21 @@ async fn allow_reverts_keeps_prior_effects() -> Result<()> {
         },
     )?;
 
-    assert!(result.succeeded, "bundle should succeed when the revert is allowed");
+    assert!(
+        result.succeeded,
+        "bundle should succeed when the revert is allowed"
+    );
     assert!(!result.per_tx[0].reverted);
     assert!(result.per_tx[1].reverted);
     // tx 0 persisted, tx 1 rolled back.
-    assert_eq!(overlay_balance(&mut overlay, token, alice)?, U256::from(900u64));
-    assert_eq!(overlay_balance(&mut overlay, token, bob)?, U256::from(100u64));
+    assert_eq!(
+        overlay_balance(&mut overlay, token, alice)?,
+        U256::from(900u64)
+    );
+    assert_eq!(
+        overlay_balance(&mut overlay, token, bob)?,
+        U256::from(100u64)
+    );
     Ok(())
 }
 
@@ -160,9 +190,13 @@ async fn direct_coinbase_payment_is_captured() -> Result<()> {
     let searcher = Address::repeat_byte(0x22);
     // Beneficiary defaults to Address::ZERO; install it so it is not lazily fetched.
     install_default_account(&mut cache, Address::ZERO);
-    cache
-        .db_mut()
-        .insert_account_info(searcher, AccountInfo { balance: U256::from(10_000u64), ..Default::default() });
+    cache.db_mut().insert_account_info(
+        searcher,
+        AccountInfo {
+            balance: U256::from(10_000u64),
+            ..Default::default()
+        },
+    );
 
     let pay = U256::from(777u64);
     let tx = BundleTx::with_config(
@@ -206,7 +240,10 @@ async fn mainnet_accounting_subtracts_burned_basefee() -> Result<()> {
     // Fund the caller's native balance so gas accounting is well-defined.
     cache.db_mut().insert_account_info(
         caller,
-        AccountInfo { balance: U256::from(10u64).pow(U256::from(20u64)), ..Default::default() },
+        AccountInfo {
+            balance: U256::from(10u64).pow(U256::from(20u64)),
+            ..Default::default()
+        },
     );
 
     let basefee: u128 = 1_000_000_000; // 1 gwei
@@ -228,7 +265,10 @@ async fn mainnet_accounting_subtracts_burned_basefee() -> Result<()> {
         let mut overlay = EvmOverlay::new(snapshot.clone(), None);
         Ok(overlay.simulate_bundle(
             std::slice::from_ref(&tx),
-            &BundleOptions { gas_accounting: accounting, ..Default::default() },
+            &BundleOptions {
+                gas_accounting: accounting,
+                ..Default::default()
+            },
         )?)
     };
     let raw = run(GasAccounting::Raw)?;
@@ -256,7 +296,10 @@ async fn commit_flag_controls_overlay_persistence() -> Result<()> {
     let mut overlay = EvmOverlay::new(snapshot.clone(), None);
     overlay.simulate_bundle(
         &[BundleTx::new(alice, token, transfer_calldata(bob, 100))],
-        &BundleOptions { commit: false, ..Default::default() },
+        &BundleOptions {
+            commit: false,
+            ..Default::default()
+        },
     )?;
     assert_eq!(overlay_balance(&mut overlay, token, bob)?, U256::ZERO);
 
@@ -264,8 +307,14 @@ async fn commit_flag_controls_overlay_persistence() -> Result<()> {
     let mut overlay = EvmOverlay::new(snapshot, None);
     overlay.simulate_bundle(
         &[BundleTx::new(alice, token, transfer_calldata(bob, 100))],
-        &BundleOptions { commit: true, ..Default::default() },
+        &BundleOptions {
+            commit: true,
+            ..Default::default()
+        },
     )?;
-    assert_eq!(overlay_balance(&mut overlay, token, bob)?, U256::from(100u64));
+    assert_eq!(
+        overlay_balance(&mut overlay, token, bob)?,
+        U256::from(100u64)
+    );
     Ok(())
 }
