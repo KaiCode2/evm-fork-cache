@@ -1,7 +1,7 @@
 //! Fan one frozen snapshot out to many parallel, isolated simulations.
 //!
 //! This is the crate's headline workflow: freeze the cache into an immutable
-//! `Arc<EvmSnapshot>` with `create_snapshot()`, then give each task its own
+//! `Arc<EvmSnapshot>` with `snapshot()`, then give each task its own
 //! `EvmOverlay` (a cheap `Arc::clone` of the snapshot plus a private dirty
 //! layer). Overlays are `Send`, so the tasks can run on separate threads, and a
 //! write committed in one overlay is invisible to its siblings.
@@ -49,7 +49,7 @@ async fn main() -> Result<()> {
     cache.insert_mapping_storage_slot(token, slot, recipient, U256::ZERO)?;
 
     // Freeze the current state into an immutable, Send + Sync snapshot.
-    let snapshot = cache.create_snapshot();
+    let snapshot = cache.snapshot();
     println!("frozen snapshot: sender starts with {start}\n");
 
     // Fan out: each thread gets a cheap Arc::clone of the snapshot and its own

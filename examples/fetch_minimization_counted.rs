@@ -50,15 +50,13 @@ fn balance_slot(owner: Address) -> U256 {
 /// An `AtomicUsize`-counting batch fetcher: tallies every requested slot and
 /// returns a canned non-zero balance, standing in for the RPC backend.
 fn counting_fetcher(counter: Arc<AtomicUsize>) -> StorageBatchFetchFn {
-    Arc::new(
-        move |requests: Vec<(Address, U256)>, _block: Option<BlockId>| {
-            counter.fetch_add(requests.len(), Ordering::Relaxed);
-            requests
-                .into_iter()
-                .map(|(addr, slot)| (addr, slot, Ok(U256::from(1_000u64))))
-                .collect()
-        },
-    )
+    Arc::new(move |requests: Vec<(Address, U256)>, _block: BlockId| {
+        counter.fetch_add(requests.len(), Ordering::Relaxed);
+        requests
+            .into_iter()
+            .map(|(addr, slot)| (addr, slot, Ok(U256::from(1_000u64))))
+            .collect()
+    })
 }
 
 /// Build an offline cache with a MockERC20 installed at `token` (storage left
@@ -102,7 +100,7 @@ async fn main() -> Result<()> {
     let warmup_fetches = counter.load(Ordering::Relaxed);
 
     // Freeze the warmed state, then fan N candidates out over cheap overlays.
-    let snapshot = cache.create_snapshot();
+    let snapshot = cache.snapshot();
     counter.store(0, Ordering::Relaxed); // measure only the fan-out from here
 
     for c in 0..N_CANDIDATES {

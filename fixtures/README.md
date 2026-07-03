@@ -53,6 +53,13 @@ jq -r '.bytecode.object' out/MockERC20.sol/MockERC20.json \
   suite exercise the real `aggregate3` build/execute/decode path (input-order
   results and `allowFailure` semantics) with no network.
 
+  It is also compiled into the library by `src/bulk_storage.rs`
+  (`multicall3_runtime_code()`), which injects it as an `eth_call` state
+  override so multi-contract bulk storage extraction works on chains — and at
+  historical blocks — where Multicall3 is not deployed. Last verified
+  byte-identical to the on-chain mainnet code (`eth_getCode`) across two
+  independent providers on 2026-07-02.
+
 ### Regenerating
 
 ```sh

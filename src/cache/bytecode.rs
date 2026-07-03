@@ -14,11 +14,11 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use alloy_primitives::Address;
-use anyhow::Result;
 use foundry_fork_db::BlockchainDb;
 use serde::{Deserialize, Serialize};
 
 use super::versioned;
+use crate::errors::PersistenceError;
 
 const BYTECODE_CACHE_MAGIC: &[u8; 8] = b"EFCBYTE\0";
 const BYTECODE_CACHE_VERSION: u32 = 1;
@@ -62,9 +62,10 @@ impl BytecodeCache {
     ///
     /// Returns an error if the parent directory cannot be created, if bincode
     /// serialization fails, or if writing the file fails.
-    pub(crate) fn save(&self, path: &Path) -> Result<()> {
+    pub(crate) fn save(&self, path: &Path) -> Result<(), PersistenceError> {
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+            std::fs::create_dir_all(parent)
+                .map_err(|err| PersistenceError::create_dir(parent, err))?;
         }
         let data = versioned::encode(
             BYTECODE_CACHE_MAGIC,
@@ -72,7 +73,7 @@ impl BytecodeCache {
             self,
             "bytecode cache",
         )?;
-        std::fs::write(path, data)?;
+        std::fs::write(path, data).map_err(|err| PersistenceError::write(path, err))?;
         Ok(())
     }
 
@@ -107,7 +108,12 @@ mod tests {
     use revm::state::{AccountInfo, Bytecode};
 
     fn temp_path(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("evm_fork_cache_bytecode_{tag}"));
+        // Keyed by pid so concurrent `cargo test` processes never share (and
+        // never `remove_dir_all`) each other's directory.
+        let dir = std::env::temp_dir().join(format!(
+            "evm_fork_cache_bytecode_{tag}_{}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("create temp dir");
         dir.join("bytecodes.bin")

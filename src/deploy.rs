@@ -10,10 +10,10 @@ use std::path::{Path, PathBuf};
 
 use alloy_primitives::{Address, Bytes};
 use alloy_sol_types::{SolType, SolValue, abi::TokenSeq};
-use anyhow::{Context, Result, bail};
 use tracing::{debug, info};
 
 use crate::cache::{EvmCache, MissingTargetBehavior};
+use crate::errors::{DeployError, DeployResult as Result};
 
 /// A Foundry JSON artifact with decoded creation bytecode.
 #[derive(Debug, Clone)]
@@ -80,7 +80,10 @@ impl FoundryArtifact {
         let init_code = self.init_code(constructor_args);
         let deployed = cache
             .deploy_contract(deployer, init_code)
-            .with_context(|| format!("deploying Foundry artifact {}", self.path.display()))?;
+            .map_err(|source| DeployError::ArtifactDeploy {
+                path: self.path.clone(),
+                source,
+            })?;
         debug!(
             artifact = %self.path.display(),
             %deployer,
@@ -171,7 +174,7 @@ impl FoundryArtifact {
         constructor_args: impl AsRef<[u8]>,
         missing_target: MissingTargetBehavior,
     ) -> Result<EtchedContract> {
-        let snapshot = cache.snapshot();
+        let checkpoint = cache.checkpoint();
         let result = self.try_etch_with_missing_target_behavior(
             cache,
             target,
@@ -181,7 +184,7 @@ impl FoundryArtifact {
         );
 
         if result.is_err() {
-            cache.restore(snapshot);
+            cache.restore(checkpoint);
         }
 
         result
@@ -198,13 +201,13 @@ impl FoundryArtifact {
         if matches!(missing_target, MissingTargetBehavior::Error) {
             cache
                 .require_contract_target(target)
-                .with_context(|| format!("validating target contract {}", target))?;
+                .map_err(|source| DeployError::TargetValidation { target, source })?;
         }
 
         let deployed = self.deploy(cache, deployer, constructor_args)?;
         cache
             .override_account_code_with_missing_target(deployed, target, missing_target)
-            .with_context(|| format!("etching runtime bytecode at {}", target))?;
+            .map_err(|source| DeployError::EtchRuntime { target, source })?;
 
         let code_size = cache
             .db_mut()
@@ -294,32 +297,31 @@ where
 ///   placeholders (`__$...$__`), or is otherwise not valid hex.
 pub fn load_foundry_creation_code(path: impl AsRef<Path>) -> Result<Bytes> {
     let path = path.as_ref();
-    let content = std::fs::read_to_string(path)
-        .with_context(|| format!("failed to read Foundry artifact at {}", path.display()))?;
-    let json: serde_json::Value = serde_json::from_str(&content).with_context(|| {
-        format!(
-            "failed to parse Foundry artifact JSON at {}",
-            path.display()
-        )
+    let content = std::fs::read_to_string(path).map_err(|source| DeployError::ReadArtifact {
+        path: path.to_path_buf(),
+        source,
     })?;
+    let json: serde_json::Value =
+        serde_json::from_str(&content).map_err(|source| DeployError::ParseArtifact {
+            path: path.to_path_buf(),
+            source,
+        })?;
 
     let bytecode = json
         .get("bytecode")
-        .ok_or_else(|| anyhow::anyhow!("artifact {} has no `bytecode` field", path.display()))?;
+        .ok_or_else(|| DeployError::MissingBytecodeField {
+            path: path.to_path_buf(),
+        })?;
 
     let bytecode_hex = bytecode
         .get("object")
         .and_then(serde_json::Value::as_str)
         .or_else(|| bytecode.as_str())
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "artifact {} has no `bytecode.object` string",
-                path.display()
-            )
+        .ok_or_else(|| DeployError::MissingBytecodeObject {
+            path: path.to_path_buf(),
         })?;
 
     decode_hex_bytecode(bytecode_hex)
-        .with_context(|| format!("failed to decode bytecode in {}", path.display()))
 }
 
 /// Build init code from creation bytecode and ABI-encoded constructor args.
@@ -429,15 +431,17 @@ pub fn etch_foundry_artifact_or_create(
 fn decode_hex_bytecode(bytecode_hex: &str) -> Result<Bytes> {
     let stripped = bytecode_hex.strip_prefix("0x").unwrap_or(bytecode_hex);
     if stripped.is_empty() {
-        bail!("empty bytecode");
+        return Err(DeployError::EmptyBytecode);
     }
     if stripped.contains("__") {
-        bail!("bytecode contains unresolved library placeholders");
+        return Err(DeployError::UnresolvedLibraryPlaceholders);
     }
 
     alloy_primitives::hex::decode(stripped)
         .map(Bytes::from)
-        .context("invalid hex bytecode")
+        .map_err(|source| DeployError::InvalidHex {
+            details: source.to_string(),
+        })
 }
 
 #[cfg(test)]
@@ -524,7 +528,7 @@ mod tests {
         let mut cache = setup_cache();
         let deployer = Address::ZERO;
         let target = Address::repeat_byte(0x33);
-        let create_address = zero_nonce_create_address()?;
+        let create_address = zero_nonce_create_address();
         let artifact = memory_artifact(non_empty_runtime_creation_code());
 
         cache
@@ -555,7 +559,7 @@ mod tests {
         let mut cache = setup_cache();
         let deployer = Address::ZERO;
         let target = Address::repeat_byte(0x44);
-        let create_address = zero_nonce_create_address()?;
+        let create_address = zero_nonce_create_address();
         let artifact = memory_artifact(empty_runtime_creation_code());
 
         cache
@@ -590,7 +594,8 @@ mod tests {
     #[test]
     fn load_foundry_creation_code_reads_bytecode_object() -> Result<()> {
         let path = temp_artifact_path("foundry-bytecode-object");
-        std::fs::write(&path, r#"{"bytecode":{"object":"0x60016002"}}"#)?;
+        std::fs::write(&path, r#"{"bytecode":{"object":"0x60016002"}}"#)
+            .expect("write test artifact");
 
         let code = load_foundry_creation_code(&path)?;
 
@@ -602,7 +607,7 @@ mod tests {
     #[test]
     fn load_foundry_creation_code_accepts_direct_string_bytecode() -> Result<()> {
         let path = temp_artifact_path("foundry-bytecode-string");
-        std::fs::write(&path, r#"{"bytecode":"0x6001"}"#)?;
+        std::fs::write(&path, r#"{"bytecode":"0x6001"}"#).expect("write test artifact");
 
         let code = load_foundry_creation_code(&path)?;
 
@@ -676,10 +681,10 @@ mod tests {
         ])
     }
 
-    fn zero_nonce_create_address() -> Result<Address> {
+    fn zero_nonce_create_address() -> Address {
         "0xbd770416a3345f91e4b34576cb804a576fa48eb1"
             .parse()
-            .context("zero nonce CREATE address should parse")
+            .expect("zero nonce CREATE address should parse")
     }
 
     fn cached_nonce(cache: &mut EvmCache, address: Address) -> Option<u64> {

@@ -22,10 +22,22 @@ use common::{
 use evm_fork_cache::cache::{
     EvmCache, EvmOverlay, SimStatus, SlotObservationTracker, StorageBatchFetchFn,
 };
+use evm_fork_cache::errors::StorageFetchResult;
 use evm_fork_cache::freshness::{
     AlwaysVerify, BlockClock, FreshnessController, FreshnessParams, FreshnessRegistry, NeverVerify,
     ObservationDriven, SimRequest, Validation, WallClock,
 };
+use revm::state::{AccountInfo, Bytecode};
+
+/// Runtime bytecode that returns `blockhash(0)`:
+/// `PUSH1 0 BLOCKHASH PUSH1 0 MSTORE PUSH1 32 PUSH1 0 RETURN`.
+///
+/// Control flow doesn't branch on the hash, but the *result* embeds it — the
+/// exact shape the validator cannot vouch for, since its overlays resolve
+/// `BLOCKHASH` to ZERO.
+const BLOCKHASH_READER_RUNTIME: &[u8] = &[
+    0x60, 0x00, 0x40, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xF3,
+];
 
 /// Hashed storage slot of `balanceOf[owner]` for the MockERC20 fixture.
 fn balance_slot_for(owner: Address) -> U256 {
@@ -271,7 +283,7 @@ async fn overlay_call_raw_with_access_list_captures_read_set() -> Result<()> {
     let balance_slot = U256::from(MOCK_ERC20_BALANCE_SLOT);
     cache.insert_mapping_storage_slot(token, balance_slot, owner, U256::from(1000))?;
 
-    let snapshot = cache.create_snapshot();
+    let snapshot = cache.snapshot();
     let mut overlay = EvmOverlay::new(Arc::clone(&snapshot), None);
 
     // balanceOf(owner) reads the token's balance mapping slot.
@@ -303,7 +315,7 @@ async fn overlay_override_slot_takes_precedence() -> Result<()> {
     let slot = U256::from(3);
     cache.inject_storage_batch(&[(contract, slot, U256::from(1))]);
 
-    let snapshot = cache.create_snapshot();
+    let snapshot = cache.snapshot();
     let mut overlay = EvmOverlay::new(snapshot, None);
     overlay.override_slot(contract, slot, U256::from(999));
 
@@ -369,11 +381,72 @@ async fn run_match_path_confirmed() -> Result<()> {
     let optimistic_gas = sim.optimistic()[0].gas_used;
     assert!(optimistic_gas > 0);
 
-    let validation = sim.validate().await;
+    let validation = sim.validate().await?;
     assert!(
-        matches!(validation, Validation::Confirmed),
+        matches!(validation, Validation::ConfirmedStorage),
         "unchanged values should confirm: {validation:?}"
     );
+    Ok(())
+}
+
+/// G5 / WS-9: a sim that reads `BLOCKHASH` must fail closed as `Unverified`.
+///
+/// The controller's overlays carry no block hashes, so the opcode resolves to
+/// ZERO — storage verification cannot vouch for the result. Before 0.2.0 this
+/// sim (which touches no volatile storage at all) sailed through the
+/// empty-verify-set early path and was silently `ConfirmedStorage`.
+#[tokio::test(flavor = "multi_thread")]
+async fn run_blockhash_reading_sim_fails_closed_as_unverified() -> Result<()> {
+    let caller = Address::repeat_byte(0x0c);
+    let target = Address::repeat_byte(0x0d);
+
+    let mut cache = setup_cache().await?;
+    install_default_account(&mut cache, caller);
+    let bytecode = Bytecode::new_raw(Bytes::from_static(BLOCKHASH_READER_RUNTIME));
+    let code_hash = bytecode.hash_slow();
+    cache.db_mut().insert_account_info(
+        target,
+        AccountInfo {
+            balance: U256::ZERO,
+            nonce: 0,
+            code: Some(bytecode),
+            code_hash,
+            account_id: None,
+        },
+    );
+    cache
+        .db_mut()
+        .replace_account_storage(target, Default::default())?;
+    // Pin a concrete height so `blockhash(0)` is IN the EVM's valid lookback
+    // range and revm actually consults the database. (Out-of-range requests
+    // return spec-mandated ZERO without a DB call — correct on-chain too, so
+    // they are deliberately not flagged.)
+    cache.set_block(BlockId::number(100));
+    // A fetcher that would happily "confirm" anything — it must never get the
+    // chance to vouch for a hash-dependent result.
+    cache.set_storage_batch_fetcher(stub_fetcher(HashMap::new()));
+
+    let mut controller = FreshnessController::new(FreshnessRegistry::new(), AlwaysVerify);
+    let sim = controller.run(
+        &mut cache,
+        vec![SimRequest::new(caller, target, Bytes::new())],
+    )?;
+    assert_eq!(
+        sim.optimistic().len(),
+        1,
+        "the optimistic run still executes"
+    );
+
+    let validation = sim.validate().await?;
+    match validation {
+        Validation::Unverified { reason } => {
+            assert!(
+                reason.contains("BLOCKHASH"),
+                "the reason must name the unverifiable read: {reason}"
+            );
+        }
+        other => panic!("BLOCKHASH-reading sim must fail closed, got {other:?}"),
+    }
     Ok(())
 }
 
@@ -444,19 +517,23 @@ async fn run_mismatch_path_corrected_only_affected_rerun() -> Result<()> {
         "optimistic token_deltas empty"
     );
 
-    let validation = sim.validate().await;
+    let validation = sim.validate().await?;
     match validation {
-        Validation::Corrected { results, changed } => {
+        Validation::Corrected {
+            results,
+            changed_slots,
+            ..
+        } => {
             // Exactly owner's balance slot changed.
             assert_eq!(
-                changed.len(),
+                changed_slots.len(),
                 1,
-                "only owner's balance changed: {changed:?}"
+                "only owner's balance changed: {changed_slots:?}"
             );
-            assert_eq!(changed[0].address, token);
-            assert_eq!(changed[0].slot, balance_slot_for(owner));
-            assert_eq!(changed[0].old, U256::from(1000));
-            assert_eq!(changed[0].new, U256::from(50));
+            assert_eq!(changed_slots[0].address, token);
+            assert_eq!(changed_slots[0].slot, balance_slot_for(owner));
+            assert_eq!(changed_slots[0].old, U256::from(1000));
+            assert_eq!(changed_slots[0].new, U256::from(50));
 
             // req1 was re-run with the reduced balance → now reverts (no log) and
             // differs from its optimistic (successful) result.
@@ -526,14 +603,18 @@ async fn run_view_call_corrected_success_to_different_success() -> Result<()> {
         "optimistic returns the old balance"
     );
 
-    let validation = sim.validate().await;
+    let validation = sim.validate().await?;
     match validation {
-        Validation::Corrected { results, changed } => {
-            assert_eq!(changed.len(), 1, "exactly the balance slot changed");
-            assert_eq!(changed[0].address, token);
-            assert_eq!(changed[0].slot, balance_slot_for(owner));
-            assert_eq!(changed[0].old, U256::from(1000));
-            assert_eq!(changed[0].new, U256::from(250));
+        Validation::Corrected {
+            results,
+            changed_slots,
+            ..
+        } => {
+            assert_eq!(changed_slots.len(), 1, "exactly the balance slot changed");
+            assert_eq!(changed_slots[0].address, token);
+            assert_eq!(changed_slots[0].slot, balance_slot_for(owner));
+            assert_eq!(changed_slots[0].old, U256::from(1000));
+            assert_eq!(changed_slots[0].new, U256::from(250));
 
             // The corrected re-run STILL succeeds (a balanceOf view never reverts)
             // but its return data reflects the NEW balance.
@@ -595,7 +676,7 @@ async fn run_drains_pending_on_next_run() -> Result<()> {
             transfer_calldata(recipient, U256::from(100)),
         )],
     )?;
-    let validation = sim.validate().await;
+    let validation = sim.validate().await?;
     assert!(matches!(validation, Validation::Corrected { .. }));
     assert_eq!(controller.pending_len(), 1, "a correction was queued");
 
@@ -627,9 +708,9 @@ async fn run_drains_pending_on_next_run() -> Result<()> {
         !sim.optimistic()[0].logs.is_empty(),
         "optimistic still succeeds"
     );
-    let validation = sim.validate().await;
+    let validation = sim.validate().await?;
     assert!(
-        matches!(validation, Validation::Confirmed),
+        matches!(validation, Validation::ConfirmedStorage),
         "{validation:?}"
     );
     Ok(())
@@ -681,7 +762,10 @@ async fn run_converges_when_corrected_slot_is_overlay_resident() -> Result<()> {
             transfer_calldata(recipient, U256::from(100)),
         )],
     )?;
-    assert!(matches!(sim.validate().await, Validation::Corrected { .. }));
+    assert!(matches!(
+        sim.validate().await?,
+        Validation::Corrected { .. }
+    ));
     assert_eq!(controller.pending_len(), 1);
 
     // Second run: drains the correction. It must overwrite the overlay-resident
@@ -702,9 +786,9 @@ async fn run_converges_when_corrected_slot_is_overlay_resident() -> Result<()> {
     );
 
     // The snapshot now matches the fetcher → Confirmed, proving convergence.
-    let validation = sim.validate().await;
+    let validation = sim.validate().await?;
     assert!(
-        matches!(validation, Validation::Confirmed),
+        matches!(validation, Validation::ConfirmedStorage),
         "must converge, got {validation:?}"
     );
     // No background re-run happened on the converged second cycle.
@@ -849,7 +933,7 @@ async fn dropping_after_fetch_started_suppresses_correction() -> Result<()> {
     let barrier = Arc::new(std::sync::Barrier::new(2));
     let fb = Arc::clone(&barrier);
     let fetcher: StorageBatchFetchFn =
-        Arc::new(move |reqs: Vec<(Address, U256)>, _block: Option<BlockId>| {
+        Arc::new(move |reqs: Vec<(Address, U256)>, _block: BlockId| {
             fb.wait(); // R1
             fb.wait(); // R2
             reqs.into_iter()
@@ -943,10 +1027,14 @@ async fn run_corrected_rerun_verifies_newly_read_volatile_slot() -> Result<()> {
         U256::from(5)
     );
 
-    match sim.validate().await {
-        Validation::Corrected { results, changed } => {
+    match sim.validate().await? {
+        Validation::Corrected {
+            results,
+            changed_slots,
+            ..
+        } => {
             let keys: std::collections::HashSet<(Address, U256)> =
-                changed.iter().map(|c| (c.address, c.slot)).collect();
+                changed_slots.iter().map(|c| (c.address, c.slot)).collect();
             assert!(keys.contains(&(contract, slot_a)), "A reported as changed");
             assert!(
                 keys.contains(&(contract, slot_b)),
@@ -999,7 +1087,7 @@ async fn overlay_call_with_tx_config_threads_value() -> Result<()> {
         .replace_account_storage(callee, Default::default())
         .unwrap();
 
-    let snapshot = cache.create_snapshot();
+    let snapshot = cache.snapshot();
     let mut overlay = EvmOverlay::new(snapshot, None);
 
     fn returned_value(res: ExecutionResult) -> U256 {
@@ -1086,14 +1174,14 @@ async fn validator_fetches_at_captured_latest_pin_despite_repin() -> Result<()> 
 
     let barrier = Arc::new(std::sync::Barrier::new(2));
     let fb = Arc::clone(&barrier);
-    let seen_block: Arc<Mutex<Option<Option<BlockId>>>> = Arc::new(Mutex::new(None));
+    let seen_block: Arc<Mutex<Option<BlockId>>> = Arc::new(Mutex::new(None));
     let seen = Arc::clone(&seen_block);
     let fetcher: StorageBatchFetchFn =
-        Arc::new(move |reqs: Vec<(Address, U256)>, block: Option<BlockId>| {
+        Arc::new(move |reqs: Vec<(Address, U256)>, block: BlockId| {
             *seen.lock().unwrap() = Some(block);
             fb.wait();
             fb.wait();
-            let at_snapshot_pin = block == Some(BlockId::latest());
+            let at_snapshot_pin = block == BlockId::latest();
             reqs.into_iter()
                 .map(|(a, s)| {
                     let v = if s == slot {
@@ -1125,14 +1213,14 @@ async fn validator_fetches_at_captured_latest_pin_despite_repin() -> Result<()> 
     cache.set_block(BlockId::Number(BlockNumberOrTag::Number(101)));
     barrier.wait();
 
-    let verdict = sim.validate().await;
+    let verdict = sim.validate().await?;
     assert!(
-        matches!(verdict, Validation::Confirmed),
+        matches!(verdict, Validation::ConfirmedStorage),
         "validator must fetch at the captured latest pin, not the later numeric repin; got {verdict:?}"
     );
     assert_eq!(
         *seen_block.lock().unwrap(),
-        Some(Some(BlockId::latest())),
+        Some(BlockId::latest()),
         "the fetch must receive the concrete snapshot pin"
     );
     Ok(())
@@ -1176,14 +1264,14 @@ async fn validator_fetches_at_snapshot_block_despite_repin() -> Result<()> {
     // a barrier so the test can repin before the fetch resolves.
     let barrier = Arc::new(std::sync::Barrier::new(2));
     let fb = Arc::clone(&barrier);
-    let seen_block: Arc<Mutex<Option<Option<BlockId>>>> = Arc::new(Mutex::new(None));
+    let seen_block: Arc<Mutex<Option<BlockId>>> = Arc::new(Mutex::new(None));
     let seen = Arc::clone(&seen_block);
     let fetcher: StorageBatchFetchFn =
-        Arc::new(move |reqs: Vec<(Address, U256)>, block: Option<BlockId>| {
+        Arc::new(move |reqs: Vec<(Address, U256)>, block: BlockId| {
             *seen.lock().unwrap() = Some(block);
             fb.wait(); // R1: fetch entered
             fb.wait(); // R2: released after the test repins
-            let at_n = block == Some(block_n);
+            let at_n = block == block_n;
             reqs.into_iter()
                 .map(|(a, s)| {
                     // At block N every slot matches the snapshot (sender = 1000,
@@ -1219,14 +1307,14 @@ async fn validator_fetches_at_snapshot_block_despite_repin() -> Result<()> {
     cache.set_block(BlockId::Number(BlockNumberOrTag::Number(n + 1)));
     barrier.wait(); // R2: release the fetcher.
 
-    let verdict = sim.validate().await;
+    let verdict = sim.validate().await?;
     assert!(
-        matches!(verdict, Validation::Confirmed),
+        matches!(verdict, Validation::ConfirmedStorage),
         "validator must fetch at the snapshot's block N, not the re-pinned N+1; got {verdict:?}"
     );
     assert_eq!(
         *seen_block.lock().unwrap(),
-        Some(Some(block_n)),
+        Some(block_n),
         "the fetch must be pinned to the snapshot block N"
     );
     Ok(())
@@ -1250,7 +1338,7 @@ async fn run_unverified_on_fetcher_error() -> Result<()> {
             transfer_calldata(recipient, U256::from(100)),
         )],
     )?;
-    let validation = sim.validate().await;
+    let validation = sim.validate().await?;
     assert!(
         matches!(validation, Validation::Unverified { .. }),
         "fetcher error should yield Unverified: {validation:?}"
@@ -1387,7 +1475,7 @@ async fn never_verify_skips_predicted_but_reconciles_read_set() -> Result<()> {
             transfer_calldata(recipient, U256::from(100)),
         )],
     )?;
-    let validation = sim.validate().await;
+    let validation = sim.validate().await?;
     assert!(
         matches!(validation, Validation::Corrected { .. }),
         "actual-read-set reconcile should still catch the change: {validation:?}"
@@ -1420,9 +1508,9 @@ async fn pinned_slot_is_not_verified() -> Result<()> {
             transfer_calldata(recipient, U256::from(100)),
         )],
     )?;
-    let validation = sim.validate().await;
+    let validation = sim.validate().await?;
     assert!(
-        matches!(validation, Validation::Confirmed),
+        matches!(validation, Validation::ConfirmedStorage),
         "pinned slot must not be verified: {validation:?}"
     );
     Ok(())
@@ -1451,9 +1539,9 @@ async fn wall_clock_controller_runs() -> Result<()> {
             transfer_calldata(recipient, U256::from(100)),
         )],
     )?;
-    let validation = sim.validate().await;
+    let validation = sim.validate().await?;
     assert!(
-        matches!(validation, Validation::Confirmed),
+        matches!(validation, Validation::ConfirmedStorage),
         "{validation:?}"
     );
     Ok(())
@@ -1487,7 +1575,10 @@ async fn valid_through_becomes_volatile_after_boundary() -> Result<()> {
             transfer_calldata(recipient, U256::from(100)),
         )],
     )?;
-    assert!(matches!(sim.validate().await, Validation::Confirmed));
+    assert!(matches!(
+        sim.validate().await?,
+        Validation::ConfirmedStorage
+    ));
 
     // Advance past the boundary: now volatile → the change is caught.
     clock.set_block(101);
@@ -1500,7 +1591,7 @@ async fn valid_through_becomes_volatile_after_boundary() -> Result<()> {
         )],
     )?;
     assert!(
-        matches!(sim.validate().await, Validation::Corrected { .. }),
+        matches!(sim.validate().await?, Validation::Corrected { .. }),
         "past ValidThrough boundary the slot is volatile and the change is caught"
     );
     Ok(())
@@ -1541,9 +1632,13 @@ async fn run_missing_slot_treated_as_zero_is_corrected() -> Result<()> {
         "unseen slot reads as zero optimistically"
     );
 
-    match sim.validate().await {
-        Validation::Corrected { results, changed } => {
-            let change = changed
+    match sim.validate().await? {
+        Validation::Corrected {
+            results,
+            changed_slots,
+            ..
+        } => {
+            let change = changed_slots
                 .iter()
                 .find(|c| c.address == token && c.slot == slot)
                 .expect("the missing balance slot should be reported as changed");
@@ -1594,7 +1689,10 @@ async fn pending_drain_alters_subsequent_result() -> Result<()> {
         !sim.optimistic()[0].logs.is_empty(),
         "first-run optimistic transfer succeeds against cached 1000"
     );
-    assert!(matches!(sim.validate().await, Validation::Corrected { .. }));
+    assert!(matches!(
+        sim.validate().await?,
+        Validation::Corrected { .. }
+    ));
     assert_eq!(controller.pending_len(), 1, "a correction (→50) is queued");
 
     // Second run drains the correction (balance := 50) BEFORE snapshotting, so
@@ -1616,9 +1714,9 @@ async fn pending_drain_alters_subsequent_result() -> Result<()> {
     Ok(())
 }
 
-// T6a: a panicking fetcher → the validator task panics → JoinError → Unverified.
+// T6a: a panicking fetcher → the validator task panics → JoinError → validate Err.
 #[tokio::test(flavor = "multi_thread")]
-async fn run_unverified_on_fetcher_panic() -> Result<()> {
+async fn validate_returns_err_on_fetcher_panic() -> Result<()> {
     let token = Address::repeat_byte(0x44);
     let owner = Address::repeat_byte(0x55);
     let recipient = Address::repeat_byte(0x66);
@@ -1635,10 +1733,13 @@ async fn run_unverified_on_fetcher_panic() -> Result<()> {
             transfer_calldata(recipient, U256::from(100)),
         )],
     )?;
-    let validation = sim.validate().await;
+    let err = sim
+        .validate()
+        .await
+        .expect_err("a panicking fetcher should make validate return Err");
     assert!(
-        matches!(validation, Validation::Unverified { .. }),
-        "a panicking fetcher (JoinError) should yield Unverified: {validation:?}"
+        err.to_string().contains("validation task failed"),
+        "a panicking fetcher should surface the JoinError: {err}"
     );
     Ok(())
 }
@@ -1683,7 +1784,7 @@ async fn run_unverified_without_fetcher() -> Result<()> {
             transfer_calldata(recipient, U256::from(100)),
         )],
     )?;
-    match sim.validate().await {
+    match sim.validate().await? {
         Validation::Unverified { reason } => {
             assert_eq!(reason, "no storage batch fetcher available", "{reason}");
         }
@@ -1745,10 +1846,12 @@ async fn observation_driven_controller_end_to_end() -> Result<()> {
 
     // Even though the policy declined to *predictively* verify the stable slot,
     // the validator's actual-read-set reconcile catches the real change.
-    match sim.validate().await {
-        Validation::Corrected { changed, .. } => {
+    match sim.validate().await? {
+        Validation::Corrected { changed_slots, .. } => {
             assert!(
-                changed.iter().any(|c| c.address == token && c.slot == slot),
+                changed_slots
+                    .iter()
+                    .any(|c| c.address == token && c.slot == slot),
                 "the actual-read-set reconcile catches the balance change"
             );
         }
@@ -1789,7 +1892,7 @@ async fn on_new_block_ages_valid_through() -> Result<()> {
         )],
     )?;
     assert!(
-        matches!(sim.validate().await, Validation::Confirmed),
+        matches!(sim.validate().await?, Validation::ConfirmedStorage),
         "at block 100 the ValidThrough slot is still pinned"
     );
 
@@ -1805,7 +1908,7 @@ async fn on_new_block_ages_valid_through() -> Result<()> {
         )],
     )?;
     assert!(
-        matches!(sim.validate().await, Validation::Corrected { .. }),
+        matches!(sim.validate().await?, Validation::Corrected { .. }),
         "after on_new_block(101) the slot is volatile and the change is caught"
     );
     Ok(())
@@ -1826,17 +1929,15 @@ async fn run_unverified_when_fetcher_omits_requested_slot() -> Result<()> {
 
     let mut cache = cache_with_balance(token, owner, U256::from(1000)).await?;
     // A fetcher that returns NOTHING — it omits every requested slot.
-    cache.set_storage_batch_fetcher(Arc::new(
-        |_req: Vec<(Address, U256)>, _block: Option<BlockId>| {
-            Vec::<(Address, U256, Result<U256>)>::new()
-        },
-    ));
+    cache.set_storage_batch_fetcher(Arc::new(|_req: Vec<(Address, U256)>, _block: BlockId| {
+        Vec::<(Address, U256, StorageFetchResult<U256>)>::new()
+    }));
 
     let mut controller = FreshnessController::new(FreshnessRegistry::new(), AlwaysVerify);
     let req = SimRequest::new(owner, token, transfer_calldata(recipient, U256::from(100)));
     let sim = controller.run(&mut cache, vec![req])?;
 
-    let validation = sim.validate().await;
+    let validation = sim.validate().await?;
     assert!(
         matches!(validation, Validation::Unverified { .. }),
         "a fetcher that omits a requested slot must yield Unverified, not a false \
@@ -1916,7 +2017,7 @@ async fn run_unverified_when_fixed_point_round_cap_exceeded() -> Result<()> {
     let req = SimRequest::new(caller, contract, Bytes::new());
     let sim = controller.run(&mut cache, vec![req])?;
 
-    let validation = sim.validate().await;
+    let validation = sim.validate().await?;
     assert!(
         matches!(validation, Validation::Unverified { .. }),
         "exceeding the fixed-point round cap must yield Unverified, not a trusted \
@@ -1928,4 +2029,31 @@ async fn run_unverified_when_fixed_point_round_cap_exceeded() -> Result<()> {
         "an Unverified (cap-exceeded) validation must queue no corrections"
     );
     Ok(())
+}
+
+/// WS-1c (manager-authored red-green): the verdict taxonomy distinguishes a
+/// storage-only confirmation from a full (storage + account) one, so callers can
+/// no longer mistake "no volatile storage slot changed" for "account state
+/// verified". The storage-only success verdict is renamed `Confirmed ->
+/// ConfirmedStorage`; a new `ConfirmedFull` means storage AND account fields were
+/// verified; and `Corrected` carries `changed_accounts` alongside `changed_slots`.
+#[test]
+fn verdict_taxonomy_separates_storage_only_from_full_confirmation() {
+    // Renamed storage-only success verdict (was `Confirmed`).
+    assert!(matches!(
+        Validation::ConfirmedStorage,
+        Validation::ConfirmedStorage
+    ));
+    // New: storage AND account fields verified.
+    assert!(matches!(
+        Validation::ConfirmedFull,
+        Validation::ConfirmedFull
+    ));
+    // Corrected now reports account changes alongside slot changes.
+    let corrected = Validation::Corrected {
+        results: vec![],
+        changed_slots: vec![],
+        changed_accounts: vec![],
+    };
+    assert!(matches!(corrected, Validation::Corrected { .. }));
 }

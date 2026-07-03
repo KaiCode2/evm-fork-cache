@@ -4,11 +4,10 @@
 //! The driver performs every fetch and call; planners are pure and IO-free. The
 //! whole module is gated behind the `reactive` feature.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use alloy_eips::BlockId;
-use alloy_primitives::Address;
-use anyhow::Result;
+use alloy_primitives::{Address, B256};
 
 use crate::cache::{EvmCache, block_in_place_handle};
 use crate::cold_start::config::{ColdStartConfig, ColdStartPin, ColdStartRunReport};
@@ -16,6 +15,8 @@ use crate::cold_start::error::ColdStartError;
 use crate::cold_start::plan::ColdStartPlan;
 use crate::cold_start::planner::{ColdStartPlanner, ColdStartStep};
 use crate::cold_start::results::{ColdStartCallResult, ColdStartResults, RoundOutcome};
+use crate::cold_start::roots::RootProbeOutcome;
+use crate::errors::CacheResult;
 use crate::events::StateView;
 use crate::freshness::{SlotFetch, SlotOutcome};
 
@@ -40,25 +41,45 @@ impl EvmCache {
     /// cold-start runtime precondition); on a current-thread runtime or with no
     /// runtime present it returns a typed error via
     /// [`block_in_place_handle`](crate::cache::block_in_place_handle).
-    pub(crate) fn ensure_account_blocking(&mut self, address: Address) -> Result<()> {
+    pub(crate) fn ensure_account_blocking(&mut self, address: Address) -> CacheResult<()> {
         let handle = block_in_place_handle()?;
         tokio::task::block_in_place(|| handle.block_on(self.ensure_account(address)))
     }
 
     /// Execute a single cold-start round and return its (possibly partial) outcome.
     ///
-    /// Fixed phase order: **accounts → verify → probe → discover**.
+    /// Fixed phase order: **verify_code → accounts → verify → probe →
+    /// probe_roots → discover**.
     ///
-    /// Per-round fetcher guard: if the plan declares any verify or probe slots and
-    /// the cache has no storage batch fetcher, the round short-circuits with
-    /// [`ColdStartError::NoBatchFetcher`] before issuing any read. A round
-    /// declaring only accounts/discover runs without a fetcher.
+    /// Per-round fetcher guards: if the plan declares any verify or probe slots
+    /// and the cache has no storage batch fetcher, the round short-circuits with
+    /// [`ColdStartError::NoBatchFetcher`] before issuing any read; likewise a
+    /// probe_roots-bearing round with no account proof fetcher short-circuits
+    /// with [`ColdStartError::NoAccountProofFetcher`], and a round with pending
+    /// code seeds but no account-fields fetcher short-circuits with
+    /// [`ColdStartError::NoAccountFieldsFetcher`]. A round declaring only
+    /// accounts/discover (and holding no pending seeds) runs without any
+    /// fetcher.
     ///
-    /// - **accounts (first):** each `plan.accounts` address is pre-seeded via
-    ///   `ensure_account_blocking`. A failure here is a hard error in the first
-    ///   phase, so nothing after it ran: every declared verify/probe slot is marked
-    ///   [`SlotFetch::NotAttempted`] and the round returns with `error: Some(..)`.
-    ///   This is the only producer of `NotAttempted`.
+    /// - **verify_code (first):** every [`CodeSeedState`](crate::cache::CodeSeedState)
+    ///   `Pending` claim is settled via
+    ///   [`verify_code_seeds`](EvmCache::verify_code_seeds); the work set is
+    ///   the cache's own pending marks, not a plan field. Matches are marked
+    ///   `Verified`; contradicted claims are purged, so an address also listed
+    ///   in `plan.accounts` is refetched by the very next phase. A transport
+    ///   failure is **not** a round hard error — it surfaces in the report's
+    ///   `unverifiable` bucket (matching probe_roots' per-address stance).
+    ///   Running first means no discover sim ever executes over an unverified
+    ///   claim, and `results.code_verifications` survives any later phase's
+    ///   hard error. With no pending seeds the phase is a no-op
+    ///   (`code_verifications: None`).
+    /// - **accounts:** each `plan.accounts` address is pre-seeded via
+    ///   `ensure_account_blocking`. A failure here is a hard error before the
+    ///   slot phases ran: every declared verify/probe slot is marked
+    ///   [`SlotFetch::NotAttempted`], every declared probe_roots address is
+    ///   synthesized as `root: None`, and the round returns with `error: Some(..)`
+    ///   (the already-computed `code_verifications` is preserved). This is the
+    ///   only producer of `NotAttempted`.
     /// - **verify:** each verify slot is re-fetched, classified into
     ///   `results.fetched`, and (when changed) injected and recorded in
     ///   `results.verified`.
@@ -67,6 +88,11 @@ impl EvmCache {
     ///   classification verify uses. Unlike verify, a probe injects nothing and
     ///   records no [`SlotChange`](crate::freshness::SlotChange): it is the
     ///   archive-miss classification for slots a consumer does not want to warm.
+    /// - **probe_roots:** each `plan.probe_roots` address is root-only probed
+    ///   (`(addr, vec![])`) through the account proof fetcher at the pinned
+    ///   block and recorded into `results.probed_roots` as a
+    ///   [`RootProbeOutcome`]. Nothing is injected; a per-address failure (or an
+    ///   address the fetcher omitted) is `root: None`, never a round hard error.
     /// - **discover (last):** each [`ColdStartCall`](crate::cold_start::ColdStartCall)
     ///   is executed via
     ///   [`call_raw_with_access_list`](EvmCache::call_raw_with_access_list), its
@@ -88,13 +114,53 @@ impl EvmCache {
             };
         }
 
-        // Accounts phase (first): pre-seed each declared account. A failure here
+        // Per-round proof-fetcher guard: only fires for probe_roots-bearing rounds.
+        if !plan.probe_roots.is_empty() && self.account_proof_fetcher().is_none() {
+            return RoundOutcome {
+                results,
+                error: Some(ColdStartError::NoAccountProofFetcher),
+            };
+        }
+
+        // Per-round fields-fetcher guard: only fires when the cache actually
+        // holds pending code seeds (the work set is cache state, not a plan
+        // declaration).
+        let pending_seeds = self.pending_code_seeds();
+        if !pending_seeds.is_empty() && self.account_fields_fetcher().is_none() {
+            return RoundOutcome {
+                results,
+                error: Some(ColdStartError::NoAccountFieldsFetcher),
+            };
+        }
+
+        // verify_code phase (first): settle every Pending canonical code claim
+        // before anything simulates over it. Purged mismatches are refetched
+        // by the accounts phase right below when listed there. The guard above
+        // front-ran the only error surface of verify_code_seeds; a residual
+        // error is synthesized exactly like an accounts-phase hard error.
+        if !pending_seeds.is_empty() {
+            match self.verify_code_seeds() {
+                Ok(report) => results.code_verifications = Some(report),
+                Err(e) => {
+                    results.fetched = not_attempted_outcomes(&plan.verify);
+                    results.probed = not_attempted_outcomes(&plan.probe);
+                    results.probed_roots = not_attempted_root_outcomes(&plan.probe_roots);
+                    return RoundOutcome {
+                        results,
+                        error: Some(ColdStartError::Fetch(e)),
+                    };
+                }
+            }
+        }
+
+        // Accounts phase: pre-seed each declared account. A failure here
         // short-circuits the round before verify/probe/discover run, so every
         // declared verify/probe slot is synthesized as NotAttempted.
         for &address in &plan.accounts {
             if let Err(e) = self.ensure_account_blocking(address) {
                 results.fetched = not_attempted_outcomes(&plan.verify);
                 results.probed = not_attempted_outcomes(&plan.probe);
+                results.probed_roots = not_attempted_root_outcomes(&plan.probe_roots);
                 return RoundOutcome {
                     results,
                     error: Some(ColdStartError::Fetch(e)),
@@ -133,13 +199,45 @@ impl EvmCache {
                 .storage_batch_fetcher()
                 .cloned()
                 .expect("probe-bearing round guarded a fetcher above");
-            let probed = (fetcher)(plan.probe.clone(), Some(self.block()));
+            let probed = (fetcher)(plan.probe.clone(), self.block());
             results.probed = probed
                 .into_iter()
                 .map(|(address, slot, fetched)| SlotOutcome {
                     address,
                     slot,
                     fetch: EvmCache::classify(fetched),
+                })
+                .collect();
+        }
+
+        // Probe-roots phase: root-only probe each declared account through the
+        // account proof fetcher at the pinned block, WITHOUT injecting anything.
+        // A per-address failure (or an address the fetcher omitted) records
+        // `root: None` — never a round hard error.
+        if !plan.probe_roots.is_empty() {
+            // The per-round guard already ensured a proof fetcher is present
+            // for a probe_roots-bearing round.
+            let fetcher = self
+                .account_proof_fetcher()
+                .cloned()
+                .expect("probe_roots-bearing round guarded a proof fetcher above");
+            let responses = (fetcher)(
+                plan.probe_roots.iter().map(|&a| (a, vec![])).collect(),
+                self.block(),
+            );
+            // Per the AccountProofFetchFn contract, at most one result comes
+            // back per requested address; Ok carries the root, Err / omitted
+            // means the root could not be observed.
+            let observed: HashMap<Address, Option<B256>> = responses
+                .into_iter()
+                .map(|(address, result)| (address, result.ok().map(|proof| proof.storage_hash)))
+                .collect();
+            results.probed_roots = plan
+                .probe_roots
+                .iter()
+                .map(|&address| RootProbeOutcome {
+                    address,
+                    root: observed.get(&address).copied().flatten(),
                 })
                 .collect();
         }
@@ -259,6 +357,23 @@ fn not_attempted_outcomes(slots: &[(Address, alloy_primitives::U256)]) -> Vec<Sl
             address,
             slot,
             fetch: SlotFetch::NotAttempted,
+        })
+        .collect()
+}
+
+/// Synthesize one `root: None` [`RootProbeOutcome`] per declared probe-roots
+/// address.
+///
+/// The probe_roots mirror of [`not_attempted_outcomes`]: when an accounts-phase
+/// hard error short-circuits a round before the probe_roots phase runs, every
+/// declared address is reported with an unobserved root rather than silently
+/// dropped.
+fn not_attempted_root_outcomes(addresses: &[Address]) -> Vec<RootProbeOutcome> {
+    addresses
+        .iter()
+        .map(|&address| RootProbeOutcome {
+            address,
+            root: None,
         })
         .collect()
 }

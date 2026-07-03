@@ -71,9 +71,9 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use alloy_primitives::{Address, Log, U256};
-use anyhow::Result;
 
 use crate::cache::EvmCache;
+use crate::errors::CacheResult as Result;
 use crate::freshness::SlotChange;
 use crate::state_update::{PurgeScope, StateDiff, StateUpdate};
 
@@ -223,9 +223,12 @@ pub struct EventPipeline {
     /// Ring of `(block, touched addresses)` for reorg purge, newest at the back,
     /// bounded to `reorg.depth`.
     touched: VecDeque<(u64, Vec<Address>)>,
-    /// Every event-derived `(address, slot)` seen so far (reconcile sampling
-    /// source).
-    derived_slots: HashSet<(Address, U256)>,
+    /// Ring of `(block, event-derived (address, slot) pairs)`, newest at the
+    /// back, bounded to the reorg horizon `reorg.depth` in lockstep with
+    /// `touched`. Only the most-recent `depth` blocks' derived slots are
+    /// retained (the reconcile sampling source); older entries age out as new
+    /// blocks are ingested, so steady-state ingestion does not grow unbounded.
+    derived: VecDeque<(u64, HashSet<(Address, U256)>)>,
 }
 
 impl EventPipeline {
@@ -235,7 +238,7 @@ impl EventPipeline {
             registry,
             reorg: ReorgConfig::default(),
             touched: VecDeque::new(),
-            derived_slots: HashSet::new(),
+            derived: VecDeque::new(),
         }
     }
 
@@ -253,13 +256,15 @@ impl EventPipeline {
     /// in the same block through the [`StateView`] (e.g. a same-block `Burn` after
     /// a `Mint`, or two overlapping `Mint`s). The touched addresses are recorded
     /// in the depth-bounded reorg ring under `block`, and the touched
-    /// `(address, slot)` pairs into the reconcile-sampling set.
+    /// `(address, slot)` pairs into the parallel depth-bounded reconcile-sampling
+    /// ring.
     pub fn ingest_logs(&mut self, cache: &mut EvmCache, block: u64, logs: &[Log]) -> BlockDigest {
         let mut digest = BlockDigest {
             block,
             ..Default::default()
         };
         let mut touched_addrs: HashSet<Address> = HashSet::new();
+        let mut block_derived: HashSet<(Address, U256)> = HashSet::new();
 
         for log in logs {
             // Decode against the current cache view (immutable borrow), then drop
@@ -278,7 +283,12 @@ impl EventPipeline {
             // freshness + reconcile) from every category of the diff.
             for change in &diff.slots {
                 touched_addrs.insert(change.address);
-                self.note_touched_slot(&mut digest, change.address, change.slot);
+                Self::note_touched_slot(
+                    &mut digest,
+                    &mut block_derived,
+                    change.address,
+                    change.slot,
+                );
             }
             for change in &diff.accounts {
                 touched_addrs.insert(change.address);
@@ -288,14 +298,14 @@ impl EventPipeline {
             }
             for skip in &diff.skipped {
                 touched_addrs.insert(skip.address);
-                self.note_touched_slot(&mut digest, skip.address, skip.slot);
+                Self::note_touched_slot(&mut digest, &mut block_derived, skip.address, skip.slot);
             }
             for skip in &diff.skipped_balances {
                 touched_addrs.insert(skip.address);
             }
             for skip in &diff.skipped_masks {
                 touched_addrs.insert(skip.address);
-                self.note_touched_slot(&mut digest, skip.address, skip.slot);
+                Self::note_touched_slot(&mut digest, &mut block_derived, skip.address, skip.slot);
             }
             // Skipped (cold) `Account` patches carry an address but no slot, so
             // track the address only — mirroring `skipped_balances`. A third-party
@@ -311,6 +321,9 @@ impl EventPipeline {
         if !touched_addrs.is_empty() {
             self.touched
                 .push_back((block, touched_addrs.into_iter().collect()));
+            if !block_derived.is_empty() {
+                self.derived.push_back((block, block_derived));
+            }
             self.trim_ring();
         }
 
@@ -335,8 +348,7 @@ impl EventPipeline {
 
         // Drop the rolled-back ring entries and the derived slots they own.
         self.touched.retain(|(block, _)| *block <= new_head);
-        self.derived_slots
-            .retain(|(addr, _)| !to_purge.contains(addr));
+        self.derived.retain(|(block, _)| *block <= new_head);
 
         let updates: Vec<StateUpdate> = to_purge
             .into_iter()
@@ -370,25 +382,43 @@ impl EventPipeline {
         })
     }
 
-    /// All event-derived slots seen so far (the sampling source for
-    /// [`reconcile`](Self::reconcile)).
+    /// All event-derived slots retained within the reorg horizon (the sampling
+    /// source for [`reconcile`](Self::reconcile)).
+    ///
+    /// Flattens the block-horizon ring and dedupes, so each `(address, slot)`
+    /// pair is yielded exactly once even if it was touched in more than one
+    /// retained block (set semantics preserved).
     pub fn derived_slots(&self) -> impl Iterator<Item = (Address, U256)> + '_ {
-        self.derived_slots.iter().copied()
+        let mut seen: HashSet<(Address, U256)> = HashSet::new();
+        for (_, pairs) in &self.derived {
+            seen.extend(pairs.iter().copied());
+        }
+        seen.into_iter()
     }
 
     /// Record a touched slot in both the per-block digest (deduped within the
-    /// block) and the global all-time reconcile-sampling set.
-    fn note_touched_slot(&mut self, digest: &mut BlockDigest, address: Address, slot: U256) {
-        self.derived_slots.insert((address, slot));
+    /// block) and the current block's derived set (later pushed onto the bounded
+    /// reconcile-sampling ring).
+    fn note_touched_slot(
+        digest: &mut BlockDigest,
+        block_derived: &mut HashSet<(Address, U256)>,
+        address: Address,
+        slot: U256,
+    ) {
+        block_derived.insert((address, slot));
         if !digest.touched_slots.contains(&(address, slot)) {
             digest.touched_slots.push((address, slot));
         }
     }
 
-    /// Trim the reorg ring to the configured depth, dropping the oldest entries.
+    /// Trim both reorg-horizon rings (`touched` and `derived`) to the configured
+    /// depth in lockstep, dropping the oldest front entries.
     fn trim_ring(&mut self) {
         while self.touched.len() > self.reorg.depth {
             self.touched.pop_front();
+        }
+        while self.derived.len() > self.reorg.depth {
+            self.derived.pop_front();
         }
     }
 }

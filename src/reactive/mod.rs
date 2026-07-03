@@ -19,8 +19,12 @@ use std::{
     future::Future,
     hash::Hash,
     marker::PhantomData,
+    num::NonZeroU64,
     pin::Pin,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
@@ -36,14 +40,15 @@ use alloy_network::{
 use alloy_primitives::{Address, B256, Bytes, U256};
 use alloy_provider::Provider;
 use alloy_rpc_types_eth::{Filter, FilterSet, Log};
-use futures::{
-    StreamExt,
-    stream::{self, BoxStream, SelectAll},
-};
+#[cfg(any(feature = "reactive-ws", feature = "reactive-polling", test))]
+use futures::{StreamExt, stream};
+use futures::{future::poll_fn, stream::BoxStream};
 
 use crate::{
-    cache::EvmCache,
+    cache::{AccountProof, BlockStateDiff, EvmCache},
+    errors::{BlockContextError, StorageFetchResult},
     events::{EventDecoder, StateView},
+    freshness::FreshnessRegistry,
     state_update::{AccountPatch, PurgeScope, StateDiff, StateUpdate},
 };
 
@@ -657,6 +662,99 @@ pub trait PendingTxMatcher<N: Network = Ethereum>: Send + Sync {
     fn matches(&self, tx: &N::TransactionResponse) -> bool;
 }
 
+/// How a tracked account is kept live by the per-block root gate (Phase-8 step 4).
+///
+/// The `storageHash` root gate behaves *oppositely* for two contract shapes, so
+/// liveness strategy is per-contract:
+///
+/// - A sparse-interest contract (a few balance slots, e.g. WETH) has its root
+///   churn on nearly every block, so the root is a noisy gate — [`Slots`] opts
+///   out. Its enumerated slots stay fresh via decoders + cadence reconcile.
+/// - A whole-economic-state contract (e.g. a Uniswap-V2 pool) has
+///   `root_moved ≈ my_state_changed`, so [`WholeAccount`] opts in: probe the root
+///   each canonical block; a move a decoder did not cover is a coverage gap.
+///
+/// A false-positive resync is never *incorrect* — it costs one batched read — so
+/// the policy is a **pure cost knob**, not a correctness lever.
+///
+/// [`Slots`]: TrackingPolicy::Slots
+/// [`WholeAccount`]: TrackingPolicy::WholeAccount
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub enum TrackingPolicy {
+    /// Sparse interest (e.g. WETH: a few balance slots). The root churns on
+    /// nearly every block, so it is a noisy gate — this policy is **never**
+    /// root-gated (spec Decision 3). Keep the enumerated slots fresh via decoders
+    /// and cadence reconcile.
+    Slots {
+        /// The enumerated storage slots of interest.
+        slots: Vec<U256>,
+    },
+    /// Whole economic state (e.g. a V2 pool). `root_moved ≈ my_state_changed`, so
+    /// the root is a tight, cheap gate: probe each canonical block; on a move no
+    /// decoder covered, emit a [`ReactiveReport::CoverageGap`] and schedule a
+    /// [`ResyncReason::RootMoved`] repair.
+    WholeAccount,
+    /// Balance / nonce / code-hash only — resolved from the same `get_proof`
+    /// response's account fields; no storage interest. Native balance/nonce
+    /// changes do **not** move the storage root, so this policy compares the
+    /// account fields directly across blocks rather than root-gating.
+    Scalars,
+}
+
+/// How often the reactive root gate probes tracked accounts
+/// ([`TrackingPolicy::WholeAccount`] / [`TrackingPolicy::Scalars`]; the
+/// `Scalars` account-fields comparison rides the same firing).
+///
+/// `eth_getProof` is the slowest read this crate issues, so per-block probing
+/// is never the default. Skipping blocks is safe by construction: the gate
+/// diffs `root_now` against its **persisted baseline**, never
+/// block-over-block, so a move in any skipped block is still visible at the
+/// next firing — cadence trades detection lag (at most `n − 1` blocks) for
+/// cost, never eventual detection. The decoder-touched set accumulates across
+/// skipped blocks and drains per firing, so a covered write in a skipped
+/// block never false-positives as a [`ReactiveReport::CoverageGap`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RootGateCadence {
+    /// Probe at most once every `n` canonical blocks (the first canonical
+    /// block ever seen always fires, so baseline adoption does not wait a
+    /// full window). `EveryNBlocks(1)` is per-block probing.
+    EveryNBlocks(NonZeroU64),
+    /// Root gate off: coverage gaps surface only via decoders + freshness.
+    Disabled,
+}
+
+impl RootGateCadence {
+    /// Probe at most once every `n` canonical blocks, clamping `0` to `1`.
+    pub fn every_n_blocks(n: u64) -> Self {
+        Self::EveryNBlocks(NonZeroU64::new(n.max(1)).expect("clamped to at least 1"))
+    }
+}
+
+impl Default for RootGateCadence {
+    /// Every 16 canonical blocks — ~3.2 min worst-case detection lag on
+    /// mainnet for a 16× probe-cost cut. Fast-block chains should *raise*
+    /// `n`, not lower it.
+    fn default() -> Self {
+        Self::every_n_blocks(16)
+    }
+}
+
+/// Per-account baseline held by the root gate: the last observed on-chain root
+/// and account fields, plus the block they were observed at.
+///
+/// The gate diffs the on-chain root **across time** (never local-vs-chain, per
+/// spec §6): it persists the *observed* root as a baseline and compares
+/// `root_now` to it. This is a currency gate, not a completeness gate.
+#[derive(Clone, Debug)]
+struct TrackedRoot {
+    last_root: B256,
+    last_block: u64,
+    balance: U256,
+    nonce: u64,
+    code_hash: B256,
+}
+
 /// Request for authoritative state repair.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResyncRequest {
@@ -685,11 +783,29 @@ impl ResyncId {
 
 /// Reason for a resync request.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum ResyncReason {
     /// Handler requested repair.
     HandlerRequested,
     /// State effect could not be applied completely.
     SkippedStateEffect,
+    /// A missed block range was detected; caller-scheduled repair.
+    ///
+    /// The runtime does not fabricate a targetless [`ResyncRequest`] for a missed
+    /// range (there are no known targets to resync). This reason is provided so a
+    /// caller building its own repair in response to a
+    /// [`ReactiveReport::MissedBlockRange`] can attribute it.
+    MissedBlockRange,
+    /// A tracked account's storage root moved with no covering decoder.
+    ///
+    /// Emitted by the per-block root gate (Phase-8 step 4). A
+    /// [`WholeAccount`](TrackingPolicy::WholeAccount)-tracked account's
+    /// `storageHash` moved between the adopted baseline and the current canonical
+    /// block, yet no decoder wrote that account during the block — a coverage gap.
+    /// The gate schedules a resync with this reason to re-read the account
+    /// authoritatively and self-heal the blind spot. Also used for the
+    /// [`Scalars`](TrackingPolicy::Scalars) account-field freshness path.
+    RootMoved,
     /// Caller-defined reason.
     Custom(String),
 }
@@ -854,8 +970,97 @@ pub enum HookBackpressure {
     Error,
 }
 
+/// Queryable coarse health of the reactive cache.
+///
+/// The runtime starts [`Healthy`](CacheHealth::Healthy) and transitions to a
+/// degraded or unhealthy state when it detects that its recovery guarantees no
+/// longer hold (for example a reorg that runs deeper than the journal, so some
+/// dropped effects are neither rolled back nor purged). Later waves report
+/// missed-range and coverage-gap conditions into the same state machine.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CacheHealth {
+    /// All recovery guarantees hold; the cache is fully self-consistent.
+    #[default]
+    Healthy,
+    /// A recoverable inconsistency was detected (for example under-recovered
+    /// reorg effects); `since_block` records the block that triggered the
+    /// transition.
+    Degraded {
+        /// Block number at which the degradation was first observed.
+        since_block: u64,
+    },
+    /// A more serious inconsistency was detected; `since_block` records the
+    /// block that triggered the transition.
+    Unhealthy {
+        /// Block number at which the unhealthy condition was first observed.
+        since_block: u64,
+    },
+}
+
+/// Point-in-time copy of the reactive runtime's observability counters.
+///
+/// Returned by [`ReactiveRuntime::metrics`]. Each field is a monotonically
+/// increasing count over the lifetime of the runtime. Counters wired by later
+/// waves (missed-range detection, storage-hash coverage gaps, stale-verdict
+/// tracking) remain zero until those waves land.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct CacheMetricsSnapshot {
+    /// Reorgs that ran deeper than the journal, so aged-out effects could not be
+    /// rolled back or purged.
+    pub deep_reorgs: u64,
+    /// Reorgs for which a [`ReorgReport`] recovery ran (including deep reorgs).
+    pub reorgs_recovered: u64,
+    /// Storage resync targets considered by the resync execution pass.
+    pub resync_requests: u64,
+    /// Storage resync targets that could not be fetched or applied.
+    pub resync_failures: u64,
+    /// Ranges of blocks the runtime detected it did not observe (reserved).
+    pub missed_ranges: u64,
+    /// Storage-hash coverage gaps detected (reserved).
+    pub coverage_gaps: u64,
+    /// Pending-source inputs that attempted a canonical cache effect.
+    pub pending_contamination: u64,
+    /// Verdicts served past their freshness horizon (reserved).
+    pub stale_verdicts: u64,
+}
+
+/// Internal atomic-backed counters mirrored by [`CacheMetricsSnapshot`].
+///
+/// Fields are [`AtomicU64`] so counters can be incremented behind a shared
+/// reference; [`ReactiveRuntime::metrics`] loads each with [`Ordering::Relaxed`]
+/// into a plain [`CacheMetricsSnapshot`].
+#[derive(Debug, Default)]
+struct CacheMetrics {
+    deep_reorgs: AtomicU64,
+    reorgs_recovered: AtomicU64,
+    resync_requests: AtomicU64,
+    resync_failures: AtomicU64,
+    missed_ranges: AtomicU64,
+    coverage_gaps: AtomicU64,
+    pending_contamination: AtomicU64,
+    stale_verdicts: AtomicU64,
+}
+
+impl CacheMetrics {
+    fn snapshot(&self) -> CacheMetricsSnapshot {
+        CacheMetricsSnapshot {
+            deep_reorgs: self.deep_reorgs.load(Ordering::Relaxed),
+            reorgs_recovered: self.reorgs_recovered.load(Ordering::Relaxed),
+            resync_requests: self.resync_requests.load(Ordering::Relaxed),
+            resync_failures: self.resync_failures.load(Ordering::Relaxed),
+            missed_ranges: self.missed_ranges.load(Ordering::Relaxed),
+            coverage_gaps: self.coverage_gaps.load(Ordering::Relaxed),
+            pending_contamination: self.pending_contamination.load(Ordering::Relaxed),
+            stale_verdicts: self.stale_verdicts.load(Ordering::Relaxed),
+        }
+    }
+}
+
 /// Runtime report.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub enum ReactiveReport<N: Network = Ethereum> {
     /// Input was accepted after deduplication.
     Input(InputReport<N>),
@@ -869,6 +1074,14 @@ pub enum ReactiveReport<N: Network = Ethereum> {
     BlockCommitted(BlockReport<N>),
     /// Reorg processing report.
     Reorg(ReorgReport<N>),
+    /// A forward gap in the canonical block sequence was detected: blocks between
+    /// the last-seen head and an arriving block were never observed.
+    MissedBlockRange(MissedRangeReport<N>),
+    /// Cache health transitioned between states.
+    Health(HealthReport<N>),
+    /// A tracked account's storage root moved with no covering decoder — a
+    /// coverage gap the per-block root gate detected (Phase-8 step 4).
+    CoverageGap(CoverageGapReport<N>),
     /// Runtime or handler error.
     Error(ReactiveErrorReport<N>),
 }
@@ -954,6 +1167,7 @@ pub struct ResyncFailure {
 
 /// Stable classification for a failed resync target.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum ResyncFailureKind {
     /// A storage target could not be fetched because no storage batch fetcher is configured.
     MissingStorageFetcher,
@@ -961,8 +1175,12 @@ pub enum ResyncFailureKind {
     StorageFetchFailed,
     /// The storage batch fetcher did not return a result for the requested slot.
     StorageFetchOmitted,
-    /// Account-field resync is not supported by the current provider-neutral cache seam.
-    UnsupportedAccountTarget,
+    /// An account target could not be fetched because no account proof fetcher is configured.
+    MissingAccountFetcher,
+    /// The account proof fetcher returned an error for the requested address.
+    AccountFetchFailed,
+    /// The account proof fetcher did not return a result for the requested address.
+    AccountFetchOmitted,
 }
 
 /// Block processing report.
@@ -1019,6 +1237,61 @@ pub enum ReorgReason {
     ReorgedInput,
     /// A canonical block did not connect to the journaled head.
     ParentMismatch,
+}
+
+/// Report of a forward gap in the canonical block sequence: an arriving block
+/// whose number is more than one past the last-seen head, so the blocks in
+/// between were never observed (for example during a subscription disconnect).
+///
+/// The arriving block is still accepted and applied — the chain extends — so this
+/// report only makes the skipped span observable; it does not drop the block. The
+/// span `from..=to` is inclusive of both endpoints.
+#[derive(Clone, Debug)]
+pub struct MissedRangeReport<N: Network = Ethereum> {
+    /// First skipped block (`last-seen block number + 1`).
+    pub from: u64,
+    /// Last skipped block (`arriving block number - 1`).
+    pub to: u64,
+    /// The arriving block's number.
+    pub block: u64,
+    /// Network marker.
+    pub _network: PhantomData<N>,
+}
+
+/// Report of a [`CacheHealth`] transition, emitted into the ingest cycle that
+/// caused it and delivered to hooks through the normal dispatch path.
+#[derive(Clone, Debug)]
+pub struct HealthReport<N: Network = Ethereum> {
+    /// Health state before the transition.
+    pub from: CacheHealth,
+    /// Health state after the transition.
+    pub to: CacheHealth,
+    /// Block number associated with the transition, when known.
+    pub block: Option<u64>,
+    /// Network marker.
+    pub _network: PhantomData<N>,
+}
+
+/// Report that a tracked account's storage root moved on a canonical block that
+/// no decoder covered — a coverage gap surfaced by the per-block root gate
+/// (Phase-8 step 4).
+///
+/// An account's `storageHash` is a collision-resistant commitment over all of its
+/// storage, so a moved root proves *something* under the account changed. When
+/// that account is [`WholeAccount`](TrackingPolicy::WholeAccount)-tracked and the
+/// batch's touched-address set does not include it, the change arrived through a
+/// path no decoder observed. The runtime emits this report (delivered through the
+/// normal dispatch path so [`ReactiveHook::on_report`] observers see it),
+/// increments [`CacheMetricsSnapshot::coverage_gaps`], and schedules a
+/// [`ResyncReason::RootMoved`] repair to re-read the account authoritatively.
+#[derive(Clone, Debug)]
+pub struct CoverageGapReport<N: Network = Ethereum> {
+    /// The tracked account whose root moved with no covering decoder.
+    pub address: Address,
+    /// The canonical block number at which the gap was observed.
+    pub block: u64,
+    /// Network marker.
+    pub _network: PhantomData<N>,
 }
 
 /// Report of a non-fatal error surfaced during an ingest cycle, with the
@@ -1143,6 +1416,30 @@ pub enum RegisterError {
     DuplicateHandler(HandlerId),
 }
 
+/// Error returned when [`ReactiveEngine`] cannot register a handler on both the
+/// runtime and subscriber sides.
+#[derive(Debug, thiserror::Error)]
+pub enum ReactiveEngineRegisterError {
+    /// Runtime registry rejected the handler.
+    #[error(transparent)]
+    Register(#[from] RegisterError),
+    /// Subscriber rejected the handler's interests.
+    #[error(transparent)]
+    Subscriber(#[from] SubscriberError),
+}
+
+/// Error returned by [`ReactiveEngine`] helpers that combine subscriber polling
+/// and runtime ingestion.
+#[derive(Debug, thiserror::Error)]
+pub enum ReactiveEngineError {
+    /// Subscriber polling failed.
+    #[error(transparent)]
+    Subscriber(#[from] SubscriberError),
+    /// Runtime ingestion failed.
+    #[error(transparent)]
+    Runtime(#[from] ReactiveError),
+}
+
 /// Absolute write target used for conflict reports.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum EffectTarget {
@@ -1193,6 +1490,36 @@ pub struct ReactiveRuntime<N: Network = Ethereum> {
     config: ReactiveConfig,
     journal: VecDeque<BlockJournal<N>>,
     pending_resyncs: Vec<ResyncRequest>,
+    health: CacheHealth,
+    metrics: CacheMetrics,
+    /// Opt-in freshness registry the runtime stamps for canonical event writes.
+    ///
+    /// `None` by default (behavior unchanged); populated by
+    /// [`enable_freshness_stamping`](Self::enable_freshness_stamping). When
+    /// present, applying a canonical handler storage-slot effect stamps the
+    /// touched `(address, slot)` as [`Validity::ValidThrough`](crate::freshness::Validity::ValidThrough)`(N)`
+    /// so event-maintained slots stop being needlessly re-verified while aging to
+    /// volatile once the clock passes `N`.
+    freshness: Option<FreshnessRegistry>,
+    /// Per-account tracking registry consulted by the per-block root gate
+    /// (Phase-8 step 4). Empty by default; populated by
+    /// [`track_account`](Self::track_account). When empty the gate is a no-op.
+    tracking: HashMap<Address, TrackingPolicy>,
+    /// Per-account root/field baselines the gate diffs against across blocks.
+    /// Adopted on first probe and re-adopted on every observed move.
+    tracked_roots: HashMap<Address, TrackedRoot>,
+    /// How often the root gate fires (§6.2); see [`RootGateCadence`].
+    root_gate_cadence: RootGateCadence,
+    /// Canonical block of the last root-gate firing. `None` until the first
+    /// firing (which happens at the first canonical block ever seen, so
+    /// baseline adoption never waits a full cadence window).
+    last_gate_block: Option<u64>,
+    /// Union of decoder-touched addresses since the last root-gate firing,
+    /// drained when it fires. Under cadence the gap rule "root moved ∧ addr ∉
+    /// touched" must judge against every covered write in the window, or a
+    /// decoder-covered write in a skipped block would false-positive as a
+    /// [`ReactiveReport::CoverageGap`].
+    touched_since_gate: HashSet<Address>,
 }
 
 #[derive(Clone, Debug)]
@@ -1255,6 +1582,40 @@ impl<N: Network> ReactiveRegistry<N> {
         Ok(())
     }
 
+    /// Remove one handler by id, leaving all other handlers and interests intact.
+    ///
+    /// Returns the removed handler when the id was registered. Cache eviction is
+    /// intentionally outside this API: unregistering stops future routing and
+    /// decode for the handler only.
+    pub fn unregister_handler(&mut self, id: &HandlerId) -> Option<Arc<dyn ReactiveHandler<N>>> {
+        let index = self
+            .handlers
+            .iter()
+            .position(|registered| &registered.id == id)?;
+        Some(self.handlers.remove(index).handler)
+    }
+
+    /// Return true when `id` is currently registered.
+    pub fn contains_handler(&self, id: &HandlerId) -> bool {
+        self.handlers.iter().any(|registered| &registered.id == id)
+    }
+
+    /// Ids of all registered handlers, in registration (= routing) order.
+    pub fn handler_ids(&self) -> Vec<HandlerId> {
+        self.handlers
+            .iter()
+            .map(|registered| registered.id.clone())
+            .collect()
+    }
+
+    /// Borrow the interests owned by one handler.
+    pub fn handler_interests(&self, id: &HandlerId) -> Option<&[ReactiveInterest<N>]> {
+        self.handlers
+            .iter()
+            .find(|registered| &registered.id == id)
+            .map(|registered| registered.interests.as_slice())
+    }
+
     /// Return all registered interests in handler registration order.
     pub fn interests(&self) -> Vec<ReactiveInterest<N>> {
         self.handlers
@@ -1315,7 +1676,162 @@ impl<N: Network> ReactiveRuntime<N> {
             config,
             journal: VecDeque::new(),
             pending_resyncs: Vec::new(),
+            health: CacheHealth::Healthy,
+            metrics: CacheMetrics::default(),
+            freshness: None,
+            tracking: HashMap::new(),
+            tracked_roots: HashMap::new(),
+            root_gate_cadence: RootGateCadence::default(),
+            last_gate_block: None,
+            touched_since_gate: HashSet::new(),
         }
+    }
+
+    /// Track `address` under `policy` for the per-block root gate (Phase-8 step 4).
+    ///
+    /// Tracking is strictly opt-in: a runtime with no tracked accounts runs the
+    /// gate as a no-op. Registering an account clears any baseline it held (a
+    /// policy change re-adopts on the next probe rather than diffing against a
+    /// baseline captured under the old policy). Each [`RootGateCadence`]
+    /// firing, the gate
+    /// probes tracked [`WholeAccount`](TrackingPolicy::WholeAccount) and
+    /// [`Scalars`](TrackingPolicy::Scalars) accounts' roots/fields via the
+    /// account-proof seam and, on a move no decoder covered, emits a
+    /// [`ReactiveReport::CoverageGap`] and schedules a
+    /// [`ResyncReason::RootMoved`] repair. [`Slots`](TrackingPolicy::Slots)
+    /// accounts are never root-gated (spec Decision 3).
+    pub fn track_account(&mut self, address: Address, policy: TrackingPolicy) {
+        self.tracking.insert(address, policy);
+        self.tracked_roots.remove(&address);
+    }
+
+    /// Stop tracking `address`, dropping its policy and any adopted baseline.
+    ///
+    /// Returns `true` if the account was tracked.
+    pub fn untrack_account(&mut self, address: Address) -> bool {
+        self.tracked_roots.remove(&address);
+        self.tracking.remove(&address).is_some()
+    }
+
+    /// Set how often the root gate probes tracked accounts (default:
+    /// [`RootGateCadence::default`] — every 16 canonical blocks; see the
+    /// [`RootGateCadence`] docs for why skipping blocks loses no detection).
+    ///
+    /// Reconfiguring resets the gate's window bookkeeping (the touched-address
+    /// accumulator and the last-fired block), so a stale window never leaks
+    /// into the new cadence: the next canonical block fires the gate.
+    pub fn set_root_gate_cadence(&mut self, cadence: RootGateCadence) {
+        self.root_gate_cadence = cadence;
+        self.last_gate_block = None;
+        self.touched_since_gate.clear();
+    }
+
+    /// The configured [`RootGateCadence`].
+    pub fn root_gate_cadence(&self) -> RootGateCadence {
+        self.root_gate_cadence
+    }
+
+    /// Enable freshness stamping of canonical event-derived writes (opt-in).
+    ///
+    /// Installs a [`FreshnessRegistry`] the runtime owns; while it is present,
+    /// applying a canonical handler storage-slot effect for a block `N` stamps the
+    /// touched `(address, slot)` as
+    /// [`Validity::ValidThrough`](crate::freshness::Validity::ValidThrough)`(N)`.
+    /// The slot is therefore not volatile *at* `N` (event-maintained, no need to
+    /// re-verify) but ages to volatile once the clock passes `N`.
+    ///
+    /// Idempotent: if a registry is already installed it is left untouched, so an
+    /// existing registry (and any stamps it holds) is never clobbered.
+    pub fn enable_freshness_stamping(&mut self) {
+        if self.freshness.is_none() {
+            self.freshness = Some(FreshnessRegistry::new());
+        }
+    }
+
+    /// Borrow the runtime's freshness registry, if stamping was enabled.
+    ///
+    /// Returns `None` unless
+    /// [`enable_freshness_stamping`](Self::enable_freshness_stamping) was called.
+    pub fn freshness(&self) -> Option<&FreshnessRegistry> {
+        self.freshness.as_ref()
+    }
+
+    /// Mutably borrow the runtime's freshness registry, if stamping was enabled.
+    ///
+    /// Returns `None` unless
+    /// [`enable_freshness_stamping`](Self::enable_freshness_stamping) was called.
+    pub fn freshness_mut(&mut self) -> Option<&mut FreshnessRegistry> {
+        self.freshness.as_mut()
+    }
+
+    /// Return the current queryable [`CacheHealth`] of the runtime.
+    pub fn health(&self) -> CacheHealth {
+        self.health
+    }
+
+    /// Return a point-in-time snapshot of the runtime's observability counters.
+    pub fn metrics(&self) -> CacheMetricsSnapshot {
+        self.metrics.snapshot()
+    }
+
+    /// Complete the caller-driven self-heal by returning health to
+    /// [`CacheHealth::Healthy`].
+    ///
+    /// A trust-loss event (a reorg deeper than the journal, or a detected missed
+    /// block range) escalates health toward [`CacheHealth::Unhealthy`] as a
+    /// "stop until rebuilt" signal that the caller must act on. Once the caller
+    /// has resynced or rebuilt the affected state, it invokes this to clear the
+    /// signal. It does not emit a [`ReactiveReport::Health`] report, since it is
+    /// called outside an ingest cycle.
+    pub fn reset_health(&mut self) {
+        self.health = CacheHealth::Healthy;
+    }
+
+    /// Escalate health one rung up the trust-loss ladder for a trust-loss event
+    /// observed at `block`, returning a [`ReactiveReport::Health`] report when the
+    /// state actually changes.
+    ///
+    /// The ladder is:
+    /// - [`Healthy`](CacheHealth::Healthy) -> [`Degraded`](CacheHealth::Degraded)
+    /// - [`Degraded`](CacheHealth::Degraded) -> [`Unhealthy`](CacheHealth::Unhealthy)
+    /// - [`Unhealthy`](CacheHealth::Unhealthy) -> no change (`None`)
+    ///
+    /// A first event degrades; a second escalates to the terminal
+    /// [`Unhealthy`](CacheHealth::Unhealthy) stop signal. This is shared by both
+    /// trust-loss paths (deep reorg beyond the journal and missed-range
+    /// detection) so mixed event types climb the same ladder.
+    fn escalate_trust(&mut self, block: u64) -> Option<Arc<ReactiveReport<N>>> {
+        let to = match self.health {
+            CacheHealth::Healthy => CacheHealth::Degraded { since_block: block },
+            CacheHealth::Degraded { .. } => CacheHealth::Unhealthy { since_block: block },
+            CacheHealth::Unhealthy { .. } => return None,
+        };
+        self.transition_health(to, Some(block))
+    }
+
+    /// Transition health to `to`, returning a [`ReactiveReport::Health`] report
+    /// when the state actually changes.
+    ///
+    /// The returned report must be threaded into the ingest cycle's dispatched
+    /// reports so it reaches hooks and appears in
+    /// [`ReactiveBatchReport::reports`]. Returns `None` when `to` equals the
+    /// current state (no transition, no report).
+    fn transition_health(
+        &mut self,
+        to: CacheHealth,
+        block: Option<u64>,
+    ) -> Option<Arc<ReactiveReport<N>>> {
+        if to == self.health {
+            return None;
+        }
+        let from = self.health;
+        self.health = to;
+        Some(Arc::new(ReactiveReport::Health(HealthReport {
+            from,
+            to,
+            block,
+            _network: PhantomData,
+        })))
     }
 
     /// Register a handler.
@@ -1324,6 +1840,93 @@ impl<N: Network> ReactiveRuntime<N> {
         handler: Arc<dyn ReactiveHandler<N>>,
     ) -> Result<(), RegisterError> {
         self.registry.register_handler(handler)
+    }
+
+    /// Remove one handler from the runtime registry without resetting runtime state.
+    ///
+    /// This delegates to [`ReactiveRegistry::unregister_handler`] only. It does
+    /// not clear the reorg journal, health, metrics, hooks, pending resyncs,
+    /// tracking policy, freshness registry, or root-gate baselines, and it does
+    /// not purge [`EvmCache`] state. Callers that want cache eviction must issue
+    /// explicit `StateUpdate::purge` updates or use cache purge APIs separately.
+    pub fn unregister_handler(&mut self, id: &HandlerId) -> Option<Arc<dyn ReactiveHandler<N>>> {
+        self.registry.unregister_handler(id)
+    }
+
+    /// Return true when the runtime has a registered handler with `id`.
+    pub fn contains_handler(&self, id: &HandlerId) -> bool {
+        self.registry.contains_handler(id)
+    }
+
+    /// Ids of all registered handlers, in registration (= routing) order.
+    pub fn handler_ids(&self) -> Vec<HandlerId> {
+        self.registry.handler_ids()
+    }
+
+    /// Borrow the interests owned by one registered handler.
+    pub fn handler_interests(&self, id: &HandlerId) -> Option<&[ReactiveInterest<N>]> {
+        self.registry.handler_interests(id)
+    }
+
+    /// The most recently journaled canonical block, if any.
+    ///
+    /// This is the runtime's current chain position: the canonical block most
+    /// recently recorded by ingestion. Reorged blocks are dropped from the
+    /// journal during recovery, so a rolled-back head does not linger here.
+    /// [`ReactiveEngine::register_handler`] uses it as the default backfill
+    /// anchor for handlers registered mid-lifecycle. `None` until the first
+    /// canonical input is journaled, and always `None` when
+    /// [`ReactiveConfig::journal_depth`] is 0 (journaling disabled).
+    pub fn last_canonical_block(&self) -> Option<BlockRef> {
+        self.journal.back().map(|entry| entry.block.clone())
+    }
+
+    /// Queued resync requests: surfaced by handlers but not yet executed by an
+    /// [`ingest_batch_with_resync`](Self::ingest_batch_with_resync) pass.
+    ///
+    /// Callers driving resync execution themselves (plain
+    /// [`ingest_batch`](Self::ingest_batch) loops) can read the ledger here;
+    /// reorg recovery cancels entries whose pinned blocks were dropped, and
+    /// [`cancel_pending_resyncs`](Self::cancel_pending_resyncs) drops entries
+    /// for torn-down accounts.
+    pub fn pending_resyncs(&self) -> &[ResyncRequest] {
+        &self.pending_resyncs
+    }
+
+    /// Cancel queued resync work that targets `address`, returning the
+    /// cancelled portions.
+    ///
+    /// Every pending [`ResyncRequest`] target referencing `address` is removed;
+    /// a request reduced to zero targets is dropped entirely, while
+    /// mixed-target requests keep their other accounts queued. Each returned
+    /// request mirrors the original id/reason/block/priority and carries only
+    /// the targets that were cancelled.
+    ///
+    /// This is part of the adapter-teardown recipe (see
+    /// [`ReactiveEngine::unregister_handler`]): it clears the pending ledger so
+    /// a dropped pool's queued repairs stop occupying memory and stop
+    /// surfacing as cancellations in reorg reports. It cannot recall requests
+    /// already returned to the caller in earlier batch reports.
+    pub fn cancel_pending_resyncs(&mut self, address: Address) -> Vec<ResyncRequest> {
+        let mut cancelled = Vec::new();
+        self.pending_resyncs.retain_mut(|request| {
+            let (matching, remaining): (Vec<_>, Vec<_>) = request
+                .targets
+                .drain(..)
+                .partition(|target| resync_target_address(target) == address);
+            request.targets = remaining;
+            if !matching.is_empty() {
+                cancelled.push(ResyncRequest {
+                    id: request.id.clone(),
+                    reason: request.reason.clone(),
+                    block: request.block.clone(),
+                    targets: matching,
+                    priority: request.priority,
+                });
+            }
+            !request.targets.is_empty()
+        });
+        cancelled
     }
 
     /// Register a hook.
@@ -1368,6 +1971,21 @@ impl<N: Network> ReactiveRuntime<N> {
 
         if !batch_report.resyncs.is_empty() {
             let resync_report = execute_resync_requests(cache, &batch_report.resyncs);
+            // Count unique logical requests: several handlers may emit the same
+            // ResyncId in one batch, and duplicates fan out per-origin in the
+            // report but are one unit of resync work for the metric.
+            let unique_requests = resync_report
+                .requested
+                .iter()
+                .map(|request| &request.id)
+                .collect::<HashSet<_>>()
+                .len();
+            self.metrics
+                .resync_requests
+                .fetch_add(unique_requests as u64, Ordering::Relaxed);
+            self.metrics
+                .resync_failures
+                .fetch_add(resync_report.failed.len() as u64, Ordering::Relaxed);
             self.remove_pending_resyncs(batch_report.resyncs.iter().map(|request| &request.id));
             self.record_journal_resync(&resync_report);
             batch_report
@@ -1389,6 +2007,12 @@ impl<N: Network> ReactiveRuntime<N> {
 
         let mut batch_report = ReactiveBatchReport::default();
         let mut reports_to_dispatch = Vec::new();
+        // Phase-8 step 4: accumulate the addresses a decoder actually wrote this
+        // batch (union of applied `StateDiff` addresses) and the batch's canonical
+        // block number, so the per-block root gate can run once after the record
+        // loop with the full touched set.
+        let mut touched_addrs: HashSet<Address> = HashSet::new();
+        let mut canonical_batch_block: Option<u64> = None;
 
         for record in records {
             let input_ref = record.input_ref();
@@ -1398,7 +2022,12 @@ impl<N: Network> ReactiveRuntime<N> {
                 _network: PhantomData,
             })));
 
-            if let Some(reorg_report) = self.recover_for_canonical_input(cache, &record) {
+            if let Some(reorg_report) =
+                self.recover_for_canonical_input(cache, &record, &mut reports_to_dispatch)
+            {
+                self.metrics
+                    .reorgs_recovered
+                    .fetch_add(1, Ordering::Relaxed);
                 remove_canceled_resyncs_from_batch(
                     &mut batch_report.resyncs,
                     &reorg_report.canceled_resyncs,
@@ -1406,7 +2035,12 @@ impl<N: Network> ReactiveRuntime<N> {
                 reports_to_dispatch.push(Arc::new(ReactiveReport::Reorg(reorg_report)));
             }
 
-            if let Some(reorg_report) = self.recover_for_reorged_input(cache, &record) {
+            if let Some(reorg_report) =
+                self.recover_for_reorged_input(cache, &record, &mut reports_to_dispatch)
+            {
+                self.metrics
+                    .reorgs_recovered
+                    .fetch_add(1, Ordering::Relaxed);
                 remove_canceled_resyncs_from_batch(
                     &mut batch_report.resyncs,
                     &reorg_report.canceled_resyncs,
@@ -1416,7 +2050,21 @@ impl<N: Network> ReactiveRuntime<N> {
             }
 
             if let Some(block) = canonical_record_block(&record) {
+                // Phase-8 step 4: remember the batch's canonical block (the last
+                // canonical record wins) so the root gate probes at that height.
+                canonical_batch_block = Some(block.number);
                 self.record_journal_input(block, input_ref);
+            }
+
+            // Phase-8 step 2: drive a per-block env refresh from canonical
+            // headers. Best-effort — a strict validation failure is surfaced as
+            // a non-fatal error report and does not abort the batch.
+            if let Some(Err(err)) = advance_block_for_canonical_record(cache, &record) {
+                reports_to_dispatch.push(Arc::new(ReactiveReport::Error(ReactiveErrorReport {
+                    input_ref: Some(input_ref),
+                    message: err.to_string(),
+                    _network: PhantomData,
+                })));
             }
 
             let executions = self.execute_handlers(cache, &record, input_ref)?;
@@ -1434,6 +2082,13 @@ impl<N: Network> ReactiveRuntime<N> {
             })));
 
             detect_conflicts(input_ref, &executions)?;
+
+            // Phase-8 step 3: canonical block number for freshness stamping.
+            // Copied out as a plain `u64` (dropping the borrow of `record`) so it
+            // can be used while `self.freshness_mut()` mutably borrows `self`
+            // inside the execution loop. `None` for pending/removed/reorged
+            // records — those never stamp canonical freshness.
+            let canonical_block_number = canonical_record_block(&record).map(|block| block.number);
 
             for execution in executions {
                 let diff = if execution.state_updates.is_empty() {
@@ -1464,6 +2119,31 @@ impl<N: Network> ReactiveRuntime<N> {
                     hook_signals: execution.hook_signals,
                     _network: PhantomData,
                 };
+                // Phase-8 step 3 (opt-in): stamp every touched `(address, slot)`
+                // from this canonical handler write as `ValidThrough(N)`, so an
+                // event-maintained slot stops being re-verified until the clock
+                // passes its write block. Read the changed slots straight off
+                // `applied.diff` (which borrows the local, not `self`) and stamp
+                // via `self.freshness`, done before `applied` is moved into the
+                // journal/batch below. Only genuinely-changed slots appear here,
+                // since a no-op re-write records no `SlotChange`.
+                if let (Some(number), Some(registry)) =
+                    (canonical_block_number, self.freshness.as_mut())
+                {
+                    for change in &applied.diff.slots {
+                        registry.valid_through_slot(change.address, change.slot, number);
+                    }
+                }
+
+                // Phase-8 step 4: record every address this decoder actually wrote
+                // (or attempted to write) so the root gate can tell a
+                // decoder-covered root move from an uncovered coverage gap. Fold in
+                // the full `StateDiff` address footprint — real changes
+                // (`slots`/`accounts`/`purged`) and cold-skipped attempts alike, so
+                // a decoder that tried to write a cold slot still counts as
+                // covering the account.
+                collect_diff_addresses(&applied.diff, &mut touched_addrs);
+
                 let report = Arc::new(ReactiveReport::Applied(applied.clone()));
                 reports_to_dispatch.push(report);
                 if let Some(block) = canonical_record_block(&record) {
@@ -1473,8 +2153,229 @@ impl<N: Network> ReactiveRuntime<N> {
             }
         }
 
+        // Phase-8 step 4 + §6.2 cadence: accumulate this batch's touched
+        // addresses (after all handler effects, so the set is complete), then
+        // fire the root gate only on cadence boundaries. The gate diffs
+        // against persisted baselines, so skipped blocks lose no detection —
+        // but the touched set must be the union since the last firing, or a
+        // decoder-covered write in a skipped block would false-positive as a
+        // CoverageGap. Fired resyncs surface in `batch_report.resyncs` (so
+        // callers see them and `ingest_batch_with_resync` executes them) and
+        // coverage reports go into the dispatched reports.
+        if self.root_gate_runnable(cache) {
+            self.touched_since_gate
+                .extend(touched_addrs.iter().copied());
+            if self.root_gate_due(canonical_batch_block) {
+                let accumulated = std::mem::take(&mut self.touched_since_gate);
+                self.run_root_gate(
+                    cache,
+                    canonical_batch_block,
+                    &accumulated,
+                    &mut batch_report.resyncs,
+                    &mut reports_to_dispatch,
+                );
+                self.last_gate_block = canonical_batch_block;
+            }
+        } else {
+            // A gate that cannot run (disabled, nothing root-gated, or no
+            // proof fetcher) must not grow the accumulator unboundedly.
+            // Dropping it is safe: without a runnable gate no baselines exist
+            // (a fetcher cannot be uninstalled, and untracking drops the
+            // baseline), so there is nothing a lost touched set could falsely
+            // gap against later.
+            self.touched_since_gate.clear();
+        }
+
         batch_report.reports = reports_to_dispatch;
         Ok(batch_report)
+    }
+
+    /// Whether the root gate could produce any signal at all: some tracked
+    /// account is root-gated (`Slots` never is) and a proof fetcher exists.
+    /// When this is false the touched accumulator is dropped rather than
+    /// grown (see the ingest call site for why that is safe).
+    fn root_gate_runnable(&self, cache: &EvmCache) -> bool {
+        if matches!(self.root_gate_cadence, RootGateCadence::Disabled) {
+            return false;
+        }
+        let has_gated_targets = self
+            .tracking
+            .values()
+            .any(|policy| !matches!(policy, TrackingPolicy::Slots { .. }));
+        has_gated_targets && cache.account_proof_fetcher().is_some()
+    }
+
+    /// Whether the root gate is due at this batch's canonical block (§6.2):
+    /// the first canonical block ever seen always fires (baseline adoption
+    /// must not wait a full window), then at most once every `n` blocks.
+    fn root_gate_due(&self, canonical_block: Option<u64>) -> bool {
+        let Some(block) = canonical_block else {
+            return false;
+        };
+        match self.root_gate_cadence {
+            RootGateCadence::Disabled => false,
+            RootGateCadence::EveryNBlocks(n) => match self.last_gate_block {
+                None => true,
+                Some(last) => block >= last.saturating_add(n.get()),
+            },
+        }
+    }
+
+    /// The `storageHash` root gate (Phase-8 step 4), fired per
+    /// [`RootGateCadence`] window (§6.2).
+    ///
+    /// Runs at the firing batch's canonical block, with `touched` carrying the
+    /// union of decoder-touched addresses since the previous firing. For each tracked
+    /// [`WholeAccount`](TrackingPolicy::WholeAccount) / [`Scalars`](TrackingPolicy::Scalars)
+    /// account, probe the root (and account fields) via the account-proof seam and
+    /// apply the spec §4 table:
+    ///
+    /// - No baseline yet ⇒ **adopt** (no gap, no resync — adoption is not a gap).
+    /// - [`WholeAccount`](TrackingPolicy::WholeAccount) root unchanged ⇒ nothing.
+    /// - [`WholeAccount`](TrackingPolicy::WholeAccount) root moved, `addr ∈ touched`
+    ///   ⇒ a decoder covered it; re-adopt, no gap.
+    /// - [`WholeAccount`](TrackingPolicy::WholeAccount) root moved, `addr ∉ touched`
+    ///   ⇒ emit [`ReactiveReport::CoverageGap`], count it, schedule a
+    ///   [`ResyncReason::RootMoved`] account resync, re-adopt.
+    /// - [`Scalars`](TrackingPolicy::Scalars) ⇒ compare balance/nonce/code-hash to
+    ///   the baseline (native field changes never move the storage root); on a move
+    ///   with `addr ∉ touched`, schedule a [`ResyncReason::RootMoved`] account
+    ///   resync for the changed fields and re-adopt.
+    ///
+    /// No-op when the tracking registry is empty, when the batch has no canonical
+    /// block, or when the cache has no account-proof fetcher installed.
+    /// [`Slots`](TrackingPolicy::Slots) accounts are never root-gated (spec
+    /// Decision 3).
+    fn run_root_gate(
+        &mut self,
+        cache: &EvmCache,
+        canonical_block: Option<u64>,
+        touched: &HashSet<Address>,
+        resyncs: &mut Vec<ResyncRequest>,
+        reports: &mut Vec<Arc<ReactiveReport<N>>>,
+    ) {
+        if self.tracking.is_empty() {
+            return;
+        }
+        let Some(block) = canonical_block else {
+            return;
+        };
+        let Some(fetcher) = cache.account_proof_fetcher().cloned() else {
+            return;
+        };
+
+        // Collect the root-gated targets (Slots opts out) in a stable order so a
+        // single-block sequence of resyncs/reports is deterministic.
+        let mut targets: Vec<(Address, bool)> = self
+            .tracking
+            .iter()
+            .filter_map(|(address, policy)| match policy {
+                TrackingPolicy::Slots { .. } => None,
+                TrackingPolicy::WholeAccount => Some((*address, true)),
+                TrackingPolicy::Scalars => Some((*address, false)),
+            })
+            .collect();
+        if targets.is_empty() {
+            return;
+        }
+        targets.sort_by_key(|(address, _)| *address);
+
+        let block_id = BlockId::number(block);
+        // ONE seam invocation carries every root-gated target (root-only
+        // probes: no storage keys needed). eth_getProof is single-address at
+        // the RPC level, so batching here lets the fetcher fan the requests
+        // out concurrently instead of paying N sequential round trips.
+        let mut probes: HashMap<Address, StorageFetchResult<AccountProof>> = (fetcher)(
+            targets
+                .iter()
+                .map(|&(address, _)| (address, vec![]))
+                .collect(),
+            block_id,
+        )
+        .into_iter()
+        .collect();
+        for (address, whole_account) in targets {
+            let Some(Ok(proof)) = probes.remove(&address) else {
+                // A failed/omitted probe carries no signal; leave the baseline
+                // untouched and try again next block.
+                continue;
+            };
+
+            let baseline = self.tracked_roots.get(&address).cloned();
+            let Some(baseline) = baseline else {
+                // First observation: adopt the baseline. Not a coverage gap.
+                self.adopt_root(address, block, &proof);
+                continue;
+            };
+
+            // A stale probe (a batch whose canonical block is not newer than the
+            // last one we baselined this account against) carries no forward
+            // signal: skip it rather than diff against — or clobber — a newer
+            // baseline.
+            if block <= baseline.last_block {
+                continue;
+            }
+
+            if whole_account {
+                if proof.storage_hash == baseline.last_root {
+                    // Tight steady-state path: unchanged root ⇒ nothing.
+                    continue;
+                }
+                // Root moved.
+                if !touched.contains(&address) {
+                    // Moved with no covering decoder — the coverage gap.
+                    reports.push(Arc::new(ReactiveReport::CoverageGap(CoverageGapReport {
+                        address,
+                        block,
+                        _network: PhantomData,
+                    })));
+                    self.metrics.coverage_gaps.fetch_add(1, Ordering::Relaxed);
+                    resyncs.push(root_moved_account_resync(
+                        address,
+                        block,
+                        AccountFieldMask {
+                            balance: true,
+                            nonce: true,
+                            code: true,
+                        },
+                    ));
+                }
+                // Adopt the new root whether or not a decoder covered it.
+                self.adopt_root(address, block, &proof);
+            } else {
+                // Scalars: compare the account fields directly (native changes do
+                // not move the storage root).
+                let balance_moved = proof.balance != baseline.balance;
+                let nonce_moved = proof.nonce != baseline.nonce;
+                let code_moved = proof.code_hash != baseline.code_hash;
+                if (balance_moved || nonce_moved || code_moved) && !touched.contains(&address) {
+                    resyncs.push(root_moved_account_resync(
+                        address,
+                        block,
+                        AccountFieldMask {
+                            balance: balance_moved,
+                            nonce: nonce_moved,
+                            code: code_moved,
+                        },
+                    ));
+                }
+                self.adopt_root(address, block, &proof);
+            }
+        }
+    }
+
+    /// Adopt (or re-adopt) `proof` as the baseline for `address` at `block`.
+    fn adopt_root(&mut self, address: Address, block: u64, proof: &AccountProof) {
+        self.tracked_roots.insert(
+            address,
+            TrackedRoot {
+                last_root: proof.storage_hash,
+                last_block: block,
+                balance: proof.balance,
+                nonce: proof.nonce,
+                code_hash: proof.code_hash,
+            },
+        );
     }
 
     fn execute_handlers(
@@ -1497,7 +2398,16 @@ impl<N: Network> ReactiveRuntime<N> {
                     source,
                 })?;
 
-            validate_effects(input_ref, &record.context, &registered.id, &outcome.effects)?;
+            if let Err(error) =
+                validate_effects(input_ref, &record.context, &registered.id, &outcome.effects)
+            {
+                if matches!(error, ReactiveError::InvalidPendingEffect { .. }) {
+                    self.metrics
+                        .pending_contamination
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                return Err(error);
+            }
             executions.push(HandlerExecution::from_outcome(
                 registered.id.clone(),
                 input_ref,
@@ -1519,6 +2429,7 @@ impl<N: Network> ReactiveRuntime<N> {
         &mut self,
         cache: &mut EvmCache,
         record: &ReactiveInputRecord<N>,
+        health_reports: &mut Vec<Arc<ReactiveReport<N>>>,
     ) -> Option<ReorgReport<N>> {
         let block = canonical_record_block(record)?;
         let latest = self.journal.back()?.block.clone();
@@ -1537,6 +2448,20 @@ impl<N: Network> ReactiveRuntime<N> {
         }
 
         if block.number > latest.number.saturating_add(1) {
+            // A forward gap: blocks between the journaled head and the arriving
+            // block were never observed (e.g. a disconnect). Make it observable
+            // and escalate health, but still accept the arriving block so it
+            // journals/applies normally (the chain extends).
+            self.metrics.missed_ranges.fetch_add(1, Ordering::Relaxed);
+            health_reports.extend(self.escalate_trust(block.number));
+            health_reports.push(Arc::new(ReactiveReport::MissedBlockRange(
+                MissedRangeReport {
+                    from: latest.number + 1,
+                    to: block.number - 1,
+                    block: block.number,
+                    _network: PhantomData,
+                },
+            )));
             return None;
         }
 
@@ -1548,11 +2473,11 @@ impl<N: Network> ReactiveRuntime<N> {
             {
                 self.drain_journal_after(parent_index)
             } else {
-                self.warn_under_recovery(block.number);
+                health_reports.extend(self.warn_under_recovery(block.number));
                 self.drain_journal_from_number(block.number)
             }
         } else {
-            self.warn_under_recovery(block.number);
+            health_reports.extend(self.warn_under_recovery(block.number));
             self.drain_journal_from_number(block.number)
         };
 
@@ -1563,6 +2488,7 @@ impl<N: Network> ReactiveRuntime<N> {
         &mut self,
         cache: &mut EvmCache,
         record: &ReactiveInputRecord<N>,
+        health_reports: &mut Vec<Arc<ReactiveReport<N>>>,
     ) -> Option<ReorgReport<N>> {
         let (dropped_block, reason) = reorg_signal_block(record)?;
         let dropped = if let Some(index) = self
@@ -1572,7 +2498,7 @@ impl<N: Network> ReactiveRuntime<N> {
         {
             self.drain_journal_from(index)
         } else {
-            self.warn_under_recovery(dropped_block.number);
+            health_reports.extend(self.warn_under_recovery(dropped_block.number));
             self.drain_journal_from_number(dropped_block.number)
         };
 
@@ -1603,7 +2529,14 @@ impl<N: Network> ReactiveRuntime<N> {
     /// recovery is limited to the blocks still journaled — effects from aged-out
     /// blocks are neither rolled back nor purged (the freshness/validation loop is
     /// the backstop). Makes the under-recovery observable instead of silent.
-    fn warn_under_recovery(&self, reorg_number: u64) {
+    ///
+    /// This is a deep reorg: it increments the `deep_reorgs` counter and escalates
+    /// health along the trust-loss ladder via [`escalate_trust`](Self::escalate_trust)
+    /// (a first event degrades to [`CacheHealth::Degraded`], a second escalates to
+    /// [`CacheHealth::Unhealthy`]). Any resulting [`ReactiveReport::Health`]
+    /// transition is returned so the caller can thread it into the ingest cycle's
+    /// dispatched reports.
+    fn warn_under_recovery(&mut self, reorg_number: u64) -> Option<Arc<ReactiveReport<N>>> {
         let oldest_journaled = self.journal.front().map(|entry| entry.block.number);
         tracing::warn!(
             reorg_block = reorg_number,
@@ -1615,6 +2548,10 @@ impl<N: Network> ReactiveRuntime<N> {
              backstop). Increase ReactiveConfig::journal_depth to recover deeper \
              reorgs precisely."
         );
+
+        self.metrics.deep_reorgs.fetch_add(1, Ordering::Relaxed);
+
+        self.escalate_trust(reorg_number)
     }
 
     fn record_journal_input(&mut self, block: &BlockRef, input_ref: InputRef) {
@@ -1759,6 +2696,39 @@ impl<N: Network> ReactiveRuntime<N> {
     }
 }
 
+/// Fold every address a [`StateDiff`] references — genuine changes
+/// (`slots`/`accounts`/`purged`) and cold-skipped attempts (`skipped*`) alike —
+/// into `into`. Used by the per-block root gate to accumulate the batch's
+/// decoder-touched address set: an account a decoder wrote (or tried to write) is
+/// "covered," so a subsequent root move for it is not a coverage gap.
+fn collect_diff_addresses(diff: &StateDiff, into: &mut HashSet<Address>) {
+    into.extend(diff.slots.iter().map(|change| change.address));
+    into.extend(diff.accounts.iter().map(|change| change.address));
+    into.extend(diff.purged.iter().map(|purge| purge.address));
+    into.extend(diff.skipped.iter().map(|skipped| skipped.address));
+    into.extend(diff.skipped_balances.iter().map(|skipped| skipped.address));
+    into.extend(diff.skipped_masks.iter().map(|skipped| skipped.address));
+    into.extend(diff.skipped_accounts.iter().map(|skipped| skipped.address));
+}
+
+/// Build the [`ResyncReason::RootMoved`] account resync the root gate schedules
+/// for an uncovered move. Re-reads `address`'s `fields` at `block` through the
+/// existing account-resync path (Wave 2). The id is derived from the address and
+/// block so a repeated move on the same account/block coalesces deterministically.
+fn root_moved_account_resync(
+    address: Address,
+    block: u64,
+    fields: AccountFieldMask,
+) -> ResyncRequest {
+    ResyncRequest {
+        id: ResyncId::new(format!("root-moved:{address:#x}:{block}")),
+        reason: ResyncReason::RootMoved,
+        block: ResyncBlock::Number(block),
+        targets: vec![ResyncTarget::Account { address, fields }],
+        priority: ResyncPriority::Normal,
+    }
+}
+
 fn canonical_record_block<N: Network>(record: &ReactiveInputRecord<N>) -> Option<&BlockRef> {
     if matches!(&record.input, ReactiveInput::Log(log) if log.removed) {
         return None;
@@ -1767,6 +2737,28 @@ fn canonical_record_block<N: Network>(record: &ReactiveInputRecord<N>) -> Option
         return context_block_ref(&record.context);
     }
     None
+}
+
+/// Best-effort per-block env refresh (Phase-8 step 2).
+///
+/// For a canonical record carrying a full header — a
+/// [`ReactiveInput::BlockHeader`] or [`ReactiveInput::FullBlock`] — refresh the
+/// cache's block env from that header via [`EvmCache::advance_block`]. Returns
+/// `Some(result)` when a header was present (so the caller can surface a strict
+/// validation error), and `None` for pending/reorged records or non-header
+/// inputs, which must never drive a canonical env refresh.
+fn advance_block_for_canonical_record<N: Network>(
+    cache: &mut EvmCache,
+    record: &ReactiveInputRecord<N>,
+) -> Option<Result<(), BlockContextError>> {
+    if !is_canonical_status(&record.context.chain_status) {
+        return None;
+    }
+    match &record.input {
+        ReactiveInput::BlockHeader(header) => Some(cache.advance_block(header)),
+        ReactiveInput::FullBlock(block) => Some(cache.advance_block(block.header())),
+        _ => None,
+    }
 }
 
 fn context_block_ref(ctx: &ReactiveContext) -> Option<&BlockRef> {
@@ -1831,6 +2823,14 @@ fn remove_canceled_resyncs_from_batch(
     }
     let canceled_ids: HashSet<_> = canceled.iter().map(|request| request.id.clone()).collect();
     resyncs.retain(|request| !canceled_ids.contains(&request.id));
+}
+
+fn resync_target_address(target: &ResyncTarget) -> Address {
+    match target {
+        ResyncTarget::StorageSlot { address, .. }
+        | ResyncTarget::StorageSlots { address, .. }
+        | ResyncTarget::Account { address, .. } => *address,
+    }
 }
 
 fn resync_request_targets_dropped_block(
@@ -1970,9 +2970,147 @@ struct StorageFetchGroup {
     seen: HashSet<(Address, U256)>,
 }
 
+/// One account-target resync collected during request scanning, resolved through
+/// the account proof fetcher after storage groups are processed.
+#[derive(Clone, Debug)]
+struct AccountResyncTarget {
+    request_id: ResyncId,
+    block: ResyncBlock,
+    address: Address,
+    fields: AccountFieldMask,
+}
+
+fn resolve_trace_resyncs(
+    cache: &EvmCache,
+    storage_groups: &mut Vec<StorageFetchGroup>,
+    account_targets: &mut Vec<AccountResyncTarget>,
+    state_updates: &mut Vec<StateUpdate>,
+) {
+    let Some(fetcher) = cache.block_state_diff_fetcher().cloned() else {
+        return;
+    };
+
+    let mut blocks = Vec::new();
+    let mut seen = HashSet::new();
+    for block in storage_groups
+        .iter()
+        .map(|group| group.block.clone())
+        .chain(account_targets.iter().map(|target| target.block.clone()))
+    {
+        if seen.insert(block.clone()) {
+            blocks.push(block);
+        }
+    }
+
+    let mut traces = HashMap::new();
+    for block in blocks {
+        match (fetcher)(resync_block_to_block_id(&block)) {
+            Ok(diff) => {
+                traces.insert(block, diff);
+            }
+            Err(error) => {
+                tracing::debug!(
+                    block = ?block,
+                    error = %error,
+                    "block trace resync source failed; falling back to point resync"
+                );
+            }
+        }
+    }
+
+    for group in storage_groups.iter_mut() {
+        let Some(trace) = traces.get(&group.block) else {
+            continue;
+        };
+        group.slots.retain(|slot| {
+            if let Some(value) = trace_storage_value(trace, slot.address, slot.slot) {
+                state_updates.push(StateUpdate::slot(slot.address, slot.slot, value));
+                return false;
+            }
+            cache
+                .cached_storage_value(slot.address, slot.slot)
+                .is_none()
+        });
+        group.seen = group
+            .slots
+            .iter()
+            .map(|slot| (slot.address, slot.slot))
+            .collect();
+    }
+    storage_groups.retain(|group| !group.slots.is_empty());
+
+    let mut unresolved_accounts = Vec::new();
+    for mut account in account_targets.drain(..) {
+        let Some(trace) = traces.get(&account.block) else {
+            unresolved_accounts.push(account);
+            continue;
+        };
+        let Some(trace_account) = trace
+            .accounts
+            .iter()
+            .find(|diff| diff.address == account.address)
+        else {
+            unresolved_accounts.push(account);
+            continue;
+        };
+
+        let mut patch = AccountPatch::default();
+        let mut unresolved = AccountFieldMask::default();
+        if account.fields.balance {
+            if let Some(balance) = trace_account.balance {
+                patch = patch.balance(balance);
+            } else {
+                unresolved.balance = true;
+            }
+        }
+        if account.fields.nonce {
+            if let Some(nonce) = trace_account.nonce {
+                patch = patch.nonce(nonce);
+            } else {
+                unresolved.nonce = true;
+            }
+        }
+        if account.fields.code {
+            if let Some(code) = &trace_account.code {
+                patch = patch.code(code.clone());
+            } else {
+                unresolved.code = true;
+            }
+        }
+
+        if patch.balance.is_some() || patch.nonce.is_some() || patch.code.is_some() {
+            state_updates.push(StateUpdate::account_upsert(account.address, patch));
+        }
+        if !account_field_mask_empty(unresolved) {
+            account.fields = unresolved;
+            unresolved_accounts.push(account);
+        }
+    }
+    *account_targets = unresolved_accounts;
+}
+
+fn trace_storage_value(trace: &BlockStateDiff, address: Address, slot: U256) -> Option<U256> {
+    trace
+        .accounts
+        .iter()
+        .find(|account| account.address == address)
+        .and_then(|account| {
+            account
+                .storage
+                .iter()
+                .find(|entry| entry.slot == slot)
+                .map(|entry| entry.value)
+        })
+}
+
+fn account_field_mask_empty(mask: AccountFieldMask) -> bool {
+    !mask.balance && !mask.nonce && !mask.code
+}
+
 fn execute_resync_requests(cache: &mut EvmCache, requests: &[ResyncRequest]) -> ResyncReport {
     let mut failed = Vec::new();
     let mut storage_groups: Vec<StorageFetchGroup> = Vec::new();
+    let mut account_targets: Vec<AccountResyncTarget> = Vec::new();
 
     for request in requests {
         for target in &request.targets {
@@ -1997,20 +3135,26 @@ fn execute_resync_requests(cache: &mut EvmCache, requests: &[ResyncRequest]) -> 
                         );
                     }
                 }
-                ResyncTarget::Account { .. } => failed.push(ResyncFailure {
-                    request_id: request.id.clone(),
-                    block: request.block.clone(),
-                    target: target.clone(),
-                    kind: ResyncFailureKind::UnsupportedAccountTarget,
-                    message:
-                        "account resync is unsupported until a provider-neutral account fetcher exists"
-                            .to_string(),
-                }),
+                ResyncTarget::Account { address, fields } => {
+                    account_targets.push(AccountResyncTarget {
+                        request_id: request.id.clone(),
+                        block: request.block.clone(),
+                        address: *address,
+                        fields: *fields,
+                    });
+                }
             }
         }
     }
 
     let mut state_updates = Vec::new();
+    resolve_trace_resyncs(
+        cache,
+        &mut storage_groups,
+        &mut account_targets,
+        &mut state_updates,
+    );
+
     if !storage_groups.is_empty() {
         if let Some(fetcher) = cache.storage_batch_fetcher().cloned() {
             for group in storage_groups {
@@ -2020,7 +3164,7 @@ fn execute_resync_requests(cache: &mut EvmCache, requests: &[ResyncRequest]) -> 
                     .iter()
                     .map(|slot| (slot.address, slot.slot))
                     .collect();
-                let results = (fetcher)(fetches, Some(resync_block_to_block_id(&block)));
+                let results = (fetcher)(fetches, resync_block_to_block_id(&block));
                 let mut pending: HashMap<(Address, U256), StorageFetchSlot> = group
                     .slots
                     .iter()
@@ -2074,6 +3218,103 @@ fn execute_resync_requests(cache: &mut EvmCache, requests: &[ResyncRequest]) -> 
                         "storage resync requires a storage batch fetcher".to_string(),
                     );
                 }
+            }
+        }
+    }
+
+    if !account_targets.is_empty() {
+        if let Some(fetcher) = cache.account_proof_fetcher().cloned() {
+            // ONE seam invocation per distinct resync block (targets may pin
+            // different blocks): eth_getProof is single-address at the RPC
+            // level, so batching the addresses lets the fetcher fan the
+            // requests out concurrently instead of paying one round trip per
+            // account. Root-only probes: account fields need no storage keys.
+            let mut groups: Vec<(BlockId, Vec<_>)> = Vec::new();
+            for account in account_targets {
+                let block_id = resync_block_to_block_id(&account.block);
+                match groups
+                    .iter_mut()
+                    .find(|(group_block, _)| *group_block == block_id)
+                {
+                    Some((_, group)) => group.push(account),
+                    None => groups.push((block_id, vec![account])),
+                }
+            }
+            for (block_id, group) in groups {
+                let probes: HashMap<Address, StorageFetchResult<AccountProof>> = (fetcher)(
+                    group
+                        .iter()
+                        .map(|account| (account.address, vec![]))
+                        .collect(),
+                    block_id,
+                )
+                .into_iter()
+                .collect();
+                for account in group {
+                    // `get` + clone rather than `remove`: two targets for the
+                    // same address in one group must both resolve from the
+                    // single probe.
+                    match probes.get(&account.address).cloned() {
+                        Some(Ok(proof)) => {
+                            // Build an authoritative account update from the requested
+                            // field mask. Use the MATERIALIZING `account_upsert` so a
+                            // resync applies even to a cold account (a partial `Account`
+                            // patch on a cold address is silently skipped).
+                            let mut patch = AccountPatch::default();
+                            if account.fields.balance {
+                                patch = patch.balance(proof.balance);
+                            }
+                            if account.fields.nonce {
+                                patch = patch.nonce(proof.nonce);
+                            }
+                            // Note: `AccountProof` carries `code_hash`, not code bytes;
+                            // the `eth_getProof` seam cannot supply runtime code, so a
+                            // code-field resync is a no-op here (code freshness is
+                            // handled by a later wave). We still materialize the account
+                            // so requested balance/nonce fields take effect.
+                            state_updates.push(StateUpdate::account_upsert(account.address, patch));
+                        }
+                        Some(Err(error)) => {
+                            failed.push(ResyncFailure {
+                                request_id: account.request_id,
+                                block: account.block,
+                                target: ResyncTarget::Account {
+                                    address: account.address,
+                                    fields: account.fields,
+                                },
+                                kind: ResyncFailureKind::AccountFetchFailed,
+                                message: error.to_string(),
+                            });
+                        }
+                        None => {
+                            failed.push(ResyncFailure {
+                                request_id: account.request_id,
+                                block: account.block,
+                                target: ResyncTarget::Account {
+                                    address: account.address,
+                                    fields: account.fields,
+                                },
+                                kind: ResyncFailureKind::AccountFetchOmitted,
+                                message:
+                                    "account proof fetcher did not return a result for address"
+                                        .to_string(),
+                            });
+                        }
+                    }
+                }
+            }
+        } else {
+            for account in account_targets {
+                failed.push(ResyncFailure {
+                    request_id: account.request_id,
+                    block: account.block,
+                    target: ResyncTarget::Account {
+                        address: account.address,
+                        fields: account.fields,
+                    },
+                    kind: ResyncFailureKind::MissingAccountFetcher,
+                    message: "account resync requires an account proof fetcher".to_string(),
+                });
             }
         }
     }
@@ -2556,7 +3797,11 @@ impl<N: Network> ReactiveHandler<N> for EventDecoderHandler {
 
 /// Provider-agnostic subscriber interface.
 pub trait EventSubscriber<N: Network = Ethereum>: Send {
-    /// Register interests with the subscriber.
+    /// Replace all interests registered with the subscriber.
+    ///
+    /// Implementations may use this as a full setup/reset operation. The
+    /// in-crate [`AlloySubscriber`] clears owner-scoped interest state and
+    /// delivery/dedupe bookkeeping when this method is called.
     fn register_interests(
         &mut self,
         interests: &[ReactiveInterest<N>],
@@ -2644,28 +3889,403 @@ impl Default for SubscriberReconnectConfig {
     }
 }
 
+/// Historical log backfill requested when adding subscriber interests.
+///
+/// Backfill applies only to [`ReactiveInterest::Logs`] entries. Block and
+/// pending-transaction interests are live-only. `AlloySubscriber` emits records
+/// fetched through this policy as [`InputSource::Backfill`] before attempting
+/// live stream initialization, and a drained backfill seeds the filter's
+/// delivery anchor at its resolved upper bound (even when the window held no
+/// logs), so the newly added filter gets the same reconnect/catch-up protection
+/// an established one has.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SubscriberBackfill {
+    from_block: u64,
+    to_block: Option<u64>,
+}
+
+impl SubscriberBackfill {
+    /// Backfill an inclusive block range.
+    pub fn range(from_block: u64, to_block: u64) -> Self {
+        Self {
+            from_block,
+            to_block: Some(to_block),
+        }
+    }
+
+    /// Backfill from `from_block` through the provider's latest block.
+    pub fn from_block(from_block: u64) -> Self {
+        Self {
+            from_block,
+            to_block: None,
+        }
+    }
+
+    /// First block included in the backfill.
+    pub fn start_block(&self) -> u64 {
+        self.from_block
+    }
+
+    /// Last block included in the backfill, or `None` for provider latest.
+    pub fn end_block(&self) -> Option<u64> {
+        self.to_block
+    }
+}
+
+/// Extension trait for subscribers that can add and remove handler-owned
+/// interests incrementally.
+///
+/// [`EventSubscriber::register_interests`] remains the full-replacement setup
+/// API. Implement this trait when a subscriber can preserve unrelated live
+/// sources and delivery state while one handler's interests are added or
+/// removed. Implementations should make owner *replacement* continuity-safe:
+/// updating an owner's interests must not silently discard delivery progress
+/// the previous interests had already established (the in-crate
+/// [`AlloySubscriber`] carries the owner's prior delivery anchor over to
+/// changed filter shapes and automatically backfills the gap).
+pub trait InterestOwnerSubscriber<N: Network = Ethereum>: EventSubscriber<N> {
+    /// Add or replace the interests owned by `owner`.
+    fn add_interest_owner(
+        &mut self,
+        owner: HandlerId,
+        interests: &[ReactiveInterest<N>],
+    ) -> Result<(), SubscriberError>;
+
+    /// Add or replace owner interests and schedule log backfill for that owner.
+    fn add_interest_owner_with_backfill(
+        &mut self,
+        owner: HandlerId,
+        interests: &[ReactiveInterest<N>],
+        backfill: SubscriberBackfill,
+    ) -> Result<(), SubscriberError>;
+
+    /// Remove one owner's interests, preserving unrelated interests.
+    fn remove_interest_owner(&mut self, owner: &HandlerId) -> Option<Vec<ReactiveInterest<N>>>;
+
+    /// Borrow the interests currently owned by `owner`.
+    fn owner_interests(&self, owner: &HandlerId) -> Option<&[ReactiveInterest<N>]>;
+}
+
+/// Binds a [`ReactiveRuntime`] to an [`EventSubscriber`] for the common
+/// subscribe-ingest lifecycle.
+///
+/// The engine treats the runtime registry as the single source of truth for
+/// handler lifecycle: [`register_handler`](Self::register_handler) and
+/// [`unregister_handler`](Self::unregister_handler) update runtime routing and
+/// subscriber interests as one operation, keyed by the handler's stable
+/// [`HandlerId`]. Registration is continuity-safe by default — once the runtime
+/// has journaled a canonical block, a newly registered handler is backfilled
+/// from that block, so a pool discovered in block *N* (say via a factory
+/// `PoolCreated` event) misses none of its own logs from *N* onward even though
+/// its live subscription starts later. Overlap between backfill and live
+/// delivery is absorbed by subscriber and runtime dedup.
+///
+/// Registration methods by intent:
+///
+/// | Method | Backfill |
+/// |---|---|
+/// | [`register_handler`](Self::register_handler) | from the runtime's last canonical block (live-only on a fresh runtime) |
+/// | [`register_handler_with_backfill`](Self::register_handler_with_backfill) | explicit range or anchor (deep history) |
+/// | [`register_handler_live_only`](Self::register_handler_live_only) | none — future logs only |
+///
+/// Unregistering a handler stops future subscription routing and runtime
+/// decode for that handler; it deliberately does not evict [`EvmCache`] state
+/// or undo runtime side effects. See
+/// [`unregister_handler`](Self::unregister_handler) for the complete teardown
+/// recipe.
+///
+/// The runtime and subscriber stay independently accessible through
+/// [`runtime_mut`](Self::runtime_mut) / [`subscriber_mut`](Self::subscriber_mut)
+/// for advanced use. One caution: avoid calling
+/// [`EventSubscriber::register_interests`] (the full-replacement setup API) on
+/// an engine-managed subscriber — implementations may clear owner-scoped
+/// bookkeeping, after which per-handler unregistration no longer releases the
+/// handler's transport subscriptions. To bootstrap the subscriber from a
+/// runtime that already has handlers, use
+/// [`sync_handler_interests`](Self::sync_handler_interests), which registers
+/// one owner per handler instead of one unowned blob.
+pub struct ReactiveEngine<S, N: Network = Ethereum> {
+    runtime: ReactiveRuntime<N>,
+    subscriber: S,
+}
+
+impl<S, N> ReactiveEngine<S, N>
+where
+    N: Network,
+    S: EventSubscriber<N>,
+{
+    /// Bind a runtime and subscriber.
+    pub fn new(runtime: ReactiveRuntime<N>, subscriber: S) -> Self {
+        Self {
+            runtime,
+            subscriber,
+        }
+    }
+
+    /// Split the engine into its runtime and subscriber parts.
+    pub fn into_parts(self) -> (ReactiveRuntime<N>, S) {
+        (self.runtime, self.subscriber)
+    }
+
+    /// Borrow the runtime.
+    pub fn runtime(&self) -> &ReactiveRuntime<N> {
+        &self.runtime
+    }
+
+    /// Mutably borrow the runtime.
+    pub fn runtime_mut(&mut self) -> &mut ReactiveRuntime<N> {
+        &mut self.runtime
+    }
+
+    /// Borrow the subscriber.
+    pub fn subscriber(&self) -> &S {
+        &self.subscriber
+    }
+
+    /// Mutably borrow the subscriber.
+    pub fn subscriber_mut(&mut self) -> &mut S {
+        &mut self.subscriber
+    }
+
+    /// Poll the subscriber for the next batch.
+    pub fn next_batch(&mut self) -> SubscriberNextBatch<'_, N> {
+        self.subscriber.next_batch()
+    }
+
+    /// Ingest one already-polled batch through the runtime (direct effects
+    /// only; surfaced resync requests are reported, not executed).
+    pub fn ingest_batch(
+        &mut self,
+        cache: &mut EvmCache,
+        batch: ReactiveInputBatch<N>,
+    ) -> Result<ReactiveBatchReport<N>, ReactiveError> {
+        self.runtime.ingest_batch(cache, batch)
+    }
+
+    /// Ingest one already-polled batch and execute the storage/account resyncs
+    /// it surfaces, exactly like
+    /// [`ReactiveRuntime::ingest_batch_with_resync`].
+    pub fn ingest_batch_with_resync(
+        &mut self,
+        cache: &mut EvmCache,
+        batch: ReactiveInputBatch<N>,
+    ) -> Result<ReactiveBatchReport<N>, ReactiveError> {
+        self.runtime.ingest_batch_with_resync(cache, batch)
+    }
+
+    /// Poll the subscriber once and ingest the returned batch when present
+    /// (direct effects only).
+    pub async fn next_ingest(
+        &mut self,
+        cache: &mut EvmCache,
+    ) -> Result<Option<ReactiveBatchReport<N>>, ReactiveEngineError> {
+        let Some(batch) = self.subscriber.next_batch().await? else {
+            return Ok(None);
+        };
+        Ok(Some(self.runtime.ingest_batch(cache, batch)?))
+    }
+
+    /// Poll the subscriber once and ingest the returned batch with resync
+    /// execution — the loop shape for consumers that rely on coverage-gap
+    /// repair (root-gate resyncs, handler-requested re-reads).
+    pub async fn next_ingest_with_resync(
+        &mut self,
+        cache: &mut EvmCache,
+    ) -> Result<Option<ReactiveBatchReport<N>>, ReactiveEngineError> {
+        let Some(batch) = self.subscriber.next_batch().await? else {
+            return Ok(None);
+        };
+        Ok(Some(self.runtime.ingest_batch_with_resync(cache, batch)?))
+    }
+}
+
+impl<S, N> ReactiveEngine<S, N>
+where
+    N: Network,
+    S: InterestOwnerSubscriber<N>,
+{
+    /// Register a handler with both the runtime and subscriber, backfilling its
+    /// log interests from the runtime's last canonical block.
+    ///
+    /// This is the continuity-safe default for mid-lifecycle registration: the
+    /// runtime already knows how far it has processed the chain, so the new
+    /// handler's logs are fetched from that block forward and no discovery gap
+    /// opens between "we decided to track this pool" and "its live subscription
+    /// started". On a runtime that has not journaled any canonical block yet
+    /// (fresh start, or `journal_depth` 0) registration is live-only, matching
+    /// pre-ingestion bootstrap. Use
+    /// [`register_handler_with_backfill`](Self::register_handler_with_backfill)
+    /// for deeper history or
+    /// [`register_handler_live_only`](Self::register_handler_live_only) to opt
+    /// out of backfill entirely.
+    ///
+    /// If subscriber registration fails, the runtime registration is rolled back
+    /// before the error is returned.
+    pub fn register_handler(
+        &mut self,
+        handler: Arc<dyn ReactiveHandler<N>>,
+    ) -> Result<(), ReactiveEngineRegisterError> {
+        let backfill = self
+            .runtime
+            .last_canonical_block()
+            .map(|block| SubscriberBackfill::from_block(block.number));
+        self.register_handler_inner(handler, backfill)
+    }
+
+    /// Register a handler and request an explicit owner-scoped log backfill for
+    /// its interests (deep history / custom anchors).
+    ///
+    /// If subscriber registration fails, the runtime registration is rolled back
+    /// before the error is returned.
+    pub fn register_handler_with_backfill(
+        &mut self,
+        handler: Arc<dyn ReactiveHandler<N>>,
+        backfill: SubscriberBackfill,
+    ) -> Result<(), ReactiveEngineRegisterError> {
+        self.register_handler_inner(handler, Some(backfill))
+    }
+
+    /// Register a handler without any log backfill — only logs delivered after
+    /// its live subscription starts are routed to it.
+    ///
+    /// If subscriber registration fails, the runtime registration is rolled back
+    /// before the error is returned.
+    pub fn register_handler_live_only(
+        &mut self,
+        handler: Arc<dyn ReactiveHandler<N>>,
+    ) -> Result<(), ReactiveEngineRegisterError> {
+        self.register_handler_inner(handler, None)
+    }
+
+    fn register_handler_inner(
+        &mut self,
+        handler: Arc<dyn ReactiveHandler<N>>,
+        backfill: Option<SubscriberBackfill>,
+    ) -> Result<(), ReactiveEngineRegisterError> {
+        let id = handler.id();
+        self.runtime.register_handler(handler)?;
+        let interests = self
+            .runtime
+            .handler_interests(&id)
+            .expect("handler was just registered")
+            .to_vec();
+
+        let subscribed = match backfill {
+            Some(backfill) => {
+                self.subscriber
+                    .add_interest_owner_with_backfill(id.clone(), &interests, backfill)
+            }
+            None => self.subscriber.add_interest_owner(id.clone(), &interests),
+        };
+        if let Err(error) = subscribed {
+            self.runtime.unregister_handler(&id);
+            return Err(error.into());
+        }
+
+        Ok(())
+    }
+
+    /// Register every handler currently in the runtime registry as a subscriber
+    /// interest owner.
+    ///
+    /// This is the bootstrap path for an engine built around a pre-populated
+    /// runtime: each handler becomes its own owner (upsert semantics, so
+    /// rerunning is safe and already-registered owners are refreshed in place).
+    /// No backfill is requested — bootstrap happens before ingestion starts, so
+    /// there is no processed position to be continuous with; use
+    /// [`register_handler_with_backfill`](Self::register_handler_with_backfill)
+    /// for handlers that need history. Owners are not removed by this call: use
+    /// [`unregister_handler`](Self::unregister_handler) for lifecycle removal
+    /// rather than mutating the runtime registry directly.
+    ///
+    /// On error, owners already synced stay registered (upserts are
+    /// independent); the call can simply be retried.
+    pub fn sync_handler_interests(&mut self) -> Result<(), SubscriberError> {
+        for id in self.runtime.handler_ids() {
+            let interests = self
+                .runtime
+                .handler_interests(&id)
+                .map(<[ReactiveInterest<N>]>::to_vec)
+                .unwrap_or_default();
+            self.subscriber.add_interest_owner(id, &interests)?;
+        }
+        Ok(())
+    }
+
+    /// Unregister a handler from both the subscriber and runtime.
+    ///
+    /// Subscriber interests are removed first so no new live records are routed
+    /// to a handler after it has left the runtime registry. Returns the removed
+    /// handler when the id was registered.
+    ///
+    /// This is the routing/transport half of dropping an adapter. State the
+    /// handler accumulated is deliberately left in place; the complete teardown
+    /// for a pool or adapter that will not return is:
+    ///
+    /// ```text
+    /// engine.unregister_handler(&id);
+    /// for address in handler_addresses {
+    ///     // stop root-gate eth_getProof probes for the account
+    ///     engine.runtime_mut().untrack_account(address);
+    ///     // drop its queued (unexecuted) repair work from the pending ledger
+    ///     engine.runtime_mut().cancel_pending_resyncs(address);
+    /// }
+    /// // optional: evict cached state via StateUpdate::purge / cache purge APIs
+    /// ```
+    ///
+    /// Health, metrics, the reorg journal, hooks, and freshness stamps are
+    /// runtime-global and are never touched by handler removal.
+    pub fn unregister_handler(&mut self, id: &HandlerId) -> Option<Arc<dyn ReactiveHandler<N>>> {
+        self.subscriber.remove_interest_owner(id);
+        self.runtime.unregister_handler(id)
+    }
+}
+
 /// Alloy-backed event subscriber.
 ///
 /// The default transport slice drives Alloy pubsub subscriptions for logs,
 /// block headers, and pending transaction hashes. The HTTP polling `watch_*`
 /// transport remains available behind the opt-in `reactive-polling` feature.
 /// Pubsub streams reconnect automatically after termination, and log
-/// subscriptions are backfilled from the last seen block. Full pending
-/// transaction hydration, full block bodies, and arbitrary historical backfill
-/// remain explicit follow-up work.
+/// subscriptions are backfilled from the last seen block. Owner-scoped log
+/// additions can request backfill from an explicit block anchor. Full pending
+/// transaction hydration and full block bodies remain explicit follow-up work.
 /// With no registered interests, [`EventSubscriber::next_batch`] returns
 /// `Ok(None)`.
 pub struct AlloySubscriber<P, N: Network = Ethereum> {
     provider: P,
     mode: SubscriberMode,
     config: SubscriberConfig,
+    base_interests: Vec<ReactiveInterest<N>>,
+    owned_interests: Vec<OwnedSubscriberInterests<N>>,
     interests: Vec<ReactiveInterest<N>>,
+    /// Stable source id per distinct live log filter. Ids key delivery anchors
+    /// and live `SubscriberEvent`s; entries are retired (and their anchors
+    /// pruned) when no base or owner interest references the filter anymore, so
+    /// long-lived owner churn cannot grow this map unboundedly.
+    log_source_ids: HashMap<Filter, usize>,
+    next_log_source_id: usize,
+    pending_backfills: VecDeque<QueuedSubscriberBackfill>,
+    /// Set when interest bookkeeping changed since the last successful stream
+    /// reconcile, so steady-state polling skips the desired-vs-live diff.
+    sources_dirty: bool,
     state: AlloySubscriberState<N>,
     pending_records: VecDeque<ReactiveInputRecord<N>>,
     last_seen_log_blocks: HashMap<usize, u64>,
     recent_input_refs: VecDeque<InputRef>,
     recent_input_ref_set: HashSet<InputRef>,
     _network: PhantomData<N>,
+}
+
+struct OwnedSubscriberInterests<N: Network = Ethereum> {
+    owner: HandlerId,
+    interests: Vec<ReactiveInterest<N>>,
+}
+
+struct QueuedSubscriberBackfill {
+    owner: HandlerId,
+    filter: Filter,
+    backfill: SubscriberBackfill,
 }
 
 /// Best-effort installation of rustls' `ring` crypto provider as the process
@@ -2691,7 +4311,13 @@ impl<P, N: Network> AlloySubscriber<P, N> {
             provider,
             mode,
             config,
+            base_interests: Vec::new(),
+            owned_interests: Vec::new(),
             interests: Vec::new(),
+            log_source_ids: HashMap::new(),
+            next_log_source_id: 0,
+            pending_backfills: VecDeque::new(),
+            sources_dirty: true,
             state: AlloySubscriberState::Uninitialized,
             pending_records: VecDeque::new(),
             last_seen_log_blocks: HashMap::new(),
@@ -2716,9 +4342,214 @@ impl<P, N: Network> AlloySubscriber<P, N> {
         &self.config
     }
 
-    /// Registered interests.
+    /// Registered interests across base and owner-scoped registrations.
     pub fn registered_interests(&self) -> &[ReactiveInterest<N>] {
         &self.interests
+    }
+
+    /// Add or replace the interests owned by `owner`.
+    ///
+    /// This preserves unrelated owners, queued/pending records, recent dedupe
+    /// state, and last-seen log anchors. The live transport is reconciled on the
+    /// next [`EventSubscriber::next_batch`] call so newly added log filters can
+    /// be subscribed without rebuilding the whole subscriber object.
+    ///
+    /// Replacing an existing owner is continuity-safe: filters the owner
+    /// already had keep their delivery anchors, and any changed or new filter
+    /// shape is automatically backfilled from the owner's oldest prior anchor —
+    /// growing a pool set on an established owner does not open a delivery gap
+    /// for what the old subscription had already covered. A brand-new owner has
+    /// no anchor to inherit; pass an explicit
+    /// [`add_interest_owner_with_backfill`](Self::add_interest_owner_with_backfill)
+    /// anchor (or register through [`ReactiveEngine::register_handler`], which
+    /// anchors to the runtime's last canonical block).
+    pub fn add_interest_owner(
+        &mut self,
+        owner: HandlerId,
+        interests: &[ReactiveInterest<N>],
+    ) -> Result<(), SubscriberError> {
+        self.set_interest_owner(owner, interests, None)
+    }
+
+    /// Add or replace owner interests and schedule log backfill for that owner.
+    ///
+    /// Backfill is queued only for log interests; block and pending transaction
+    /// interests are live-only. Queued backfill is drained before live stream
+    /// initialization, its resolved upper bound seeds the filter's delivery
+    /// anchor, and the anchored filter is caught up again right after its live
+    /// stream connects — so the discovery boundary is closed end to end as long
+    /// as `backfill` starts at (or before) the block the interest was
+    /// discovered in. Continuity backfill for a replaced owner (see
+    /// [`add_interest_owner`](Self::add_interest_owner)) is queued in addition,
+    /// unless this explicit backfill is open-ended and already starts at or
+    /// below the owner's prior anchor.
+    pub fn add_interest_owner_with_backfill(
+        &mut self,
+        owner: HandlerId,
+        interests: &[ReactiveInterest<N>],
+        backfill: SubscriberBackfill,
+    ) -> Result<(), SubscriberError> {
+        self.set_interest_owner(owner, interests, Some(backfill))
+    }
+
+    /// Remove one owner's interests, preserving unrelated owner/base interests.
+    ///
+    /// The owner's queued backfills are dropped, and source-id/anchor
+    /// bookkeeping for filters no other owner references is retired. Live
+    /// streams for retired filters are torn down on the next
+    /// [`EventSubscriber::next_batch`] call (dropping an Alloy subscription
+    /// unsubscribes provider-side); events already in flight from them stop
+    /// matching the merged interest set and are discarded.
+    pub fn remove_interest_owner(&mut self, owner: &HandlerId) -> Option<Vec<ReactiveInterest<N>>> {
+        let index = self
+            .owned_interests
+            .iter()
+            .position(|entry| &entry.owner == owner)?;
+        let removed = self.owned_interests.remove(index).interests;
+        self.pending_backfills
+            .retain(|backfill| &backfill.owner != owner);
+        self.rebuild_registered_interests();
+        self.retire_unreferenced_filters();
+        self.sources_dirty = true;
+        Some(removed)
+    }
+
+    /// Borrow the interests currently owned by `owner`.
+    pub fn owner_interests(&self, owner: &HandlerId) -> Option<&[ReactiveInterest<N>]> {
+        self.owned_interests
+            .iter()
+            .find(|entry| &entry.owner == owner)
+            .map(|entry| entry.interests.as_slice())
+    }
+
+    fn set_interest_owner(
+        &mut self,
+        owner: HandlerId,
+        interests: &[ReactiveInterest<N>],
+        backfill: Option<SubscriberBackfill>,
+    ) -> Result<(), SubscriberError> {
+        validate_subscriber_config(&self.config)?;
+
+        let mut next_owned = self.clone_owned_interests();
+        match next_owned.iter_mut().find(|entry| entry.owner == owner) {
+            Some(entry) => entry.interests = interests.to_vec(),
+            None => next_owned.push(OwnedSubscriberInterests {
+                owner: owner.clone(),
+                interests: interests.to_vec(),
+            }),
+        }
+        let next_registered = aggregate_interests(&self.base_interests, &next_owned);
+        validate_supported_interests(self.mode, &self.config, &next_registered)?;
+
+        // Continuity capture, before the mutation lands: the owner's previous
+        // filter shapes and the oldest delivery anchor among them. A changed
+        // filter gets a fresh source id with no anchor, so without this
+        // hand-off, replacing an owner's interests (the normal way to grow a
+        // pool set) would silently discard the delivery watermark and open a
+        // gap until some later explicit backfill.
+        let previous_filters: Vec<Filter> = self
+            .owner_interests(&owner)
+            .map(log_filters)
+            .unwrap_or_default();
+        let continuity_anchor: Option<u64> = previous_filters
+            .iter()
+            .filter_map(|filter| self.log_anchor(filter))
+            .min();
+
+        self.owned_interests = next_owned;
+        self.interests = next_registered;
+        self.retire_unreferenced_filters();
+        self.sources_dirty = true;
+
+        // Re-queue this owner's backfills from scratch: previously queued
+        // entries may reference filter shapes that no longer exist.
+        self.pending_backfills
+            .retain(|queued| queued.owner != owner);
+        for filter in log_filters(interests) {
+            if let Some(backfill) = backfill {
+                self.pending_backfills.push_back(QueuedSubscriberBackfill {
+                    owner: owner.clone(),
+                    filter: filter.clone(),
+                    backfill,
+                });
+            }
+
+            // Continuity backfill for changed/new shapes only: an unchanged
+            // filter kept its anchor and its live stream, and an open-ended
+            // explicit backfill starting at or below the anchor already covers
+            // the window.
+            let unchanged = previous_filters.contains(&filter);
+            let explicit_covers = backfill.is_some_and(|explicit| {
+                explicit.end_block().is_none()
+                    && continuity_anchor.is_some_and(|anchor| explicit.start_block() <= anchor)
+            });
+            if let Some(anchor) = continuity_anchor
+                && !unchanged
+                && !explicit_covers
+            {
+                self.pending_backfills.push_back(QueuedSubscriberBackfill {
+                    owner: owner.clone(),
+                    filter,
+                    backfill: SubscriberBackfill::from_block(anchor),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn clone_owned_interests(&self) -> Vec<OwnedSubscriberInterests<N>> {
+        self.owned_interests
+            .iter()
+            .map(|entry| OwnedSubscriberInterests {
+                owner: entry.owner.clone(),
+                interests: entry.interests.clone(),
+            })
+            .collect()
+    }
+
+    fn rebuild_registered_interests(&mut self) {
+        self.interests = aggregate_interests(&self.base_interests, &self.owned_interests);
+    }
+
+    /// Delivery anchor (last block known fully delivered) for `filter`, if the
+    /// filter has a source id and has seen delivery.
+    fn log_anchor(&self, filter: &Filter) -> Option<u64> {
+        let id = self.log_source_ids.get(filter)?;
+        self.last_seen_log_blocks.get(id).copied()
+    }
+
+    /// Every live log filter across base and owner interests — merged within
+    /// each origin (owner boundaries are preserved so one owner's churn cannot
+    /// rewrite another's subscription), then deduplicated across origins so an
+    /// identical shape shared by several owners maps to exactly one stream and
+    /// one delivery anchor.
+    // `Filter` derives `Hash`/`Eq` and has no interior mutability; the
+    // `mutable_key_type` lint is a known false positive for it.
+    #[allow(clippy::mutable_key_type)]
+    fn log_stream_filters(&self) -> Vec<Filter> {
+        let mut filters = log_filters(&self.base_interests);
+        for entry in &self.owned_interests {
+            filters.extend(log_filters(&entry.interests));
+        }
+        let mut seen = HashSet::new();
+        filters.retain(|filter| seen.insert(filter.clone()));
+        filters
+    }
+
+    /// Drop source-id and anchor bookkeeping for filters no longer referenced
+    /// by any base or owner interest, so long-lived owner churn cannot grow the
+    /// maps unboundedly. Live streams for retired filters are pruned by the
+    /// next reconcile.
+    // `Filter` derives `Hash`/`Eq` and has no interior mutability; the
+    // `mutable_key_type` lint is a known false positive for it.
+    #[allow(clippy::mutable_key_type)]
+    fn retire_unreferenced_filters(&mut self) {
+        let live: HashSet<Filter> = self.log_stream_filters().into_iter().collect();
+        self.log_source_ids
+            .retain(|filter, _| live.contains(filter));
+        let live_ids: HashSet<usize> = self.log_source_ids.values().copied().collect();
+        self.last_seen_log_blocks
+            .retain(|id, _| live_ids.contains(id));
     }
 
     fn drain_next_batch(&mut self) -> Option<ReactiveInputBatch<N>> {
@@ -2736,6 +4567,42 @@ impl<P, N: Network> AlloySubscriber<P, N> {
         self.last_seen_log_blocks.clear();
         self.recent_input_refs.clear();
         self.recent_input_ref_set.clear();
+        self.pending_backfills.clear();
+        self.log_source_ids.clear();
+        self.next_log_source_id = 0;
+        self.sources_dirty = true;
+    }
+}
+
+impl<P, N> InterestOwnerSubscriber<N> for AlloySubscriber<P, N>
+where
+    P: Provider<N> + Send + Sync,
+    N: Network + 'static,
+    N::HeaderResponse: Send + 'static,
+{
+    fn add_interest_owner(
+        &mut self,
+        owner: HandlerId,
+        interests: &[ReactiveInterest<N>],
+    ) -> Result<(), SubscriberError> {
+        AlloySubscriber::add_interest_owner(self, owner, interests)
+    }
+
+    fn add_interest_owner_with_backfill(
+        &mut self,
+        owner: HandlerId,
+        interests: &[ReactiveInterest<N>],
+        backfill: SubscriberBackfill,
+    ) -> Result<(), SubscriberError> {
+        AlloySubscriber::add_interest_owner_with_backfill(self, owner, interests, backfill)
+    }
+
+    fn remove_interest_owner(&mut self, owner: &HandlerId) -> Option<Vec<ReactiveInterest<N>>> {
+        AlloySubscriber::remove_interest_owner(self, owner)
+    }
+
+    fn owner_interests(&self, owner: &HandlerId) -> Option<&[ReactiveInterest<N>]> {
+        AlloySubscriber::owner_interests(self, owner)
     }
 }
 
@@ -2746,26 +4613,109 @@ enum AlloySubscriberState<N: Network> {
 }
 
 struct SubscriberStreams<N: Network> {
-    streams: SelectAll<BoxStream<'static, SubscriberEvent<N>>>,
+    entries: Vec<SubscriberStreamEntry<N>>,
+    next_index: usize,
+}
+
+struct SubscriberStreamEntry<N: Network> {
+    source: SubscriberStreamSource,
+    stream: BoxStream<'static, SubscriberEvent<N>>,
 }
 
 impl<N: Network> SubscriberStreams<N> {
     fn new() -> Self {
         Self {
-            streams: SelectAll::new(),
+            entries: Vec::new(),
+            next_index: 0,
         }
     }
 
     fn is_empty(&self) -> bool {
-        self.streams.is_empty()
+        self.entries.is_empty()
     }
 
-    fn push(&mut self, stream: BoxStream<'static, SubscriberEvent<N>>) {
-        self.streams.push(stream);
+    fn push(
+        &mut self,
+        source: SubscriberStreamSource,
+        stream: BoxStream<'static, SubscriberEvent<N>>,
+    ) {
+        self.entries.push(SubscriberStreamEntry { source, stream });
+    }
+
+    #[cfg(all(test, feature = "reactive-ws"))]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn contains_source(&self, source: &SubscriberStreamSource) -> bool {
+        self.entries
+            .iter()
+            .any(|entry| entry.source.same_key(source))
+    }
+
+    fn retain_sources(&mut self, sources: &[SubscriberStreamSource]) {
+        self.entries
+            .retain(|entry| sources.iter().any(|source| entry.source.same_key(source)));
+        self.normalize_next_index();
+    }
+
+    fn normalize_next_index(&mut self) {
+        if self.entries.is_empty() {
+            self.next_index = 0;
+        } else if self.next_index >= self.entries.len() {
+            self.next_index %= self.entries.len();
+        }
     }
 
     async fn next(&mut self) -> Option<SubscriberEvent<N>> {
-        self.streams.next().await
+        poll_fn(|cx| {
+            self.normalize_next_index();
+            if self.entries.is_empty() {
+                return std::task::Poll::Ready(None);
+            }
+
+            let mut index = self.next_index;
+            let mut checked = 0usize;
+            while checked < self.entries.len() {
+                if index >= self.entries.len() {
+                    index = 0;
+                }
+                match self.entries[index].stream.as_mut().poll_next(cx) {
+                    std::task::Poll::Ready(Some(event)) => {
+                        if matches!(event, SubscriberEvent::StreamTerminated(_)) {
+                            self.entries.remove(index);
+                            self.next_index = if self.entries.is_empty() {
+                                0
+                            } else {
+                                index % self.entries.len()
+                            };
+                        } else {
+                            self.next_index = (index + 1) % self.entries.len();
+                        }
+                        return std::task::Poll::Ready(Some(event));
+                    }
+                    std::task::Poll::Ready(None) => {
+                        self.entries.remove(index);
+                        if self.entries.is_empty() {
+                            self.next_index = 0;
+                            return std::task::Poll::Ready(None);
+                        }
+                    }
+                    std::task::Poll::Pending => {
+                        checked += 1;
+                        index += 1;
+                    }
+                }
+            }
+
+            if self.entries.is_empty() {
+                std::task::Poll::Ready(None)
+            } else {
+                self.next_index = index % self.entries.len();
+                std::task::Poll::Pending
+            }
+        })
+        .await
     }
 }
 
@@ -2802,6 +4752,19 @@ impl SubscriberStreamSource {
             Self::PubSubLog { .. } | Self::PubSubPendingHashes | Self::PubSubBlockHeaders
         )
     }
+
+    fn same_key(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::PubSubLog { filter: left, .. }, Self::PubSubLog { filter: right, .. })
+            | (Self::PollingLog { filter: left }, Self::PollingLog { filter: right }) => {
+                left == right
+            }
+            (Self::PubSubPendingHashes, Self::PubSubPendingHashes)
+            | (Self::PubSubBlockHeaders, Self::PubSubBlockHeaders)
+            | (Self::PollingPendingHashes, Self::PollingPendingHashes) => true,
+            _ => false,
+        }
+    }
 }
 
 #[allow(dead_code)]
@@ -2828,7 +4791,9 @@ where
         validate_subscriber_config(&self.config)?;
         validate_supported_interests(self.mode, &self.config, interests)?;
 
-        self.interests = interests.to_vec();
+        self.base_interests = interests.to_vec();
+        self.owned_interests.clear();
+        self.rebuild_registered_interests();
         self.reset_delivery_state();
         self.state = AlloySubscriberState::Uninitialized;
         Ok(())
@@ -2840,17 +4805,18 @@ where
                 return Ok(Some(batch));
             }
 
-            if self.interests.is_empty() {
-                return Ok(None);
+            self.drain_pending_backfills().await?;
+            if let Some(batch) = self.drain_next_batch() {
+                return Ok(Some(batch));
             }
 
-            if matches!(self.state, AlloySubscriberState::Uninitialized) {
-                let streams = self.init_streams().await?;
-                self.state = if streams.is_empty() {
-                    AlloySubscriberState::Empty
-                } else {
-                    AlloySubscriberState::Active(streams)
-                };
+            self.ensure_streams().await?;
+            if let Some(batch) = self.drain_next_batch() {
+                return Ok(Some(batch));
+            }
+
+            if self.interests.is_empty() {
+                return Ok(None);
             }
 
             loop {
@@ -2873,19 +4839,194 @@ where
     N: Network + 'static,
     N::HeaderResponse: Send + 'static,
 {
-    async fn init_streams(&mut self) -> Result<SubscriberStreams<N>, SubscriberError> {
-        let mut streams = SubscriberStreams::new();
-        for source in self.stream_sources()? {
-            streams.push(self.connect_source_stream(source).await?);
+    /// Bring live streams in line with the current interest set.
+    ///
+    /// Runs incrementally: the desired-vs-live diff only happens when interest
+    /// bookkeeping changed since the last successful pass (`sources_dirty`), so
+    /// steady-state polling costs nothing here. Missing sources are connected,
+    /// sources for retired filters are dropped (dropping an Alloy subscription
+    /// unsubscribes provider-side), and unrelated live streams — with their
+    /// delivery and anchor state — are left untouched.
+    ///
+    /// A newly connected log source whose filter already has a delivery anchor
+    /// is caught up from that anchor immediately after subscribing (the same
+    /// subscribe-then-backfill order the reconnect path uses). Together with
+    /// anchor seeding in [`Self::drain_pending_backfills`], that closes the
+    /// window between an adoption backfill and live stream start.
+    async fn ensure_streams(&mut self) -> Result<(), SubscriberError> {
+        if !self.sources_dirty {
+            return Ok(());
         }
-        Ok(streams)
+        // An interest-less subscriber stays Uninitialized and never touches the
+        // provider ([`EventSubscriber::next_batch`] returns `Ok(None)`),
+        // matching setup-before-interests behavior.
+        if matches!(self.state, AlloySubscriberState::Uninitialized) && self.interests.is_empty() {
+            return Ok(());
+        }
+
+        let desired = self.stream_sources()?;
+        let missing: Vec<SubscriberStreamSource> = match &self.state {
+            AlloySubscriberState::Active(streams) => desired
+                .iter()
+                .filter(|source| !streams.contains_source(source))
+                .cloned()
+                .collect(),
+            AlloySubscriberState::Uninitialized | AlloySubscriberState::Empty => desired.clone(),
+        };
+
+        let mut connected = Vec::new();
+        for source in missing {
+            let stream = self.connect_source_stream(source.clone()).await?;
+            // Anchored catch-up for a source with a known delivery watermark
+            // (seeded by a drained adoption backfill, or inherited from a
+            // filter shape that was live before): subscribe first, then fetch
+            // the gap, so nothing lands between the two.
+            if let Some(event) = self.backfill_reconnected_source(&source).await? {
+                self.enqueue_event(event);
+            }
+            connected.push((source, stream));
+        }
+
+        match &mut self.state {
+            AlloySubscriberState::Active(streams) => {
+                streams.retain_sources(&desired);
+                for (source, stream) in connected {
+                    streams.push(source, stream);
+                }
+                if streams.is_empty() {
+                    self.state = AlloySubscriberState::Empty;
+                }
+            }
+            AlloySubscriberState::Uninitialized | AlloySubscriberState::Empty => {
+                let mut streams = SubscriberStreams::new();
+                for (source, stream) in connected {
+                    streams.push(source, stream);
+                }
+                self.state = if streams.is_empty() {
+                    AlloySubscriberState::Empty
+                } else {
+                    AlloySubscriberState::Active(streams)
+                };
+            }
+        }
+
+        self.sources_dirty = false;
+        Ok(())
     }
 
-    fn stream_sources(&self) -> Result<Vec<SubscriberStreamSource>, SubscriberError> {
-        match resolve_subscriber_transport(self.mode)? {
-            SubscriberTransport::PubSub => Ok(pubsub_stream_sources(&self.interests)),
-            SubscriberTransport::Polling => Ok(polling_stream_sources(&self.interests)),
+    /// Fetch queued adoption/continuity backfills, oldest first.
+    ///
+    /// An entry is consumed only after its `get_logs` fetch succeeds — a
+    /// transient RPC failure surfaces the error and leaves the entry queued for
+    /// the next poll, so a flaky request cannot silently discard the missed
+    /// window the backfill exists to close. Open-ended backfills resolve their
+    /// upper bound to the provider's current head before fetching, and every
+    /// drained backfill advances the filter's delivery anchor to that bound —
+    /// even a zero-log window — so the filter is reconnect-protected from then
+    /// on. Draining pauses as soon as records are ready for delivery; remaining
+    /// entries stay queued.
+    async fn drain_pending_backfills(&mut self) -> Result<(), SubscriberError> {
+        while let Some(queued) = self.pending_backfills.front() {
+            // Owner was removed while its backfill was queued.
+            if self.owner_interests(&queued.owner).is_none() {
+                self.pending_backfills.pop_front();
+                continue;
+            }
+            let filter = queued.filter.clone();
+            let backfill = queued.backfill;
+
+            let to_block = match backfill.end_block() {
+                Some(to_block) => to_block,
+                None => self
+                    .provider
+                    .get_block_number()
+                    .await
+                    .map_err(provider_error)?,
+            };
+            if to_block < backfill.start_block() {
+                // Anchor already at (or past) the provider head: nothing to
+                // fetch, and the anchor keeps its current value.
+                self.pending_backfills.pop_front();
+                continue;
+            }
+
+            let range = filter
+                .clone()
+                .from_block(backfill.start_block())
+                .to_block(to_block);
+            let logs = self
+                .provider
+                .get_logs(&range)
+                .await
+                .map_err(provider_error)?;
+
+            // Fetch succeeded: consume the entry, deliver, and advance the
+            // anchor through the fetched bound.
+            self.pending_backfills.pop_front();
+            let source_id = self.log_source_id(&filter);
+            self.enqueue_backfilled_logs(logs, Some(source_id));
+            let anchor = self
+                .last_seen_log_blocks
+                .entry(source_id)
+                .or_insert(to_block);
+            *anchor = (*anchor).max(to_block);
+
+            if !self.pending_records.is_empty() {
+                break;
+            }
         }
+        Ok(())
+    }
+
+    fn stream_sources(&mut self) -> Result<Vec<SubscriberStreamSource>, SubscriberError> {
+        match resolve_subscriber_transport(self.mode)? {
+            SubscriberTransport::PubSub => Ok(self.pubsub_stream_sources()),
+            SubscriberTransport::Polling => Ok(self.polling_stream_sources()),
+        }
+    }
+
+    fn pubsub_stream_sources(&mut self) -> Vec<SubscriberStreamSource> {
+        let mut sources = Vec::new();
+
+        for filter in self.log_stream_filters() {
+            let id = self.log_source_id(&filter);
+            sources.push(SubscriberStreamSource::PubSubLog { id, filter });
+        }
+
+        if needs_pending_hash_stream(&self.interests) {
+            sources.push(SubscriberStreamSource::PubSubPendingHashes);
+        }
+
+        if needs_header_block_stream(&self.interests) {
+            sources.push(SubscriberStreamSource::PubSubBlockHeaders);
+        }
+
+        sources
+    }
+
+    fn polling_stream_sources(&self) -> Vec<SubscriberStreamSource> {
+        let mut sources = Vec::new();
+
+        for filter in self.log_stream_filters() {
+            sources.push(SubscriberStreamSource::PollingLog { filter });
+        }
+
+        if needs_pending_hash_stream(&self.interests) {
+            sources.push(SubscriberStreamSource::PollingPendingHashes);
+        }
+
+        sources
+    }
+
+    fn log_source_id(&mut self, filter: &Filter) -> usize {
+        if let Some(id) = self.log_source_ids.get(filter) {
+            return *id;
+        }
+
+        let id = self.next_log_source_id;
+        self.next_log_source_id = self.next_log_source_id.saturating_add(1);
+        self.log_source_ids.insert(filter.clone(), id);
+        id
     }
 
     async fn connect_source_stream(
@@ -3089,13 +5230,7 @@ where
                 }
             }
             SubscriberEvent::BackfilledLogs { source_id, logs } => {
-                for log in logs {
-                    if log_matches_any_interest(&log, &self.interests) {
-                        let record = log_input_record(log, InputSource::Backfill);
-                        self.note_log_block(source_id, &record);
-                        self.enqueue_record(record);
-                    }
-                }
+                self.enqueue_backfilled_logs(logs, Some(source_id));
             }
             SubscriberEvent::Logs(logs) => self.pending_records.extend(
                 logs.into_iter()
@@ -3118,6 +5253,18 @@ where
                     .map(|hash| pending_hash_input_record::<N>(hash, InputSource::Poll)),
             ),
             SubscriberEvent::StreamTerminated(_) => {}
+        }
+    }
+
+    fn enqueue_backfilled_logs(&mut self, logs: Vec<Log>, source_id: Option<usize>) {
+        for log in logs {
+            if log_matches_any_interest(&log, &self.interests) {
+                let record = log_input_record(log, InputSource::Backfill);
+                if let Some(source_id) = source_id {
+                    self.note_log_block(source_id, &record);
+                }
+                self.enqueue_record(record);
+            }
         }
     }
 
@@ -3177,7 +5324,7 @@ where
         let backfill_event = self.backfill_reconnected_source(&source).await?;
 
         match &mut self.state {
-            AlloySubscriberState::Active(streams) => streams.push(stream),
+            AlloySubscriberState::Active(streams) => streams.push(source, stream),
             AlloySubscriberState::Uninitialized | AlloySubscriberState::Empty => {
                 return Err(SubscriberError::Provider(
                     "Alloy subscriber state changed before reconnect completed".to_owned(),
@@ -3259,6 +5406,7 @@ where
     }
 }
 
+#[cfg(any(feature = "reactive-ws", feature = "reactive-polling", test))]
 fn stream_with_termination<N, S>(
     stream: S,
     source: SubscriberStreamSource,
@@ -3274,40 +5422,18 @@ where
         .boxed()
 }
 
-fn pubsub_stream_sources<N: Network>(
-    interests: &[ReactiveInterest<N>],
-) -> Vec<SubscriberStreamSource> {
-    let mut sources = Vec::new();
-
-    for (id, filter) in log_filters(interests).into_iter().enumerate() {
-        sources.push(SubscriberStreamSource::PubSubLog { id, filter });
-    }
-
-    if needs_pending_hash_stream(interests) {
-        sources.push(SubscriberStreamSource::PubSubPendingHashes);
-    }
-
-    if needs_header_block_stream(interests) {
-        sources.push(SubscriberStreamSource::PubSubBlockHeaders);
-    }
-
-    sources
-}
-
-fn polling_stream_sources<N: Network>(
-    interests: &[ReactiveInterest<N>],
-) -> Vec<SubscriberStreamSource> {
-    let mut sources = Vec::new();
-
-    for filter in log_filters(interests) {
-        sources.push(SubscriberStreamSource::PollingLog { filter });
-    }
-
-    if needs_pending_hash_stream(interests) {
-        sources.push(SubscriberStreamSource::PollingPendingHashes);
-    }
-
-    sources
+fn aggregate_interests<N: Network>(
+    base: &[ReactiveInterest<N>],
+    owned: &[OwnedSubscriberInterests<N>],
+) -> Vec<ReactiveInterest<N>> {
+    base.iter()
+        .cloned()
+        .chain(
+            owned
+                .iter()
+                .flat_map(|entry| entry.interests.iter().cloned()),
+        )
+        .collect()
 }
 
 fn stream_terminated_error(source: &SubscriberStreamSource) -> SubscriberError {
@@ -3409,21 +5535,35 @@ mod subscriber_helper_tests {
     }
 
     #[test]
+    #[cfg(feature = "reactive-ws")]
     fn pubsub_sources_assign_stable_log_ids_before_shared_streams() {
-        let sources = pubsub_stream_sources::<Ethereum>(&[
-            ReactiveInterest::Logs(LogInterest {
-                provider_filter: Filter::new().address(Address::repeat_byte(0x01)),
-                local_matcher: None,
-                route_key: None,
-            }),
-            ReactiveInterest::Logs(LogInterest {
-                provider_filter: Filter::new().address(Address::repeat_byte(0x02)),
-                local_matcher: None,
-                route_key: None,
-            }),
-            ReactiveInterest::PendingTransactions(PendingTxInterest::default()),
-        ]);
+        let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig::default(),
+        );
+        subscriber
+            .register_interests(&[
+                ReactiveInterest::Logs(LogInterest {
+                    provider_filter: Filter::new().address(Address::repeat_byte(0x01)),
+                    local_matcher: None,
+                    route_key: None,
+                }),
+                ReactiveInterest::Logs(LogInterest {
+                    provider_filter: Filter::new().address(Address::repeat_byte(0x02)),
+                    local_matcher: None,
+                    route_key: None,
+                }),
+                ReactiveInterest::PendingTransactions(PendingTxInterest::default()),
+            ])
+            .expect("register base interests");
 
+        // The two default-block-option log filters merge into one address
+        // superset (existing consolidation behavior), so there is one log source
+        // — assigned id 0, before the pending-hash source.
+        let sources = subscriber.stream_sources().expect("stream sources");
+        assert_eq!(sources.len(), 2);
         assert!(matches!(
             &sources[0],
             SubscriberStreamSource::PubSubLog { id: 0, .. }
@@ -3432,6 +5572,10 @@ mod subscriber_helper_tests {
             sources[1],
             SubscriberStreamSource::PubSubPendingHashes
         ));
+
+        // Ids are stable across repeated source construction.
+        let again = subscriber.stream_sources().expect("stream sources again");
+        assert!(again[0].same_key(&sources[0]));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -3457,7 +5601,9 @@ mod subscriber_helper_tests {
         )];
 
         let mut streams = SubscriberStreams::new();
+        let source = SubscriberStreamSource::PubSubPendingHashes;
         streams.push(
+            source,
             stream::once(async {
                 SubscriberEvent::<Ethereum>::StreamTerminated(
                     SubscriberStreamSource::PubSubPendingHashes,
@@ -3539,6 +5685,604 @@ mod subscriber_helper_tests {
             InputSource::Backfill
         );
         assert_eq!(subscriber.last_seen_log_blocks.get(&0), Some(&7));
+    }
+
+    #[test]
+    #[cfg(feature = "reactive-ws")]
+    fn owner_removal_preserves_delivery_and_dedupe_state() {
+        let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig::default(),
+        );
+        subscriber
+            .add_interest_owner(
+                HandlerId::new("pool-a"),
+                &[ReactiveInterest::Logs(LogInterest {
+                    provider_filter: Filter::new()
+                        .address(Address::repeat_byte(0x42))
+                        .event_signature(B256::repeat_byte(0x01)),
+                    local_matcher: None,
+                    route_key: None,
+                })],
+            )
+            .expect("register pool-a owner");
+        subscriber
+            .add_interest_owner(
+                HandlerId::new("pool-b"),
+                &[ReactiveInterest::Logs(LogInterest {
+                    provider_filter: Filter::new()
+                        .address(Address::repeat_byte(0x24))
+                        .event_signature(B256::repeat_byte(0x02)),
+                    local_matcher: None,
+                    route_key: None,
+                })],
+            )
+            .expect("register pool-b owner");
+
+        // Allocate source ids the way live stream setup would (pool-a -> id 0),
+        // so the injected delivery anchor hangs off a referenced filter.
+        let _ = subscriber.stream_sources().expect("stream sources");
+        subscriber.enqueue_event(SubscriberEvent::Log {
+            source_id: 0,
+            log: rpc_log(false),
+        });
+        assert_eq!(subscriber.pending_records.len(), 1);
+        assert_eq!(subscriber.recent_input_refs.len(), 1);
+        assert_eq!(subscriber.last_seen_log_blocks.get(&0), Some(&7));
+
+        let removed = subscriber
+            .remove_interest_owner(&HandlerId::new("pool-b"))
+            .expect("pool-b should be removed");
+
+        assert_eq!(removed.len(), 1);
+        assert_eq!(subscriber.pending_records.len(), 1);
+        assert_eq!(subscriber.recent_input_refs.len(), 1);
+        assert_eq!(subscriber.last_seen_log_blocks.get(&0), Some(&7));
+        assert!(
+            subscriber
+                .owner_interests(&HandlerId::new("pool-a"))
+                .is_some()
+        );
+        assert!(
+            subscriber
+                .owner_interests(&HandlerId::new("pool-b"))
+                .is_none()
+        );
+        assert_eq!(subscriber.registered_interests().len(), 1);
+    }
+
+    #[test]
+    #[cfg(feature = "reactive-ws")]
+    fn owner_log_sources_do_not_merge_across_owners() {
+        let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig::default(),
+        );
+        subscriber
+            .add_interest_owner(
+                HandlerId::new("pool-a"),
+                &[ReactiveInterest::Logs(LogInterest {
+                    provider_filter: Filter::new().address(Address::repeat_byte(0xa1)),
+                    local_matcher: None,
+                    route_key: None,
+                })],
+            )
+            .expect("register pool-a owner");
+
+        let initial_sources = subscriber.stream_sources().expect("initial sources");
+        assert_eq!(initial_sources.len(), 1);
+        let pool_a_source = initial_sources[0].clone();
+        assert!(matches!(
+            &pool_a_source,
+            SubscriberStreamSource::PubSubLog { id: 0, .. }
+        ));
+
+        subscriber
+            .add_interest_owner(
+                HandlerId::new("pool-b"),
+                &[ReactiveInterest::Logs(LogInterest {
+                    provider_filter: Filter::new().address(Address::repeat_byte(0xb2)),
+                    local_matcher: None,
+                    route_key: None,
+                })],
+            )
+            .expect("register pool-b owner");
+
+        let expanded_sources = subscriber.stream_sources().expect("expanded sources");
+        assert_eq!(expanded_sources.len(), 2);
+        assert!(
+            expanded_sources
+                .iter()
+                .any(|source| source.same_key(&pool_a_source)),
+            "adding pool-b should not rewrite pool-a's stream source"
+        );
+
+        subscriber
+            .remove_interest_owner(&HandlerId::new("pool-b"))
+            .expect("pool-b should be removed");
+        let trimmed_sources = subscriber.stream_sources().expect("trimmed sources");
+        assert_eq!(trimmed_sources.len(), 1);
+        assert!(trimmed_sources[0].same_key(&pool_a_source));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[cfg(feature = "reactive-ws")]
+    async fn owner_backfill_seeds_reconnect_anchor_before_live_log() {
+        let asserter = Asserter::new();
+        asserter.push_success(&vec![rpc_log(false)]);
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig::default(),
+        );
+        subscriber
+            .add_interest_owner_with_backfill(
+                HandlerId::new("pool-a"),
+                &[ReactiveInterest::Logs(LogInterest {
+                    provider_filter: Filter::new()
+                        .address(Address::repeat_byte(0x42))
+                        .event_signature(B256::repeat_byte(0x01)),
+                    local_matcher: None,
+                    route_key: None,
+                })],
+                SubscriberBackfill::range(1, 7),
+            )
+            .expect("register pool-a with backfill");
+
+        subscriber
+            .drain_pending_backfills()
+            .await
+            .expect("owner backfill should drain");
+
+        assert_eq!(subscriber.pending_records.len(), 1);
+        assert_eq!(subscriber.last_seen_log_blocks.get(&0), Some(&7));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn subscriber_streams_poll_ready_sources_round_robin() {
+        let first_hash = B256::repeat_byte(0x01);
+        let second_hash = B256::repeat_byte(0x02);
+        let mut streams = SubscriberStreams::new();
+        streams.push(
+            SubscriberStreamSource::PubSubPendingHashes,
+            stream::iter([
+                SubscriberEvent::<Ethereum>::PendingHash(first_hash),
+                SubscriberEvent::<Ethereum>::PendingHash(first_hash),
+            ])
+            .boxed(),
+        );
+        streams.push(
+            SubscriberStreamSource::PubSubBlockHeaders,
+            stream::once(async move { SubscriberEvent::<Ethereum>::PendingHash(second_hash) })
+                .boxed(),
+        );
+
+        assert!(matches!(
+            streams.next().await,
+            Some(SubscriberEvent::PendingHash(hash)) if hash == first_hash
+        ));
+        assert!(matches!(
+            streams.next().await,
+            Some(SubscriberEvent::PendingHash(hash)) if hash == second_hash
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[cfg(feature = "reactive-ws")]
+    async fn owner_updates_ensure_streams_without_full_reset() {
+        let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig::default(),
+        );
+        subscriber
+            .register_interests(&[ReactiveInterest::PendingTransactions(
+                PendingTxInterest::default(),
+            )])
+            .expect("register base pending interest");
+        subscriber
+            .add_interest_owner(
+                HandlerId::new("headers"),
+                &[ReactiveInterest::Blocks(BlockInterest::default())],
+            )
+            .expect("register header owner");
+
+        let mut streams = SubscriberStreams::new();
+        streams.push(
+            SubscriberStreamSource::PubSubPendingHashes,
+            stream::pending::<SubscriberEvent<Ethereum>>().boxed(),
+        );
+        streams.push(
+            SubscriberStreamSource::PubSubBlockHeaders,
+            stream::pending::<SubscriberEvent<Ethereum>>().boxed(),
+        );
+        subscriber.state = AlloySubscriberState::Active(streams);
+
+        subscriber
+            .remove_interest_owner(&HandlerId::new("headers"))
+            .expect("header owner should be removed");
+        assert!(matches!(
+            &subscriber.state,
+            AlloySubscriberState::Active(streams) if streams.len() == 2
+        ));
+
+        subscriber
+            .ensure_streams()
+            .await
+            .expect("pure removal reconciliation should not touch provider");
+
+        assert!(matches!(
+            &subscriber.state,
+            AlloySubscriberState::Active(streams)
+                if streams.len() == 1
+                    && streams.contains_source(&SubscriberStreamSource::PubSubPendingHashes)
+                    && !streams.contains_source(&SubscriberStreamSource::PubSubBlockHeaders)
+        ));
+
+        subscriber
+            .add_interest_owner(
+                HandlerId::new("headers"),
+                &[ReactiveInterest::Blocks(BlockInterest::default())],
+            )
+            .expect("re-add header owner");
+        assert!(matches!(
+            &subscriber.state,
+            AlloySubscriberState::Active(streams) if streams.len() == 1
+        ));
+    }
+
+    // A log interest matching `rpc_log` (address 0x42, topic0 0x01).
+    #[cfg(feature = "reactive-ws")]
+    fn log_interest_matching_rpc_log() -> ReactiveInterest<Ethereum> {
+        ReactiveInterest::Logs(LogInterest {
+            provider_filter: Filter::new()
+                .address(Address::repeat_byte(0x42))
+                .event_signature(B256::repeat_byte(0x01)),
+            local_matcher: None,
+            route_key: None,
+        })
+    }
+
+    #[cfg(feature = "reactive-ws")]
+    fn log_interest_for(address: u8) -> ReactiveInterest<Ethereum> {
+        ReactiveInterest::Logs(LogInterest {
+            provider_filter: Filter::new().address(Address::repeat_byte(address)),
+            local_matcher: None,
+            route_key: None,
+        })
+    }
+
+    // B1: a transient provider error must not consume the queued backfill — the
+    // missed window has to survive for the next poll to retry.
+    #[tokio::test(flavor = "multi_thread")]
+    #[cfg(feature = "reactive-ws")]
+    async fn drain_backfill_retains_queue_entry_on_provider_error() {
+        let asserter = Asserter::new();
+        asserter.push_failure_msg("rate limited");
+        asserter.push_success(&vec![rpc_log(false)]);
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let mut subscriber = AlloySubscriber::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig::default(),
+        );
+        subscriber
+            .add_interest_owner_with_backfill(
+                HandlerId::new("pool"),
+                &[log_interest_matching_rpc_log()],
+                SubscriberBackfill::range(1, 7),
+            )
+            .expect("register owner with backfill");
+        assert_eq!(subscriber.pending_backfills.len(), 1);
+
+        let first = subscriber.drain_pending_backfills().await;
+        assert!(first.is_err(), "provider failure should surface");
+        assert_eq!(
+            subscriber.pending_backfills.len(),
+            1,
+            "failed fetch must leave the backfill queued for retry"
+        );
+        assert!(subscriber.pending_records.is_empty());
+
+        subscriber
+            .drain_pending_backfills()
+            .await
+            .expect("retry should succeed");
+        assert!(subscriber.pending_backfills.is_empty());
+        assert_eq!(subscriber.pending_records.len(), 1);
+    }
+
+    // B3: a zero-log backfill window still advances the delivery anchor to its
+    // upper bound, so a later reconnect catches up from the right block.
+    #[tokio::test(flavor = "multi_thread")]
+    #[cfg(feature = "reactive-ws")]
+    async fn drain_backfill_seeds_anchor_on_empty_window() {
+        let asserter = Asserter::new();
+        asserter.push_success(&Vec::<Log>::new());
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let mut subscriber = AlloySubscriber::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig::default(),
+        );
+        subscriber
+            .add_interest_owner_with_backfill(
+                HandlerId::new("pool"),
+                &[log_interest_matching_rpc_log()],
+                SubscriberBackfill::range(1, 42),
+            )
+            .expect("register owner with backfill");
+
+        subscriber
+            .drain_pending_backfills()
+            .await
+            .expect("empty backfill should drain");
+
+        assert!(subscriber.pending_records.is_empty());
+        let filter = log_filters(subscriber.owner_interests(&HandlerId::new("pool")).unwrap())
+            .pop()
+            .unwrap();
+        assert_eq!(
+            subscriber.log_anchor(&filter),
+            Some(42),
+            "empty window must still seed the anchor at its upper bound"
+        );
+    }
+
+    // B3 (open-ended): a `from_block`-only backfill resolves its upper bound to
+    // the provider head and seeds the anchor there.
+    #[tokio::test(flavor = "multi_thread")]
+    #[cfg(feature = "reactive-ws")]
+    async fn drain_backfill_open_ended_resolves_head_and_seeds_anchor() {
+        let asserter = Asserter::new();
+        asserter.push_success(&100u64); // get_block_number
+        asserter.push_success(&Vec::<Log>::new()); // get_logs
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let mut subscriber = AlloySubscriber::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig::default(),
+        );
+        subscriber
+            .add_interest_owner_with_backfill(
+                HandlerId::new("pool"),
+                &[log_interest_matching_rpc_log()],
+                SubscriberBackfill::from_block(10),
+            )
+            .expect("register owner with open-ended backfill");
+
+        subscriber
+            .drain_pending_backfills()
+            .await
+            .expect("open-ended backfill should drain");
+
+        let filter = log_filters(subscriber.owner_interests(&HandlerId::new("pool")).unwrap())
+            .pop()
+            .unwrap();
+        assert_eq!(subscriber.log_anchor(&filter), Some(100));
+    }
+
+    // B2: two owners requesting the same filter shape share exactly one live
+    // source (and thus one anchor), rather than double-subscribing.
+    #[test]
+    #[cfg(feature = "reactive-ws")]
+    fn duplicate_filters_across_owners_map_to_single_source() {
+        let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig::default(),
+        );
+        subscriber
+            .add_interest_owner(HandlerId::new("pool-a"), &[log_interest_for(0xaa)])
+            .expect("register pool-a");
+        subscriber
+            .add_interest_owner(HandlerId::new("pool-b"), &[log_interest_for(0xaa)])
+            .expect("register pool-b with identical filter");
+
+        assert_eq!(
+            subscriber.log_stream_filters().len(),
+            1,
+            "identical filters across owners must collapse to one"
+        );
+        let sources = subscriber.stream_sources().expect("stream sources");
+        assert_eq!(sources.len(), 1);
+    }
+
+    // B4: removing an owner retires the source-id and anchor bookkeeping for
+    // filters no other owner references, so long-lived churn cannot leak.
+    #[test]
+    #[cfg(feature = "reactive-ws")]
+    fn owner_removal_prunes_source_ids_and_anchors() {
+        let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig::default(),
+        );
+        subscriber
+            .add_interest_owner(HandlerId::new("pool-a"), &[log_interest_for(0xaa)])
+            .expect("register pool-a");
+        subscriber
+            .add_interest_owner(HandlerId::new("pool-b"), &[log_interest_for(0xbb)])
+            .expect("register pool-b");
+
+        // Allocate ids and simulate delivery anchors on both.
+        let _ = subscriber.stream_sources().expect("stream sources");
+        let filter_a = log_filters(&[log_interest_for(0xaa)]).pop().unwrap();
+        let filter_b = log_filters(&[log_interest_for(0xbb)]).pop().unwrap();
+        let id_a = subscriber.log_source_id(&filter_a);
+        let id_b = subscriber.log_source_id(&filter_b);
+        subscriber.last_seen_log_blocks.insert(id_a, 10);
+        subscriber.last_seen_log_blocks.insert(id_b, 20);
+        assert_eq!(subscriber.log_source_ids.len(), 2);
+
+        subscriber
+            .remove_interest_owner(&HandlerId::new("pool-b"))
+            .expect("remove pool-b");
+
+        assert_eq!(
+            subscriber.log_source_ids.len(),
+            1,
+            "pool-b's filter id should be retired"
+        );
+        assert!(subscriber.log_source_ids.contains_key(&filter_a));
+        assert_eq!(subscriber.last_seen_log_blocks.get(&id_a), Some(&10));
+        assert_eq!(
+            subscriber.last_seen_log_blocks.get(&id_b),
+            None,
+            "pool-b's anchor should be pruned"
+        );
+    }
+
+    // D1: growing an owner's filter set (a new pool on an existing adapter)
+    // changes the merged filter shape; the new shape must inherit the old
+    // anchor via an automatic continuity backfill, or logs between the last
+    // delivery and the new subscription are silently lost.
+    #[test]
+    #[cfg(feature = "reactive-ws")]
+    fn owner_filter_growth_queues_continuity_backfill_from_prior_anchor() {
+        let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig::default(),
+        );
+        subscriber
+            .add_interest_owner(HandlerId::new("amm"), &[log_interest_for(0xaa)])
+            .expect("register amm with pool A");
+
+        // Simulate the owner's single merged filter having delivered up to
+        // block 50.
+        let filter_a = log_filters(&[log_interest_for(0xaa)]).pop().unwrap();
+        let id_a = subscriber.log_source_id(&filter_a);
+        subscriber.last_seen_log_blocks.insert(id_a, 50);
+
+        // Grow the owner to also watch pool B (same block option -> merges into
+        // one {A,B} filter, a new shape).
+        subscriber
+            .add_interest_owner(
+                HandlerId::new("amm"),
+                &[log_interest_for(0xaa), log_interest_for(0xbb)],
+            )
+            .expect("grow amm to pools A+B");
+
+        assert_eq!(
+            subscriber.pending_backfills.len(),
+            1,
+            "the changed merged filter should queue exactly one continuity backfill"
+        );
+        let queued = &subscriber.pending_backfills[0];
+        assert_eq!(queued.owner, HandlerId::new("amm"));
+        assert_eq!(queued.backfill.start_block(), 50);
+        assert_eq!(
+            queued.backfill.end_block(),
+            None,
+            "continuity backfill runs open-ended to the current head"
+        );
+    }
+
+    // D1 negative: replacing an owner's interests with the identical shape must
+    // NOT re-fetch — the filter kept its anchor and its live stream.
+    #[test]
+    #[cfg(feature = "reactive-ws")]
+    fn unchanged_owner_filter_does_not_queue_continuity_backfill() {
+        let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig::default(),
+        );
+        subscriber
+            .add_interest_owner(HandlerId::new("amm"), &[log_interest_for(0xaa)])
+            .expect("register amm");
+        let filter_a = log_filters(&[log_interest_for(0xaa)]).pop().unwrap();
+        let id_a = subscriber.log_source_id(&filter_a);
+        subscriber.last_seen_log_blocks.insert(id_a, 50);
+
+        subscriber
+            .add_interest_owner(HandlerId::new("amm"), &[log_interest_for(0xaa)])
+            .expect("re-register identical interests");
+
+        assert!(
+            subscriber.pending_backfills.is_empty(),
+            "an unchanged filter shape must not queue continuity backfill"
+        );
+    }
+
+    // D5 interaction: an explicit open-ended backfill starting at or below the
+    // owner's prior anchor already covers the continuity window, so no extra
+    // continuity backfill is queued (no redundant double fetch).
+    #[test]
+    #[cfg(feature = "reactive-ws")]
+    fn explicit_open_ended_backfill_below_anchor_suppresses_continuity() {
+        let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig::default(),
+        );
+        subscriber
+            .add_interest_owner(HandlerId::new("amm"), &[log_interest_for(0xaa)])
+            .expect("register amm");
+        let filter_a = log_filters(&[log_interest_for(0xaa)]).pop().unwrap();
+        let id_a = subscriber.log_source_id(&filter_a);
+        subscriber.last_seen_log_blocks.insert(id_a, 50);
+
+        // Grow with an explicit deep backfill from block 10 (< anchor 50).
+        subscriber
+            .add_interest_owner_with_backfill(
+                HandlerId::new("amm"),
+                &[log_interest_for(0xaa), log_interest_for(0xbb)],
+                SubscriberBackfill::from_block(10),
+            )
+            .expect("grow amm with explicit deep backfill");
+
+        assert_eq!(
+            subscriber.pending_backfills.len(),
+            1,
+            "only the explicit backfill should be queued; continuity is subsumed"
+        );
+        assert_eq!(subscriber.pending_backfills[0].backfill.start_block(), 10);
+    }
+
+    // The dirty flag gates reconciliation: when nothing changed since the last
+    // reconcile, `ensure_streams` must not touch the provider or the state.
+    #[tokio::test(flavor = "multi_thread")]
+    #[cfg(feature = "reactive-ws")]
+    async fn ensure_streams_is_noop_when_not_dirty() {
+        let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig::default(),
+        );
+        // An interest that WOULD require a new block-header source...
+        subscriber
+            .add_interest_owner(
+                HandlerId::new("headers"),
+                &[ReactiveInterest::Blocks(BlockInterest::default())],
+            )
+            .expect("register header owner");
+        // ...but we mark bookkeeping clean and start from Empty.
+        subscriber.state = AlloySubscriberState::Empty;
+        subscriber.sources_dirty = false;
+
+        subscriber
+            .ensure_streams()
+            .await
+            .expect("clean reconcile must be a no-op");
+
+        assert!(
+            matches!(subscriber.state, AlloySubscriberState::Empty),
+            "not-dirty ensure_streams must not connect new sources"
+        );
     }
 }
 

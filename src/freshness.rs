@@ -25,13 +25,22 @@
 //!
 //! The optimistic loop verifies only **volatile storage slots** in each sim's
 //! read set. Account-level state — native balance, nonce, and bytecode — is
-//! **not** re-fetched or diffed, so [`Validation::Confirmed`] means *"no volatile
-//! storage slot the sims read had changed"*, not *"no account state changed"*. A
-//! sim whose result depends on a `BALANCE`/`SELFBALANCE` (or nonce/code) that
-//! moved on-chain without a co-changing storage slot in its read set can still be
-//! reported `Confirmed`. If account-level state matters to a sim, mark the
-//! account [`Validity::Pinned`] and keep it fresh via event-driven writes, or
-//! reconcile it out of band. See [`Validation`] for the per-verdict note.
+//! **not** re-fetched or diffed today, so [`Validation::ConfirmedStorage`] means
+//! *"no volatile storage slot the sims read had changed"*, not *"no account state
+//! changed"*. A sim whose result depends on a `BALANCE`/`SELFBALANCE` (or
+//! nonce/code) that moved on-chain without a co-changing storage slot in its read
+//! set can still be reported `ConfirmedStorage`. If account-level state matters to
+//! a sim, mark the account [`Validity::Pinned`] and keep it fresh via event-driven
+//! writes, or reconcile it out of band.
+//!
+//! The verdict taxonomy is deliberately split so this over-promise is visible in
+//! the type: [`ConfirmedStorage`](Validation::ConfirmedStorage) (storage only,
+//! account fields unverified) is distinct from
+//! [`ConfirmedFull`](Validation::ConfirmedFull) (storage *and* verified
+//! account-level fields both unchanged). `ConfirmedFull` is defined but not yet
+//! emitted — a follow-up wave wires validator-side account verification that will
+//! populate it and the [`Corrected`](Validation::Corrected) verdict's
+//! `changed_accounts`. See [`Validation`] for the per-verdict note.
 //!
 //! # Example
 //!
@@ -81,7 +90,8 @@ use crate::cache::{
     CallSimulationResult, EvmCache, EvmOverlay, EvmSnapshot, SimStatus, SlotObservationTracker,
     StorageBatchFetchFn, TxConfig,
 };
-use crate::state_update::StateUpdate;
+use crate::errors::{FreshnessError, FreshnessResult as Result, StorageFetchResult};
+use crate::state_update::{AccountChange, StateUpdate};
 
 /// Default minimum observations before the change-frequency data is trusted.
 pub const DEFAULT_MIN_OBSERVATIONS: u32 = 10;
@@ -521,34 +531,67 @@ pub enum SlotFetch {
 
 /// The deferred verdict on a [`SpeculativeSim`]'s optimistic results.
 ///
+/// # Verdict taxonomy
+///
+/// The verdict distinguishes *what* was reconciled:
+///
+/// - [`ConfirmedStorage`](Validation::ConfirmedStorage): no volatile storage slot
+///   the sims read changed. Account-level fields (balance/nonce/code) were **not**
+///   verified — this is what today's validator emits on a storage-only success.
+/// - [`ConfirmedFull`](Validation::ConfirmedFull): no volatile storage slot **and**
+///   no verified account-level field changed. Defined but not yet emitted (a
+///   follow-up wave wires validator-side account verification).
+/// - [`Corrected`](Validation::Corrected): at least one read slot (and, once
+///   account verification lands, account field) changed; carries `changed_slots`
+///   and `changed_accounts`.
+/// - [`Unverified`](Validation::Unverified): the fetcher failed; results are not
+///   trusted.
+///
 /// # Reconciliation scope
 ///
-/// The verdict reflects only **volatile storage slots** in each sim's read set.
-/// Account-level state — native balance, nonce, and bytecode — is **not**
+/// Today the verdict reflects only **volatile storage slots** in each sim's read
+/// set. Account-level state — native balance, nonce, and bytecode — is **not**
 /// re-verified, so a sim whose result depends on a `BALANCE`/`SELFBALANCE` (or
 /// nonce/code) that changed on-chain *without* a co-changing storage slot in its
-/// read set can still be reported [`Confirmed`](Validation::Confirmed). Classify
-/// such accounts as [`Validity::Pinned`] and keep them fresh via event-driven
-/// writes if their account-level state matters to your sims. See the module-level
-/// docs for the full freshness contract.
+/// read set can still be reported
+/// [`ConfirmedStorage`](Validation::ConfirmedStorage). Classify such accounts as
+/// [`Validity::Pinned`] and keep them fresh via event-driven writes if their
+/// account-level state matters to your sims. A follow-up wave wires validator-side
+/// account verification that will populate
+/// [`ConfirmedFull`](Validation::ConfirmedFull) and the `changed_accounts` field
+/// of [`Corrected`](Validation::Corrected). See the module-level docs for the full
+/// freshness contract.
 pub enum Validation {
-    /// No **volatile storage slot** in the sims' read sets had changed, so the
-    /// optimistic results are trusted. Note this does *not* cover account-level
-    /// balance/nonce/code changes — see the [type-level scope](Validation).
-    Confirmed,
+    /// No **volatile storage slot** the sims read changed; account-level
+    /// balance/nonce/code was **NOT** verified. This is the storage-only success
+    /// verdict today's validator emits — it does *not* cover account-level state
+    /// (see the [type-level scope](Validation)).
+    ConfirmedStorage,
+    /// No volatile storage slot **AND** no verified account-level field
+    /// (balance/nonce/code) changed. Not emitted yet: a follow-up wave wires the
+    /// validator-side account verification that populates it (see the
+    /// [type-level scope](Validation)).
+    ConfirmedFull,
     /// At least one read storage slot changed. `results` is the optimistic set
-    /// with the affected sims re-run against the fresh values; `changed` lists the
-    /// slots that differed (also queued for flow-back into the cache). Only
-    /// storage slots are reconciled — account-level state is not (see the
+    /// with the affected sims re-run against the fresh values; `changed_slots`
+    /// lists the slots that differed (also queued for flow-back into the cache) and
+    /// `changed_accounts` lists any account-level fields that differed. Only
+    /// storage slots are reconciled today — account-level verification is wired by
+    /// a follow-up wave, so `changed_accounts` is currently always empty (see the
     /// [type-level scope](Validation)).
     Corrected {
         /// Optimistic results with the affected sims replaced by re-runs.
         results: Vec<CallSimulationResult>,
         /// Slots whose fresh value differed from the snapshot.
-        changed: Vec<SlotChange>,
+        changed_slots: Vec<SlotChange>,
+        /// Accounts whose native fields differed from the snapshot. Empty until a
+        /// follow-up wave wires validator-side account verification.
+        changed_accounts: Vec<AccountChange>,
     },
-    /// The fetcher failed, so the results could not be validated. The optimistic
-    /// results are *not* trusted.
+    /// Validation could not complete — the fetcher failed or was missing, a
+    /// corrected re-run could not execute, the fixed-point round cap was hit,
+    /// or a sim read `BLOCKHASH` (which validator overlays resolve to ZERO and
+    /// therefore cannot vouch for). The optimistic results are *not* trusted.
     Unverified {
         /// Human-readable description of why validation could not complete.
         reason: String,
@@ -558,10 +601,16 @@ pub enum Validation {
 impl std::fmt::Debug for Validation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Validation::Confirmed => write!(f, "Confirmed"),
-            Validation::Corrected { changed, .. } => f
+            Validation::ConfirmedStorage => write!(f, "ConfirmedStorage"),
+            Validation::ConfirmedFull => write!(f, "ConfirmedFull"),
+            Validation::Corrected {
+                changed_slots,
+                changed_accounts,
+                ..
+            } => f
                 .debug_struct("Corrected")
-                .field("changed", changed)
+                .field("changed_slots", changed_slots)
+                .field("changed_accounts", changed_accounts)
                 .finish_non_exhaustive(),
             Validation::Unverified { reason } => f
                 .debug_struct("Unverified")
@@ -670,14 +719,9 @@ impl SpeculativeSim {
     /// Consume the handle and return the optimistic results, aborting the
     /// background validation task.
     ///
-    /// # Panics
-    /// The validation [`JoinHandle`] is single-consumption. Because this takes
-    /// `self` by value, it and [`validate`](Self::validate) are mutually
-    /// exclusive: only one of them can ever run for a given `SpeculativeSim`, and
-    /// each takes the handle. `into_optimistic` takes the handle defensively (it
-    /// does not panic if the handle is already gone), whereas `validate` panics
-    /// with `"validation handle taken twice"` if it is invoked once the handle has
-    /// been consumed.
+    /// Because this takes `self` by value, it and [`validate`](Self::validate)
+    /// are mutually exclusive: only one of them can ever run for a given
+    /// `SpeculativeSim`, and each takes the handle.
     pub fn into_optimistic(mut self) -> Vec<CallSimulationResult> {
         self.cancelled.store(true, Ordering::Relaxed);
         if let Some(handle) = self.validation.take() {
@@ -688,28 +732,17 @@ impl SpeculativeSim {
 
     /// Await the deferred validation verdict.
     ///
-    /// If the background task failed to complete (e.g. it panicked), returns
-    /// [`Validation::Unverified`]. This consumes `self`, so it is mutually
+    /// If the background task failed to complete (e.g. it panicked), returns an
+    /// error. This consumes `self`, so it is mutually
     /// exclusive with the cancel paths ([`into_optimistic`](Self::into_optimistic)
     /// / drop) — a handle that is awaited here is never cancelled.
-    ///
-    /// # Panics
-    /// The validation [`JoinHandle`] is single-consumption: it is taken by the
-    /// first of `validate` or [`into_optimistic`](Self::into_optimistic) to run.
-    /// `validate` panics with `"validation handle taken twice"` if the handle has
-    /// already been consumed. Both take `self` by value, so under normal ownership
-    /// this is unreachable.
-    pub async fn validate(mut self) -> Validation {
-        let handle = self
-            .validation
-            .take()
-            .expect("validation handle taken twice");
-        match handle.await {
-            Ok(v) => v,
-            Err(e) => Validation::Unverified {
-                reason: format!("validation task failed: {e}"),
-            },
-        }
+    pub async fn validate(mut self) -> Result<Validation> {
+        let Some(handle) = self.validation.take() else {
+            return Err(FreshnessError::ValidationHandleConsumed);
+        };
+        handle
+            .await
+            .map_err(|source| FreshnessError::ValidationTaskFailed { source })
     }
 }
 
@@ -867,7 +900,7 @@ impl<P: FreshnessPolicy, C: FreshnessClock> FreshnessController<P, C> {
         &mut self,
         cache: &mut EvmCache,
         requests: Vec<SimRequest>,
-    ) -> anyhow::Result<SpeculativeSim> {
+    ) -> Result<SpeculativeSim> {
         let now = self.clock.now();
 
         // 1. Drain pending corrections into the cache before snapshotting.
@@ -889,14 +922,18 @@ impl<P: FreshnessPolicy, C: FreshnessClock> FreshnessController<P, C> {
         // 2. Snapshot + fetcher (Arc clones, both Send). Capture the cache's
         //    pinned block now, so the deferred validator fetches at the block the
         //    snapshot was built from even if the cache is re-pinned meanwhile.
-        let snapshot = cache.create_snapshot();
+        let snapshot = cache.snapshot();
         let fetcher = cache.storage_batch_fetcher().cloned();
         let validation_block = cache.block();
 
-        // 3. Optimistic sims + per-sim actual volatile read sets.
+        // 3. Optimistic sims + per-sim actual volatile read sets. Sims whose
+        //    execution read `BLOCKHASH` through the ext-db-less overlay (which
+        //    resolves it to ZERO) are recorded so the validator can fail
+        //    closed instead of confirming a result the replay cannot verify.
         let mut optimistic = Vec::with_capacity(requests.len());
         let mut read_sets: Vec<Vec<(Address, U256)>> = Vec::with_capacity(requests.len());
-        for req in &requests {
+        let mut blockhash_readers: Vec<usize> = Vec::new();
+        for (index, req) in requests.iter().enumerate() {
             let mut overlay = EvmOverlay::new(Arc::clone(&snapshot), None);
             let (result, access) = overlay.call_raw_with_access_list_with(
                 req.from,
@@ -904,6 +941,9 @@ impl<P: FreshnessPolicy, C: FreshnessClock> FreshnessController<P, C> {
                 req.calldata.clone(),
                 &req.tx,
             )?;
+            if overlay.blockhash_zero_fallback() {
+                blockhash_readers.push(index);
+            }
             optimistic.push(result_to_sim(result, &access.to_eip2930()));
 
             let volatile: Vec<(Address, U256)> = access
@@ -963,6 +1003,7 @@ impl<P: FreshnessPolicy, C: FreshnessClock> FreshnessController<P, C> {
                 optimistic: optimistic_for_task,
                 cancelled: cancelled_for_task,
                 validation_block,
+                blockhash_readers,
             })
         });
 
@@ -991,6 +1032,11 @@ struct ValidatorInput {
     /// Block the snapshot was built from; passed to the fetcher so the deferred
     /// fetch reads the same block the snapshot represents.
     validation_block: BlockId,
+    /// Indices of requests whose optimistic run read `BLOCKHASH` through the
+    /// ZERO fallback. Non-empty ⇒ the validator fails closed (`Unverified`):
+    /// storage verification cannot vouch for a result whose control flow may
+    /// depend on a hash these overlays cannot resolve.
+    blockhash_readers: Vec<usize>,
 }
 
 /// Maximum fixed-point iterations the background validator performs while a
@@ -1010,8 +1056,8 @@ const MAX_VALIDATION_ROUNDS: u32 = 8;
 /// false confirmation or correction.
 fn collect_fetch_results(
     requested: &[(Address, U256)],
-    results: Vec<(Address, U256, anyhow::Result<U256>)>,
-) -> Result<HashMap<(Address, U256), U256>, String> {
+    results: Vec<(Address, U256, StorageFetchResult<U256>)>,
+) -> std::result::Result<HashMap<(Address, U256), U256>, String> {
     let mut map: HashMap<(Address, U256), U256> = HashMap::new();
     for (addr, slot, value) in results {
         match value {
@@ -1048,12 +1094,29 @@ fn run_validator(input: ValidatorInput) -> Validation {
         optimistic,
         cancelled,
         validation_block,
+        blockhash_readers,
     } = input;
 
     // Checkpoint: cancelled before we even begin (the caller dropped or
     // `into_optimistic`d the handle while we were parked at the initial yield).
     if cancelled.load(Ordering::Relaxed) {
-        return Validation::Confirmed;
+        return Validation::ConfirmedStorage;
+    }
+
+    // Fail closed on unverifiable `BLOCKHASH` reads (G5). The overlays these
+    // sims ran on carry no block hashes, so the opcode resolved to ZERO;
+    // re-checking storage slots cannot vouch for a result whose control flow
+    // may depend on the real hash. This must precede the empty-verify-set
+    // early confirm below — a hash-reading sim that touches no volatile slots
+    // would otherwise silently confirm.
+    if let Some(first) = blockhash_readers.first() {
+        return Validation::Unverified {
+            reason: format!(
+                "request {first} read BLOCKHASH, which resolves to ZERO in \
+                 validator overlays (block hashes are not tracked); the result \
+                 cannot be verified"
+            ),
+        };
     }
 
     let Some(fetcher) = fetcher else {
@@ -1072,19 +1135,19 @@ fn run_validator(input: ValidatorInput) -> Validation {
     }
     verify.retain(|(addr, slot)| registry.is_volatile(*addr, *slot, now));
     if verify.is_empty() {
-        return Validation::Confirmed;
+        return Validation::ConfirmedStorage;
     }
     let verify: Vec<(Address, U256)> = verify.into_iter().collect();
 
     // Checkpoint: cancelled before issuing the (costly, side-effecting) fetch.
     // This is what makes the "dropped before fetching" guarantee hold.
     if cancelled.load(Ordering::Relaxed) {
-        return Validation::Confirmed;
+        return Validation::ConfirmedStorage;
     }
 
     // Fetch fresh values. Any error OR any omitted slot → Unverified (never trust
     // silently: a missing result must not default to zero).
-    let results = (fetcher)(verify.clone(), Some(validation_block));
+    let results = (fetcher)(verify.clone(), validation_block);
     let fresh = match collect_fetch_results(&verify, results) {
         Ok(map) => map,
         Err(reason) => return Validation::Unverified { reason },
@@ -1094,7 +1157,7 @@ fn run_validator(input: ValidatorInput) -> Validation {
     // observations or queue a correction. A cancel seen here discards the
     // verdict's side effects entirely.
     if cancelled.load(Ordering::Relaxed) {
-        return Validation::Confirmed;
+        return Validation::ConfirmedStorage;
     }
 
     // Compare the initial verify set against the snapshot, observe each checked
@@ -1123,7 +1186,7 @@ fn run_validator(input: ValidatorInput) -> Validation {
     }
 
     if changed_map.is_empty() {
-        return Validation::Confirmed;
+        return Validation::ConfirmedStorage;
     }
 
     // Re-run affected sims to a fixed point. A correction can flip control flow
@@ -1177,6 +1240,18 @@ fn run_validator(input: ValidatorInput) -> Validation {
                     };
                 }
             };
+            // A correction can flip control flow onto a `BLOCKHASH` read the
+            // optimistic run never made; the re-run saw ZERO for it, so the
+            // "corrected" result cannot be trusted either (G5, fail closed).
+            if overlay.blockhash_zero_fallback() {
+                return Validation::Unverified {
+                    reason: format!(
+                        "corrected re-run for request {i} read BLOCKHASH, which \
+                         resolves to ZERO in validator overlays; the corrected \
+                         result cannot be verified"
+                    ),
+                };
+            }
             results[i] = result_to_sim(result, &access.to_eip2930());
             let new_volatile: Vec<(Address, U256)> = access
                 .slots
@@ -1218,13 +1293,13 @@ fn run_validator(input: ValidatorInput) -> Validation {
         // Checkpoint: cancelled mid-loop. Results so far reflect the applied
         // overrides; do not fetch further or queue corrections.
         if cancelled.load(Ordering::Relaxed) {
-            return Validation::Confirmed;
+            return Validation::ConfirmedStorage;
         }
 
         // Fetch the newly-discovered candidates; any error OR omitted slot →
         // Unverified (a missing result must not default to zero).
         let new_vec: Vec<(Address, U256)> = new_candidates.into_iter().collect();
-        let fetched = (fetcher)(new_vec.clone(), Some(validation_block));
+        let fetched = (fetcher)(new_vec.clone(), validation_block);
         let new_fresh = match collect_fetch_results(&new_vec, fetched) {
             Ok(map) => map,
             Err(reason) => return Validation::Unverified { reason },
@@ -1268,13 +1343,19 @@ fn run_validator(input: ValidatorInput) -> Validation {
     rerun_count.fetch_add(rerun_indices.len(), Ordering::Relaxed);
 
     // Queue every accumulated correction for flow-back into the cache next run.
-    let changed: Vec<SlotChange> = changed_map.into_values().collect();
+    let changed_slots: Vec<SlotChange> = changed_map.into_values().collect();
     {
         let mut pending = pending.lock().unwrap_or_else(|e| e.into_inner());
-        pending.extend(changed.iter().cloned());
+        pending.extend(changed_slots.iter().cloned());
     }
 
-    Validation::Corrected { results, changed }
+    // Account-level changes are populated by a follow-up wave that wires
+    // validator-side account verification; empty for now.
+    Validation::Corrected {
+        results,
+        changed_slots,
+        changed_accounts: Vec::new(),
+    }
 }
 
 /// Build a [`CallSimulationResult`] from a non-committing execution result and

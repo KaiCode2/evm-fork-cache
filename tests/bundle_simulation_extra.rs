@@ -64,7 +64,7 @@ async fn token_with_funded_alice() -> Result<(EvmCache, Address, Address, Addres
 async fn empty_bundle_succeeds_as_noop() -> Result<()> {
     let mut cache = setup_cache().await?;
     install_default_account(&mut cache, Address::ZERO);
-    let mut overlay = EvmOverlay::new(cache.create_snapshot(), None);
+    let mut overlay = EvmOverlay::new(cache.snapshot(), None);
 
     let result = overlay.simulate_bundle(&[], &BundleOptions::default())?;
     assert!(result.succeeded);
@@ -79,7 +79,7 @@ async fn empty_bundle_succeeds_as_noop() -> Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn allow_reverts_non_whitelisted_index_aborts_atomically() -> Result<()> {
     let (mut cache, token, alice, bob) = token_with_funded_alice().await?;
-    let mut overlay = EvmOverlay::new(cache.create_snapshot(), None);
+    let mut overlay = EvmOverlay::new(cache.snapshot(), None);
 
     let txs = vec![
         BundleTx::new(alice, token, transfer_calldata(bob, 100)),
@@ -111,7 +111,7 @@ async fn allow_reverts_non_whitelisted_index_aborts_atomically() -> Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn allow_reverts_commit_false_is_isolated() -> Result<()> {
     let (mut cache, token, alice, bob) = token_with_funded_alice().await?;
-    let mut overlay = EvmOverlay::new(cache.create_snapshot(), None);
+    let mut overlay = EvmOverlay::new(cache.snapshot(), None);
 
     let txs = vec![
         BundleTx::new(alice, token, transfer_calldata(bob, 100)),
@@ -154,7 +154,7 @@ async fn cache_simulate_bundle_does_not_mutate_cache() -> Result<()> {
     assert_eq!(result.per_tx.len(), 1);
 
     // The cache is unchanged: a fresh snapshot still shows alice's full balance.
-    let mut overlay = EvmOverlay::new(cache.create_snapshot(), None);
+    let mut overlay = EvmOverlay::new(cache.snapshot(), None);
     assert_eq!(
         overlay_balance(&mut overlay, token, alice)?,
         U256::from(1_000u64)

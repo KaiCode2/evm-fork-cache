@@ -2,8 +2,8 @@
 //! snapshots, authored before implementation.
 //!
 //! The gate is a *differential-equivalence* property: the new, memoized
-//! [`EvmCache::create_snapshot`] must be **read-indistinguishable** from the
-//! retained reference [`EvmCache::create_snapshot_deep_clone`] after every kind of
+//! [`EvmCache::snapshot`] must be **read-indistinguishable** from the
+//! retained reference [`EvmCache::snapshot_deep_clone`] after every kind of
 //! cache mutation. Because the two use different internal representations (the COW
 //! snapshot shares an `Arc`-ed cold base; the reference is a full flatten), they are
 //! compared *through reads only* — `storage_value`, overlay `basic`/`storage`, and a
@@ -15,7 +15,7 @@
 //!
 //! All state is injected over a mocked provider — no test touches the network.
 //!
-//! These reference `create_snapshot_deep_clone` and `EvmOverlay::reset`, which do
+//! These reference `snapshot_deep_clone` and `EvmOverlay::reset`, which do
 //! not exist until the Phase 5 implementation lands; until then this file fails to
 //! compile (red), exactly as intended.
 
@@ -73,8 +73,8 @@ fn overlay_balance_of(overlay: &mut EvmOverlay, token: Address, owner: Address) 
 /// Assert the COW snapshot and the deep-clone reference are read-indistinguishable
 /// across a probe set of addresses and slots. `label` identifies the mutation step.
 fn assert_equivalent(cache: &mut EvmCache, addrs: &[Address], slots: &[U256], label: &str) {
-    let cow = cache.create_snapshot();
-    let deep = cache.create_snapshot_deep_clone();
+    let cow = cache.snapshot();
+    let deep = cache.snapshot_deep_clone();
 
     let mut ov_cow = EvmOverlay::new(Arc::clone(&cow), None);
     let mut ov_deep = EvmOverlay::new(Arc::clone(&deep), None);
@@ -287,7 +287,7 @@ async fn invalidate_snapshot_base_rehonest_after_escape_hatch_write() -> Result<
     let slot = U256::from(0u64);
 
     cache.inject_storage_batch(&[(pool, slot, U256::from(111u64))]);
-    let _warm = cache.create_snapshot(); // memoize the base at 111
+    let _warm = cache.snapshot(); // memoize the base at 111
 
     // Out-of-band overwrite at unchanged length (bypasses the write funnel).
     {
@@ -301,8 +301,8 @@ async fn invalidate_snapshot_base_rehonest_after_escape_hatch_write() -> Result<
 
     // The documented re-honest hook must make the next snapshot reflect the write.
     cache.invalidate_snapshot_base();
-    let cow = cache.create_snapshot();
-    let deep = cache.create_snapshot_deep_clone();
+    let cow = cache.snapshot();
+    let deep = cache.snapshot_deep_clone();
     assert_eq!(
         cow.storage_value(pool, slot),
         deep.storage_value(pool, slot),
@@ -345,7 +345,7 @@ async fn invalidate_snapshot_base_rehonest_after_existing_account_write() -> Res
         let bdb = cache.unchecked_blockchain_db();
         bdb.accounts().write().insert(account, original.clone());
     }
-    let warm = cache.create_snapshot(); // memoize the base with `original`.
+    let warm = cache.snapshot(); // memoize the base with `original`.
     let mut ov_warm = EvmOverlay::new(Arc::clone(&warm), None);
     let warm_info = ov_warm
         .basic(account)
@@ -381,8 +381,8 @@ async fn invalidate_snapshot_base_rehonest_after_existing_account_write() -> Res
     }
 
     cache.invalidate_snapshot_base();
-    let cow = cache.create_snapshot();
-    let deep = cache.create_snapshot_deep_clone();
+    let cow = cache.snapshot();
+    let deep = cache.snapshot_deep_clone();
     let mut ov_cow = EvmOverlay::new(Arc::clone(&cow), None);
     let mut ov_deep = EvmOverlay::new(Arc::clone(&deep), None);
 
@@ -424,7 +424,7 @@ async fn with_blockchain_db_mut_rehonest_after_storage_overwrite() -> Result<()>
     let slot = U256::from(0u64);
 
     cache.inject_storage_batch(&[(pool, slot, U256::from(111u64))]);
-    let _warm = cache.create_snapshot();
+    let _warm = cache.snapshot();
 
     cache.with_blockchain_db_mut(|bdb| {
         bdb.storage()
@@ -434,8 +434,8 @@ async fn with_blockchain_db_mut_rehonest_after_storage_overwrite() -> Result<()>
             .insert(slot, U256::from(222u64));
     });
 
-    let cow = cache.create_snapshot();
-    let deep = cache.create_snapshot_deep_clone();
+    let cow = cache.snapshot();
+    let deep = cache.snapshot_deep_clone();
     assert_eq!(
         cow.storage_value(pool, slot),
         deep.storage_value(pool, slot),
@@ -471,7 +471,7 @@ async fn with_blockchain_db_mut_rehonest_after_account_overwrite() -> Result<()>
     cache.with_blockchain_db_mut(|bdb| {
         bdb.accounts().write().insert(account, original);
     });
-    let _warm = cache.create_snapshot();
+    let _warm = cache.snapshot();
 
     cache.with_blockchain_db_mut(|bdb| {
         let mut accounts = bdb.accounts().write();
@@ -480,8 +480,8 @@ async fn with_blockchain_db_mut_rehonest_after_account_overwrite() -> Result<()>
         assert_eq!(accounts.len(), len_before);
     });
 
-    let cow = cache.create_snapshot();
-    let deep = cache.create_snapshot_deep_clone();
+    let cow = cache.snapshot();
+    let deep = cache.snapshot_deep_clone();
     let mut ov_cow = EvmOverlay::new(Arc::clone(&cow), None);
     let mut ov_deep = EvmOverlay::new(Arc::clone(&deep), None);
     let cow_basic = ov_cow.basic(account).expect("cow basic");
@@ -533,7 +533,7 @@ async fn cow_code_index_matches_deep_clone_after_base_account_recoded() -> Resul
     };
     put_account(&cache, &code_v1, h1);
     cache.invalidate_snapshot_base();
-    let warm = cache.create_snapshot(); // base now indexes h1 -> code_v1
+    let warm = cache.snapshot(); // base now indexes h1 -> code_v1
     let mut ov_warm = EvmOverlay::new(Arc::clone(&warm), None);
     assert_eq!(
         ov_warm
@@ -554,8 +554,8 @@ async fn cow_code_index_matches_deep_clone_after_base_account_recoded() -> Resul
         U256::from(9u64),
     )]);
 
-    let cow = cache.create_snapshot();
-    let deep = cache.create_snapshot_deep_clone();
+    let cow = cache.snapshot();
+    let deep = cache.snapshot_deep_clone();
     let mut ov_cow = EvmOverlay::new(Arc::clone(&cow), None);
     let mut ov_deep = EvmOverlay::new(Arc::clone(&deep), None);
 
@@ -588,12 +588,12 @@ async fn earlier_snapshot_unaffected_by_later_base_mutation() -> Result<()> {
     let slot = U256::from(3u64);
 
     cache.inject_storage_batch(&[(pool, slot, U256::from(100u64))]);
-    let early = cache.create_snapshot();
+    let early = cache.snapshot();
     assert_eq!(early.storage_value(pool, slot), Some(U256::from(100u64)));
 
     // Mutate the same base slot, then take a second snapshot.
     cache.inject_storage_batch(&[(pool, slot, U256::from(200u64))]);
-    let late = cache.create_snapshot();
+    let late = cache.snapshot();
 
     assert_eq!(
         early.storage_value(pool, slot),
@@ -634,7 +634,7 @@ async fn overlay_reset_restores_pristine_snapshot_reads() -> Result<()> {
         U256::ZERO,
     )?;
 
-    let snapshot = cache.create_snapshot();
+    let snapshot = cache.snapshot();
     let mut overlay = EvmOverlay::new(Arc::clone(&snapshot), None);
 
     // Mutate the dirty layer with a committing transfer through the overlay.
@@ -694,7 +694,7 @@ async fn overlay_buffer_reuse_is_result_stable() -> Result<()> {
         U256::from(7_777u64),
     )?;
 
-    let snapshot = cache.create_snapshot();
+    let snapshot = cache.snapshot();
     let mut overlay = EvmOverlay::new(snapshot, None);
 
     let first = overlay_balance_of(&mut overlay, token, owner)?;

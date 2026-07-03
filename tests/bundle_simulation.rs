@@ -74,7 +74,7 @@ async fn token_with_funded_alice()
 #[tokio::test(flavor = "multi_thread")]
 async fn bundle_applies_txs_over_cumulative_state() -> Result<()> {
     let (mut cache, token, alice, bob, carol) = token_with_funded_alice().await?;
-    let mut overlay = EvmOverlay::new(cache.create_snapshot(), None);
+    let mut overlay = EvmOverlay::new(cache.snapshot(), None);
 
     let txs = vec![
         BundleTx::new(alice, token, transfer_calldata(bob, 100)),
@@ -113,7 +113,7 @@ async fn bundle_applies_txs_over_cumulative_state() -> Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn atomic_bundle_reverts_whole_on_failure() -> Result<()> {
     let (mut cache, token, alice, bob, _carol) = token_with_funded_alice().await?;
-    let mut overlay = EvmOverlay::new(cache.create_snapshot(), None);
+    let mut overlay = EvmOverlay::new(cache.snapshot(), None);
 
     let txs = vec![
         BundleTx::new(alice, token, transfer_calldata(bob, 100)),
@@ -147,7 +147,7 @@ async fn atomic_bundle_reverts_whole_on_failure() -> Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn allow_reverts_keeps_prior_effects() -> Result<()> {
     let (mut cache, token, alice, bob, _carol) = token_with_funded_alice().await?;
-    let mut overlay = EvmOverlay::new(cache.create_snapshot(), None);
+    let mut overlay = EvmOverlay::new(cache.snapshot(), None);
 
     let txs = vec![
         BundleTx::new(alice, token, transfer_calldata(bob, 100)),
@@ -207,7 +207,7 @@ async fn direct_coinbase_payment_is_captured() -> Result<()> {
         },
     );
 
-    let mut overlay = EvmOverlay::new(cache.create_snapshot(), None);
+    let mut overlay = EvmOverlay::new(cache.snapshot(), None);
     let result = overlay.simulate_bundle(
         std::slice::from_ref(&tx),
         &BundleOptions {
@@ -254,7 +254,7 @@ async fn coinbase_payment_is_priority_fee_only() -> Result<()> {
         },
     );
 
-    let mut overlay = EvmOverlay::new(cache.create_snapshot(), None);
+    let mut overlay = EvmOverlay::new(cache.snapshot(), None);
     let result = overlay.simulate_bundle(std::slice::from_ref(&tx), &BundleOptions::default())?;
 
     assert!(result.gas_used > 0);
@@ -272,7 +272,7 @@ async fn coinbase_payment_is_priority_fee_only() -> Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn commit_flag_controls_overlay_persistence() -> Result<()> {
     let (mut cache, token, alice, bob, _carol) = token_with_funded_alice().await?;
-    let snapshot = cache.create_snapshot();
+    let snapshot = cache.snapshot();
 
     // commit = false: overlay unchanged afterward.
     let mut overlay = EvmOverlay::new(snapshot.clone(), None);
@@ -297,6 +297,81 @@ async fn commit_flag_controls_overlay_persistence() -> Result<()> {
     assert_eq!(
         overlay_balance(&mut overlay, token, bob)?,
         U256::from(100u64)
+    );
+    Ok(())
+}
+
+/// WS-7 (manager-authored red-green): cost-accounting breakdown. After an
+/// `AllowReverts` bundle whose whitelisted tx reverts, the reverted tx's gas is
+/// excluded from `coinbase_payment` (the honest miner receipt) but is exposed via
+/// `reverted_tx_gas`, and `successful_tx_gas + reverted_tx_gas == gas_used`. This
+/// lets a searcher compute net cost (`coinbase_payment + reverted_tx_gas`) without
+/// manually iterating `per_tx`.
+#[tokio::test(flavor = "multi_thread")]
+async fn allow_reverts_exposes_reverted_and_successful_gas() -> Result<()> {
+    let (mut cache, token, alice, bob, _carol) = token_with_funded_alice().await?;
+    let mut overlay = EvmOverlay::new(cache.snapshot(), None);
+
+    let txs = vec![
+        BundleTx::new(alice, token, transfer_calldata(bob, 100)),
+        BundleTx::new(alice, token, Bytes::from(vec![0xde, 0xad, 0xbe, 0xef])),
+    ];
+    let result = overlay.simulate_bundle(
+        &txs,
+        &BundleOptions {
+            revert_policy: RevertPolicy::AllowReverts(vec![1]),
+            commit: true,
+        },
+    )?;
+
+    assert!(result.succeeded);
+    assert!(!result.per_tx[0].reverted);
+    assert!(result.per_tx[1].reverted);
+
+    assert_eq!(
+        result.successful_tx_gas, result.per_tx[0].gas_used,
+        "successful bucket = kept tx gas"
+    );
+    assert_eq!(
+        result.reverted_tx_gas, result.per_tx[1].gas_used,
+        "reverted bucket = reverted tx gas"
+    );
+    assert!(
+        result.reverted_tx_gas > 0,
+        "the reverted whitelisted tx still consumed gas"
+    );
+    assert_eq!(
+        result.successful_tx_gas + result.reverted_tx_gas,
+        result.gas_used,
+        "the two buckets must reconstruct total gas_used"
+    );
+    Ok(())
+}
+
+/// WS-7 (manager-authored red-green): a fully successful bundle reports zero
+/// reverted gas and all gas in the successful bucket.
+#[tokio::test(flavor = "multi_thread")]
+async fn successful_bundle_reports_zero_reverted_gas() -> Result<()> {
+    let (mut cache, token, alice, bob, carol) = token_with_funded_alice().await?;
+    let mut overlay = EvmOverlay::new(cache.snapshot(), None);
+
+    let txs = vec![
+        BundleTx::new(alice, token, transfer_calldata(bob, 100)),
+        BundleTx::new(bob, token, transfer_calldata(carol, 30)),
+    ];
+    let result = overlay.simulate_bundle(
+        &txs,
+        &BundleOptions {
+            commit: true,
+            ..Default::default()
+        },
+    )?;
+
+    assert!(result.succeeded);
+    assert_eq!(result.reverted_tx_gas, 0, "no tx reverted");
+    assert_eq!(
+        result.successful_tx_gas, result.gas_used,
+        "all gas is in the successful bucket"
     );
     Ok(())
 }

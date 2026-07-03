@@ -16,12 +16,12 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use alloy_primitives::{Address, U256};
-use anyhow::{Context as _, Result};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
 use crate::StorageAccessList;
 use crate::cache::{EvmCache, versioned};
+use crate::errors::PersistenceError;
 
 const PREFETCH_REGISTRY_MAGIC: &[u8; 8] = b"EFC-PFRG";
 const PREFETCH_REGISTRY_VERSION: u32 = 1;
@@ -94,11 +94,10 @@ impl PrefetchRegistry {
     ///
     /// Returns an error if the parent directory cannot be created, serialization
     /// fails, or the write fails.
-    pub fn save(&self, path: &Path) -> Result<()> {
+    pub fn save(&self, path: &Path) -> Result<(), PersistenceError> {
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).with_context(|| {
-                format!("failed to create prefetch registry directory {parent:?}")
-            })?;
+            std::fs::create_dir_all(parent)
+                .map_err(|err| PersistenceError::create_dir(parent, err))?;
         }
         let data = versioned::encode(
             PREFETCH_REGISTRY_MAGIC,
@@ -106,8 +105,7 @@ impl PrefetchRegistry {
             self,
             "prefetch registry",
         )?;
-        std::fs::write(path, data)
-            .with_context(|| format!("failed to persist prefetch registry to {path:?}"))?;
+        std::fs::write(path, data).map_err(|err| PersistenceError::write(path, err))?;
 
         let total_slots: usize = self.phases.values().map(|al| al.slots.len()).sum::<usize>()
             + self
@@ -265,8 +263,8 @@ fn batch_prefetch(
 
     let start = std::time::Instant::now();
     let total_requested = requests.len();
-    // `None`: fetch at the cache's currently-pinned block (synchronous, no repin race).
-    let results = fetcher(requests, None);
+    // Fetch at the cache's currently-pinned block.
+    let results = fetcher(requests, cache.block());
 
     let mut successes: Vec<(Address, U256, U256)> = Vec::with_capacity(results.len());
     let mut errors = 0usize;

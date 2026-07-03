@@ -19,7 +19,9 @@ use alloy_provider::network::AnyNetwork;
 use alloy_rpc_client::RpcClient;
 use alloy_transport::mock::Asserter;
 use anyhow::Result;
-use evm_fork_cache::cache::{CacheConfig, EvmCache, EvmCacheBuilder};
+use evm_fork_cache::cache::{
+    CacheConfig, CacheSpeedMode, EvmCache, EvmCacheBuilder, StorageBatchConfig,
+};
 
 fn mock_provider() -> Arc<RootProvider<AnyNetwork>> {
     Arc::new(RootProvider::<AnyNetwork>::new(RpcClient::mocked(
@@ -95,5 +97,30 @@ async fn set_chain_id_updates_after_construction() -> Result<()> {
     assert_eq!(cache.chain_id(), 1);
     cache.set_chain_id(137); // Polygon
     assert_eq!(cache.chain_id(), 137);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn storage_batch_config_is_per_cache_instance() -> Result<()> {
+    let custom = StorageBatchConfig::new(321, 9);
+    let default_cache = EvmCacheBuilder::new(mock_provider()).build().await;
+    let fast_cache = EvmCacheBuilder::new(mock_provider())
+        .speed_mode(CacheSpeedMode::Fast)
+        .build()
+        .await;
+    let custom_cache = EvmCacheBuilder::new(mock_provider())
+        .storage_batch_config(custom)
+        .build()
+        .await;
+
+    assert_eq!(
+        default_cache.storage_batch_config(),
+        StorageBatchConfig::from(CacheSpeedMode::Slow)
+    );
+    assert_eq!(
+        fast_cache.storage_batch_config(),
+        StorageBatchConfig::from(CacheSpeedMode::Fast)
+    );
+    assert_eq!(custom_cache.storage_batch_config(), custom);
     Ok(())
 }

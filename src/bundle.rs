@@ -133,9 +133,27 @@ pub struct BundleResult {
     /// transactions (priority fee + direct coinbase tips; the base fee is already
     /// excluded by revm — see the [module docs](self#coinbase-accounting)).
     /// Saturating; `0` for an [`Atomic`](RevertPolicy::Atomic) bundle that aborted.
+    ///
+    /// Under [`AllowReverts`](RevertPolicy::AllowReverts) a whitelisted tx that
+    /// reverts contributes **nothing** to this figure (its beneficiary credit is
+    /// rolled back with the rest of its effects), even though it still burned gas.
+    /// A searcher's net cost therefore also includes that wasted gas:
+    /// `coinbase_payment + reverted_tx_gas` approximates net searcher cost under
+    /// `AllowReverts`.
     pub coinbase_payment: U256,
-    /// Total gas used across the executed transactions.
+    /// Total gas used across **all** executed transactions — successful and
+    /// reverted alike. Equal to `successful_tx_gas + reverted_tx_gas`. Saturating.
     pub gas_used: u64,
+    /// Sum of [`gas_used`](TxOutcome::gas_used) over the executed transactions that
+    /// did **not** revert (`!reverted`). This is the gas backing
+    /// [`coinbase_payment`](Self::coinbase_payment). Saturating.
+    pub successful_tx_gas: u64,
+    /// Sum of [`gas_used`](TxOutcome::gas_used) over the executed transactions that
+    /// **reverted** (`reverted`). Under [`AllowReverts`](RevertPolicy::AllowReverts)
+    /// this is the gas a whitelisted revert wasted without contributing to
+    /// [`coinbase_payment`](Self::coinbase_payment); a searcher recovers it here
+    /// instead of iterating [`per_tx`](Self::per_tx). Saturating.
+    pub reverted_tx_gas: u64,
     /// `false` iff an [`Atomic`](RevertPolicy::Atomic) bundle aborted on a
     /// revert/halt (or an `AllowReverts` bundle hit a revert at a non-whitelisted
     /// index).

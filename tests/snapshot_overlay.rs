@@ -2,7 +2,7 @@
 //! underpin the crate's parallel fan-out model.
 //!
 //! These pin the invariants a search loop relies on:
-//! - [`EvmCache::create_snapshot`] yields an immutable, point-in-time view that
+//! - [`EvmCache::snapshot`] yields an immutable, point-in-time view that
 //!   later cache mutations cannot perturb.
 //! - Overlays derived from one snapshot are isolated from each other and from the
 //!   live cache.
@@ -65,7 +65,7 @@ async fn snapshot_is_immutable_after_later_cache_mutation() -> Result<()> {
     cache.insert_mapping_storage_slot(token, balance_slot, recipient, U256::ZERO)?;
 
     // Freeze the state, then mutate the live cache with a committed transfer.
-    let snapshot = cache.create_snapshot();
+    let snapshot = cache.snapshot();
     transfer(&mut cache, token, owner, recipient, U256::from(250u64))?;
 
     // The live cache reflects the transfer...
@@ -106,12 +106,12 @@ async fn overlays_from_one_snapshot_are_isolated() -> Result<()> {
     // a StorageCleared account reads as ZERO via `cached_storage_value` (mirroring
     // the EVM SLOAD), so the live-cache assertion below would observe 0. Seeding
     // the overlay (the winning layer) is what the test means by "the cache holds
-    // `original`" and is captured by `create_snapshot`.
+    // `original`" and is captured by `snapshot`.
     cache
         .db_mut()
         .insert_account_storage(contract, slot, original)?;
 
-    let snapshot = cache.create_snapshot();
+    let snapshot = cache.snapshot();
     let mut overlay_a = EvmOverlay::new(Arc::clone(&snapshot), None);
     let mut overlay_b = EvmOverlay::new(Arc::clone(&snapshot), None);
 
@@ -159,7 +159,7 @@ async fn overlay_reads_reflect_snapshot_state() -> Result<()> {
         U256::from(42_000u64),
     )?;
 
-    let snapshot: Arc<EvmSnapshot> = cache.create_snapshot();
+    let snapshot: Arc<EvmSnapshot> = cache.snapshot();
     let mut overlay = EvmOverlay::new(snapshot, None);
 
     assert_eq!(
@@ -178,7 +178,7 @@ async fn overlay_reads_reflect_snapshot_state() -> Result<()> {
     Ok(())
 }
 
-/// Regression (§16 fix-review HIGH): `create_snapshot` must mirror the live
+/// Regression (§16 fix-review HIGH): `snapshot` must mirror the live
 /// account-state-aware read. A `StorageCleared` account with a backend-only
 /// (shadowed) slot reads ZERO live; the snapshot, `storage_value`, and a
 /// snapshot-backed overlay must all agree — not the shadowed backend value. Pre-
@@ -194,7 +194,7 @@ async fn snapshot_mirrors_live_read_for_cleared_account() -> Result<()> {
     // Live read is ZERO (the §16.0 fix).
     assert_eq!(cache.cached_storage_value(token, slot), Some(U256::ZERO));
 
-    let snapshot: Arc<EvmSnapshot> = cache.create_snapshot();
+    let snapshot: Arc<EvmSnapshot> = cache.snapshot();
     assert_eq!(
         snapshot.storage_value(token, slot),
         Some(U256::ZERO),
@@ -215,7 +215,7 @@ async fn snapshot_mirrors_live_read_for_cleared_account() -> Result<()> {
     Ok(())
 }
 
-/// Regression (round-2 HIGH, account axis): `create_snapshot` / `EvmOverlay::basic`
+/// Regression (round-2 HIGH, account axis): `snapshot` / `EvmOverlay::basic`
 /// must mirror the live account read for a `NotExisting` account. revm treats such
 /// an account as absent (`DbAccount::info()` → None), and `loaded_account_info`
 /// already does; the snapshot/parallel path must agree — not surface a phantom
@@ -246,7 +246,7 @@ async fn snapshot_basic_returns_none_for_notexisting_account() -> Result<()> {
         .expect("overlay account present")
         .account_state = AccountState::NotExisting;
 
-    let snapshot: Arc<EvmSnapshot> = cache.create_snapshot();
+    let snapshot: Arc<EvmSnapshot> = cache.snapshot();
     let mut overlay = EvmOverlay::new(Arc::clone(&snapshot), None);
     let basic = overlay
         .basic(acct)

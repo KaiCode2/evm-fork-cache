@@ -607,3 +607,171 @@ async fn reactive_runtime_allows_speculative_pending_effects_without_cache_mutat
     );
     Ok(())
 }
+
+// --- Handler lifecycle accessors (0.2.0 register/unregister support) ---
+
+#[tokio::test]
+async fn reactive_runtime_last_canonical_block_tracks_journal_head() -> Result<()> {
+    let emitter = Address::repeat_byte(0x91);
+    let mut cache = setup_cache().await?;
+    install_mock_erc20(&mut cache, emitter);
+
+    let mut runtime = ReactiveRuntime::<Ethereum>::new(ReactiveConfig::default());
+    runtime.register_handler(Arc::new(SlotWriter::any_log_from(
+        "writer",
+        emitter,
+        U256::from(1),
+        U256::from(2),
+    )))?;
+
+    // Nothing ingested yet: no canonical position.
+    assert!(runtime.last_canonical_block().is_none());
+
+    runtime.ingest_batch(
+        &mut cache,
+        batch(vec![(
+            ReactiveInput::Log(rpc_log(emitter, vec![keccak256(b"Write()")], 100, 0, 0)),
+            included_context(100, 0),
+        )]),
+    )?;
+    let head = runtime
+        .last_canonical_block()
+        .expect("a canonical block should be journaled");
+    assert_eq!(head.number, 100);
+
+    // A later canonical block advances the head.
+    runtime.ingest_batch(
+        &mut cache,
+        batch(vec![(
+            ReactiveInput::Log(rpc_log(emitter, vec![keccak256(b"Write()")], 105, 0, 0)),
+            included_context(105, 0),
+        )]),
+    )?;
+    assert_eq!(runtime.last_canonical_block().map(|b| b.number), Some(105));
+    Ok(())
+}
+
+#[tokio::test]
+async fn reactive_runtime_cancel_pending_resyncs_drops_targeted_account() -> Result<()> {
+    let address = Address::repeat_byte(0x76);
+    let slot = U256::from(11);
+    let mut cache = setup_cache().await?;
+    install_mock_erc20(&mut cache, address);
+    cache
+        .db_mut()
+        .insert_account_storage(address, slot, U256::from(123))?;
+
+    let mut runtime = ReactiveRuntime::<Ethereum>::new(ReactiveConfig::default());
+    runtime.register_handler(Arc::new(InvalidateAndResyncHandler { address, slot }))?;
+
+    // ingest_batch (no resync execution) leaves the request queued in the
+    // pending ledger.
+    runtime.ingest_batch(
+        &mut cache,
+        batch(vec![(
+            ReactiveInput::Log(rpc_log(address, vec![keccak256(b"Repair()")], 50, 0, 0)),
+            included_context(50, 0),
+        )]),
+    )?;
+    assert_eq!(runtime.pending_resyncs().len(), 1);
+
+    // An unrelated address cancels nothing.
+    let none = runtime.cancel_pending_resyncs(Address::repeat_byte(0xff));
+    assert!(none.is_empty());
+    assert_eq!(runtime.pending_resyncs().len(), 1);
+
+    // The targeted address is cancelled and returned.
+    let cancelled = runtime.cancel_pending_resyncs(address);
+    assert_eq!(cancelled.len(), 1);
+    assert_eq!(cancelled[0].id, ResyncId::new("resync-slot"));
+    assert_eq!(cancelled[0].targets.len(), 1);
+    assert!(runtime.pending_resyncs().is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn reactive_runtime_cancel_pending_resyncs_preserves_other_targets() -> Result<()> {
+    let keep = Address::repeat_byte(0x33);
+    let drop = Address::repeat_byte(0x44);
+    let mut cache = setup_cache().await?;
+    install_mock_erc20(&mut cache, keep);
+
+    let mut runtime = ReactiveRuntime::<Ethereum>::new(ReactiveConfig::default());
+    runtime.register_handler(Arc::new(MultiTargetResyncHandler {
+        emitter: keep,
+        keep,
+        drop,
+    }))?;
+
+    runtime.ingest_batch(
+        &mut cache,
+        batch(vec![(
+            ReactiveInput::Log(rpc_log(keep, vec![keccak256(b"Multi()")], 60, 0, 0)),
+            included_context(60, 0),
+        )]),
+    )?;
+    assert_eq!(runtime.pending_resyncs().len(), 1);
+    assert_eq!(runtime.pending_resyncs()[0].targets.len(), 2);
+
+    // Cancelling one account keeps the request alive with its other target.
+    let cancelled = runtime.cancel_pending_resyncs(drop);
+    assert_eq!(cancelled.len(), 1);
+    assert_eq!(cancelled[0].targets.len(), 1);
+    assert_eq!(runtime.pending_resyncs().len(), 1);
+    assert_eq!(runtime.pending_resyncs()[0].targets.len(), 1);
+    Ok(())
+}
+
+struct MultiTargetResyncHandler {
+    emitter: Address,
+    keep: Address,
+    drop: Address,
+}
+
+impl ReactiveHandler<Ethereum> for MultiTargetResyncHandler {
+    fn id(&self) -> HandlerId {
+        HandlerId::new("multi-target-resync")
+    }
+
+    fn interests(&self) -> Vec<ReactiveInterest> {
+        vec![ReactiveInterest::Logs(LogInterest {
+            provider_filter: Filter::new().address(self.emitter),
+            local_matcher: None,
+            route_key: Some(RouteKeySpec::EmitterAddress),
+        })]
+    }
+
+    fn handle(
+        &self,
+        _ctx: &ReactiveContext,
+        _input: &ReactiveInput<Ethereum>,
+        _state: &dyn StateView,
+    ) -> Result<HandlerOutcome, HandlerError> {
+        Ok(HandlerOutcome {
+            effects: vec![ReactiveEffect::Resync(ResyncRequest {
+                id: ResyncId::new("multi"),
+                reason: ResyncReason::HandlerRequested,
+                block: ResyncBlock::Latest,
+                targets: vec![
+                    ResyncTarget::Account {
+                        address: self.keep,
+                        fields: evm_fork_cache::reactive::AccountFieldMask {
+                            balance: true,
+                            ..Default::default()
+                        },
+                    },
+                    ResyncTarget::Account {
+                        address: self.drop,
+                        fields: evm_fork_cache::reactive::AccountFieldMask {
+                            balance: true,
+                            ..Default::default()
+                        },
+                    },
+                ],
+                priority: ResyncPriority::Normal,
+            })],
+            quality: StateEffectQuality::AppliedWithPendingResync,
+            tags: vec![],
+        })
+    }
+}

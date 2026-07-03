@@ -6,17 +6,17 @@
 //! quantify the Pillar A (copy-on-write snapshot) win.
 //!
 //! Expected shapes:
-//! - **`create_snapshot` group (A/B).** The cold index is seeded into **layer 2**
+//! - **`snapshot` group (A/B).** The cold index is seeded into **layer 2**
 //!   via `inject_storage_batch` (`populated_cache_layer2`), the way a fork cache
-//!   actually holds it. For each size it benches both the COW `create_snapshot`
-//!   and the retained `create_snapshot_deep_clone`. The deep clone is an O(total
+//!   actually holds it. For each size it benches both the COW `snapshot`
+//!   and the retained `snapshot_deep_clone`. The deep clone is an O(total
 //!   state) copy, so its cost slopes up with the index size; the COW path shares
 //!   the memoized base and avoids cloning total storage slots. It still scans
 //!   accounts and new layer-1 entries, so it should be much flatter than the deep
 //!   clone, especially as slots/account grows, but not strictly flat by account
 //!   count.
 //! - **`resnapshot_hot_loop`.** Warms the base with one snapshot, applies a small
-//!   `apply_updates` layer-1 mutation, then measures `create_snapshot`. This is
+//!   `apply_updates` layer-1 mutation, then measures `snapshot`. This is
 //!   the memoization win: the COW path avoids cloning cold storage slots but
 //!   remains sensitive to account scans and new layer-1 entries.
 //! - **`overlay_fanout`.** Measures fanning one frozen snapshot out into many
@@ -62,7 +62,7 @@ fn offline_cache(rt: &Runtime) -> EvmCache {
 
 /// A cache whose cold index lives in **layer 2** — seeded via
 /// `inject_storage_batch`, the path a fork cache actually uses to bulk-load its
-/// cold state. This is what the COW `create_snapshot` memoizes into its base.
+/// cold state. This is what the COW `snapshot` memoizes into its base.
 fn populated_cache_layer2(rt: &Runtime, accounts: usize, slots_per: usize) -> EvmCache {
     let mut cache = offline_cache(rt);
     let mut batch: Vec<(Address, U256, U256)> = Vec::with_capacity(accounts * slots_per);
@@ -80,15 +80,15 @@ fn populated_cache_layer2(rt: &Runtime, accounts: usize, slots_per: usize) -> Ev
     cache
 }
 
-/// A/B snapshot creation across cold-index sizes: the COW `create_snapshot` vs.
-/// the retained `create_snapshot_deep_clone`, both over a layer-2-seeded index.
+/// A/B snapshot creation across cold-index sizes: the COW `snapshot` vs.
+/// the retained `snapshot_deep_clone`, both over a layer-2-seeded index.
 ///
 /// The deep clone slopes up with total slots; the COW path, after a warm-up
 /// snapshot has memoized the base, avoids cloning those slots but still pays the
 /// O(accounts) growth scan.
-fn bench_create_snapshot(c: &mut Criterion) {
+fn bench_snapshot(c: &mut Criterion) {
     let rt = Runtime::new().unwrap();
-    let mut group = c.benchmark_group("create_snapshot");
+    let mut group = c.benchmark_group("snapshot");
     for &(accounts, slots) in &[
         (100usize, 8usize),
         (1_000, 8),
@@ -99,24 +99,24 @@ fn bench_create_snapshot(c: &mut Criterion) {
         let mut cache = populated_cache_layer2(&rt, accounts, slots);
         // Warm the memoized base once so the COW measurement reflects the
         // steady-state (reuse) cost, not the first full build.
-        black_box(cache.create_snapshot());
+        black_box(cache.snapshot());
         group.throughput(criterion::Throughput::Elements((accounts * slots) as u64));
         group.bench_with_input(
             BenchmarkId::new("cow", format!("{accounts}acct_x{slots}slot")),
             &accounts,
-            |b, _| b.iter(|| black_box(cache.create_snapshot())),
+            |b, _| b.iter(|| black_box(cache.snapshot())),
         );
         group.bench_with_input(
             BenchmarkId::new("deep_clone", format!("{accounts}acct_x{slots}slot")),
             &accounts,
-            |b, _| b.iter(|| black_box(cache.create_snapshot_deep_clone())),
+            |b, _| b.iter(|| black_box(cache.snapshot_deep_clone())),
         );
     }
     group.finish();
 }
 
 /// The memoization win: a hot re-snapshot loop. Warm the base once, apply a
-/// *small* layer-1 mutation, then measure `create_snapshot`. Cost should track
+/// *small* layer-1 mutation, then measure `snapshot`. Cost should track
 /// account scanning plus new layer-1 entries, staying much flatter than the deep
 /// clone as cold storage grows.
 fn bench_resnapshot_hot_loop(c: &mut Criterion) {
@@ -125,7 +125,7 @@ fn bench_resnapshot_hot_loop(c: &mut Criterion) {
     for &(accounts, slots) in &[(1_000usize, 8usize), (5_000, 16), (10_000, 16)] {
         let mut cache = populated_cache_layer2(&rt, accounts, slots);
         // Warm the base.
-        black_box(cache.create_snapshot());
+        black_box(cache.snapshot());
         // A handful of layer-1 writes (does not dirty the memoized base).
         let target = addr(0);
         group.throughput(criterion::Throughput::Elements((accounts * slots) as u64));
@@ -137,7 +137,7 @@ fn bench_resnapshot_hot_loop(c: &mut Criterion) {
                     cache
                         .db_mut()
                         .insert_account_info(target, AccountInfo::default());
-                    black_box(cache.create_snapshot());
+                    black_box(cache.snapshot());
                 })
             },
         );
@@ -170,7 +170,7 @@ fn bench_overlay_fanout(c: &mut Criterion) {
         .insert_mapping_storage_slot(token, U256::from(BALANCE_SLOT), owner, U256::from(1_000u64))
         .unwrap();
 
-    let snapshot = cache.create_snapshot();
+    let snapshot = cache.snapshot();
     let calldata = Bytes::from(MockERC20::balanceOfCall { account: owner }.abi_encode());
 
     let mut group = c.benchmark_group("overlay_fanout");
@@ -331,7 +331,7 @@ fn bench_inject_storage_batch(c: &mut Criterion) {
 
 criterion_group!(
     benches,
-    bench_create_snapshot,
+    bench_snapshot,
     bench_resnapshot_hot_loop,
     bench_overlay_fanout,
     bench_cache_call_raw,

@@ -14,7 +14,12 @@ struct TempDir(PathBuf);
 
 impl TempDir {
     fn new(tag: &str) -> Self {
-        let dir = std::env::temp_dir().join(format!("evm_fork_cache_roundtrip_{tag}"));
+        // Keyed by pid so concurrent `cargo test` processes never share (and
+        // never `remove_dir_all`) each other's directory.
+        let dir = std::env::temp_dir().join(format!(
+            "evm_fork_cache_roundtrip_{tag}_{}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("create temp dir");
         TempDir(dir)

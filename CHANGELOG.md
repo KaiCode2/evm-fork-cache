@@ -12,7 +12,247 @@ surface freezes at 1.0.
 
 ## [Unreleased]
 
-No unreleased changes.
+Remaining from the 0.2.0 plan, tracked as fast-follow: the docs/examples
+polish remainder (a toy constant-product AMM example and the end-to-end
+reactive integration tests enumerated in
+[`docs/KNOWN_ISSUES.md`](docs/KNOWN_ISSUES.md)).
+
+## [0.2.0] - 2026-07-05
+
+Closes the top publication-review gaps (account-level freshness, strict
+block-context, bounded `derived_slots`, conservative deep-reorg behavior) and
+lands the full Phase-8 liveness plan (spec steps 1–6). Breaking changes are
+grouped under **Changed**; they are permitted pre-1.0 (see the policy above).
+
+### Performance
+
+The round's RPC-economics wins (each documented with numbers and a reproduction
+path; see the README "Performance & honest trade-offs" section for the full,
+hedged picture):
+
+- **Bulk `eth_call` storage extraction is now the default loader.** One
+  state-override call reads thousands of slots at a flat ~26 CU instead of one
+  point read each — e.g. 10,000 slots in 1 call vs 200,000 CU, and a full
+  Uniswap V3 tick range (7,674 slots) in 2 calls / 52 CU (**~2,952× cheaper**),
+  with automatic point-read fallback. Methodology + tables:
+  [`docs/bulk-storage-extraction.md`](docs/bulk-storage-extraction.md);
+  reproduce with `RPC_URL=… cargo run --release --example bulk_storage_bench`.
+- **Verified code-seed cold starts.** Materializing a known contract set's code
+  and balances is one bulk call settled against on-chain `EXTCODEHASH` rather
+  than three reads per account: **~46× cheaper, ~25.6× faster** for 20 contracts
+  (48 ms vs ~1.2 s, 26 CU vs 1,200). Same doc + bench (scenario 11).
+- **Proof economics.** `eth_getProof` (no bulk substitute) is kept off the
+  per-block path: root-gate probes fire on a cadence (default every 16 blocks →
+  **16× fewer probes** by construction) and batch every gated account into one
+  bounded fan-out (**≈4.7–7.3× over serial** across runs, live-measured for a
+  50-account sweep — bounded by the concurrency cap, larger when per-proof
+  latency is higher; reproduce with `E2E_RPC_URL=… cargo test --test
+  liveness_root_gate -- --ignored`).
+
+### Added
+
+- **Mid-lifecycle adapter register/unregister (`ReactiveEngine`).** A new
+  `ReactiveEngine` binds a `ReactiveRuntime` to an `EventSubscriber` and drives
+  handler lifecycle as one operation, for consumers that add and drop adapters
+  while the cache runs (e.g. register an AMM on a `PoolCreated` event, drop it
+  later). `register_handler` updates runtime routing and subscriber interests
+  together and, once ingestion has journaled a canonical block, backfills the
+  new handler from that block automatically — closing the discovery→subscription
+  gap with no caller bookkeeping (`register_handler_with_backfill` for deeper
+  history, `register_handler_live_only` to opt out; `sync_handler_interests`
+  bootstraps a pre-populated runtime). `unregister_handler` removes routing and
+  transport for that handler only; the runtime adds `last_canonical_block()`,
+  `pending_resyncs()`, `cancel_pending_resyncs(address)`, `handler_ids()`,
+  `contains_handler`, `handler_interests`, and `unregister_handler` for the full
+  teardown recipe (unregister + `untrack_account` + `cancel_pending_resyncs`;
+  cache eviction stays explicit). Under the hood the new
+  `InterestOwnerSubscriber` trait lets a subscriber add/remove interests keyed by
+  a stable per-adapter `HandlerId` without disturbing unrelated owners; growing
+  an owner's filter set carries its delivery anchor across the change and
+  self-heals the gap, identical filters across owners share one subscription, and
+  retired filters release their bookkeeping. `SubscriberBackfill` describes the
+  anchor for owner-scoped `get_logs` backfill (`ReactiveEngineError` /
+  `ReactiveEngineRegisterError` are the engine's typed errors). All existing
+  runtime/subscriber APIs are unchanged; `register_interests` remains the
+  full-replacement setup path.
+- **Queryable cache health + metrics.** `ReactiveRuntime::health() -> CacheHealth`
+  (`Healthy` / `Degraded` / `Unhealthy`) and `metrics() -> CacheMetricsSnapshot`
+  (atomic counters: `deep_reorgs`, `reorgs_recovered`, `resync_requests`/`_failures`,
+  `missed_ranges`, `coverage_gaps`, `pending_contamination`). `ReactiveReport::Health`
+  transition reports and a caller-invoked `reset_health()`.
+- **Conservative deep-reorg self-heal + missed-range detection.** A forward gap in
+  the canonical block sequence (block *N* → *N+k*) is no longer silently accepted:
+  it emits `ReactiveReport::MissedBlockRange` (+ `ResyncReason::MissedBlockRange`)
+  and escalates health, while still applying the arriving block. Repeated trust-loss
+  events (deep reorg beyond the journal, or a missed range) escalate
+  `Healthy → Degraded → Unhealthy` (a "stop until rebuilt" signal).
+- **Account/root fetcher seam.** `EvmCache::account_proof_fetcher` /
+  `set_account_proof_fetcher` (`AccountProofFetchFn` over `eth_getProof`, returning
+  `AccountProof`); `ResyncTarget::Account` resyncs now resolve through it
+  (materializing so cold accounts are not silently skipped).
+- **Bulk storage extraction (`bulk_storage` module) — now the default storage
+  loader.** Every provider-backed cache ships a `StorageBatchFetchFn` that
+  loads thousands of slots per `eth_call` by overriding target code with
+  [Dedaub's 23-byte extractor](https://dedaub.com/blog/bulk-storage-extraction/)
+  (storage survives a code override), plus a Multicall3-dispatch path that
+  spans many contracts in one call — with the classic point-read fetcher as
+  automatic fallback (tiny requests, providers without override support —
+  which also latch the fetcher to point reads after consecutive failures —
+  and precompile targets). Public surface:
+  `bulk_call_storage_fetcher[_with_fallback]`, the async core
+  `fetch_slots_bulk`, `BulkCallConfig` (chunking, concurrency,
+  `CallDispatch::CallMany` for Erigon-lineage endpoints where one 20-CU
+  `eth_callMany` request carries the whole batch), `planned_call_count`,
+  `StorageFetchStrategy` + `EvmCacheBuilder::{storage_fetch_strategy,
+  bulk_call_config}` (opt-out / tuning), `point_read_storage_fetcher` (the
+  extracted classic path), and both Shanghai (`PUSH0`) and pre-Shanghai
+  extractor variants — all executed against revm in the offline test suite.
+  Measured on Alchemy: 10,000 slots in one 26-CU call (vs 200,000 CU as point
+  reads); a full Uniswap V3 pool tick range — 7,674 slots — in 2 calls /
+  52 CU; 100 contracts × 30 slots in one call
+  ([benchmarks + limitations](docs/bulk-storage-extraction.md)).
+  `StorageFetchError` and `RuntimeError` now derive `Clone` so one
+  chunk-level failure can be reported per affected slot.
+- **Custom storage programs + companion extractors + prewarm.**
+  `StorageProgram` / `run_storage_program[s]` inject caller-supplied bytecode
+  via the same override transport, enabling data-*dependent* extraction
+  derived in-EVM (a worked one-shot Uniswap V3 observation-ring loader — zero
+  calldata — ships in the benchmark example and revm tests);
+  `fetch_account_fields_bulk` (`BALANCE` + `EXTCODEHASH` for many accounts in
+  one call) and `fetch_block_context` (seven env words in one call) ride the
+  same mechanism; `EvmCache::prewarm_slots` bulk-loads a declared working set
+  into layer 2 through the installed fetcher, returning a `PrewarmReport`.
+- **Verified code seeding & local etch.** Adapters can push runtime bytecode
+  into the cache instead of paying an `eth_getCode` (plus the lazy backend's
+  balance/nonce round trips) per address, with per-address trust marks
+  (`CodeSeedState`; absence of a mark = RPC-origin) persisted to
+  `code_seeds.bin` — saved *before* `bytecodes.bin` and pruned on load, so an
+  unverified claim can never masquerade as chain-fetched across restarts.
+  `seed_account_code[_with]` records a *canonical claim* (`Pending`);
+  `verify_code_seeds()` settles the whole pending set against on-chain
+  `EXTCODEHASH` in **one** `eth_call` through the new `AccountFieldsFetchFn`
+  seam (default-wired to `fetch_account_fields_bulk`), marking matches
+  `Verified` durably (real balance patched from the same response) and
+  purging contradicted claims for refetch — `CodeVerifyReport` buckets
+  `mismatched` / `not_deployed` / `codeless` / `unverifiable` (the last is
+  fail-safe: transport failures keep seeds `Pending`). Chain-fetched code
+  beats templates: an equal-hash seed over RPC-origin code verifies
+  instantly with zero RPC; a conflicting one errors
+  (`CacheError::CodeSeedConflict`) without touching the cache.
+  `etch_account_code` is the raw-bytes *deliberate divergence* sibling
+  (`Etched`, never verified); `override_account_code*` and `deploy_contract`
+  targets now also record `Etched`, making `etched_accounts()` the single
+  local-divergence health surface. The cold-start driver gained a
+  `verify_code` phase that runs **first** — no discover sim executes over an
+  unverified claim — recording `ColdStartResults.code_verifications` and
+  guarded by `ColdStartError::NoAccountFieldsFetcher` for pending-bearing
+  rounds. Spec: `docs/verified-code-seeding-spec.md`.
+- **Strict block context + engine-driven env refresh.** `BlockContextRequirements`
+  (`strict`/`lenient`/per-field) + `BlockContextError`;
+  `EvmCacheBuilder::strict_block_context` / `block_context_requirements` and a
+  fallible `try_build` (`EvmCache::new` stays infallible + lenient);
+  `EvmCache::advance_block(header)` refreshes the full block env
+  (number/basefee/coinbase/prevrandao/gas-limit/timestamp) with the same strict
+  validation, driven from the reactive canonical-header path; new
+  `coinbase()` / `prevrandao()` / `block_gas_limit()` getters.
+- **`Validity` stamping (opt-in).** `ReactiveRuntime::enable_freshness_stamping()`
+  stamps canonical event-derived writes `Validity::ValidThrough(N)` so
+  event-maintained slots stop being needlessly re-verified.
+- **storageHash root gate + `TrackingPolicy` + `RootGateCadence`.**
+  `TrackingPolicy` (`Slots` / `WholeAccount` / `Scalars`) + `track_account`;
+  the root gate emits `ReactiveReport::CoverageGap` (+
+  `ResyncReason::RootMoved`) when a tracked account's storage root moves with
+  no covering decoder, and `Scalars` tracks native balance/nonce/code (which
+  do not move the storage root). The gate fires per `RootGateCadence`
+  (`set_root_gate_cadence`), **default every 16 canonical blocks, never
+  per-block**: `eth_getProof` is the slowest read the crate issues, and the
+  gate diffs against its persisted baseline (never block-over-block), so
+  skipping blocks trades bounded detection lag for a 16× probe-cost cut
+  without losing detection. The decoder-touched set accumulates across
+  skipped blocks (drained per firing) so covered writes never false-positive
+  as gaps; `every_n_blocks(1)` restores per-block probing and `Disabled`
+  turns the gate off. All root-gate and account-resync probes now go through
+  **one seam invocation per firing** (grouped by resync block), and the
+  default proof fetcher fans them out with bounded, order-preserving
+  concurrency — `EvmCacheBuilder::max_concurrent_proofs` (default 8) — so a
+  fleet probe costs ~`ceil(N / cap)` round trips instead of `N`.
+- **Cold-start root baseline (`roots.bin`).** `RootBaseline` persists each
+  tracked account's `storageHash` alongside the state file (versioned binary,
+  magic `EFCROOT`); on restart, `RootBaselinePlanner` root-probes the baseline
+  via `eth_getProof` and converts moved roots into targeted resyncs instead of
+  trusting stale disk state (restart-drift detection, Phase-8 step 5).
+- **Tier-3 trace-backed resync.** The reactive runtime resolves matching
+  resync targets from one `debug_traceBlockByNumber` (`prestateTracer`,
+  `diffMode`) block diff before falling back to storage/account point reads —
+  `BlockStateDiffFetchFn` (+ `set_block_state_diff_fetcher`),
+  `BlockStateDiff`/`BlockStateAccountDiff`/`BlockStateStorageDiff`, and
+  `ReactiveRuntime::ingest_batch_with_resync` (Phase-8 step 6). Measured
+  economics/latency in
+  [`docs/trace-resync-benchmarks.md`](docs/trace-resync-benchmarks.md).
+- **Bundle cost accounting.** `BundleResult::successful_tx_gas` and
+  `reverted_tx_gas` — net searcher cost (`coinbase_payment + reverted_tx_gas`) is now
+  direct under `AllowReverts`.
+- **Snapshot-consistency generation guard.** `EvmCache::snapshot_generation()`
+  — an opaque monotonic counter bumped by targeted state writes
+  (`apply_update`/`apply_updates`/`modify_slot` and everything built on them)
+  and block re-pins (`set_block`/`advance_block`), but not by cold prefetch.
+  Read it around `snapshot()` to detect (and retry) a snapshot taken
+  mid-block during continuous ingestion, closing the ROADMAP-listed
+  consistency gap (G6).
+
+### Changed (breaking)
+
+- **Freshness verdict taxonomy is honest about scope.** `Validation::Confirmed` is
+  renamed `ConfirmedStorage` (it only ever meant "no volatile storage slot changed",
+  not account-level state); a new `ConfirmedFull` covers storage **and** verified
+  account fields; `Validation::Corrected`'s `changed` field is renamed
+  `changed_slots` and gains `changed_accounts: Vec<AccountChange>`.
+- **`ResyncFailureKind::UnsupportedAccountTarget` removed**, replaced by
+  `MissingAccountFetcher` / `AccountFetchFailed` / `AccountFetchOmitted` now that
+  account resync is supported.
+- **Growth-bound enums are now `#[non_exhaustive]`.** `ReactiveReport`,
+  `ResyncReason`, `ResyncFailureKind`, `TrackingPolicy`, `CacheHealth`, and the
+  `CacheMetricsSnapshot` struct are marked `#[non_exhaustive]` (matching the
+  `StateUpdate`/`PurgeScope` precedent): downstream `match`es need a wildcard arm,
+  and future variants/counters will no longer be breaking changes.
+- **Snapshot API names are now role-based.** The low-level in-place rollback copy
+  is `EvmCache::checkpoint()` and the immutable fan-out view is
+  `EvmCache::snapshot() -> Arc<EvmSnapshot>`. The pre-0.2.0 `snapshot()` /
+  `create_snapshot()` public names were removed rather than aliased; the hidden
+  benchmark/reference helper is now `snapshot_deep_clone()`.
+- **Storage batch tuning is per instance.** `StorageBatchConfig` exposes
+  `slots_per_batch` and `max_concurrent_batches` for the provider-backed
+  storage fetcher. `EvmCacheBuilder::storage_batch_config(...)` accepts exact
+  values, `CacheSpeedMode` remains as presets via `From<CacheSpeedMode>`, and
+  `EvmCacheBuilder::speed_mode(...)` is shorthand. The process-global
+  `set_cache_speed_mode` / `cache_speed_mode` functions and static are removed.
+- **`SpeculativeSim::validate()` returns `Result<Validation>`.** Validator-owned
+  uncertainty still returns `Validation::Unverified`, while a failed background
+  task (for example a panic) now surfaces as an error instead of being folded into
+  a verdict or panicking on the handle.
+- **Crate-owned fallible APIs now return typed errors instead of `anyhow`.**
+  Public helpers expose domain errors such as `CacheError`, `StorageFetchError`,
+  `RpcError`, `FreshnessError`, `DeployError`, `MulticallError`, and
+  `AccessListError`; `SimError::Other` now carries `SimHostError`. `anyhow` is no
+  longer a normal library dependency, though examples/tests may still use it as
+  harness glue.
+
+### Fixed
+
+- **`EventPipeline::derived_slots` no longer grows unbounded.** It is now a
+  block-horizon ring bounded to `ReorgConfig::depth` (mirroring the `touched` ring),
+  so steady-state ingestion does not leak memory.
+- **`BLOCKHASH`-reading sims fail closed in freshness validation.** Validator
+  overlays carry no block hashes, so an in-lookback-range `BLOCKHASH` read
+  resolves to ZERO; such sims were previously eligible for a silent
+  `ConfirmedStorage`. The read is now recorded
+  (`EvmOverlay::blockhash_zero_fallback`) and the verdict is
+  `Validation::Unverified` — on the optimistic pass and on corrected re-runs.
+  Out-of-lookback reads return the spec-mandated ZERO and are not flagged.
+- **Block-diff traces now surface full account deletions.** A SELFDESTRUCTed
+  account (present in the trace's `pre`, absent from `post`) gets explicit
+  zeroed balance/nonce/code in `BlockStateDiff`, so account-target resyncs
+  resolve from the trace instead of falling back to point reads.
 
 ## [0.1.0] - 2026-06-30
 
@@ -202,8 +442,9 @@ pre-release development phases (see [`docs/ROADMAP.md`](docs/ROADMAP.md)).
   a pubsub stream terminates, plus an adapter from legacy `EventDecoder`s to
   reactive handlers. HTTP polling `watch_logs` / `watch_pending_transactions`
   support is still exported behind the opt-in `reactive-polling` feature. Full
-  block bodies, full pending transaction hydration, and arbitrary historical
-  backfill remain follow-up transport work. Generic core.
+  block bodies and full pending transaction hydration remain follow-up transport
+  work; owner-scoped log backfill can fetch from an explicit block anchor when
+  adding new interests. Generic core.
 - **Reactive storage resync execution** — `ReactiveRuntime::ingest_batch_with_resync`
   preserves the direct-effect behavior of `ingest_batch`, then executes surfaced
   storage resync requests through `EvmCache`'s provider-neutral
@@ -211,8 +452,9 @@ pre-release development phases (see [`docs/ROADMAP.md`](docs/ROADMAP.md)).
   updates, and reports requested targets, applied updates, the resulting
   `StateDiff`, and per-target failures in `ResyncReport`. `ResyncFailureKind`
   gives downstream retry policy and metrics a stable failure classification.
-  Account-field resyncs remain explicitly unsupported until a provider-neutral
-  account fetch callback exists. Generic core.
+  Account targets resolve through the provider-neutral account proof fetcher;
+  missing, failed, or omitted account fetches surface as typed failures. Generic
+  core.
 - **Reactive block journaling and reorg recovery** — canonical block inputs and
   applied handler reports are retained in a depth-bounded runtime journal.
   Removed logs, explicit `ChainStatus::Reorged` inputs, and parent-hash
@@ -440,5 +682,6 @@ pre-release development phases (see [`docs/ROADMAP.md`](docs/ROADMAP.md)).
 - `EvmCache` requires a multi-thread tokio runtime for any RPC-touching path.
 - See [`docs/KNOWN_ISSUES.md`](docs/KNOWN_ISSUES.md) for current limitations.
 
-[Unreleased]: https://github.com/KaiCode2/evm-fork-cache/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/KaiCode2/evm-fork-cache/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/KaiCode2/evm-fork-cache/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/KaiCode2/evm-fork-cache/releases/tag/v0.1.0

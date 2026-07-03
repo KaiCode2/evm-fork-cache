@@ -325,7 +325,7 @@ where
 /// # use evm_fork_cache::cache::{EvmOverlay, EvmSnapshot, TxConfig};
 /// # use evm_fork_cache::inspector::TransferInspector;
 /// # use evm_fork_cache::{CallTracer, InspectorStack};
-/// # fn run(snapshot: Arc<EvmSnapshot>, from: Address, to: Address) -> anyhow::Result<()> {
+/// # fn run(snapshot: Arc<EvmSnapshot>, from: Address, to: Address) -> Result<(), Box<dyn std::error::Error>> {
 /// let mut overlay = EvmOverlay::new(snapshot, None);
 /// let (_result, stack) = overlay.call_raw_with_inspector(
 ///     from,

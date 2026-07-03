@@ -9,11 +9,11 @@
 
 use alloy_primitives::{Address, Bytes, address};
 use alloy_sol_types::{SolCall, sol};
-use anyhow::{Result, anyhow};
 use tracing::{debug, instrument};
 
 use crate::access_set::StorageAccessList;
 use crate::cache::EvmCache;
+use crate::errors::{MulticallError, MulticallResult as Result};
 
 /// Multicall3 contract address (same on all EVM chains).
 pub const MULTICALL3_ADDRESS: Address = address!("cA11bde05977b3631167028862bE2a173976CA11");
@@ -158,14 +158,19 @@ impl MulticallBatch {
             revm::context::result::ExecutionResult::Success { output, .. } => {
                 let out = output.into_data();
                 let results: Vec<IMulticall3::Result> =
-                    IMulticall3::aggregate3Call::abi_decode_returns(&out)
-                        .map_err(|e| anyhow!("Failed to decode multicall result: {:?}", e))?;
+                    IMulticall3::aggregate3Call::abi_decode_returns(&out).map_err(|e| {
+                        MulticallError::Decode {
+                            details: format!("{e:?}"),
+                        }
+                    })?;
 
                 debug!(results = results.len(), "multicall batch executed");
 
                 Ok(results)
             }
-            other => Err(anyhow!("Multicall failed: {:?}", other)),
+            other => Err(MulticallError::AggregateFailed {
+                result: format!("{other:?}"),
+            }),
         }
     }
 
@@ -207,8 +212,11 @@ impl MulticallBatch {
             revm::context::result::ExecutionResult::Success { output, .. } => {
                 let out = output.into_data();
                 let results: Vec<IMulticall3::Result> =
-                    IMulticall3::aggregate3Call::abi_decode_returns(&out)
-                        .map_err(|e| anyhow!("Failed to decode multicall result: {:?}", e))?;
+                    IMulticall3::aggregate3Call::abi_decode_returns(&out).map_err(|e| {
+                        MulticallError::Decode {
+                            details: format!("{e:?}"),
+                        }
+                    })?;
 
                 debug!(
                     results = results.len(),
@@ -217,7 +225,9 @@ impl MulticallBatch {
 
                 Ok((results, access_list))
             }
-            other => Err(anyhow!("Multicall failed: {:?}", other)),
+            other => Err(MulticallError::AggregateFailed {
+                result: format!("{other:?}"),
+            }),
         }
     }
 }
@@ -294,11 +304,12 @@ where
 /// `result.returnData` cannot be ABI-decoded into `C::Return`.
 pub fn decode_result<C: SolCall>(result: &IMulticall3::Result) -> Result<C::Return> {
     if !result.success {
-        return Err(anyhow!("Call failed"));
+        return Err(MulticallError::CallFailed);
     }
 
-    C::abi_decode_returns(&result.returnData)
-        .map_err(|e| anyhow!("Failed to decode result: {:?}", e))
+    C::abi_decode_returns(&result.returnData).map_err(|e| MulticallError::Decode {
+        details: format!("{e:?}"),
+    })
 }
 
 /// Like [`decode_result`], but returns `None` instead of an `Err` when the call

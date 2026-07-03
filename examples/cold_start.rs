@@ -110,8 +110,8 @@ async fn main() -> Result<()> {
 
     // A stub fetcher standing in for the chain: the owner's true on-chain balance
     // is 1_000_000; everything else reads as a genuine zero.
-    let fetcher: StorageBatchFetchFn = Arc::new(
-        move |requests: Vec<(Address, U256)>, _block: Option<BlockId>| {
+    let fetcher: StorageBatchFetchFn =
+        Arc::new(move |requests: Vec<(Address, U256)>, _block: BlockId| {
             requests
                 .into_iter()
                 .map(|(a, s)| {
@@ -123,8 +123,7 @@ async fn main() -> Result<()> {
                     (a, s, Ok(value))
                 })
                 .collect()
-        },
-    );
+        });
     cache.set_storage_batch_fetcher(fetcher);
 
     println!(

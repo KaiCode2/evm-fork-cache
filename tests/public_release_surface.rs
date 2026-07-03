@@ -102,11 +102,16 @@ fn release_docs_and_ci_do_not_advertise_removed_protocol_feature() {
         "docs/ROADMAP.md",
     ] {
         let text = read(path);
+        // NOTE: `--no-default-features` was previously forbidden here — in the
+        // protocols-feature era it was the "exclude protocol adapters"
+        // incantation. That feature is gone; the flag now legitimately drives the
+        // reactive feature matrix in CI (polling-only / no-reactive core), so it
+        // is no longer a protocol-surface tell. The specific protocol strings
+        // below remain the real guard.
         for forbidden in [
             "protocols feature",
             "feature = \"protocols\"",
             "default = [\"protocols\"]",
-            "--no-default-features",
             "non-`protocols`",
             "UniswapV3Decoder",
             "inject_v3_",
@@ -186,6 +191,110 @@ fn generic_storage_purge_api_uses_contract_terminology() {
             assert!(
                 !text.contains(forbidden),
                 "{path} still exposes pool-oriented cache wording: {forbidden}"
+            );
+        }
+    }
+}
+
+#[test]
+fn pre_1_0_api_renames_are_clean_breaks_not_aliases() {
+    let cache = read("src/cache/mod.rs");
+
+    for required in [
+        "pub fn checkpoint(&self) -> revm::database::Cache",
+        "pub fn snapshot(&mut self) -> Arc<snapshot::EvmSnapshot>",
+        "pub struct StorageBatchConfig",
+        "impl From<CacheSpeedMode> for StorageBatchConfig",
+        "pub fn storage_batch_config(mut self, config: impl Into<StorageBatchConfig>) -> Self",
+        "pub fn speed_mode(self, mode: CacheSpeedMode) -> Self",
+        "pub fn storage_batch_config(&self) -> StorageBatchConfig",
+        "StorageFetchResult<U256>",
+        "StorageFetchResult<AccountProof>",
+    ] {
+        assert!(
+            cache.contains(required),
+            "cache API should expose the renamed surface: {required}"
+        );
+    }
+
+    for forbidden in [
+        "pub fn create_snapshot(",
+        "pub fn set_cache_speed_mode",
+        "pub fn cache_speed_mode",
+        "static CACHE_SPEED_MODE",
+        "validation handle taken twice",
+        "dyn Fn(Vec<(Address, U256)>, Option<BlockId>)",
+        "dyn Fn(Vec<(Address, Vec<U256>)>, Option<BlockId>)",
+        "batch_block_id",
+    ] {
+        assert!(
+            !cache.contains(forbidden),
+            "cache API should not keep pre-0.2.0 aliases/state: {forbidden}"
+        );
+    }
+
+    let freshness = read("src/freshness.rs");
+    assert!(
+        freshness.contains("pub async fn validate(mut self) -> Result<Validation>"),
+        "SpeculativeSim::validate should return Result<Validation>"
+    );
+    assert!(
+        !freshness.contains("validation handle taken twice"),
+        "SpeculativeSim::validate should return Err instead of panicking on a consumed handle"
+    );
+}
+
+#[test]
+fn library_error_surface_is_typed_not_anyhow() {
+    let manifest = read("Cargo.toml");
+    let dependencies = manifest
+        .split("[dev-dependencies]")
+        .next()
+        .expect("manifest has dependency section");
+    assert!(
+        !dependencies.contains("anyhow"),
+        "anyhow should not be a normal library dependency"
+    );
+
+    let errors = read("src/errors.rs");
+    for required in [
+        "pub enum CacheError",
+        "pub enum StorageFetchError",
+        "pub enum RpcError",
+        "pub enum FreshnessError",
+        "pub enum DeployError",
+        "pub enum MulticallError",
+        "pub enum AccessListError",
+        "pub enum SimHostError",
+        "Other(#[source] SimHostError)",
+    ] {
+        assert!(
+            errors.contains(required),
+            "typed error surface should expose {required}"
+        );
+    }
+
+    for path in [
+        "src/access_list.rs",
+        "src/cache/mod.rs",
+        "src/cache/overlay.rs",
+        "src/deploy.rs",
+        "src/errors.rs",
+        "src/events/mod.rs",
+        "src/freshness.rs",
+        "src/multicall.rs",
+    ] {
+        let text = read(path);
+        for forbidden in [
+            "use anyhow",
+            "anyhow::Result",
+            "anyhow::Error",
+            "anyhow!(",
+            "From<anyhow::Error>",
+        ] {
+            assert!(
+                !text.contains(forbidden),
+                "{path} should not expose crate-owned anyhow errors: {forbidden}"
             );
         }
     }

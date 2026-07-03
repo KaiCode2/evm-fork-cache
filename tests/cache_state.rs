@@ -1,5 +1,5 @@
 //! Offline integration tests for `EvmCache` state manipulation: balance
-//! overrides via storage-slot scanning, snapshot/restore, two-layer cache
+//! overrides via storage-slot scanning, checkpoint/restore, two-layer cache
 //! purging, and contract deployment/etching.
 //!
 //! All state is injected directly over a mocked provider, so these tests run
@@ -22,6 +22,7 @@ use common::{
     mock_erc20_creation_code, mock_erc20_runtime, setup_cache, transfer,
 };
 use evm_fork_cache::cache::{EvmCache, TxConfig};
+use evm_fork_cache::errors::CacheError;
 
 /// Deterministic CREATE address for `Address::ZERO` at nonce 0:
 /// `keccak256(rlp([ZERO, 0]))[12..]`.
@@ -67,7 +68,7 @@ async fn snapshot_restore_reverts_token_state() -> Result<()> {
 
     assert_eq!(balance_of(&mut cache, token, owner)?, initial_balance);
 
-    let snapshot = cache.snapshot();
+    let checkpoint = cache.checkpoint();
 
     transfer(&mut cache, token, owner, recipient, U256::from(123u64))?;
     assert_eq!(
@@ -75,7 +76,7 @@ async fn snapshot_restore_reverts_token_state() -> Result<()> {
         initial_balance - U256::from(123u64)
     );
 
-    cache.restore(snapshot);
+    cache.restore(checkpoint);
     assert_eq!(balance_of(&mut cache, token, owner)?, initial_balance);
 
     Ok(())
@@ -388,7 +389,7 @@ async fn balance_delta_post_read_error_reverts_target_checkpoint() -> Result<()>
         .simulate_call_with_balance_deltas(owner, token, Bytes::new(), owner, [token], true)
         .expect_err("post balanceOf failure must surface as an error");
     assert!(
-        err.to_string().contains("balanceOf call failed"),
+        matches!(err, CacheError::CallNotSuccessful { .. }),
         "unexpected error: {err:#}"
     );
     assert_eq!(
