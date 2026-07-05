@@ -13,10 +13,10 @@
 //!   (committed sim changes, write-throughs, freshness corrections), which always
 //!   shadows the base on a read.
 //!
-//! [`super::EvmCache::create_snapshot`] memoizes the base (via the internal
+//! [`super::EvmCache::snapshot`] memoizes the base (via the internal
 //! `refresh_base`) and folds only layer 1 fresh, so its cost tracks *changed*
 //! state, not *total* state. The retained
-//! [`super::EvmCache::create_snapshot_deep_clone`] produces the same two-tier
+//! [`super::EvmCache::snapshot_deep_clone`] produces the same two-tier
 //! shape with everything flattened into the base and empty overlay maps; it is the
 //! A/B benchmark baseline and the read-equivalence reference.
 //!
@@ -75,7 +75,7 @@ pub(crate) struct BaseState {
 /// public [`storage_value`](Self::storage_value)) are O(1) and lock-free, and
 /// reproduce the live cache's layered semantics bit-for-bit.
 ///
-/// Created via [`super::EvmCache::create_snapshot()`]. Each parallel simulation
+/// Created via [`super::EvmCache::snapshot()`]. Each parallel simulation
 /// task gets its own [`super::EvmOverlay`] backed by a cheap `Arc::clone` of
 /// the snapshot.
 pub struct EvmSnapshot {

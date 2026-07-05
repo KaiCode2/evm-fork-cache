@@ -91,7 +91,7 @@ async fn main() -> Result<()> {
         ),
     ];
 
-    let mut overlay = EvmOverlay::new(cache.create_snapshot(), None);
+    let mut overlay = EvmOverlay::new(cache.snapshot(), None);
     let result = overlay.simulate_bundle(
         &bundle,
         &BundleOptions {
@@ -122,7 +122,7 @@ async fn main() -> Result<()> {
         BundleTx::new(alice, token, transfer(bob, 100)),
         BundleTx::new(alice, token, Bytes::from(vec![0xde, 0xad, 0xbe, 0xef])),
     ];
-    let snapshot = cache.create_snapshot();
+    let snapshot = cache.snapshot();
 
     let mut atomic = EvmOverlay::new(snapshot.clone(), None);
     let r = atomic.simulate_bundle(

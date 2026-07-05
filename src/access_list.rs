@@ -29,11 +29,11 @@ use alloy_provider::Provider;
 use alloy_rlp::Encodable;
 use alloy_rpc_types_eth::{TransactionInput, TransactionRequest};
 use alloy_sol_types::{SolCall, sol};
-use anyhow::{Context as _, Result};
 use revm::context::result::ExecutionResult;
 use tracing::{debug, info};
 
 use crate::cache::EvmCache;
+use crate::errors::{AccessListError, AccessListResult as Result};
 
 /// Arbitrum ArbGasInfo precompile.
 const ARB_GAS_INFO: Address = address!("000000000000000000000000000000000000006C");
@@ -200,12 +200,12 @@ impl SmartAccessList {
         let prices = prices_call
             .call()
             .await
-            .context("failed to query ArbGasInfo prices for access-list profitability")?;
+            .map_err(|e| AccessListError::query("ArbGasInfo prices", e))?;
         let l1_fee_call = arb.getL1BaseFeeEstimate();
         let l1_base_fee = l1_fee_call
             .call()
             .await
-            .context("failed to query ArbGasInfo L1 base fee for access-list profitability")?;
+            .map_err(|e| AccessListError::query("ArbGasInfo L1 base fee", e))?;
 
         let l2_gas_price = prices.perArbGas;
 
@@ -261,12 +261,12 @@ pub async fn access_list_if_profitable<P: Provider>(
         .getPricesInWei()
         .call()
         .await
-        .context("failed to query ArbGasInfo prices for access-list profitability")?;
+        .map_err(|e| AccessListError::query("ArbGasInfo prices", e))?;
     let l1_base_fee = arb
         .getL1BaseFeeEstimate()
         .call()
         .await
-        .context("failed to query ArbGasInfo L1 base fee for access-list profitability")?;
+        .map_err(|e| AccessListError::query("ArbGasInfo L1 base fee", e))?;
 
     let l2_gas_price = prices.perArbGas;
 
@@ -329,17 +329,25 @@ async fn access_list_if_profitable_op_stack<P: Provider>(
     tx_without_access_list: Bytes,
     tx_with_access_list: Bytes,
 ) -> Result<Option<AccessList>> {
-    let l2_gas_price =
-        U256::from(provider.get_gas_price().await.context(
-            "failed to query OP Stack provider gas price for access-list profitability",
-        )?);
+    let l2_gas_price = U256::from(
+        provider
+            .get_gas_price()
+            .await
+            .map_err(|e| AccessListError::query("OP Stack provider gas price", e))?,
+    );
 
     let l1_fee_without = query_op_l1_fee(provider, tx_without_access_list)
         .await
-        .context("failed to query OP Stack GasPriceOracle L1 fee without access list")?;
+        .map_err(|e| AccessListError::Query {
+            operation: "OP Stack GasPriceOracle L1 fee without access list",
+            details: e.to_string(),
+        })?;
     let l1_fee_with = query_op_l1_fee(provider, tx_with_access_list)
         .await
-        .context("failed to query OP Stack GasPriceOracle L1 fee with access list")?;
+        .map_err(|e| AccessListError::Query {
+            operation: "OP Stack GasPriceOracle L1 fee with access list",
+            details: e.to_string(),
+        })?;
 
     let incremental_l1_fee = l1_fee_with.saturating_sub(l1_fee_without);
     let total_entries = access_list_entry_count(&access_list);
@@ -375,7 +383,7 @@ async fn query_op_l1_fee<P: Provider>(provider: &P, tx_data: Bytes) -> Result<U2
         .client()
         .request("eth_call", (tx, BlockNumberOrTag::Latest))
         .await
-        .context("OP Stack GasPriceOracle.getL1Fee eth_call failed")
+        .map_err(|e| AccessListError::query("OP Stack GasPriceOracle.getL1Fee eth_call", e))
 }
 
 /// Query the current L1 base fee estimate, dispatching to the correct predeploy

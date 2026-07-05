@@ -33,15 +33,13 @@ fn balance_slot(owner: Address) -> U256 {
 }
 
 fn counting_fetcher(counter: Arc<AtomicUsize>) -> StorageBatchFetchFn {
-    Arc::new(
-        move |requests: Vec<(Address, U256)>, _block: Option<BlockId>| {
-            counter.fetch_add(requests.len(), Ordering::Relaxed);
-            requests
-                .into_iter()
-                .map(|(addr, slot)| (addr, slot, Ok(U256::from(SEEDED_BALANCE))))
-                .collect()
-        },
-    )
+    Arc::new(move |requests: Vec<(Address, U256)>, _block: BlockId| {
+        counter.fetch_add(requests.len(), Ordering::Relaxed);
+        requests
+            .into_iter()
+            .map(|(addr, slot)| (addr, slot, Ok(U256::from(SEEDED_BALANCE))))
+            .collect()
+    })
 }
 
 async fn cache_with_counter(token: Address) -> Result<(EvmCache, Arc<AtomicUsize>)> {
@@ -90,7 +88,7 @@ async fn fan_out_reuses_one_warmup_fetch_across_all_candidates() -> Result<()> {
         "warm-up fetches each working-set slot exactly once"
     );
 
-    let snapshot = cache.create_snapshot();
+    let snapshot = cache.snapshot();
     counter.store(0, Ordering::Relaxed);
 
     // Fan N candidates out; each reads the whole shared hot set from the snapshot.

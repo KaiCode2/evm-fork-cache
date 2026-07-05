@@ -62,7 +62,7 @@ async fn tracer_captures_single_top_level_frame() -> Result<()> {
     install_default_account(&mut cache, caller);
     install_mock_erc20(&mut cache, token);
 
-    let mut overlay = EvmOverlay::new(cache.create_snapshot(), None);
+    let mut overlay = EvmOverlay::new(cache.snapshot(), None);
     let calldata = balance_of_calldata(caller);
     let (_result, tracer) = overlay.call_raw_with_inspector(
         caller,
@@ -103,7 +103,7 @@ async fn tracer_captures_nested_subcalls() -> Result<()> {
     }];
     let calldata = Bytes::from(IMulticall3::aggregate3Call { calls }.abi_encode());
 
-    let mut overlay = EvmOverlay::new(cache.create_snapshot(), None);
+    let mut overlay = EvmOverlay::new(cache.snapshot(), None);
     let (_result, tracer) = overlay.call_raw_with_inspector(
         caller,
         MULTICALL3_ADDRESS,
@@ -134,7 +134,7 @@ async fn tracer_attributes_reverts() -> Result<()> {
     install_default_account(&mut cache, caller);
     install_mock_erc20(&mut cache, token);
 
-    let mut overlay = EvmOverlay::new(cache.create_snapshot(), None);
+    let mut overlay = EvmOverlay::new(cache.snapshot(), None);
     let (_result, tracer) = overlay.call_raw_with_inspector(
         caller,
         token,
@@ -176,7 +176,7 @@ async fn inspector_stack_composes_tracer_and_transfer() -> Result<()> {
         .abi_encode(),
     );
 
-    let mut overlay = EvmOverlay::new(cache.create_snapshot(), None);
+    let mut overlay = EvmOverlay::new(cache.snapshot(), None);
     let (_result, stack) = overlay.call_raw_with_inspector(
         alice,
         token,

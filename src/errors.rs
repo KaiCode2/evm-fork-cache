@@ -34,12 +34,13 @@
 //! }
 //! ```
 
-use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt;
+use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
+use std::{borrow::Cow, io};
 
-use alloy_primitives::{Bytes, FixedBytes};
+use alloy_primitives::{Address, B256, Bytes, FixedBytes, U256};
 use alloy_sol_types::SolError;
 use tracing::warn;
 
@@ -583,6 +584,680 @@ impl fmt::Display for SimulationError {
 
 impl std::error::Error for SimulationError {}
 
+/// Error raised when validating or refreshing the block-execution context
+/// (`NUMBER` / `BASEFEE` / `COINBASE` / `PREVRANDAO` / `GASLIMIT` opcodes).
+///
+/// Under strict [`BlockContextRequirements`](crate::cache::BlockContextRequirements)
+/// a missing header field surfaces loudly as one of these variants instead of
+/// silently defaulting the corresponding EVM block-env field.
+#[derive(Debug, thiserror::Error)]
+pub enum BlockContextError {
+    /// The block header could not be fetched (the provider errored or returned
+    /// no block) while strict requirements demanded one at construction.
+    #[error("block-context header fetch failed: {0}")]
+    FetchFailed(String),
+    /// A header was available but a required block-context field was absent.
+    ///
+    /// `field` is the lowercased field token (e.g. `"basefee"`, `"prevrandao"`).
+    #[error("required block-context field missing: {field}")]
+    MissingField {
+        /// The lowercased name of the missing field.
+        field: &'static str,
+    },
+}
+
+/// Error returned when crate-managed synchronous RPC bridges cannot enter the
+/// required tokio runtime context.
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum RuntimeError {
+    /// A current-thread runtime was active, but the crate needs
+    /// `tokio::task::block_in_place`, which is available only on multi-thread
+    /// runtimes.
+    #[error(
+        "evm-fork-cache RPC operations require a multi-thread tokio runtime; \
+         found a current-thread runtime (block_in_place is not supported there). \
+         Build the runtime with `tokio::runtime::Builder::new_multi_thread()` \
+         or annotate with `#[tokio::main(flavor = \"multi_thread\")]`"
+    )]
+    CurrentThreadRuntime,
+    /// No usable runtime handle was available.
+    #[error(
+        "evm-fork-cache RPC operations require a running multi-thread tokio runtime: {details}"
+    )]
+    MissingRuntime {
+        /// The runtime lookup error rendered by tokio.
+        details: String,
+    },
+}
+
+/// Error returned by direct RPC call callbacks installed on [`EvmCache`].
+///
+/// [`EvmCache`]: crate::cache::EvmCache
+#[derive(Debug, thiserror::Error)]
+pub enum RpcError {
+    /// Runtime precondition failure before the RPC call could be made.
+    #[error(transparent)]
+    Runtime(#[from] RuntimeError),
+    /// The provider rejected or failed the RPC request.
+    #[error("RPC provider call {operation} failed: {details}")]
+    Provider {
+        /// JSON-RPC method or high-level operation name.
+        operation: &'static str,
+        /// Provider/transport error text. Alloy's provider error type is generic
+        /// over the transport, so this boundary preserves it as display text.
+        details: String,
+    },
+    /// Caller-provided callback failure.
+    #[error("custom RPC callback failed: {message}")]
+    Custom {
+        /// Caller-provided error text.
+        message: String,
+    },
+}
+
+impl RpcError {
+    /// Build a provider-failure error from any displayable provider error.
+    pub fn provider(operation: &'static str, source: impl fmt::Display) -> Self {
+        Self::Provider {
+            operation,
+            details: source.to_string(),
+        }
+    }
+
+    /// Build a custom-callback error.
+    pub fn custom(message: impl Into<String>) -> Self {
+        Self::Custom {
+            message: message.into(),
+        }
+    }
+}
+
+/// Error returned by storage/proof batch callbacks.
+///
+/// `Clone` lets a batch-level failure (one `eth_call` or one JSON-RPC batch)
+/// be reported once per affected slot without re-stringifying the source.
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum StorageFetchError {
+    /// Runtime precondition failure before a fetch could be made.
+    #[error(transparent)]
+    Runtime(#[from] RuntimeError),
+    /// The provider rejected or failed an RPC request.
+    #[error("storage/provider request {operation} failed: {details}")]
+    Provider {
+        /// JSON-RPC method or high-level operation name.
+        operation: &'static str,
+        /// Provider/transport error text. Alloy's provider error type is generic
+        /// over the transport, so this boundary preserves it as display text.
+        details: String,
+    },
+    /// JSON-RPC batch serialization failed before sending.
+    #[error("failed to serialize storage batch request: {details}")]
+    Serialization {
+        /// Serialization error text.
+        details: String,
+    },
+    /// Sending the JSON-RPC batch failed before per-call waiters could resolve.
+    #[error("failed to send storage batch request: {details}")]
+    BatchSend {
+        /// Send error text.
+        details: String,
+    },
+    /// Caller-provided callback failure.
+    #[error("custom storage/proof fetcher failed: {message}")]
+    Custom {
+        /// Caller-provided error text.
+        message: String,
+    },
+}
+
+impl StorageFetchError {
+    /// Build a provider-failure error from any displayable provider error.
+    pub fn provider(operation: &'static str, source: impl fmt::Display) -> Self {
+        Self::Provider {
+            operation,
+            details: source.to_string(),
+        }
+    }
+
+    /// Build a batch-send error.
+    pub fn batch_send(source: impl fmt::Display) -> Self {
+        Self::BatchSend {
+            details: source.to_string(),
+        }
+    }
+
+    /// Build a serialization error.
+    pub fn serialization(source: impl fmt::Display) -> Self {
+        Self::Serialization {
+            details: source.to_string(),
+        }
+    }
+
+    /// Build a custom-callback error.
+    pub fn custom(message: impl Into<String>) -> Self {
+        Self::Custom {
+            message: message.into(),
+        }
+    }
+}
+
+/// Result type returned by storage/proof batch callbacks.
+pub type StorageFetchResult<T> = Result<T, StorageFetchError>;
+
+/// Persistence failure for crate-owned on-disk cache files.
+#[derive(Debug, thiserror::Error)]
+pub enum PersistenceError {
+    /// bincode serialization failed.
+    #[error("failed to serialize {label}: {source}")]
+    Serialize {
+        /// Human-readable cache payload label.
+        label: &'static str,
+        /// bincode serialization failure.
+        #[source]
+        source: bincode::Error,
+    },
+    /// A parent directory could not be created.
+    #[error("failed to create directory {path:?}: {source}")]
+    CreateDir {
+        /// Directory path.
+        path: PathBuf,
+        /// Filesystem error.
+        #[source]
+        source: io::Error,
+    },
+    /// A file write failed.
+    #[error("failed to write {path:?}: {source}")]
+    Write {
+        /// File path.
+        path: PathBuf,
+        /// Filesystem error.
+        #[source]
+        source: io::Error,
+    },
+}
+
+impl PersistenceError {
+    /// Build a bincode serialization error.
+    pub(crate) fn serialize(label: &'static str, source: bincode::Error) -> Self {
+        Self::Serialize { label, source }
+    }
+
+    /// Build a directory creation error.
+    pub(crate) fn create_dir(path: impl Into<PathBuf>, source: io::Error) -> Self {
+        Self::CreateDir {
+            path: path.into(),
+            source,
+        }
+    }
+
+    /// Build a file write error.
+    pub(crate) fn write(path: impl Into<PathBuf>, source: io::Error) -> Self {
+        Self::Write {
+            path: path.into(),
+            source,
+        }
+    }
+}
+
+/// General cache-operation error for APIs that execute or mutate local fork
+/// state but do not classify EVM reverts as [`SimError`].
+#[derive(Debug, thiserror::Error)]
+pub enum CacheError {
+    /// Runtime precondition failure.
+    #[error(transparent)]
+    Runtime(#[from] RuntimeError),
+    /// Direct RPC callback failure.
+    #[error(transparent)]
+    Rpc(#[from] RpcError),
+    /// On-disk persistence failure.
+    #[error(transparent)]
+    Persistence(#[from] PersistenceError),
+    /// A storage verification/reconciliation path had no batch fetcher.
+    #[error("storage verification requires a storage batch fetcher")]
+    MissingStorageBatchFetcher,
+    /// Code-seed verification had pending seeds but no account-fields fetcher.
+    #[error("code-seed verification requires an account fields fetcher")]
+    MissingAccountFieldsFetcher,
+    /// Reconciliation could not fetch any requested slot, so it cannot prove the
+    /// local state fresh.
+    #[error(
+        "reconcile could not fetch any of the {requested} requested slot(s) \
+         (no usable storage fetcher / provider unreachable)"
+    )]
+    ReconcileFetchFailed {
+        /// Number of requested slots.
+        requested: usize,
+    },
+    /// Account fetch failed.
+    #[error("failed to fetch account {address}: {details}")]
+    AccountFetch {
+        /// Account address.
+        address: Address,
+        /// Backend/provider error text.
+        details: String,
+    },
+    /// A canonical code seed contradicts code already fetched from the chain.
+    ///
+    /// Chain-fetched state is authoritative over templates: the seed is
+    /// rejected and the cached code is left untouched. If the caller believes
+    /// the chain has moved (e.g. a redeploy), purge the account first and
+    /// re-seed.
+    #[error(
+        "code seed for {address} conflicts with chain-fetched code \
+         (cached hash {cached}, seeded hash {seeded})"
+    )]
+    CodeSeedConflict {
+        /// Account address.
+        address: Address,
+        /// Code hash of the RPC-origin code already in the cache.
+        cached: B256,
+        /// Code hash of the rejected seed.
+        seeded: B256,
+    },
+    /// A code seed/etch was given empty bytes; claiming an address is
+    /// code-less is not a supported seed (that is what verification's
+    /// `codeless` classification reports).
+    #[error("cannot seed/etch empty code at {address}")]
+    CodeSeedEmpty {
+        /// Account address.
+        address: Address,
+    },
+    /// Storage read failed.
+    #[error("storage read failed for {address} slot {slot}: {details}")]
+    StorageRead {
+        /// Contract address.
+        address: Address,
+        /// Storage slot.
+        slot: U256,
+        /// Backend/provider error text.
+        details: String,
+    },
+    /// Storage insert failed.
+    #[error("storage insert failed for {address} slot {slot}: {details}")]
+    StorageInsert {
+        /// Contract address.
+        address: Address,
+        /// Storage slot.
+        slot: U256,
+        /// Backend error text.
+        details: String,
+    },
+    /// Transaction environment construction failed.
+    #[error("failed to build transaction environment: {details}")]
+    TxEnv {
+        /// Builder error text.
+        details: String,
+    },
+    /// revm returned a host/database transaction error.
+    #[error("failed to transact: {details}")]
+    Transact {
+        /// revm/database error text.
+        details: String,
+    },
+    /// A helper that requires a successful EVM call observed a revert or halt.
+    #[error("EVM call did not succeed: {result}")]
+    CallNotSuccessful {
+        /// Debug rendering of the execution result.
+        result: String,
+    },
+    /// A debug/trace RPC response could not be parsed into the cache's typed
+    /// block state-diff representation.
+    #[error("failed to parse block state trace: {details}")]
+    TraceParse {
+        /// Parser error text.
+        details: String,
+    },
+    /// ABI or helper-specific decode failure.
+    #[error("failed to decode {what}: {details}")]
+    Decode {
+        /// Human-readable decode target.
+        what: &'static str,
+        /// Decoder error text.
+        details: String,
+    },
+    /// A typed Solidity call executed but did not succeed.
+    #[error("Solidity call {signature} from {from:?} to {to:?} did not succeed: {result}")]
+    SolCallFailed {
+        /// Solidity function signature.
+        signature: &'static str,
+        /// Call sender.
+        from: Address,
+        /// Call target.
+        to: Address,
+        /// Debug rendering of the execution result.
+        result: String,
+    },
+    /// A typed Solidity call returned malformed data.
+    #[error(
+        "failed to decode Solidity call {signature} return data from {from:?} to {to:?}: \
+         output_len={output_len}, error: {details}"
+    )]
+    SolCallDecode {
+        /// Solidity function signature.
+        signature: &'static str,
+        /// Call sender.
+        from: Address,
+        /// Call target.
+        to: Address,
+        /// Return-data length in bytes.
+        output_len: usize,
+        /// Decoder error text.
+        details: String,
+    },
+    /// Deployment succeeded without a created address.
+    #[error("contract deployment succeeded but no address returned")]
+    DeploymentMissingAddress,
+    /// Deployment reverted.
+    #[error("contract deployment reverted: 0x{output_hex}")]
+    DeploymentReverted {
+        /// Hex-encoded revert output.
+        output_hex: String,
+    },
+    /// Deployment halted.
+    #[error("contract deployment halted: {reason}")]
+    DeploymentHalted {
+        /// Debug rendering of the halt reason.
+        reason: String,
+    },
+    /// Source account did not contain bytecode for an override.
+    #[error("no bytecode found at source address {source_address}")]
+    MissingSourceBytecode {
+        /// Source address.
+        source_address: Address,
+    },
+    /// Runtime bytecode was required but absent or empty.
+    #[error("{role} account {address} has no runtime bytecode")]
+    MissingRuntimeCode {
+        /// Account role in the operation.
+        role: &'static str,
+        /// Account address.
+        address: Address,
+    },
+    /// Target account was required but absent.
+    #[error(
+        "target account {target} not found; use override_or_create_account_code for synthetic targets"
+    )]
+    MissingTargetAccount {
+        /// Target address.
+        target: Address,
+    },
+    /// Target account fetch failed while validating an override target.
+    #[error("failed to fetch target account {target}: {details}")]
+    TargetAccountFetch {
+        /// Target address.
+        target: Address,
+        /// Backend/provider error text.
+        details: String,
+    },
+}
+
+impl CacheError {
+    /// Convert a transaction-builder error into [`CacheError::TxEnv`].
+    pub fn tx_env(source: impl fmt::Debug) -> Self {
+        Self::TxEnv {
+            details: format!("{source:?}"),
+        }
+    }
+
+    /// Convert a revm host/database transaction error into
+    /// [`CacheError::Transact`].
+    pub fn transact(source: impl fmt::Debug) -> Self {
+        Self::Transact {
+            details: format!("{source:?}"),
+        }
+    }
+}
+
+/// Result type returned by cache APIs.
+pub type CacheResult<T, E = CacheError> = Result<T, E>;
+
+/// Error for immutable snapshot-overlay execution helpers that do not classify
+/// reverts as [`SimError`].
+#[derive(Debug, thiserror::Error)]
+pub enum OverlayError {
+    /// Transaction environment construction failed.
+    #[error("failed to build transaction environment: {details}")]
+    TxEnv {
+        /// Builder error text.
+        details: String,
+    },
+    /// revm returned a host/database transaction error.
+    #[error("failed to transact: {details}")]
+    Transact {
+        /// revm/database error text.
+        details: String,
+    },
+}
+
+impl OverlayError {
+    /// Convert a transaction-builder error into [`OverlayError::TxEnv`].
+    pub fn tx_env(source: impl fmt::Debug) -> Self {
+        Self::TxEnv {
+            details: format!("{source:?}"),
+        }
+    }
+
+    /// Convert a revm host/database transaction error into
+    /// [`OverlayError::Transact`].
+    pub fn transact(source: impl fmt::Debug) -> Self {
+        Self::Transact {
+            details: format!("{source:?}"),
+        }
+    }
+}
+
+/// Result type returned by overlay APIs that return raw [`ExecutionResult`]
+/// values instead of classifying reverts.
+///
+/// [`ExecutionResult`]: revm::context::result::ExecutionResult
+pub type OverlayResult<T, E = OverlayError> = Result<T, E>;
+
+/// Host-side failure for simulation entry points.
+#[derive(Debug, thiserror::Error)]
+pub enum SimHostError {
+    /// Transaction environment construction failed.
+    #[error("failed to build transaction environment: {details}")]
+    TxEnv {
+        /// Builder error text.
+        details: String,
+    },
+    /// revm returned a host/database transaction error.
+    #[error("failed to transact: {details}")]
+    Transact {
+        /// revm/database error text.
+        details: String,
+    },
+    /// Database read failed outside a transaction execution.
+    #[error("database operation failed: {details}")]
+    Database {
+        /// Database error text.
+        details: String,
+    },
+    /// Cache helper failed.
+    #[error(transparent)]
+    Cache(#[from] CacheError),
+    /// Overlay helper failed.
+    #[error(transparent)]
+    Overlay(#[from] OverlayError),
+}
+
+impl SimHostError {
+    /// Convert a transaction-builder error into [`SimHostError::TxEnv`].
+    pub fn tx_env(source: impl fmt::Debug) -> Self {
+        Self::TxEnv {
+            details: format!("{source:?}"),
+        }
+    }
+
+    /// Convert a revm host/database transaction error into
+    /// [`SimHostError::Transact`].
+    pub fn transact(source: impl fmt::Debug) -> Self {
+        Self::Transact {
+            details: format!("{source:?}"),
+        }
+    }
+
+    /// Convert a database error into [`SimHostError::Database`].
+    pub fn database(source: impl fmt::Debug) -> Self {
+        Self::Database {
+            details: format!("{source:?}"),
+        }
+    }
+}
+
+/// Multicall3 helper failure.
+#[derive(Debug, thiserror::Error)]
+pub enum MulticallError {
+    /// Underlying EVM cache call failed.
+    #[error(transparent)]
+    Cache(#[from] CacheError),
+    /// The aggregate3 call reverted or halted.
+    #[error("Multicall3 aggregate call failed: {result}")]
+    AggregateFailed {
+        /// Debug rendering of the execution result.
+        result: String,
+    },
+    /// A per-call result marked `success = false`.
+    #[error("multicall result indicates the call failed")]
+    CallFailed,
+    /// ABI decode failure.
+    #[error("failed to decode multicall result: {details}")]
+    Decode {
+        /// Decoder error text.
+        details: String,
+    },
+}
+
+/// Result type returned by Multicall3 helpers.
+pub type MulticallResult<T> = Result<T, MulticallError>;
+
+/// Deployment and Foundry-artifact loading failure.
+#[derive(Debug, thiserror::Error)]
+pub enum DeployError {
+    /// Artifact file could not be read.
+    #[error("failed to read Foundry artifact at {path}: {source}")]
+    ReadArtifact {
+        /// Artifact path.
+        path: PathBuf,
+        /// Filesystem error.
+        #[source]
+        source: io::Error,
+    },
+    /// Artifact JSON was invalid.
+    #[error("failed to parse Foundry artifact JSON at {path}: {source}")]
+    ParseArtifact {
+        /// Artifact path.
+        path: PathBuf,
+        /// JSON parse error.
+        #[source]
+        source: serde_json::Error,
+    },
+    /// Artifact had no bytecode field.
+    #[error("artifact {path} has no `bytecode` field")]
+    MissingBytecodeField {
+        /// Artifact path.
+        path: PathBuf,
+    },
+    /// Artifact bytecode was not a supported string shape.
+    #[error("artifact {path} has no `bytecode.object` string")]
+    MissingBytecodeObject {
+        /// Artifact path.
+        path: PathBuf,
+    },
+    /// Bytecode was empty.
+    #[error("empty bytecode")]
+    EmptyBytecode,
+    /// Bytecode still contains unresolved Foundry library placeholders.
+    #[error("bytecode contains unresolved library placeholders")]
+    UnresolvedLibraryPlaceholders,
+    /// Hex bytecode could not be decoded.
+    #[error("invalid hex bytecode: {details}")]
+    InvalidHex {
+        /// Hex decoder error text.
+        details: String,
+    },
+    /// Underlying cache operation failed.
+    #[error(transparent)]
+    Cache(#[from] CacheError),
+    /// Artifact deployment failed, with path context.
+    #[error("deploying Foundry artifact {path} failed: {source}")]
+    ArtifactDeploy {
+        /// Artifact path.
+        path: PathBuf,
+        /// Cache operation failure.
+        #[source]
+        source: CacheError,
+    },
+    /// Target validation failed before etching.
+    #[error("validating target contract {target} failed: {source}")]
+    TargetValidation {
+        /// Target address.
+        target: Address,
+        /// Cache operation failure.
+        #[source]
+        source: CacheError,
+    },
+    /// Runtime bytecode etch failed.
+    #[error("etching runtime bytecode at {target} failed: {source}")]
+    EtchRuntime {
+        /// Target address.
+        target: Address,
+        /// Cache operation failure.
+        #[source]
+        source: CacheError,
+    },
+}
+
+/// Result type returned by deployment helpers.
+pub type DeployResult<T> = Result<T, DeployError>;
+
+/// Access-list pricing query failure.
+#[derive(Debug, thiserror::Error)]
+pub enum AccessListError {
+    /// Provider/oracle query failed.
+    #[error("failed to query {operation}: {details}")]
+    Query {
+        /// Operation being queried.
+        operation: &'static str,
+        /// Provider/transport error text.
+        details: String,
+    },
+}
+
+impl AccessListError {
+    /// Build a query error from any displayable provider error.
+    pub fn query(operation: &'static str, source: impl fmt::Display) -> Self {
+        Self::Query {
+            operation,
+            details: source.to_string(),
+        }
+    }
+}
+
+/// Result type returned by access-list pricing helpers.
+pub type AccessListResult<T> = Result<T, AccessListError>;
+
+/// Error returned by speculative freshness orchestration.
+#[derive(Debug, thiserror::Error)]
+pub enum FreshnessError {
+    /// The validation handle was already consumed.
+    #[error("validation handle already consumed")]
+    ValidationHandleConsumed,
+    /// The background validation task failed to join.
+    #[error("validation task failed: {source}")]
+    ValidationTaskFailed {
+        /// Tokio join failure.
+        #[source]
+        source: tokio::task::JoinError,
+    },
+    /// An optimistic simulation failed before validation was spawned.
+    #[error(transparent)]
+    Overlay(#[from] OverlayError),
+}
+
+/// Result type returned by freshness APIs.
+pub type FreshnessResult<T> = Result<T, FreshnessError>;
+
 /// Result type returned by simulation entry points: `Ok(T)` on success, or a
 /// [`SimError`] distinguishing a transaction-level revert, an EVM halt, and a
 /// host-side failure.
@@ -615,7 +1290,7 @@ pub enum SimError {
     },
     /// An unexpected host-side error (RPC, database, ABI encoding).
     #[error("{0}")]
-    Other(anyhow::Error),
+    Other(#[source] SimHostError),
 }
 
 impl SimError {
@@ -642,9 +1317,21 @@ impl SimError {
     }
 }
 
-impl From<anyhow::Error> for SimError {
-    fn from(e: anyhow::Error) -> Self {
+impl From<SimHostError> for SimError {
+    fn from(e: SimHostError) -> Self {
         SimError::Other(e)
+    }
+}
+
+impl From<CacheError> for SimError {
+    fn from(e: CacheError) -> Self {
+        SimError::Other(e.into())
+    }
+}
+
+impl From<OverlayError> for SimError {
+    fn from(e: OverlayError) -> Self {
+        SimError::Other(e.into())
     }
 }
 

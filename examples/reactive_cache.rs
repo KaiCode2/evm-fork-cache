@@ -86,15 +86,14 @@ async fn main() -> Result<()> {
     let counter = fetches.clone();
     let fresh: HashMap<(Address, U256), U256> =
         HashMap::from([((token, bob_slot), U256::from(260))]);
-    let fetcher: StorageBatchFetchFn = Arc::new(
-        move |requests: Vec<(Address, U256)>, _block: Option<BlockId>| {
+    let fetcher: StorageBatchFetchFn =
+        Arc::new(move |requests: Vec<(Address, U256)>, _block: BlockId| {
             counter.fetch_add(requests.len(), Ordering::Relaxed);
             requests
                 .into_iter()
                 .map(|(a, s)| (a, s, Ok(fresh.get(&(a, s)).copied().unwrap_or(U256::ZERO))))
                 .collect()
-        },
-    );
+        });
     cache.set_storage_batch_fetcher(fetcher);
 
     let block = 100u64;

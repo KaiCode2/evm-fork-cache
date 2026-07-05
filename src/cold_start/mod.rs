@@ -1,8 +1,8 @@
 //! Protocol-neutral cold-start sync for [`EvmCache`](crate::cache::EvmCache).
 //!
 //! Cold start declares rounds of authoritative slot work — verify, probe,
-//! accounts, discover — and drives a bounded multi-round loop via a pure
-//! [`ColdStartPlanner`]. Every verify and probe slot yields a per-slot
+//! probe_roots, accounts, discover — and drives a bounded multi-round loop via
+//! a pure [`ColdStartPlanner`]. Every verify and probe slot yields a per-slot
 //! [`SlotOutcome`] distinguishing a genuine on-chain zero ([`SlotFetch::Zero`])
 //! from a fetch failure ([`SlotFetch::FetchFailed`]) — closing the "archive-miss"
 //! gap where a transient fetch failure was indistinguishable from absence.
@@ -72,12 +72,14 @@ mod error;
 mod plan;
 mod planner;
 mod results;
+pub mod roots;
 
 pub use config::{ColdStartConfig, ColdStartPin, ColdStartRoundSummary, ColdStartRunReport};
 pub use error::ColdStartError;
 pub use plan::{ColdStartCall, ColdStartPlan};
 pub use planner::{ColdStartPlanner, ColdStartStep};
 pub use results::{ColdStartCallResult, ColdStartResults, RoundOutcome};
+pub use roots::{RootBaseline, RootBaselinePlanner, RootProbeOutcome};
 
 // The per-slot fetch surface is ungated in `freshness`; re-export so
 // `evm_fork_cache::cold_start::SlotFetch` resolves for consumers.

@@ -35,8 +35,8 @@ Confidence legend: **[V]** verified against the source during review;
 
 4. **[FIXED] Explicit persistence failures are observable.**
    `cache::save_binary_state`, `PrefetchRegistry::save`, and
-   `EvmCache::flush` now return `anyhow::Result<()>`. `Drop` remains best-effort
-   and logs flush errors.
+   `EvmCache::flush` now return typed errors (`PersistenceError` /
+   `CacheError`). `Drop` remains best-effort and logs flush errors.
 
 5. **[FIXED] Access-list profitability uses exact EIP-2930 RLP bytes.**
    Arbitrum profitability now centralizes data-gas accounting in
@@ -86,38 +86,48 @@ surface was moved out of this crate.
 
 ## API ergonomics
 
-1. **[R] `snapshot()` vs `create_snapshot()`.** `snapshot()` returns a low-level
-    `revm::database::Cache` for in-place `restore()`; `create_snapshot()` returns
-    an `Arc<EvmSnapshot>` for cross-thread fan-out. The names don't convey the
-    difference. Docs now cross-reference them (see the rustdoc), but a rename
-    could be considered pre-1.0.
+1. **[R][Closed in 0.2.0] Snapshot API names.** The low-level
+    `revm::database::Cache` restore point is now `checkpoint()`; the
+    cross-thread `Arc<EvmSnapshot>` fan-out view is now `snapshot()`. The old
+    `snapshot()` / `create_snapshot()` public names were removed rather than
+    kept as aliases.
 
-2. **[R] Process-global cache speed mode.** `set_cache_speed_mode` /
-    `cache_speed_mode` are a process-wide `static`, so two caches in one process
-    cannot tune concurrency independently. Phase 1 moved configuration toward
-    per-instance (`EvmCacheBuilder::cache_config`); the global setter remains.
+2. **[R][Closed in 0.2.0] Per-instance storage batch tuning.**
+    `StorageBatchConfig` exposes exact `slots_per_batch` and
+    `max_concurrent_batches` knobs for one cache's provider-backed storage
+    fetcher. `CacheSpeedMode` remains as preset shorthand via
+    `From<CacheSpeedMode>` / `EvmCacheBuilder::speed_mode`. The old
+    process-global setter/getter/static are removed.
 
-3. **[V] `SpeculativeSim` consumption contract.** Both `validate()` and
-    `into_optimistic()` take `self` by value, so double-consumption is unreachable
-    under normal ownership. Internally `validate()` uses `.expect("validation
-    handle taken twice")` (defensive) while `into_optimistic()` no-ops if the
-    handle was already taken; this is now documented with a `# Panics` note on
-    `validate`. A `Result`-returning variant could remove the residual foot-gun.
+3. **[V][Closed in 0.2.0] `SpeculativeSim` consumption contract.**
+    `SpeculativeSim::validate()` now returns `Result<Validation>`: validator
+    uncertainty remains `Validation::Unverified`, while a failed background task
+    surfaces as an error instead of panicking on a defensive `.expect(...)`.
 
 ## Limitations by design / roadmap
 
-- **Freshness reconciles storage slots only, not account-level state.** The
-  optimistic verify-and-rerun loop (`FreshnessController::run`) builds its verify
-  set exclusively from the volatile storage *slots* in each sim's read set; it
-  never re-fetches or diffs an account's native balance, nonce, or bytecode.
-  Consequently `Validation::Confirmed` guarantees only that *no volatile storage
-  slot the sims read had changed* — a sim whose result depends on a
-  `BALANCE`/`SELFBALANCE` (or nonce/code) that moved on-chain without a
-  co-changing storage slot can still be reported `Confirmed`. If account-level
-  state matters to a sim, classify the account `Pinned` and keep it fresh via
-  event-driven writes (`apply_update`/`apply_updates`), or reconcile it out of
-  band. The verdict types and the `freshness` module docs state this scope; a
-  future revision may extend reconcile to touched accounts.
+- **Storage-only freshness verification is the default; account-level
+  verification is opt-in.** The optimistic verify-and-rerun loop builds its
+  verify set from the volatile storage *slots* in each sim's read set, and the
+  default verdict says exactly that: `Validation::ConfirmedStorage` guarantees
+  only that no volatile storage slot the sims read had changed — a sim whose
+  result depends on a `BALANCE`/`SELFBALANCE` (or nonce/code) that moved
+  on-chain without a co-changing storage slot can still be
+  `ConfirmedStorage`. Since 0.2.0, opting accounts into account-field
+  verification (`TrackingPolicy::WholeAccount`/`Scalars` + the `eth_getProof`
+  fetcher seam) upgrades the verdict to `ConfirmedFull` (storage **and**
+  verified account fields). The residual limitation is that account
+  verification remains per-tracked-account opt-in rather than derived
+  automatically from each sim's `BALANCE`/`CODE` read set.
+- **`Verified` code seeds are never re-verified (EIP-6780 assumption).** A
+  canonical code seed confirmed once against on-chain `EXTCODEHASH` is marked
+  `CodeSeedState::Verified` durably, including across restarts. Post-Cancun
+  (EIP-6780) deployed code is immutable — `SELFDESTRUCT` only works in the
+  creating transaction — so one confirmation is sound on mainnet and current
+  major L2s. On a chain without 6780, a `SELFDESTRUCT`-then-redeploy can
+  change code under a `Verified` mark; the escape hatch is
+  `EvmCache::purge_account` (clears the mark; the next touch refetches
+  authoritative chain state) before re-seeding.
 - **Solidity `Panic(uint256)` codes above `u64::MAX` decode as `Unknown`.**
   `decode_solidity_panic` drops out-of-range codes rather than exposing a lossy
   `u64`. Real compiler-emitted panic codes are single-byte constants, so this is
@@ -131,17 +141,25 @@ surface was moved out of this crate.
   token emitting such a value would corrupt the reconstructed delta. Real ERC-20
   supplies are far below 2^255, so this is unreachable for honest tokens; a
   malicious token can misreport balances by other means regardless.
-- **`BLOCKHASH` resolves to ZERO in ext-db-less overlays.** Snapshots do not track
-  block hashes (`block_hashes` is always empty — the live cache does not track
-  them either), so an `EvmOverlay` built without an `ext_db` (e.g. the freshness
-  validator's internal overlays) returns `B256::ZERO` for the `BLOCKHASH` opcode.
-  A simulation of a contract that reads `BLOCKHASH` through such an overlay sees
-  ZERO rather than the real historical hash.
-- **`EventPipeline::derived_slots` grows unbounded without reorgs.** Every
-  event-derived `(address, slot)` is retained for sampled reconciliation and is
-  only pruned by `reorg_to`. In long-running steady-state ingestion (no reorgs)
-  the set grows monotonically (~52 bytes/slot). The field doc says "seen so far";
-  a future revision may bound it to the reorg ring's horizon.
+- **[Hardened in 0.2.0] `BLOCKHASH` resolves to ZERO in ext-db-less overlays —
+  and the freshness validator now fails closed on it.** Snapshots do not track
+  block hashes (the live cache does not track them either), so an `EvmOverlay`
+  built without an `ext_db` returns `B256::ZERO` for in-lookback-range
+  `BLOCKHASH` reads. Since 0.2.0 the freshness pipeline records such reads
+  (`EvmOverlay::blockhash_zero_fallback`) and reports the batch
+  `Validation::Unverified` — on the optimistic pass **and** on corrected
+  re-runs — instead of silently confirming a result whose control flow may
+  depend on the real hash. Out-of-range reads return the spec-mandated ZERO
+  without a database call and are deliberately not flagged (they are correct
+  on-chain too). Direct, non-validator simulations over ext-db-less overlays
+  still observe ZERO; supply an `ext_db` or snapshot-provided hashes when
+  `BLOCKHASH` accuracy matters to such a sim.
+- **[Closed in 0.2.0] `EventPipeline::derived_slots` is bounded.** The
+  event-derived `(address, slot)` set is now a block-horizon ring bounded to
+  `ReorgConfig::depth` (mirroring the `touched` ring), so steady-state
+  ingestion no longer grows it monotonically. Slots aged past the horizon
+  cannot be reorg-invalidated anyway, so eviction loses nothing actionable;
+  sampled reconciliation now draws from the resident window.
 - **Reorgs deeper than `ReorgConfig::depth` cannot fully purge.** The touched-
   address ring is bounded to `depth` blocks; `reorg_to(n)` only purges addresses
   still in the ring, so state touched solely in blocks that have already aged out
@@ -167,7 +185,7 @@ surface was moved out of this crate.
   reverted txs' gas yourself (it is in `per_tx[i].gas_used`). Only relevant under
   `AllowReverts` with a tx that actually reverts; the `Atomic` path is unaffected.
   A future revision may surface reverted-tx gas cost directly.
-- **Copy-on-write snapshots (Phase 5, Pillar A) — done.** `create_snapshot()` is
+- **Copy-on-write snapshots (Phase 5, Pillar A) — done.** `snapshot()` is
   no longer an O(total state) deep clone. The cold `BlockchainDb` index (layer 2)
   is flattened once into an internal, immutable, `Arc`-shared base (per-account
   storage shared by `Arc`), memoized across snapshots and rebuilt copy-on-write
@@ -179,10 +197,10 @@ surface was moved out of this crate.
   since `foundry-fork-db` cannot be hooked) plus an **O(layer-1) fold** of the hot
   delta — so the cost tracks `accounts + changed state`, not total slots. A
   full rebuild (first snapshot, or after `set_block`/re-pin) is still O(total
-  state). `create_snapshot` is now `&mut self` (it memoizes the base, Decision
-  D5). The retained `create_snapshot_deep_clone()` (the legacy full flatten) is
+  state). `snapshot` is `&mut self` (it memoizes the base, Decision D5). The
+  retained `snapshot_deep_clone()` (the legacy full flatten) is
   kept as the A/B benchmark baseline and the read-equivalence reference; the
-  `create_snapshot` group in `benches/simulation.rs` measures both. Decisions and
+  `snapshot` group in `benches/simulation.rs` measures both. Decisions and
   the cost model are summarized in `ROADMAP.md` and `docs/INTERNALS.md`.
 - **Layer-2 unchecked accessors remain an explicit contract boundary (Phase 5).** The
   snapshot base's growth scan is count/absence-based, which is sufficient for the
@@ -221,20 +239,30 @@ surface was moved out of this crate.
   (WebSocket `subscribe_logs`/`subscribe_blocks`/`subscribe_pending_transactions`
   with exponential-backoff reconnect and `get_logs` backfill) all ship. Honest
   remaining transport limits: **full block bodies**, **full pending-transaction
-  hydration**, and **arbitrary historical backfill** are not implemented (the
+  hydration**, and non-log historical backfill are not implemented (the
   subscriber returns a typed `SubscriberError::Unsupported` for non-hash pending
-  interests); reconnect backfills inclusively from the last-seen block and relies
-  on the bounded `dedupe_window` to suppress overlap, so a reconnect after more
-  than `dedupe_window` matching logs can re-emit already-processed logs as
-  `Backfill` records (the runtime's canonical dedup catches most). Account-field
-  resync is unsupported until a provider-neutral account fetch callback exists.
+  interests). Mid-lifecycle handler registration through `ReactiveEngine`
+  backfills a new handler's logs from the runtime's last canonical block
+  automatically and catches the newly connected stream up from that anchor after
+  it subscribes, so the discovery→subscription window is closed without caller
+  bookkeeping; the bounded `dedupe_window` suppresses the overlap. The residual
+  limit is a genuinely live-only registration (no anchor and no backfill
+  requested): logs between the registration call and the live subscription start
+  are not fetched. A reconnect after more than `dedupe_window` matching logs can
+  re-emit already-processed logs as `Backfill` records (the runtime's canonical
+  dedup catches most). Account-field resync requires an account proof fetcher;
+  missing, failed, or omitted fetches surface as typed failures.
 - **Reactive integration-test coverage is partial.** The reactive runtime, the
   subscriber, and reorg recovery are well covered individually (reorg rollback is
   pinned by state-equivalence assertions; reconnect/backfill/dedup by inline unit
-  tests), but several public paths lack dedicated/integration coverage: composing
-  `AlloySubscriber` output into `ReactiveRuntime::ingest_batch` end-to-end, the
-  block-header ingest path, the `ReactiveReport::Decoded` shape, the
-  `EventDecoderHandler` adapter, and custom pending-tx matcher/route-key routing.
-  These are tracked follow-ups, not known defects.
+  tests). Composing `AlloySubscriber` output into `ReactiveRuntime::ingest_batch`
+  end-to-end is now covered offline in `tests/reactive_subscriber_ingest.rs` (a
+  real subscriber batch, produced via the mockable `get_logs` backfill path,
+  drives a real runtime ingest and asserts the cache write). The remaining paths
+  without dedicated integration coverage are the block-header ingest path, the
+  `ReactiveReport::Decoded` shape, the `EventDecoderHandler` adapter, and custom
+  pending-tx matcher/route-key routing; the live WebSocket transport plumbing is
+  covered by reconnect/termination unit tests but not by a networked end-to-end
+  test. These are tracked follow-ups, not known defects.
 - **Recent toolchain.** MSRV 1.88 and edition 2024 are intentional and
   CI-enforced; consumers on older toolchains are not supported.

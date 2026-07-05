@@ -25,7 +25,7 @@ use std::sync::{Arc, Mutex};
 use alloy_eips::BlockId;
 use alloy_primitives::{Address, B256, Bytes, U256, keccak256};
 use alloy_sol_types::{SolCall, SolValue};
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use revm::primitives::hardfork::SpecId;
 
 use evm_fork_cache::cache::{EvmCache, StorageBatchFetchFn};
@@ -33,6 +33,7 @@ use evm_fork_cache::cold_start::{
     ColdStartCall, ColdStartConfig, ColdStartError, ColdStartPin, ColdStartPlan, ColdStartPlanner,
     ColdStartResults, ColdStartStep, SlotFetch,
 };
+use evm_fork_cache::errors::StorageFetchError;
 use evm_fork_cache::events::StateView;
 
 use common::{
@@ -148,22 +149,20 @@ fn mixed_fetcher(
     value: U256,
     fail_slot: (Address, U256),
 ) -> StorageBatchFetchFn {
-    Arc::new(
-        move |requests: Vec<(Address, U256)>, _block: Option<BlockId>| {
-            requests
-                .into_iter()
-                .map(|(addr, slot)| {
-                    if (addr, slot) == fail_slot {
-                        (addr, slot, Err(anyhow!("archive miss")))
-                    } else if (addr, slot) == value_slot {
-                        (addr, slot, Ok(value))
-                    } else {
-                        (addr, slot, Ok(U256::ZERO))
-                    }
-                })
-                .collect()
-        },
-    )
+    Arc::new(move |requests: Vec<(Address, U256)>, _block: BlockId| {
+        requests
+            .into_iter()
+            .map(|(addr, slot)| {
+                if (addr, slot) == fail_slot {
+                    (addr, slot, Err(StorageFetchError::custom("archive miss")))
+                } else if (addr, slot) == value_slot {
+                    (addr, slot, Ok(value))
+                } else {
+                    (addr, slot, Ok(U256::ZERO))
+                }
+            })
+            .collect()
+    })
 }
 
 /// Build a cache with NO storage batch fetcher (mirrors the canonical pattern in
@@ -949,18 +948,16 @@ async fn probe_and_verify_in_one_round_are_independent() -> Result<()> {
 // S4 acceptance tests: ColdStartPin::Hash pins the run and restores afterward
 // ---------------------------------------------------------------------------
 
-/// A fetcher that records the `Option<BlockId>` it is called with, so a test can
+/// A fetcher that records the `BlockId` it is called with, so a test can
 /// assert which block the run's reads were pinned to.
-fn block_recording_fetcher(seen: Arc<Mutex<Vec<Option<BlockId>>>>) -> StorageBatchFetchFn {
-    Arc::new(
-        move |requests: Vec<(Address, U256)>, block: Option<BlockId>| {
-            seen.lock().unwrap().push(block);
-            requests
-                .into_iter()
-                .map(|(addr, slot)| (addr, slot, Ok(U256::ZERO)))
-                .collect()
-        },
-    )
+fn block_recording_fetcher(seen: Arc<Mutex<Vec<BlockId>>>) -> StorageBatchFetchFn {
+    Arc::new(move |requests: Vec<(Address, U256)>, block: BlockId| {
+        seen.lock().unwrap().push(block);
+        requests
+            .into_iter()
+            .map(|(addr, slot)| (addr, slot, Ok(U256::ZERO)))
+            .collect()
+    })
 }
 
 /// `ColdStartPin::Hash { require_canonical }` pins every round's reads to
@@ -1002,7 +999,7 @@ async fn hash_pin_reads_at_hash_and_restores_prior_block() -> Result<()> {
     let seen = seen.lock().unwrap();
     assert!(!seen.is_empty(), "the verify phase issued a pinned read");
     assert!(
-        seen.iter().all(|b| *b == Some(expected)),
+        seen.iter().all(|b| *b == expected),
         "every read was pinned to the hash (with require_canonical): {seen:?}"
     );
     assert_eq!(
@@ -1046,6 +1043,127 @@ async fn hash_pin_restores_prior_block_on_error() -> Result<()> {
         cache.block(),
         prior_block,
         "the prior block is restored even on the error path"
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// verify_code phase (verified code seeding, spec §3.5 / acceptance item 9)
+// ---------------------------------------------------------------------------
+
+/// Runtime bytes for code-seed driver tests: returns one 32-byte word and
+/// touches no storage, so nothing here ever reaches the mocked backend.
+const SEED_RUNTIME: [u8; 10] = [0x60, 0x01, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3];
+
+/// The `NoAccountFieldsFetcher` guard fires only for pending-bearing rounds:
+/// the same fetcher-less cache runs an empty round cleanly, then errors once
+/// a pending seed exists.
+#[tokio::test(flavor = "multi_thread")]
+async fn verify_code_guard_fires_only_for_pending_bearing_rounds() -> Result<()> {
+    let mut cache = no_fetcher_cache().await?;
+    assert!(cache.account_fields_fetcher().is_none());
+
+    // No pending seeds: the round runs without any fetcher and the phase is
+    // a no-op.
+    let outcome = cache.execute_cold_start_round(&ColdStartPlan::default());
+    assert!(outcome.error.is_none(), "got {:?}", outcome.error);
+    assert!(outcome.results.code_verifications.is_none());
+
+    // A pending seed with no fields fetcher short-circuits before any read.
+    cache.seed_account_code(
+        Address::repeat_byte(0xc0),
+        Bytes::from(SEED_RUNTIME.to_vec()),
+    )?;
+    let outcome = cache.execute_cold_start_round(&ColdStartPlan::default());
+    assert!(
+        matches!(outcome.error, Some(ColdStartError::NoAccountFieldsFetcher)),
+        "got {:?}",
+        outcome.error
+    );
+    assert!(outcome.results.code_verifications.is_none());
+    Ok(())
+}
+
+/// verify_code runs before accounts, and its report survives an
+/// accounts-phase hard error: the mismatched seed is purged first, then the
+/// accounts phase's refetch of that same (now cold) address fails against the
+/// empty mock queue — proving both the ordering and the partial-outcome
+/// contract.
+#[tokio::test(flavor = "multi_thread")]
+async fn verify_code_report_survives_accounts_hard_error() -> Result<()> {
+    let mut cache = setup_cache().await?;
+    let pool = Address::repeat_byte(0xc1);
+    let expected = cache.seed_account_code(pool, Bytes::from(SEED_RUNTIME.to_vec()))?;
+
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let actual = B256::repeat_byte(0xdd);
+    cache.set_account_fields_fetcher(common::stub_fields_fetcher(
+        HashMap::from([(pool, (U256::ZERO, actual))]),
+        calls.clone(),
+    ));
+
+    let plan = ColdStartPlan {
+        accounts: vec![pool],
+        ..ColdStartPlan::default()
+    };
+    let outcome = cache.execute_cold_start_round(&plan);
+
+    // The accounts phase fails: verify_code purged the mismatched seed, so
+    // ensure_account falls through to the (empty) mocked backend.
+    assert!(
+        matches!(outcome.error, Some(ColdStartError::Fetch(_))),
+        "got {:?}",
+        outcome.error
+    );
+    // ...but the verify_code report, computed first, is preserved.
+    let report = outcome
+        .results
+        .code_verifications
+        .expect("the verify_code report must survive an accounts-phase hard error");
+    assert_eq!(report.mismatched.len(), 1);
+    assert_eq!(report.mismatched[0].address, pool);
+    assert_eq!(report.mismatched[0].expected, expected);
+    assert_eq!(report.mismatched[0].actual, actual);
+    assert!(
+        cache.code_seed_state(&pool).is_none(),
+        "the contradicted claim was purged before the accounts phase ran"
+    );
+    Ok(())
+}
+
+/// Happy path: a matching seed settles in round one (report recorded, mark
+/// Verified) and the phase is a no-op in round two — the fetcher is consulted
+/// exactly once across both rounds.
+#[tokio::test(flavor = "multi_thread")]
+async fn verify_code_settles_in_one_round_then_noops() -> Result<()> {
+    let mut cache = setup_cache().await?;
+    let pool = Address::repeat_byte(0xc2);
+    let expected = cache.seed_account_code(pool, Bytes::from(SEED_RUNTIME.to_vec()))?;
+
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    cache.set_account_fields_fetcher(common::stub_fields_fetcher(
+        HashMap::from([(pool, (U256::from(9u64), expected))]),
+        calls.clone(),
+    ));
+
+    let first = cache.execute_cold_start_round(&ColdStartPlan::default());
+    assert!(first.error.is_none(), "got {:?}", first.error);
+    let report = first
+        .results
+        .code_verifications
+        .expect("a pending-bearing round records a report");
+    assert_eq!(report.verified, vec![pool]);
+
+    let second = cache.execute_cold_start_round(&ColdStartPlan::default());
+    assert!(second.error.is_none());
+    assert!(
+        second.results.code_verifications.is_none(),
+        "a settled set makes the phase a no-op"
+    );
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the fields fetcher is consulted exactly once across both rounds"
     );
     Ok(())
 }

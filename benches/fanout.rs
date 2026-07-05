@@ -3,7 +3,7 @@
 //! The honest, defensible win of the snapshot/overlay model is **parallelism**.
 //! A live mutable fork (one `revm` EVM isolated with `checkpoint`/`revert`) can
 //! only evaluate candidates *sequentially* — it cannot be shared mutably across
-//! threads. `create_snapshot()` produces an immutable `Send + Sync` view; cloning
+//! threads. `snapshot()` produces an immutable `Send + Sync` view; cloning
 //! the `Arc` hands each worker thread its own cheap `EvmOverlay`, so the same N
 //! candidates fan out across cores.
 //!
@@ -85,7 +85,7 @@ fn warm_cache(rt: &Runtime) -> (EvmCache, Address, Address, Bytes) {
 fn bench_candidate_fanout(c: &mut Criterion) {
     let rt = Runtime::new().unwrap();
     let (mut cache, token, owner, calldata) = warm_cache(&rt);
-    black_box(cache.create_snapshot()); // warm the memoized base once
+    black_box(cache.snapshot()); // warm the memoized base once
 
     let workers = thread::available_parallelism()
         .map(|n| n.get())
@@ -114,7 +114,7 @@ fn bench_candidate_fanout(c: &mut Criterion) {
         // here too — single-threaded the snapshot model is ~1×, not a win.
         group.bench_with_input(BenchmarkId::new("sequential", n), &n, |b, &n| {
             b.iter(|| {
-                let snapshot = cache.create_snapshot();
+                let snapshot = cache.snapshot();
                 for _ in 0..n {
                     let mut overlay = EvmOverlay::new(snapshot.clone(), None);
                     run_candidate(&mut overlay);
@@ -127,7 +127,7 @@ fn bench_candidate_fanout(c: &mut Criterion) {
         // which a single mutable fork cannot do.
         group.bench_with_input(BenchmarkId::new("parallel", n), &n, |b, &n| {
             b.iter(|| {
-                let snapshot = cache.create_snapshot();
+                let snapshot = cache.snapshot();
                 let per = n.div_ceil(workers);
                 thread::scope(|s| {
                     for start in (0..n).step_by(per) {

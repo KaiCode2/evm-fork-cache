@@ -26,22 +26,31 @@ jobs:
       - name: Formatting
         run: cargo fmt --all --check
 
-      - name: Clippy
-        run: cargo clippy --all-targets --no-deps -- -D warnings
+      - name: Clippy (all features)
+        run: cargo clippy --all-targets --all-features --no-deps -- -D warnings
 
-      - name: Tests (all targets)
-        run: cargo test --all-targets
+      - name: Tests (all targets, all features)
+        run: cargo test --all-targets --all-features
 
-      - name: Doc tests
-        run: cargo test --doc
+      - name: Doc tests (all features)
+        run: cargo test --doc --all-features
 
-      - name: Docs
-        run: cargo doc --no-deps
+      - name: Docs (all features)
+        run: cargo doc --no-deps --all-features
         env:
           RUSTDOCFLAGS: "-D warnings"
 
+      # --all-features enables reactive-ws, which shadows the polling-only and
+      # no-reactive cfg branches. Exercise those distinct compile paths too so a
+      # feature-gated regression cannot slip through.
+      - name: Feature matrix (polling-only + no-reactive core)
+        run: |
+          cargo clippy --all-targets --no-default-features --features reactive-polling --no-deps -- -D warnings
+          cargo test --no-default-features --features reactive-polling
+          cargo build --no-default-features
+
       - name: Benchmarks compile
-        run: cargo bench --no-run
+        run: cargo bench --no-run --all-features
 
       - name: Package
         run: cargo package --locked

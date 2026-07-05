@@ -101,7 +101,7 @@ async fn main() -> Result<()> {
     ];
     let calldata = Bytes::from(IMulticall3::aggregate3Call { calls }.abi_encode());
 
-    let mut overlay = EvmOverlay::new(cache.create_snapshot(), None);
+    let mut overlay = EvmOverlay::new(cache.snapshot(), None);
     let (_result, tracer) = overlay.call_raw_with_inspector(
         caller,
         MULTICALL3_ADDRESS,
@@ -125,7 +125,7 @@ async fn main() -> Result<()> {
         }
         .abi_encode(),
     );
-    let mut overlay = EvmOverlay::new(cache.create_snapshot(), None);
+    let mut overlay = EvmOverlay::new(cache.snapshot(), None);
     let (_result, stack) = overlay.call_raw_with_inspector(
         alice,
         token,

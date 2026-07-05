@@ -1,8 +1,10 @@
 # evm-fork-cache — engineering roadmap
 
-> Status: living document. Last updated after Phase 6 — the provider-neutral
-> reactive runtime, the live `AlloySubscriber` transport, and cold-start — landed
-> on top of the Phase 0-5 core.
+> Status: living document. Phases 0-8 have landed: through bundle simulation +
+> call tracing, plus Phase 8 — storageHash liveness & state invalidation —
+> which shipped in **0.2.0** (all six steps of
+> [`phase-8-liveness-spec.md`](phase-8-liveness-spec.md), including the
+> cold-start root baseline and the Tier-3 trace-backed resync source).
 
 ## Vision
 
@@ -20,11 +22,15 @@ Today the crate implements all three pillars end-to-end: copy-on-write snapshots
 and overlays, the freshness control plane, targeted state-update writers, the
 event-to-state reader pipeline, and — as of Phase 6 — a provider-neutral reactive
 runtime with journaled reorg recovery, a live WebSocket `AlloySubscriber`
-transport, declarative cold-start warming, and — as of Phase 7 — multi-transaction
-bundle simulation with coinbase accounting and a call-frame tracer. The remaining
-work toward 1.0 is breadth on those primitives (`Create`-kind bundle txs, opcode
+transport, declarative cold-start warming; as of Phase 7 — multi-transaction
+bundle simulation with coinbase accounting and a call-frame tracer; and — as of
+Phase 8 — liveness as a first-class engine responsibility via `storageHash`-based
+state invalidation (the root gate, tracking policies, and the trace-backed resync
+source), plus mid-lifecycle adapter register/unregister. The remaining work
+toward 1.0 is breadth on those primitives (`Create`-kind bundle txs, opcode
 tracing) and transport depth (full block bodies, full pending-tx hydration,
-arbitrary historical backfill), not the core control plane.
+non-log historical backfill; log interests can request owner-scoped `get_logs`
+backfill from a block anchor).
 
 ## Target architecture
 
@@ -34,7 +40,7 @@ Four layers, bottom to top:
 Parallel overlays ×N        (isolated Send simulations)
         ▲ clone ×N (cheap)
 Snapshot · Arc · COW         (rapidly clonable, point-in-time)
-        ▲ create_snapshot
+        ▲ snapshot
 Fork DB (foundry-fork-db)    (lazy RPC fetch + local state cache)
         ▲ lazy fetch              ▲ targeted writes / purge (no RPC)
 RPC node                     Event-driven sync  ← WS logs · new block
@@ -50,7 +56,7 @@ RPC node                     Event-driven sync  ← WS logs · new block
 
 ### The three pillars
 
-- **Pillar A — COW snapshots.** Replace the deep-clone `create_snapshot` with
+- **Pillar A — COW snapshots.** Replace the deep-clone `snapshot` with
   structurally-shared, copy-on-write state so cloning is O(changed), not
   O(total). This is the performance payoff for parallel fan-out.
 - **Pillar B — Event → state pipeline.** Decode protocol events into targeted
@@ -86,6 +92,7 @@ RPC node                     Event-driven sync  ← WS logs · new block
 | **5** | COW snapshots (Pillar A): structural sharing; overlay buffer reuse. | **Done** (`phase-5-cow-snapshots`) |
 | **6** | Reactive runtime + live transport: provider-neutral `ReactiveRuntime` / `ReactiveHandler`, journaled depth-bounded reorg recovery, the WebSocket `AlloySubscriber`, and declarative `cold_start` warming. | **Done** (`cold-start-sync`) |
 | **7** | Bundle simulation + call tracing: `EvmOverlay::simulate_bundle` (ordered cumulative-state txs, `RevertPolicy`, coinbase-payment accounting) and a `CallTracer` (call-frame tree) + composable `InspectorStack`. | **Done** (`phase-6-bundle-sim`) |
+| **8** | storageHash liveness & state invalidation (Pillar C): account/root fetcher seam (`eth_getProof`); per-block root gate + complement resync (`ResyncReason::RootMoved`) + coverage alarm; per-contract `TrackingPolicy` (`Slots`/`WholeAccount`/`Scalars`); event-write `Validity` stamping; `advance_block` block-env refresh; cold-start root baseline (`roots.bin`); Tier-3 trace-backed resync. | **Done in 0.2.0** ([spec](phase-8-liveness-spec.md)) |
 
 Cross-cutting remaining work: `Create`-kind / state-override bundles, opcode-level
 tracing, and a full no-provider build split.
@@ -104,11 +111,11 @@ a 1.0.
 
 - **Change:** derive the simulation error with `thiserror`; add a first-class
   `Halt { reason, gas_used }` variant instead of folding halts into the generic
-  `Other(anyhow::Error)`. Keep `SimulationError` (the decoded revert) as the
-  `Revert` payload.
+  host failure arm. Keep `SimulationError` (the decoded revert) as the
+  `Revert` payload, and route host failures through `SimHostError`.
 - **Files:** `src/errors.rs` (+ `thiserror` dep), call sites in
   `src/cache/mod.rs` / `src/cache/overlay.rs`.
-- **API:** `enum SimError { Revert(Box<SimulationError>), Halt { .. }, Host(anyhow::Error) }`;
+- **API:** `enum SimError { Revert(Box<SimulationError>), Halt { .. }, Other(SimHostError) }`;
   `type SimulationResult<T> = Result<T, SimError>`. `SimulationErrorKind`
   retained as a deprecated alias.
 - **Done when:** halts surface typed; `cargo test` + clippy green.
@@ -132,7 +139,7 @@ a 1.0.
 
 ### 1c — Hot-path benchmarks
 
-- **Change:** add offline criterion benches for the real hot paths — `create_snapshot`
+- **Change:** add offline criterion benches for the real hot paths — `snapshot`
   across cache sizes (N accounts × M slots), an M-way overlay fan-out
   (clone + simulate), and `inject_storage_batch`. Build the cache once inside a
   runtime; benchmark the sync hot paths.
@@ -142,14 +149,14 @@ a 1.0.
 ### 1d — Builder
 
 - **Change:** add `EvmCacheBuilder` (fluent: block, spec, cache config,
-  shared-memory capacity) as the preferred constructor over positional
+  shared-memory capacity, storage batch config) as the preferred constructor over positional
   `with_cache` / `from_backend`.
 - **Files:** `src/cache/mod.rs` (+ a `builder` submodule).
 - **API:** `EvmCache::builder(provider).block(..).spec(..).build().await`.
   Existing constructors retained (possibly deprecated).
-- **Done:** builder constructs an equivalent cache. The legacy process-global
-  speed-mode setter remains as accepted API ergonomics debt (tracked in
-  `docs/KNOWN_ISSUES.md`).
+- **Done:** builder constructs an equivalent cache. Storage batch tuning is now
+  per cache via `EvmCacheBuilder::storage_batch_config`, with
+  `EvmCacheBuilder::speed_mode` as preset shorthand.
 
 ### 1e — Protocol adapter extraction
 
@@ -240,22 +247,27 @@ pub struct FreshnessController<P: FreshnessPolicy, C: FreshnessClock> { /* regis
 
 `run` returns a `SpeculativeSim { optimistic, validation }` **as soon as the
 optimistic sims finish** — it does *not* await RPC. The caller computes against
-`optimistic()` immediately and `validate().await`s the verdict when ready.
+`optimistic()` immediately and `validate().await?`s the verdict when ready.
 
 ```rust
 pub struct SpeculativeSim { /* optimistic results + JoinHandle<Validation> */ }
 impl SpeculativeSim {
     pub fn optimistic(&self) -> &[SimOutcome];
-    pub async fn validate(self) -> Validation;
+    pub async fn validate(self) -> Result<Validation>;
 }
 pub enum Validation {
-    Confirmed,
-    Corrected { results: Vec<SimOutcome>, changed: Vec<SlotChange> },
+    ConfirmedStorage,
+    ConfirmedFull,
+    Corrected {
+        results: Vec<SimOutcome>,
+        changed_slots: Vec<SlotChange>,
+        changed_accounts: Vec<AccountChange>,
+    },
     Unverified { reason: String },
 }
 ```
 
-Main thread (`run`): drain pending corrections into the cache → `create_snapshot()`
+Main thread (`run`): drain pending corrections into the cache → `snapshot()`
 → run optimistic sims (capturing read-sets) → **spawn** the validator with `Send`
 data only (`Arc<EvmSnapshot>`, the `Arc` `StorageBatchFetchFn`, requests, read-sets)
 → return `SpeculativeSim`.
@@ -407,7 +419,7 @@ is recorded in `KNOWN_ISSUES.md`.
 
 ## Phase 5 — copy-on-write snapshots (detailed, decisions locked)
 
-Builds **Pillar A**: replace the O(total state) deep-clone `create_snapshot` with
+Builds **Pillar A**: replace the O(total state) deep-clone `snapshot` with
 a two-tier copy-on-write view whose cost tracks *changed* state, not *total*
 state. The cold `BlockchainDb` index (layer 2) is flattened once into an
 internal, immutable, `Arc`-shared base — both the base as a whole and each
@@ -425,10 +437,10 @@ below.
 2. **Base memoized as immutable; over-invalidation is acceptable, silent
    staleness is not** (D2). The write-through funnel marks an address dirty
    unconditionally; the differential-equivalence test is the hard backstop.
-3. **Keep the deep clone** as `create_snapshot_deep_clone` (D3) — the A/B
+3. **Keep the deep clone** as `snapshot_deep_clone` (D3) — the A/B
    benchmark baseline and the read-equivalence reference.
 4. **Overlay reuse: buffer reuse *and* `reset()` recycle** (D4) — both in scope.
-5. **`create_snapshot` becomes `&mut self`** (D5) — the memoization cost; the
+5. **`snapshot` becomes `&mut self`** (D5) — the memoization cost; the
    freshness controller and all callers are updated.
 
 ### Acceptance — met
@@ -441,8 +453,8 @@ snapshot/overlay/freshness tests pass unchanged.
 Landed on `phase-5-cow-snapshots`: the memoized two-tier base (`BaseState` +
 the rewritten two-tier `EvmSnapshot` with `account_info`/`storage_value`/`code`
 accessors, `src/cache/snapshot.rs`); `EvmCache::refresh_base`/`build_base_full`,
-the COW `create_snapshot` (now `&mut self`), the retained
-`create_snapshot_deep_clone`, and the `mark_base_dirty`/`invalidate_base`
+the COW `snapshot` (now `&mut self`), the retained
+`snapshot_deep_clone`, and the `mark_base_dirty`/`invalidate_base`
 invalidation wired into `write_slot_through`/`apply_slot_run`/
 `write_account_info_through`/`inject_storage_batch`/the `purge_*` paths and
 `set_block` (`src/cache/mod.rs`); `EvmOverlay::reset` plus the reusable
@@ -501,10 +513,11 @@ WebSocket transport, and a declarative cold-start warmer. Landed on
   the backstop. `journal_depth` must exceed the deepest reorg you intend to
   recover from.
 - The subscriber surfaces pending-transaction **hashes** only (no full pending-tx
-  hydration), no full block bodies, and backfill is anchored at the last-seen
-  block (no arbitrary historical backfill). Account-field resync targets return a
-  typed `Unsupported` error. Hook dispatch is synchronous on the ingest thread;
-  `hook_backpressure` is reserved for a future async dispatcher.
+  hydration), no full block bodies, and non-log historical backfill is not
+  implemented. Log interests can request owner-scoped `get_logs` backfill from a
+  block anchor; reconnect backfill is still anchored at the last-seen block. Hook
+  dispatch is synchronous on the ingest thread; `hook_backpressure` is reserved
+  for a future async dispatcher.
 
 ### Acceptance — met
 
@@ -514,6 +527,80 @@ WebSocket transport, and a declarative cold-start warmer. Landed on
 `AlloySubscriber`), `src/cold_start/` (planner/driver/plan/results), the
 `reactive_cache` / `reactive_runtime` / `reactive_alloy_amm_live_probe` examples,
 `benches/event_pipeline.rs`, and `tests/reactive_*` + `tests/cold_start.rs`.
+
+---
+
+## Phase 8 — storageHash liveness & state invalidation (shipped in 0.2.0)
+
+Deepens **Pillar C** by making liveness a first-class engine responsibility
+instead of a consumer chore. Today freshness can only re-check slots a sim
+actually read or the caller explicitly sampled, and the event pipeline only keeps
+state fresh for protocols with a decoder — so state changed by any uncovered path
+(proxy `sstore`, admin writes, an undecoded token, a `SELFDESTRUCT`/`CREATE2`
+redeploy) goes silently stale. An account's storage-trie root (`storageHash`, from
+`eth_getProof`) is a commitment over *all* its storage, so `root_unchanged ⟹
+provably nothing under the account changed` — a sound, per-account change oracle
+with zero false negatives, obtainable from any standard RPC in one call, with **no
+local trie and no proof verification**. This phase uses it to detect and repair
+the staleness the current footprint-bounded model cannot see.
+
+Full design, type sketches, tests, and the cold-start correctness argument live in
+[`phase-8-liveness-spec.md`](phase-8-liveness-spec.md). The build set (in order):
+
+1. **Account/root fetcher seam** on `EvmCache` (`AccountProofFetchFn` over
+   `eth_getProof`, mirroring `StorageBatchFetchFn`). The linchpin — it also
+   resolves the tracked `ResyncTarget::Account` `Unsupported` gap
+   (`reactive/mod.rs`) and the account-field freshness gap.
+2. **`advance_block(header)`** — engine-driven block-env refresh from the
+   canonical header stream (the runtime does not refresh scalars per block today).
+3. **`Validity` stamping** of reactive/event-derived writes — the first (minimal,
+   intentional) coupling of the reactive runtime to `FreshnessRegistry`
+   (`valid_through_slot(N)` on touched slots, aged by `on_new_block`).
+4. **The centerpiece:** per-contract `TrackingPolicy` (`Slots` / `WholeAccount` /
+   `Scalars`) + a per-block **root gate** that, on a root move no decoder
+   explained, emits a `ResyncRequest` (new `ResyncReason::RootMoved`) through the
+   runtime's existing resync channel and raises a `CoverageGap` report.
+5. **Cold-start root baseline** (`roots.bin`) + restart drift diff in the
+   `ColdStartPlanner` — "if the observed root matches the persisted baseline,
+   we're already synced; skip re-reading."
+6. A Tier-3 state-diff trace source (`debug_traceBlock` /
+   `trace_replayBlockTransactions`) that resolves matching resync targets with
+   one block-level diff where available, then falls back to portable point reads
+   for unresolved targets.
+   [`trace-resync-benchmarks.md`](trace-resync-benchmarks.md) records the live
+   RPC measurements behind the policy: trace wins CU economics quickly, gzip
+   materially helps large trace payloads, and latency-sensitive small slot sets
+   should continue to use batched point reads.
+
+### Locked decisions
+
+1. **No local storage trie; no cryptographic proof verification.** The root is
+   *observed* via `eth_getProof`, never reconstructed locally, and never verified
+   against a `stateRoot` fetched from the same (already-trusted) RPC — that would
+   be circular. `alloy-trie` stays out. No new production dependency.
+2. **`storageHash` gates `WholeAccount` only**, never `Slots` (a sparse-interest
+   contract's root churns every block → noisy, wasteful). The policy is a pure
+   cost knob: a false-positive resync is never *incorrect*, only redundant.
+3. **Compose, don't merge** — a `TrackingRegistry` sits beside
+   `FreshnessRegistry`; the freshness API stays verbatim.
+4. **Reuse the existing resync channel** — the root gate emits `ResyncRequest`s;
+   it does not build a parallel repair loop.
+5. **Cold-start gate is currency, not completeness** — the across-time root diff
+   proves tracked slots are current, not that the cache is complete; a
+   `FullMirror` completeness mode is explicitly deferred.
+
+### Closes (on landing, convert in `KNOWN_ISSUES.md`)
+
+Account-field resync `Unsupported` (`reactive/mod.rs`), "freshness reconciles
+storage slots only" (the balance/nonce/code gap), and the account-field-resync
+transport-depth item below.
+
+### Acceptance (target)
+
+Branch `phase-8-liveness`. Green bar at every commit: `cargo fmt --all --check`,
+`cargo clippy --all-targets --all-features -- -D warnings`, `cargo test`,
+`RUSTDOCFLAGS=-D warnings cargo doc --no-deps`, `cargo bench --no-run`. Offline
+acceptance contract in the spec (`tests/liveness_*`).
 
 ---
 
@@ -531,12 +618,13 @@ WebSocket transport, and a declarative cold-start warmer. Landed on
    subscriptions, exponential-backoff reconnect, `get_logs` backfill, and
    journaled parent-hash reorg recovery. The remaining transport gaps are full
    block bodies, full pending-transaction hydration (today only pending-tx
-   hashes), arbitrary historical backfill beyond the last-seen-block anchor, and
-   account-field (balance/nonce/code) resync — all tracked in
-   `docs/KNOWN_ISSUES.md`.
-3. **Snapshot consistency point in continuous ingestion.** Applications that run
-   a live event loop should snapshot at block boundaries or behind their own
-   generation guard so simulations do not observe a partially applied block.
+   hashes), and non-log historical backfill. Log interests can request
+   owner-scoped `get_logs` backfill from a block anchor. Remaining gaps are
+   tracked in `docs/KNOWN_ISSUES.md`.
+3. **Snapshot consistency point in continuous ingestion.** Closed in 0.2.0:
+   `EvmCache::snapshot_generation()` is the crate-provided generation guard —
+   read it around `snapshot()` and re-snapshot when it moved, so simulations
+   never observe a partially applied block (G6).
 4. **Full no-provider build split.** The dependency graph still includes
    provider/RPC crates. A later `rpc` feature can make those optional for pure
    offline users.

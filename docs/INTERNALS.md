@@ -4,7 +4,7 @@
 > consumer cares about (fetch minimization, candidate throughput, reactive sync,
 > optimistic latency) see the **Performance** section of the [README](../README.md).
 
-`create_snapshot()` is the operation a search loop runs once per block before
+`snapshot()` is the operation a search loop runs once per block before
 fanning candidates out. Phase 5 replaced its original O(total state) deep clone
 with a two-tier copy-on-write view: the cold `BlockchainDb` index (layer 2) is
 flattened once into an immutable, `Arc`-shared base (per-account storage shared by
@@ -13,15 +13,15 @@ addresses; each snapshot then folds just the hot CacheDB delta (layer 1). Reads
 stay O(1) and bit-for-bit identical to the deep clone (pinned by the differential
 gate in `tests/cow_snapshot.rs`).
 
-The retained `create_snapshot_deep_clone()` is kept as (a) the read-equivalence
+The retained `snapshot_deep_clone()` is kept as (a) the read-equivalence
 reference and (b) the A/B regression baseline, so a future change can't silently
-regress `create_snapshot` back toward O(total state). The `create_snapshot` group
+regress `snapshot` back toward O(total state). The `snapshot` group
 in `benches/simulation.rs` measures both.
 
 Indicative A/B (Apple M1 Pro, `aarch64-apple-darwin`, Criterion medians; offline,
 state injected directly — read the ratio, not the absolute):
 
-| Cache size (accounts × slots) | Deep clone | COW `create_snapshot` | Ratio |
+| Cache size (accounts × slots) | Deep clone | COW `snapshot` | Ratio |
 |:-----------------------------:|:----------:|:---------------------:|:-----:|
 | 100 × 8     | 53 µs   | 2.1 µs | ~25× |
 | 1,000 × 8   | 791 µs  | 19 µs  | ~41× |
@@ -42,5 +42,5 @@ still O(total state). The decisions and cost model are summarized in
 [`ROADMAP.md`](ROADMAP.md), and the residual is recorded in
 [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md).
 
-Reproduce: `cargo bench --bench simulation` (the `create_snapshot` and
+Reproduce: `cargo bench --bench simulation` (the `snapshot` and
 `resnapshot_hot_loop` groups).

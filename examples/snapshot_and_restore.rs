@@ -1,12 +1,12 @@
-//! Snapshot cache state, mutate it, then roll back — the core primitive for
+//! Checkpoint cache state, mutate it, then roll back — the core primitive for
 //! evaluating many candidate transactions from the same starting point.
 //!
-//! `snapshot()` captures a cheap in-memory copy of the cache's state; `restore()`
+//! `checkpoint()` captures a cheap in-memory copy of the cache's state; `restore()`
 //! resets to it. Here we transfer tokens (committing the change), observe the new
 //! balances, then restore and confirm the transfer was undone.
 //!
 //! This is the in-place rollback API on a single `EvmCache`. It is distinct from
-//! `create_snapshot()`, which returns an `Arc<EvmSnapshot>` for sharing one frozen
+//! `snapshot()`, which returns an `Arc<EvmSnapshot>` for sharing one frozen
 //! state across many parallel `EvmOverlay` simulations — see the
 //! `parallel_overlays` example for that workflow.
 //!
@@ -51,7 +51,7 @@ async fn main() -> Result<()> {
     );
 
     // Capture a restore point.
-    let snapshot = cache.snapshot();
+    let checkpoint = cache.checkpoint();
 
     // Commit a transfer of 250 from alice to bob.
     let transfer = mock::MockERC20::transferCall {
@@ -65,8 +65,8 @@ async fn main() -> Result<()> {
         mock::balance_of(&mut cache, token, bob)?
     );
 
-    // Roll back to the snapshot — the transfer is undone.
-    cache.restore(snapshot);
+    // Roll back to the checkpoint — the transfer is undone.
+    cache.restore(checkpoint);
     println!(
         "after restore: alice={}, bob={}",
         mock::balance_of(&mut cache, token, alice)?,

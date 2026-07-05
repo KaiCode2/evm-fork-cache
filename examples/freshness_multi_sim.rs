@@ -84,8 +84,8 @@ async fn main() -> Result<()> {
         ((token, balance_slot(senders[1])), U256::from(50)), // changed!
         ((token, balance_slot(senders[2])), U256::from(1000)),
     ]);
-    let fetcher: StorageBatchFetchFn = Arc::new(
-        move |requests: Vec<(Address, U256)>, _block: Option<BlockId>| {
+    let fetcher: StorageBatchFetchFn =
+        Arc::new(move |requests: Vec<(Address, U256)>, _block: BlockId| {
             requests
                 .into_iter()
                 .map(|(addr, slot)| {
@@ -93,8 +93,7 @@ async fn main() -> Result<()> {
                     (addr, slot, Ok(v))
                 })
                 .collect()
-        },
-    );
+        });
     cache.set_storage_batch_fetcher(fetcher);
 
     // ── Classification layer ───────────────────────────────────────────────
@@ -137,13 +136,17 @@ async fn main() -> Result<()> {
         .collect();
     println!("optimistic (against the snapshot): {optimistic_ok:?} (all succeed)");
 
-    match sim.validate().await {
-        Validation::Corrected { results, changed } => {
+    match sim.validate().await? {
+        Validation::Corrected {
+            results,
+            changed_slots,
+            ..
+        } => {
             println!(
                 "\nvalidation: Corrected — {} slot(s) changed:",
-                changed.len()
+                changed_slots.len()
             );
-            for c in &changed {
+            for c in &changed_slots {
                 println!("  sender slot {} : {} -> {}", c.slot, c.old, c.new);
             }
             let corrected_ok: Vec<bool> = results
@@ -154,14 +157,20 @@ async fn main() -> Result<()> {
 
             // Exactly the second sim flipped success -> revert; the others are
             // untouched (selective re-run).
-            assert_eq!(changed.len(), 1, "only one sender's balance changed");
+            assert_eq!(changed_slots.len(), 1, "only one sender's balance changed");
             assert_eq!(corrected_ok, vec![true, false, true]);
             println!(
                 "\n→ only sim #2 was re-run (its balance fell below the transfer); \
                  sims #1 and #3 were left as-is."
             );
         }
-        Validation::Confirmed => println!("validation: Confirmed (unexpected here)"),
+        Validation::ConfirmedStorage => println!(
+            "validation: ConfirmedStorage — storage-only success, account fields \
+             NOT verified (unexpected here)"
+        ),
+        Validation::ConfirmedFull => {
+            println!("validation: ConfirmedFull — storage + account verified (unexpected here)")
+        }
         Validation::Unverified { reason } => println!("validation: Unverified — {reason}"),
     }
 

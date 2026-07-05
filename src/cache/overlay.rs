@@ -1,3 +1,13 @@
+//! Per-simulation state overlays layered over a snapshot or the live cache.
+//!
+//! An [`EvmOverlay`] wraps a read-only base (an
+//! [`EvmSnapshot`] or the cache itself) with
+//! a scratch write layer, so a simulation can mutate balances, storage, and code
+//! and run calls without disturbing the base or other overlays. Overlays are the
+//! `Send` unit of parallel fan-out: snapshot once, clone cheaply, overlay per
+//! candidate. Reads fall through the write layer to the base; writes and reverts
+//! stay local to the overlay.
+
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -5,7 +15,6 @@ use std::sync::Arc;
 
 use alloy_eips::eip2930::{AccessList, AccessListItem};
 use alloy_primitives::{Address, B256, Bytes, TxKind, U256};
-use anyhow::{Result, anyhow};
 use foundry_fork_db::{DatabaseError, SharedBackend};
 use revm::{
     Context, ExecuteCommitEvm, ExecuteEvm, InspectEvm, MainBuilder, MainContext,
@@ -18,7 +27,10 @@ use super::snapshot::EvmSnapshot;
 use super::{CallSimulationResult, SimStatus, TxConfig, unix_timestamp_secs_saturating};
 use crate::access_set::StorageAccessList;
 use crate::bundle::{BundleOptions, BundleResult, BundleTx, RevertPolicy, TxOutcome};
-use crate::errors::{SimError, SimulationError, SimulationResult};
+use crate::errors::{
+    OverlayError, OverlayResult as Result, SimError, SimHostError, SimulationError,
+    SimulationResult,
+};
 use crate::inspector::TransferInspector;
 
 type OverlayEvm<'a> = revm::MainnetEvm<
@@ -65,6 +77,12 @@ pub struct EvmOverlay {
     /// [`SharedMemoryCapacity`](super::SharedMemoryCapacity) so overlays honor the
     /// capacity set on the originating [`EvmCache`].
     buffer_capacity: usize,
+    /// Set when a `BLOCKHASH` read fell through to the ZERO fallback (no
+    /// snapshot-provided hash and no `ext_db`). The freshness validator reads
+    /// this via [`Self::blockhash_zero_fallback`] to fail closed instead of
+    /// confirming a sim whose control flow may rest on a hash its overlays
+    /// cannot resolve. Cleared by [`Self::reset`].
+    blockhash_zero_fallback: bool,
 }
 
 impl EvmOverlay {
@@ -82,6 +100,7 @@ impl EvmOverlay {
             ext_db,
             reusable_buffer: Vec::with_capacity(buffer_capacity),
             buffer_capacity,
+            blockhash_zero_fallback: false,
         }
     }
 
@@ -98,8 +117,26 @@ impl EvmOverlay {
     pub fn reset(&mut self) {
         self.dirty_accounts.clear();
         self.dirty_storage.clear();
+        self.blockhash_zero_fallback = false;
         // Keep: snapshot Arc, ext_db, and the reusable buffer. The buffer is
         // already cleared after each call, so nothing to do for it here.
+    }
+
+    /// `true` if any `BLOCKHASH` read on this overlay fell through to the ZERO
+    /// fallback (no snapshot-provided hash for that number and no `ext_db`)
+    /// since construction or the last [`reset`](Self::reset).
+    ///
+    /// The freshness validator uses this to **fail closed**: a sim that read a
+    /// hash its ext-db-less overlays cannot resolve is reported
+    /// [`Unverified`](crate::freshness::Validation::Unverified) rather than
+    /// silently confirmed against a ZERO stand-in.
+    ///
+    /// Only reads revm actually routes to the database can set this: requests
+    /// outside the EVM's valid lookback window (`[current − 256, current)`)
+    /// return spec-mandated ZERO without a database call — that value is
+    /// correct on-chain too, so such reads are deliberately not flagged.
+    pub fn blockhash_zero_fallback(&self) -> bool {
+        self.blockhash_zero_fallback
     }
 
     /// Chain ID of the block context captured by the underlying snapshot.
@@ -243,7 +280,7 @@ impl EvmOverlay {
     /// # use std::sync::Arc;
     /// # use alloy_primitives::{Address, Bytes};
     /// # use evm_fork_cache::cache::{EvmOverlay, EvmSnapshot};
-    /// # fn run(snapshot: Arc<EvmSnapshot>) -> anyhow::Result<()> {
+    /// # fn run(snapshot: Arc<EvmSnapshot>) -> Result<(), Box<dyn std::error::Error>> {
     /// let mut overlay = EvmOverlay::new(snapshot, None);
     /// let result = overlay.call_raw(Address::ZERO, Address::ZERO, Bytes::new())?;
     /// // State is reverted; a second call sees the same base state.
@@ -264,7 +301,7 @@ impl EvmOverlay {
             .data(calldata)
             .value(U256::ZERO)
             .build()
-            .map_err(|e| anyhow!("Failed to build tx env: {:?}", e))?;
+            .map_err(OverlayError::tx_env)?;
 
         // Recycle the reusable buffer (Pillar A.2): take it out as a plain Vec
         // (keeping the overlay Send), lend it to a method-local Rc<RefCell> for
@@ -279,9 +316,7 @@ impl EvmOverlay {
             let mut evm = self.build_evm_with_local(local);
             use revm::context_interface::JournalTr;
             let checkpoint = evm.journaled_state.checkpoint();
-            let result = evm
-                .transact_one(tx)
-                .map_err(|e| anyhow!("Failed to transact: {:?}", e));
+            let result = evm.transact_one(tx).map_err(OverlayError::transact);
             evm.journaled_state.checkpoint_revert(checkpoint);
             result
         };
@@ -392,7 +427,7 @@ impl EvmOverlay {
     /// # use std::sync::Arc;
     /// # use alloy_primitives::{Address, Bytes};
     /// # use evm_fork_cache::cache::{EvmOverlay, EvmSnapshot};
-    /// # fn run(snapshot: Arc<EvmSnapshot>, token: Address, owner: Address) -> anyhow::Result<()> {
+    /// # fn run(snapshot: Arc<EvmSnapshot>, token: Address, owner: Address) -> Result<(), Box<dyn std::error::Error>> {
     /// let mut overlay = EvmOverlay::new(snapshot, None);
     /// let sim = overlay.simulate_with_transfer_tracking(
     ///     owner,
@@ -421,7 +456,7 @@ impl EvmOverlay {
             .data(calldata)
             .value(U256::ZERO)
             .build()
-            .map_err(|e| SimError::Other(anyhow!("Failed to build tx env: {:?}", e)))?;
+            .map_err(|e| SimError::Other(SimHostError::tx_env(e)))?;
 
         let inspector = TransferInspector::new();
 
@@ -440,7 +475,7 @@ impl EvmOverlay {
 
             let result = evm
                 .inspect_one_tx(tx)
-                .map_err(|e| SimError::Other(anyhow!("Failed to transact: {:?}", e)));
+                .map_err(|e| SimError::Other(SimHostError::transact(e)));
 
             match result {
                 Ok(ExecutionResult::Success {
@@ -535,7 +570,7 @@ impl EvmOverlay {
     /// # use alloy_primitives::{Address, Bytes};
     /// # use evm_fork_cache::cache::{EvmOverlay, EvmSnapshot, TxConfig};
     /// # use evm_fork_cache::CallTracer;
-    /// # fn run(snapshot: Arc<EvmSnapshot>, to: Address) -> anyhow::Result<()> {
+    /// # fn run(snapshot: Arc<EvmSnapshot>, to: Address) -> Result<(), Box<dyn std::error::Error>> {
     /// let mut overlay = EvmOverlay::new(snapshot, None);
     /// let (result, tracer) = overlay.call_raw_with_inspector(
     ///     Address::ZERO,
@@ -590,7 +625,7 @@ impl EvmOverlay {
         }
         let tx_env = builder
             .build()
-            .map_err(|e| SimError::Other(anyhow!("Failed to build tx env: {:?}", e)))?;
+            .map_err(|e| SimError::Other(SimHostError::tx_env(e)))?;
 
         // Recycle the reusable buffer (Pillar A.2); reclaimed after the EVM drops.
         let buffer = Rc::new(RefCell::new(std::mem::take(&mut self.reusable_buffer)));
@@ -617,7 +652,7 @@ impl EvmOverlay {
                 }
                 Err(e) => {
                     evm.journaled_state.checkpoint_revert(checkpoint);
-                    Err(SimError::Other(anyhow!("Failed to transact: {:?}", e)))
+                    Err(SimError::Other(SimHostError::transact(e)))
                 }
             }
         };
@@ -697,9 +732,9 @@ impl EvmOverlay {
                 }
                 builder
                     .build()
-                    .map_err(|e| SimError::Other(anyhow!("Failed to build tx env: {:?}", e)))
+                    .map_err(|e| SimError::Other(SimHostError::tx_env(e)))
             })
-            .collect::<Result<_, _>>()?;
+            .collect::<std::result::Result<_, _>>()?;
 
         // Resolve the beneficiary and read its pre-bundle balance before the
         // mutable borrow of `self` by the EVM (the post-bundle delta is the miner
@@ -710,7 +745,7 @@ impl EvmOverlay {
             .unwrap_or_else(|| revm::context::BlockEnv::default().beneficiary);
         let pre_beneficiary_balance = self
             .basic(beneficiary)
-            .map_err(|e| SimError::Other(anyhow!("Failed to load beneficiary: {:?}", e)))?
+            .map_err(|e| SimError::Other(SimHostError::database(e)))?
             .map(|info| info.balance)
             .unwrap_or(U256::ZERO);
 
@@ -744,7 +779,7 @@ impl EvmOverlay {
                         evm.journaled_state.checkpoint_revert(outer);
                         drop(evm);
                         self.reclaim_buffer(buffer);
-                        return Err(SimError::Other(anyhow!("Failed to transact: {:?}", e)));
+                        return Err(SimError::Other(SimHostError::transact(e)));
                     }
                 };
 
@@ -779,6 +814,19 @@ impl EvmOverlay {
                 // Successful tx: its effects stay journaled for the next tx.
             }
 
+            // Partition total gas into successful/reverted buckets in a single
+            // pass. Saturating (consistent with `total_gas`); the invariant
+            // `successful_tx_gas + reverted_tx_gas == total_gas` holds by
+            // construction since every executed tx lands in exactly one bucket.
+            let (successful_tx_gas, reverted_tx_gas) =
+                per_tx.iter().fold((0u64, 0u64), |(succ, rev), tx| {
+                    if tx.reverted {
+                        (succ, rev.saturating_add(tx.gas_used))
+                    } else {
+                        (succ.saturating_add(tx.gas_used), rev)
+                    }
+                });
+
             if aborted {
                 // State is reverted to the pre-bundle outer checkpoint regardless
                 // of `commit`; no payment.
@@ -786,6 +834,8 @@ impl EvmOverlay {
                     per_tx,
                     coinbase_payment: U256::ZERO,
                     gas_used: total_gas,
+                    successful_tx_gas,
+                    reverted_tx_gas,
                     succeeded: false,
                 }
             } else {
@@ -814,6 +864,8 @@ impl EvmOverlay {
                     per_tx,
                     coinbase_payment,
                     gas_used: total_gas,
+                    successful_tx_gas,
+                    reverted_tx_gas,
                     succeeded: true,
                 }
             }
@@ -847,7 +899,7 @@ impl EvmOverlay {
     /// # use std::sync::Arc;
     /// # use alloy_primitives::{Address, Bytes};
     /// # use evm_fork_cache::cache::{EvmOverlay, EvmSnapshot};
-    /// # fn run(snapshot: Arc<EvmSnapshot>) -> anyhow::Result<()> {
+    /// # fn run(snapshot: Arc<EvmSnapshot>) -> Result<(), Box<dyn std::error::Error>> {
     /// let mut overlay = EvmOverlay::new(snapshot, None);
     /// let (result, access_list) =
     ///     overlay.call_raw_with_access_list(Address::ZERO, Address::ZERO, Bytes::new())?;
@@ -899,9 +951,7 @@ impl EvmOverlay {
         if let Some(access_list) = &tx.access_list {
             builder = builder.access_list(access_list.clone());
         }
-        let tx_env = builder
-            .build()
-            .map_err(|e| anyhow!("Failed to build tx env: {:?}", e))?;
+        let tx_env = builder.build().map_err(OverlayError::tx_env)?;
 
         // Recycle the reusable buffer (Pillar A.2); reclaimed after the EVM drops.
         let buffer = Rc::new(RefCell::new(std::mem::take(&mut self.reusable_buffer)));
@@ -932,7 +982,7 @@ impl EvmOverlay {
                     // Revert the checkpoint even on a host/transact error so the EVM
                     // journal is not left dirty (mirrors `call_raw`).
                     evm.journaled_state.checkpoint_revert(checkpoint);
-                    Err(anyhow!("Failed to transact: {:?}", e))
+                    Err(OverlayError::transact(e))
                 }
             }
         };
@@ -963,7 +1013,7 @@ impl EvmOverlay {
     /// # use std::sync::Arc;
     /// # use alloy_primitives::{Address, Bytes, U256};
     /// # use evm_fork_cache::cache::{EvmOverlay, EvmSnapshot};
-    /// # fn run(snapshot: Arc<EvmSnapshot>, token: Address, slot: U256) -> anyhow::Result<()> {
+    /// # fn run(snapshot: Arc<EvmSnapshot>, token: Address, slot: U256) -> Result<(), Box<dyn std::error::Error>> {
     /// let mut overlay = EvmOverlay::new(snapshot, None);
     /// // Inject the fresh value, then re-run to observe the corrected result.
     /// overlay.override_slot(token, slot, U256::from(42u64));
@@ -1077,8 +1127,10 @@ impl Database for EvmOverlay {
         // Snapshots never populate `block_hashes` (the live cache does not track
         // block hashes), so without an `ext_db` the `BLOCKHASH` opcode resolves to
         // ZERO. Overlays built internally (e.g. the freshness validator) pass
-        // `ext_db = None`; a contract that reads `BLOCKHASH` through such an
-        // overlay sees ZERO. Documented in docs/KNOWN_ISSUES.md.
+        // `ext_db = None`; the fallback is recorded so the validator can fail
+        // closed (`Unverified`) instead of confirming a sim whose control flow
+        // may depend on the real hash. See `blockhash_zero_fallback()`.
+        self.blockhash_zero_fallback = true;
         Ok(B256::ZERO)
     }
 }
@@ -1108,7 +1160,7 @@ mod tests {
 
     /// Build a two-tier `EvmSnapshot` whose cold base holds the given accounts,
     /// storage, and code, with an empty hot overlay — the shape
-    /// `create_snapshot_deep_clone` produces. The `Arc`-per-account storage of the
+    /// `snapshot_deep_clone` produces. The `Arc`-per-account storage of the
     /// base is built from the plain per-account maps.
     fn snap(
         accounts: HashMap<Address, AccountInfo>,
@@ -1148,6 +1200,31 @@ mod tests {
     fn test_overlay_is_send() {
         fn assert_send<T: Send>() {}
         assert_send::<EvmOverlay>();
+    }
+
+    #[test]
+    fn blockhash_zero_fallback_flags_only_unresolved_reads() {
+        let known = B256::repeat_byte(0xAB);
+        let snapshot = snap(
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::from([(5u64, known)]),
+        );
+        let mut overlay = EvmOverlay::new(snapshot, None);
+
+        // A snapshot-provided hash resolves for real: no flag.
+        assert_eq!(overlay.block_hash(5).unwrap(), known);
+        assert!(!overlay.blockhash_zero_fallback());
+
+        // An untracked number falls back to ZERO and is flagged so the
+        // freshness validator can fail closed.
+        assert_eq!(overlay.block_hash(6).unwrap(), B256::ZERO);
+        assert!(overlay.blockhash_zero_fallback());
+
+        // The flag is per-simulation state: reset clears it.
+        overlay.reset();
+        assert!(!overlay.blockhash_zero_fallback());
     }
 
     #[test]

@@ -114,7 +114,7 @@ fn stub_fetcher(
     values: HashMap<(Address, U256), U256>,
     delay: Option<Duration>,
 ) -> StorageBatchFetchFn {
-    Arc::new(move |reqs: Vec<(Address, U256)>, _block: Option<BlockId>| {
+    Arc::new(move |reqs: Vec<(Address, U256)>, _block: BlockId| {
         if let Some(d) = delay {
             std::thread::sleep(d);
         }
@@ -191,7 +191,7 @@ fn bench_phase2_cpu(c: &mut Criterion) {
                             vec![SimRequest::new(SENDER, TOKEN, calldata.clone())],
                         )
                         .unwrap();
-                    black_box(sim.validate().await);
+                    black_box(sim.validate().await.unwrap());
                 });
             },
             BatchSize::SmallInput,
@@ -214,7 +214,7 @@ fn bench_phase2_cpu(c: &mut Criterion) {
                             vec![SimRequest::new(SENDER, TOKEN, calldata.clone())],
                         )
                         .unwrap();
-                    let v = sim.validate().await;
+                    let v = sim.validate().await.unwrap();
                     debug_assert!(matches!(v, Validation::Corrected { .. }));
                     black_box(v);
                 });
@@ -250,7 +250,7 @@ fn bench_phase2_latency(c: &mut Criterion) {
                 cache
                     .verify_slots(&[(TOKEN, balance_slot(SENDER))])
                     .unwrap(); // pays L
-                let snapshot = cache.create_snapshot();
+                let snapshot = cache.snapshot();
                 let mut overlay = EvmOverlay::new(snapshot, None);
                 black_box(overlay.call_raw(SENDER, TOKEN, calldata.clone()).unwrap());
             },
@@ -299,7 +299,7 @@ fn bench_phase2_latency(c: &mut Criterion) {
                             vec![SimRequest::new(SENDER, TOKEN, calldata.clone())],
                         )
                         .unwrap();
-                    black_box(sim.validate().await);
+                    black_box(sim.validate().await.unwrap());
                 });
             },
             BatchSize::SmallInput,
@@ -376,8 +376,8 @@ fn bench_multi_sim(c: &mut Criterion) {
                     |(mut cache, mut ctrl, reqs)| {
                         rt.block_on(async {
                             let sim = ctrl.run(&mut cache, reqs).unwrap();
-                            let v = sim.validate().await;
-                            debug_assert!(matches!(v, Validation::Confirmed));
+                            let v = sim.validate().await.unwrap();
+                            debug_assert!(matches!(v, Validation::ConfirmedStorage));
                             black_box(v);
                         });
                     },

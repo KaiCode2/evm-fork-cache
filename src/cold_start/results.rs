@@ -5,7 +5,9 @@
 //! failure — plus the injected [`SlotChange`]s and any discovered access lists.
 
 use crate::access_set::StorageAccessList;
+use crate::cache::CodeVerifyReport;
 use crate::cold_start::error::ColdStartError;
+use crate::cold_start::roots::RootProbeOutcome;
 use crate::freshness::{SlotChange, SlotOutcome};
 
 use revm::context::result::ExecutionResult;
@@ -30,8 +32,16 @@ pub struct ColdStartResults {
     pub fetched: Vec<SlotOutcome>,
     /// One outcome per declared probe slot (classified, not injected).
     pub probed: Vec<SlotOutcome>,
+    /// One outcome per declared probe-roots address (`root: None` when the
+    /// probe failed, the fetcher omitted the address, or the phase never ran).
+    pub probed_roots: Vec<RootProbeOutcome>,
     /// One result per discover call.
     pub discovered: Vec<ColdStartCallResult>,
+    /// The `verify_code` phase's report, when the round found pending code
+    /// seeds (`None` means the phase was a no-op). The phase runs **first**,
+    /// so this survives a later phase's hard error. Adapters that require
+    /// verified code before serving gate on its `unverifiable` bucket.
+    pub code_verifications: Option<CodeVerifyReport>,
 }
 
 /// The result of one discover view-call: the raw EVM execution result and the

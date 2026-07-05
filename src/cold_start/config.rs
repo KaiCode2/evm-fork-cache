@@ -94,6 +94,11 @@ pub struct ColdStartRoundSummary {
     pub probe_requested: usize,
     /// Probe slots whose fetch failed.
     pub probe_failed: usize,
+    /// Probe-roots addresses requested this round.
+    pub probe_roots_requested: usize,
+    /// Probe-roots addresses whose root could not be observed
+    /// (`RootProbeOutcome::root` is `None`).
+    pub probe_roots_failed: usize,
     /// Discover calls issued this round.
     pub discover_calls: usize,
     /// Slots touched by this round's discover calls.
@@ -105,7 +110,11 @@ impl ColdStartRunReport {
     ///
     /// Plain field accumulation, no IO. `failed_slots` counts
     /// [`FetchFailed`](crate::freshness::SlotFetch::FetchFailed) outcomes across
-    /// both the verify (`fetched`) and probe (`probed`) phases.
+    /// both the verify (`fetched`) and probe (`probed`) phases. Root probes are
+    /// not slots, so probe-roots counts are recorded per round
+    /// (`probe_roots_requested` / `probe_roots_failed`) and never fold into
+    /// `failed_slots` — mirroring how `probe_requested` / `probe_failed` carry
+    /// no dedicated run-level totals.
     pub(crate) fn absorb_round(&mut self, plan: &ColdStartPlan, results: &ColdStartResults) {
         self.rounds += 1;
         let verify_failed = results
@@ -117,6 +126,11 @@ impl ColdStartRunReport {
             .probed
             .iter()
             .filter(|o| matches!(o.fetch, SlotFetch::FetchFailed { .. }))
+            .count();
+        let probe_roots_failed = results
+            .probed_roots
+            .iter()
+            .filter(|o| o.root.is_none())
             .count();
         let discovered_slots: usize = results
             .discovered
@@ -141,6 +155,8 @@ impl ColdStartRunReport {
             verify_failed,
             probe_requested: plan.probe.len(),
             probe_failed,
+            probe_roots_requested: plan.probe_roots.len(),
+            probe_roots_failed,
             discover_calls: plan.discover.len(),
             discovered_slots,
         });

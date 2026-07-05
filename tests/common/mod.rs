@@ -6,17 +6,20 @@
 #![allow(dead_code)]
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 use alloy_eips::BlockId;
-use alloy_primitives::{Address, Bytes, U256, hex};
+use alloy_primitives::{Address, B256, Bytes, U256, hex};
 use alloy_provider::RootProvider;
 use alloy_provider::network::AnyNetwork;
 use alloy_rpc_client::RpcClient;
 use alloy_sol_types::{SolCall, sol};
 use alloy_transport::mock::Asserter;
 use anyhow::{Result, anyhow};
-use evm_fork_cache::cache::{EvmCache, StorageBatchFetchFn};
+use evm_fork_cache::bulk_storage::AccountFieldsSample;
+use evm_fork_cache::cache::{AccountFieldsFetchFn, EvmCache, StorageBatchFetchFn};
+use evm_fork_cache::errors::{StorageFetchError, StorageFetchResult};
 use revm::context::result::ExecutionResult;
 use revm::state::{AccountInfo, Bytecode};
 
@@ -115,27 +118,66 @@ pub fn balance_of(cache: &mut EvmCache, token: Address, owner: Address) -> Resul
 /// how an unseen slot reads in a simulation). This is the offline stand-in for
 /// the real RPC batch fetcher.
 pub fn stub_fetcher(values: HashMap<(Address, U256), U256>) -> StorageBatchFetchFn {
-    Arc::new(
-        move |requests: Vec<(Address, U256)>, _block: Option<BlockId>| {
-            requests
-                .into_iter()
-                .map(|(addr, slot)| {
-                    let value = values.get(&(addr, slot)).copied().unwrap_or(U256::ZERO);
-                    (addr, slot, Ok(value))
+    Arc::new(move |requests: Vec<(Address, U256)>, _block: BlockId| {
+        requests
+            .into_iter()
+            .map(|(addr, slot)| {
+                let value = values.get(&(addr, slot)).copied().unwrap_or(U256::ZERO);
+                (addr, slot, Ok(value))
+            })
+            .collect()
+    })
+}
+
+/// Stub [`AccountFieldsFetchFn`] reporting fixed `(balance, code_hash)`
+/// samples, counting invocations. Addresses absent from `samples` are omitted
+/// from the response (the "fetcher omitted this address" path).
+pub fn stub_fields_fetcher(
+    samples: HashMap<Address, (U256, B256)>,
+    calls: Arc<AtomicUsize>,
+) -> AccountFieldsFetchFn {
+    Arc::new(move |addresses: Vec<Address>, _block: BlockId| {
+        calls.fetch_add(1, Ordering::SeqCst);
+        Ok(addresses
+            .into_iter()
+            .filter_map(|address| {
+                samples.get(&address).map(|(balance, code_hash)| {
+                    (
+                        address,
+                        AccountFieldsSample {
+                            balance: *balance,
+                            code_hash: *code_hash,
+                        },
+                    )
                 })
-                .collect()
-        },
-    )
+            })
+            .collect())
+    })
+}
+
+/// Stub [`AccountFieldsFetchFn`] that fails the whole call (the transport
+/// fail-safe path), counting invocations.
+pub fn failing_fields_fetcher(calls: Arc<AtomicUsize>) -> AccountFieldsFetchFn {
+    Arc::new(move |_addresses: Vec<Address>, _block: BlockId| {
+        calls.fetch_add(1, Ordering::SeqCst);
+        Err(StorageFetchError::custom("stub transport failure"))
+    })
 }
 
 /// Build a stub [`StorageBatchFetchFn`] that fails every request.
 ///
 /// Used to exercise the `Unverified` / error paths offline.
 pub fn failing_fetcher() -> StorageBatchFetchFn {
-    Arc::new(|requests: Vec<(Address, U256)>, _block: Option<BlockId>| {
+    Arc::new(|requests: Vec<(Address, U256)>, _block: BlockId| {
         requests
             .into_iter()
-            .map(|(addr, slot)| (addr, slot, Err(anyhow!("stub fetcher error"))))
+            .map(|(addr, slot)| {
+                (
+                    addr,
+                    slot,
+                    Err(StorageFetchError::custom("stub fetcher error")),
+                )
+            })
             .collect()
     })
 }
@@ -195,18 +237,16 @@ pub fn gated_tracking_fetcher(
     values: HashMap<(Address, U256), U256>,
     gate: Gate,
 ) -> StorageBatchFetchFn {
-    Arc::new(
-        move |requests: Vec<(Address, U256)>, _block: Option<BlockId>| {
-            gate.wait();
-            requests
-                .into_iter()
-                .map(|(addr, slot)| {
-                    let value = values.get(&(addr, slot)).copied().unwrap_or(U256::ZERO);
-                    (addr, slot, Ok(value))
-                })
-                .collect()
-        },
-    )
+    Arc::new(move |requests: Vec<(Address, U256)>, _block: BlockId| {
+        gate.wait();
+        requests
+            .into_iter()
+            .map(|(addr, slot)| {
+                let value = values.get(&(addr, slot)).copied().unwrap_or(U256::ZERO);
+                (addr, slot, Ok(value))
+            })
+            .collect()
+    })
 }
 
 /// Build a stub [`StorageBatchFetchFn`] that panics, to exercise the validator's
@@ -214,8 +254,8 @@ pub fn gated_tracking_fetcher(
 pub fn panicking_fetcher() -> StorageBatchFetchFn {
     Arc::new(
         |_requests: Vec<(Address, U256)>,
-         _block: Option<BlockId>|
-         -> Vec<(Address, U256, Result<U256>)> {
+         _block: BlockId|
+         -> Vec<(Address, U256, StorageFetchResult<U256>)> {
             panic!("panicking fetcher: deliberate failure for the Unverified test")
         },
     )
@@ -230,5 +270,5 @@ pub fn transfer(
     amount: U256,
 ) -> Result<ExecutionResult> {
     let call = MockERC20::transferCall { to, amount };
-    cache.call_raw(from, token, Bytes::from(call.abi_encode()), true)
+    Ok(cache.call_raw(from, token, Bytes::from(call.abi_encode()), true)?)
 }

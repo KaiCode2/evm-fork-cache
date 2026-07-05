@@ -23,6 +23,7 @@ use tracing::{debug, warn};
 use crate::freshness::FreshnessParams;
 
 use super::versioned;
+use crate::errors::PersistenceError;
 
 const SLOT_OBSERVATIONS_MAGIC: &[u8; 8] = b"EFC-SOBS";
 const SLOT_OBSERVATIONS_VERSION: u32 = 1;
@@ -63,6 +64,7 @@ pub struct SlotObservationTracker {
 }
 
 impl SlotObservationTracker {
+    /// Create an empty tracker with no recorded observations.
     pub fn new() -> Self {
         Self {
             observations: HashMap::new(),
@@ -108,12 +110,13 @@ impl SlotObservationTracker {
 
     /// Persist observations to disk using the versioned binary format.
     /// Called at end of cycle or on shutdown.
-    pub fn save(&mut self, path: &Path) -> anyhow::Result<()> {
+    pub fn save(&mut self, path: &Path) -> Result<(), PersistenceError> {
         if !self.dirty {
             return Ok(());
         }
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+            std::fs::create_dir_all(parent)
+                .map_err(|err| PersistenceError::create_dir(parent, err))?;
         }
         let data = versioned::encode(
             SLOT_OBSERVATIONS_MAGIC,
@@ -121,7 +124,7 @@ impl SlotObservationTracker {
             &self.observations,
             "slot observations",
         )?;
-        std::fs::write(path, data)?;
+        std::fs::write(path, data).map_err(|err| PersistenceError::write(path, err))?;
         self.dirty = false;
         debug!(entries = self.observations.len(), "Saved slot observations");
         Ok(())

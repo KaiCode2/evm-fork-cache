@@ -5,8 +5,9 @@
 //! [`alloy`], and [`foundry-fork-db`] to provide a lazy-loading state cache,
 //! immutable snapshots shareable across threads, per-simulation overlays, a
 //! freshness control plane, and the state-manipulation helpers a search loop
-//! needs (balance overrides, batched multicalls, Foundry-style bytecode etching,
-//! CREATE3 address derivation, and an extensible revert decoder).
+//! needs (balance overrides, batched multicalls, verified code seeding +
+//! Foundry-style bytecode etching, CREATE3 address derivation, and an
+//! extensible revert decoder).
 //!
 //! [`revm`]: https://github.com/bluealloy/revm
 //! [`alloy`]: https://github.com/alloy-rs/alloy
@@ -21,7 +22,7 @@
 //! EvmOverlay × N      isolated, Send simulations (cheap Arc clones)
 //!      ▲ clone × N
 //! EvmSnapshot         immutable, point-in-time, Send + Sync
-//!      ▲ create_snapshot()
+//!      ▲ snapshot()
 //! EvmCache            lazy RPC fetch + local state cache + targeted writes/purge
 //!      ▲ lazy fetch
 //! RPC provider
@@ -29,7 +30,7 @@
 //!
 //! The entry point is [`cache::EvmCache`]: construct one over an RPC backend
 //! (see [`cache::EvmCacheBuilder`]), then snapshot it with
-//! [`cache::EvmCache::create_snapshot`] to fan out parallel simulations, each
+//! [`cache::EvmCache::snapshot`] to fan out parallel simulations, each
 //! driving its own [`cache::EvmOverlay`]. `EvmCache` is `!Send` (it owns the
 //! mutable fork and blocks on RPC internally); `EvmSnapshot` is `Send + Sync`
 //! and `EvmOverlay` is `Send`, so the fan-out parallelizes safely.
@@ -63,7 +64,8 @@
 //! - `cold_start` — default-enabled (reactive-gated) declarative warming of a
 //!   working set of accounts/slots into the cache in one batched pass
 //!   (`EvmCache::run_cold_start` + `ColdStartPlanner`), returning a structured
-//!   `ColdStartRunReport`.
+//!   `ColdStartRunReport`. Each round verifies any pending code seeds first
+//!   (the `verify_code` phase), so sims never run over unverified claims.
 //! - [`bundle`] — multi-transaction bundle execution over cumulative block state
 //!   ([`EvmOverlay::simulate_bundle`](cache::EvmOverlay::simulate_bundle)): ordered
 //!   txs, an `Atomic`/`AllowReverts` revert policy, and coinbase/miner-payment
@@ -74,9 +76,15 @@
 //!   ([`CallTracer`] building a [`CallTrace`] tree) plus [`InspectorStack`] for
 //!   composing several inspectors over one pass, driven through
 //!   [`EvmOverlay::call_raw_with_inspector`](cache::EvmOverlay::call_raw_with_inspector).
+//! - [`bulk_storage`] — bulk storage extraction over `eth_call` state
+//!   overrides (the **default** batch storage fetcher): thousands of slots —
+//!   across many contracts — per call, plus custom storage programs and
+//!   account-fields/block-context extractors. See
+//!   `docs/bulk-storage-extraction.md` for measured economics.
 //! - [`multicall`] — batched read-only calls through Multicall3.
 //! - [`deploy`] / [`create3`] — contract deployment and CREATE3 address math.
-//! - [`prefetch_registry`] — two-stage storage-slot pre-warming.
+//! - [`prefetch_registry`] — two-stage storage-slot pre-warming
+//!   (complemented by the declarative [`cache::EvmCache::prewarm_slots`]).
 //!
 //! # Requirements
 //!
@@ -101,9 +109,13 @@
 //!
 //! Simulation entry points that distinguish failure modes return
 //! [`errors::SimulationResult`] (`Result<T, SimError>`), where
-//! [`SimError`](errors::SimError) separates a decoded [`Revert`](errors::SimError::Revert),
+//! [`SimError`] separates a decoded [`Revert`](errors::SimError::Revert),
 //! an EVM [`Halt`](errors::SimError::Halt), and an unexpected host-side
-//! [`Other`](errors::SimError::Other) error (RPC, database, ABI encoding). The
+//! [`Other`](errors::SimError::Other) [`SimHostError`]
+//! (RPC, database, ABI encoding). Other fallible modules expose domain errors
+//! such as [`CacheError`], [`FreshnessError`], and [`StorageFetchError`] rather
+//! than erasing failures
+//! into a dynamic catch-all error. The
 //! freshness loop never silently trusts stale data: a transient RPC failure
 //! surfaces as [`freshness::Validation::Unverified`] so callers can retry rather
 //! than act on unverified results.
@@ -117,8 +129,11 @@
 //! The `examples/` directory has runnable, documented walkthroughs of each
 //! module — offline ones that need no network, plus a few that fork real chain
 //! state over RPC. See the crate README for the full list.
+#![warn(missing_docs)]
+
 pub mod access_list;
 pub mod access_set;
+pub mod bulk_storage;
 pub mod bundle;
 pub mod cache;
 #[cfg(feature = "reactive")]
@@ -137,19 +152,37 @@ pub mod state_update;
 pub mod tracing;
 
 pub use access_set::StorageAccessList;
+// Bulk storage extraction over eth_call state overrides — the default batch
+// storage fetcher since 0.2.0 (see docs/bulk-storage-extraction.md).
+pub use bulk_storage::{
+    AccountFieldsSample, BlockContextSample, BulkCallConfig, CallDispatch, StorageProgram,
+    bulk_call_storage_fetcher, bulk_call_storage_fetcher_with_fallback, fetch_account_fields_bulk,
+    fetch_block_context, fetch_slots_bulk, planned_call_count, run_storage_program,
+    run_storage_programs,
+};
 // Phase 6 Track A+B: bundle simulation + coinbase accounting public vocabulary.
 pub use bundle::{BundleOptions, BundleResult, BundleTx, RevertPolicy, TxOutcome};
 // Primary entry points, hoisted to the crate root for discoverability. The
 // fully-qualified module paths (`cache::EvmCache`, `reactive::ReactiveRuntime`,
 // …) remain valid, so this is purely additive.
 pub use cache::{
-    CallSimulationResult, EvmCache, EvmCacheBuilder, EvmOverlay, EvmSnapshot, TxConfig,
+    AccountFieldsFetchFn, AccountProof, AccountProofFetchFn, BlockContextRequirements,
+    BlockStateAccountDiff, BlockStateDiff, BlockStateDiffFetchFn, BlockStateStorageDiff,
+    CacheSpeedMode, CallSimulationResult, CodeMismatch, CodeSeedState, CodeVerifyReport, EvmCache,
+    EvmCacheBuilder, EvmOverlay, EvmSnapshot, PrewarmReport, StorageBatchConfig,
+    StorageFetchStrategy, TxConfig, point_read_storage_fetcher,
 };
 #[cfg(feature = "reactive")]
 pub use cold_start::{
     ColdStartCall, ColdStartCallResult, ColdStartConfig, ColdStartError, ColdStartPin,
     ColdStartPlan, ColdStartPlanner, ColdStartResults, ColdStartRoundSummary, ColdStartRunReport,
-    ColdStartStep, RoundOutcome,
+    ColdStartStep, RootBaseline, RootBaselinePlanner, RootProbeOutcome, RoundOutcome,
+};
+pub use errors::{
+    AccessListError, AccessListResult, BlockContextError, CacheError, CacheResult, DeployError,
+    DeployResult, FreshnessError, FreshnessResult, MulticallError, MulticallResult, OverlayError,
+    OverlayResult, PersistenceError, RpcError, RuntimeError, SimError, SimHostError,
+    SimulationError, SimulationResult, StorageFetchError, StorageFetchResult,
 };
 pub use events::erc20::Erc20TransferDecoder;
 pub use events::{
@@ -162,7 +195,10 @@ pub use freshness::{
     SlotFetch, SlotOutcome, SpeculativeSim, Validation, Validity, WallClock,
 };
 #[cfg(feature = "reactive")]
-pub use reactive::{ReactiveConfig, ReactiveHandler, ReactiveRuntime};
+pub use reactive::{
+    InterestOwnerSubscriber, ReactiveConfig, ReactiveEngine, ReactiveEngineError,
+    ReactiveEngineRegisterError, ReactiveHandler, ReactiveRuntime,
+};
 pub use state_update::{
     AccountChange, AccountPatch, PurgeRecord, PurgeScope, SkippedAccountPatch, SkippedBalanceDelta,
     SkippedDelta, SkippedMask, SlotDelta, StateDiff, StateUpdate,

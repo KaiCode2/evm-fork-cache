@@ -13,13 +13,13 @@ use std::time::Instant;
 
 use alloy_primitives::map::HashMap;
 use alloy_primitives::{Address, B256, U256};
-use anyhow::{Context as _, Result};
 use foundry_fork_db::BlockchainDb;
 use revm::state::AccountInfo;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
 use super::versioned;
+use crate::errors::PersistenceError;
 
 const BINARY_STATE_MAGIC: &[u8; 8] = b"EFCSTAT\0";
 const BINARY_STATE_VERSION: u32 = 1;
@@ -54,7 +54,10 @@ struct BinaryAccountInfo {
 /// The on-disk format carries magic bytes and a version number before the
 /// bincode payload. Unknown versions are treated as a cache miss rather than
 /// being migrated.
-pub fn save_binary_state(blockchain_db: &BlockchainDb, path: &Path) -> Result<()> {
+pub fn save_binary_state(
+    blockchain_db: &BlockchainDb,
+    path: &Path,
+) -> Result<(), PersistenceError> {
     let start = Instant::now();
 
     let accounts: Vec<(Address, BinaryAccountInfo)> = blockchain_db
@@ -89,11 +92,9 @@ pub fn save_binary_state(blockchain_db: &BlockchainDb, path: &Path) -> Result<()
         "binary EVM state",
     )?;
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create binary EVM state directory {parent:?}"))?;
+        std::fs::create_dir_all(parent).map_err(|err| PersistenceError::create_dir(parent, err))?;
     }
-    std::fs::write(path, &data)
-        .with_context(|| format!("failed to write binary EVM state to {path:?}"))?;
+    std::fs::write(path, &data).map_err(|err| PersistenceError::write(path, err))?;
 
     let ms = start.elapsed().as_millis();
     debug!(

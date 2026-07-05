@@ -227,15 +227,14 @@ async fn main() -> Result<()> {
     // counter would catch it.
     let fetches = Arc::new(AtomicUsize::new(0));
     let counter = fetches.clone();
-    let fetcher: StorageBatchFetchFn = Arc::new(
-        move |requests: Vec<(Address, U256)>, _block: Option<BlockId>| {
+    let fetcher: StorageBatchFetchFn =
+        Arc::new(move |requests: Vec<(Address, U256)>, _block: BlockId| {
             counter.fetch_add(requests.len(), Ordering::Relaxed);
             requests
                 .into_iter()
                 .map(|(a, s)| (a, s, Ok(U256::ZERO)))
                 .collect()
-        },
-    );
+        });
     cache.set_storage_batch_fetcher(fetcher);
 
     let hook = Arc::new(AppliedLog::default());

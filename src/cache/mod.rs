@@ -1,5 +1,21 @@
+//! The forked-EVM state cache: lazy RPC loading, a layered write funnel, and
+//! cheap copy-on-write snapshots.
+//!
+//! [`EvmCache`] is the core handle. It fronts a [`foundry_fork_db`]-backed fork
+//! database with a hot [`revm`] cache layer, lazily fetching account and storage
+//! state from a provider on the first miss and serving it locally thereafter.
+//! Targeted writes and purges ([`StateUpdate`], balance/code overrides, verified
+//! code seeds) flow through a single write
+//! funnel — never the RPC path — so event-driven state maintenance never round-trips.
+//! [`EvmCache::snapshot`] produces an immutable, `Arc`-shared, cross-thread
+//! [`EvmSnapshot`] (see [`snapshot`]) for parallel fan-out; [`overlay`]
+//! layers per-simulation state on top. See the crate-root docs for the full
+//! state stack and [`docs/INTERNALS.md`](https://github.com/KaiCode2/evm-fork-cache/blob/main/docs/INTERNALS.md)
+//! for the snapshot cost model.
+
 mod binary_state;
 mod bytecode;
+mod code_seeds;
 mod journal_access_list;
 mod metadata;
 pub mod overlay;
@@ -18,10 +34,7 @@ use std::{
     collections::{HashMap, HashSet},
     fs,
     rc::Rc,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicU8, Ordering},
-    },
+    sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -33,7 +46,6 @@ use alloy_primitives::{Address, B256, Bytes, I256, Log, TxKind, U256, keccak256}
 use alloy_provider::{Provider, network::AnyNetwork};
 use alloy_rpc_types_eth::TransactionRequest;
 use alloy_sol_types::{SolCall, SolValue, sol};
-use anyhow::{Context as _, Result, anyhow};
 use foundry_fork_db::{BlockchainDb, SharedBackend, cache::BlockchainDbMeta};
 use revm::{
     Context, ExecuteCommitEvm, ExecuteEvm, InspectEvm, MainBuilder, MainContext,
@@ -46,7 +58,11 @@ use revm::{
 use tracing::{debug, instrument, trace, warn};
 
 use crate::access_set::StorageAccessList;
-use crate::errors::{SimError, SimulationError, SimulationResult};
+use crate::bulk_storage::AccountFieldsSample;
+use crate::errors::{
+    BlockContextError, CacheError, CacheResult as Result, RpcError, RuntimeError, SimError,
+    SimHostError, SimulationError, SimulationResult, StorageFetchError, StorageFetchResult,
+};
 use crate::freshness::{SlotChange, SlotFetch, SlotOutcome};
 use crate::inspector::TransferInspector;
 use crate::state_update::{
@@ -55,6 +71,8 @@ use crate::state_update::{
 };
 
 use bytecode::BytecodeCache;
+use code_seeds::CodeSeedCache;
+pub use code_seeds::CodeSeedState;
 use journal_access_list::{extract_access_list, merge_access_lists};
 
 /// Re-export AnyNetwork for callers that need to construct providers.
@@ -67,7 +85,7 @@ pub type ForkCacheDB = CacheDB<SharedBackend>;
 /// Callback for making direct RPC `eth_call` requests, bypassing revm simulation.
 /// Used when batch-querying many contracts where revm's lazy storage fetching would
 /// be prohibitively slow (e.g. querying 500+ gauge contracts).
-pub type RpcCallFn = Arc<dyn Fn(Address, Bytes) -> Result<Bytes> + Send + Sync>;
+pub type RpcCallFn = Arc<dyn Fn(Address, Bytes) -> Result<Bytes, RpcError> + Send + Sync>;
 
 /// Callback for batch-fetching storage slots directly from RPC, bypassing SharedBackend.
 ///
@@ -75,13 +93,14 @@ pub type RpcCallFn = Arc<dyn Fn(Address, Bytes) -> Result<Bytes> + Send + Sync>;
 /// round-trips through SharedBackend. Fires concurrent `eth_getStorageAt` calls
 /// directly via the provider and returns results for bulk injection into
 /// BlockchainDb.
+/// Users may replace the provider-backed implementation with their own fetcher via
+/// [`EvmCache::set_storage_batch_fetcher`].
 ///
-/// The second argument pins the fetch to a specific block: `Some(block)` fetches
-/// at exactly that block, while `None` uses the fetcher's configured block (the
-/// cache's currently-pinned block). The freshness validator passes the block its
-/// snapshot was built from, so a concurrent [`EvmCache::set_block`] cannot make
-/// the deferred fetch read a *different* block than the snapshot it is compared
-/// against.
+/// The second argument pins the fetch to a specific block. Callers pass the
+/// cache's pinned block at the point they schedule the fetch; deferred callers
+/// such as the freshness validator pass the block their snapshot was built from,
+/// so a concurrent [`EvmCache::set_block`] cannot make the deferred fetch read a
+/// *different* block than the snapshot it is compared against.
 ///
 /// **Contract:** an implementation must return **exactly one** result tuple per
 /// requested `(address, slot)` (order does not matter). Callers — `verify_slots`,
@@ -90,10 +109,108 @@ pub type RpcCallFn = Arc<dyn Fn(Address, Bytes) -> Result<Bytes> + Send + Sync>;
 /// reorders-and-truncates, or duplicates entries breaks the "one outcome per
 /// requested slot" guarantee those APIs document.
 pub type StorageBatchFetchFn = Arc<
-    dyn Fn(Vec<(Address, U256)>, Option<BlockId>) -> Vec<(Address, U256, Result<U256>)>
+    dyn Fn(Vec<(Address, U256)>, BlockId) -> Vec<(Address, U256, StorageFetchResult<U256>)>
         + Send
         + Sync,
 >;
+
+/// Account header + optional storage-proof slots from `eth_getProof`.
+/// `slots` is populated only for requested storage keys; an empty key list is a
+/// root-only probe (account fields + `storage_hash`, no slot payload).
+#[derive(Clone, Debug)]
+pub struct AccountProof {
+    /// Merkle root of the account's storage trie (`storageHash`).
+    pub storage_hash: B256,
+    /// Account balance.
+    pub balance: U256,
+    /// Account nonce.
+    pub nonce: u64,
+    /// Hash of the account's runtime code (`codeHash`).
+    pub code_hash: B256,
+    /// Proven `(slot, value)` pairs for the requested storage keys. Empty for a
+    /// root-only probe.
+    pub slots: Vec<(U256, U256)>,
+}
+
+/// Callback for fetching account headers (and optional storage-proof slots)
+/// directly from RPC via `eth_getProof`, mirroring [`StorageBatchFetchFn`].
+///
+/// Used by callers that need authoritative account fields (balance/nonce/code
+/// hash) plus the account's `storageHash`, e.g. account-target resyncs and
+/// account-level freshness. Each request is a `(address, keys)` pair; an empty
+/// `keys` list is a root-only probe.
+///
+/// The second argument pins the fetch to a specific block, matching
+/// [`StorageBatchFetchFn`]'s block semantics.
+///
+/// **Contract:** an implementation returns at most one result per requested
+/// address. An address present with `Ok(..)` succeeded; present with `Err(..)`
+/// failed; omitted entirely means the fetcher produced no result for it. Callers
+/// derive their per-address outcome from whether the address appears and, if so,
+/// whether it is `Ok`/`Err`.
+pub type AccountProofFetchFn = Arc<
+    dyn Fn(Vec<(Address, Vec<U256>)>, BlockId) -> Vec<(Address, StorageFetchResult<AccountProof>)>
+        + Send
+        + Sync,
+>;
+
+/// Callback fetching `(balance, EXTCODEHASH)` samples for many addresses at a
+/// pinned block — one bulk `eth_call` by default (the
+/// [`ACCOUNT_FIELDS_EXTRACTOR_CODE`](crate::bulk_storage::ACCOUNT_FIELDS_EXTRACTOR_CODE)
+/// program). Sync and type-erased with the same bridging rules as
+/// [`StorageBatchFetchFn`] (multi-thread tokio runtime required for the
+/// default provider-backed implementation).
+///
+/// **Contract:** the call is all-or-nothing — `Ok` carries one sample per
+/// requested address (an omitted address is treated by callers as
+/// unverifiable), `Err` means the whole fetch failed and nothing can be
+/// concluded about any address. Used by
+/// [`EvmCache::verify_code_seeds`](EvmCache::verify_code_seeds) and the
+/// cold-start `verify_code` phase.
+pub type AccountFieldsFetchFn = Arc<
+    dyn Fn(Vec<Address>, BlockId) -> StorageFetchResult<Vec<(Address, AccountFieldsSample)>>
+        + Send
+        + Sync,
+>;
+
+/// Final state changes observed from a block-level state-diff trace.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BlockStateDiff {
+    /// Accounts changed by the traced block.
+    pub accounts: Vec<BlockStateAccountDiff>,
+}
+
+/// Final account/storage values observed for one account in a block trace.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BlockStateAccountDiff {
+    /// Changed account address.
+    pub address: Address,
+    /// Final balance when the trace reports a balance change.
+    pub balance: Option<U256>,
+    /// Final nonce when the trace reports a nonce change.
+    pub nonce: Option<u64>,
+    /// Final runtime bytecode when the trace reports a code change.
+    pub code: Option<Bytes>,
+    /// Final storage-slot values reported for this account.
+    pub storage: Vec<BlockStateStorageDiff>,
+}
+
+/// Final value for one storage slot observed from a block trace.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BlockStateStorageDiff {
+    /// Storage slot key.
+    pub slot: U256,
+    /// Final slot value after the block. Cleared slots are represented as zero.
+    pub value: U256,
+}
+
+/// Callback for fetching one block's state diff through debug/trace RPC.
+///
+/// The callback returns final post-block values for accounts/storage slots that
+/// changed in the block. Callers may resolve matching resync targets from this
+/// diff before falling back to point reads.
+pub type BlockStateDiffFetchFn =
+    Arc<dyn Fn(BlockId) -> StorageFetchResult<BlockStateDiff> + Send + Sync>;
 
 /// Return a tokio runtime [`Handle`] suitable for `block_in_place` + `block_on`,
 /// or an error describing why one is unavailable.
@@ -105,21 +222,242 @@ pub type StorageBatchFetchFn = Arc<
 /// degrade to a typed error instead.
 ///
 /// Requires a **multi-thread** tokio runtime.
-pub(crate) fn block_in_place_handle() -> Result<tokio::runtime::Handle> {
+pub(crate) fn block_in_place_handle() -> Result<tokio::runtime::Handle, RuntimeError> {
     match tokio::runtime::Handle::try_current() {
         Ok(handle) => match handle.runtime_flavor() {
-            tokio::runtime::RuntimeFlavor::CurrentThread => Err(anyhow!(
-                "evm-fork-cache RPC operations require a multi-thread tokio runtime; \
-                 found a current-thread runtime (block_in_place is not supported there). \
-                 Build the runtime with `tokio::runtime::Builder::new_multi_thread()` \
-                 or annotate with `#[tokio::main(flavor = \"multi_thread\")]`"
-            )),
+            tokio::runtime::RuntimeFlavor::CurrentThread => Err(RuntimeError::CurrentThreadRuntime),
             _ => Ok(handle),
         },
-        Err(e) => Err(anyhow!(
-            "evm-fork-cache RPC operations require a running multi-thread tokio runtime: {e}"
-        )),
+        Err(e) => Err(RuntimeError::MissingRuntime {
+            details: e.to_string(),
+        }),
     }
+}
+
+fn trace_rpc_method_and_params(block: BlockId) -> (&'static str, serde_json::Value) {
+    let tracer = serde_json::json!({
+        "tracer": "prestateTracer",
+        "tracerConfig": {
+            "diffMode": true,
+        },
+    });
+    match block {
+        BlockId::Hash(hash) => (
+            "debug_traceBlockByHash",
+            serde_json::json!([hash.block_hash, tracer]),
+        ),
+        BlockId::Number(number) => (
+            "debug_traceBlockByNumber",
+            serde_json::json!([block_number_or_tag_param(number), tracer]),
+        ),
+    }
+}
+
+fn block_number_or_tag_param(number: BlockNumberOrTag) -> serde_json::Value {
+    match number {
+        BlockNumberOrTag::Number(number) => serde_json::json!(format!("{number:#x}")),
+        BlockNumberOrTag::Latest => serde_json::json!("latest"),
+        BlockNumberOrTag::Finalized => serde_json::json!("finalized"),
+        BlockNumberOrTag::Safe => serde_json::json!("safe"),
+        BlockNumberOrTag::Earliest => serde_json::json!("earliest"),
+        BlockNumberOrTag::Pending => serde_json::json!("pending"),
+    }
+}
+
+fn parse_block_state_diff_trace(value: &serde_json::Value) -> Result<BlockStateDiff> {
+    let mut accounts: HashMap<Address, BlockStateAccountDiff> = HashMap::new();
+    match value {
+        serde_json::Value::Array(traces) => {
+            for trace in traces {
+                merge_trace_diff(trace, &mut accounts)?;
+            }
+        }
+        trace => merge_trace_diff(trace, &mut accounts)?,
+    }
+
+    let mut accounts: Vec<_> = accounts.into_values().collect();
+    accounts.sort_by_key(|account| account.address);
+    for account in &mut accounts {
+        account.storage.sort_by_key(|slot| slot.slot);
+    }
+    Ok(BlockStateDiff { accounts })
+}
+
+fn merge_trace_diff(
+    trace: &serde_json::Value,
+    accounts: &mut HashMap<Address, BlockStateAccountDiff>,
+) -> Result<()> {
+    let diff = trace.get("result").unwrap_or(trace);
+    let Some(pre) = diff.get("pre").and_then(serde_json::Value::as_object) else {
+        return Ok(());
+    };
+    let Some(post) = diff.get("post").and_then(serde_json::Value::as_object) else {
+        return Ok(());
+    };
+
+    for (address, post_account) in post {
+        let address = parse_trace_address(address)?;
+        let entry = accounts
+            .entry(address)
+            .or_insert_with(|| empty_block_state_account_diff(address));
+
+        if let Some(balance) = post_account.get("balance") {
+            entry.balance = Some(parse_trace_u256(balance)?);
+        }
+        if let Some(nonce) = post_account.get("nonce") {
+            entry.nonce = Some(parse_trace_u64(nonce)?);
+        }
+        if let Some(code) = post_account.get("code") {
+            entry.code = Some(parse_trace_bytes(code)?);
+        }
+        if let Some(storage) = post_account
+            .get("storage")
+            .and_then(serde_json::Value::as_object)
+        {
+            for (slot, value) in storage {
+                upsert_block_state_storage_diff(
+                    entry,
+                    parse_trace_u256_str(slot)?,
+                    parse_trace_u256(value)?,
+                );
+            }
+        }
+    }
+
+    // In diff mode, state that ends the block *absent* appears in `pre` but is
+    // omitted from `post`. Convert those omissions into explicit final values:
+    for (address_key, pre_account) in pre {
+        let address = parse_trace_address(address_key)?;
+        let post_account = post.get(address_key);
+
+        // An account entirely absent from `post` was deleted by the block
+        // (SELFDESTRUCT; post-Cancun, a same-tx create+destruct). Synthesize
+        // the explicit post-deletion fields so account-target resyncs resolve
+        // authoritatively from the trace instead of falling back to point
+        // reads. A later transaction in the same block re-creating the account
+        // overwrites these in its own merge pass (entries merge in tx order).
+        if post_account.is_none() {
+            let entry = accounts
+                .entry(address)
+                .or_insert_with(|| empty_block_state_account_diff(address));
+            entry.balance = Some(U256::ZERO);
+            entry.nonce = Some(0);
+            entry.code = Some(Bytes::new());
+        }
+
+        // Storage cleared to zero: present in `pre`, omitted from `post`.
+        let Some(pre_storage) = pre_account
+            .get("storage")
+            .and_then(serde_json::Value::as_object)
+        else {
+            continue;
+        };
+        let post_storage = post_account
+            .and_then(|account| account.get("storage"))
+            .and_then(serde_json::Value::as_object);
+        for slot in pre_storage.keys() {
+            let cleared = post_storage.is_none_or(|storage| !storage.contains_key(slot));
+            if cleared {
+                let entry = accounts
+                    .entry(address)
+                    .or_insert_with(|| empty_block_state_account_diff(address));
+                upsert_block_state_storage_diff(entry, parse_trace_u256_str(slot)?, U256::ZERO);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn empty_block_state_account_diff(address: Address) -> BlockStateAccountDiff {
+    BlockStateAccountDiff {
+        address,
+        balance: None,
+        nonce: None,
+        code: None,
+        storage: Vec::new(),
+    }
+}
+
+fn upsert_block_state_storage_diff(account: &mut BlockStateAccountDiff, slot: U256, value: U256) {
+    if let Some(existing) = account.storage.iter_mut().find(|entry| entry.slot == slot) {
+        existing.value = value;
+    } else {
+        account.storage.push(BlockStateStorageDiff { slot, value });
+    }
+}
+
+fn parse_trace_address(value: &str) -> Result<Address> {
+    value.parse().map_err(|err| CacheError::TraceParse {
+        details: format!("invalid address `{value}`: {err}"),
+    })
+}
+
+fn parse_trace_u256(value: &serde_json::Value) -> Result<U256> {
+    match value {
+        serde_json::Value::String(value) => parse_trace_u256_str(value),
+        serde_json::Value::Number(value) => parse_trace_u256_str(&value.to_string()),
+        other => Err(CacheError::TraceParse {
+            details: format!("expected U256 string/number, got {other:?}"),
+        }),
+    }
+}
+
+fn parse_trace_u256_str(value: &str) -> Result<U256> {
+    if let Some(value) = value.strip_prefix("0x") {
+        if value.is_empty() {
+            return Ok(U256::ZERO);
+        }
+        return U256::from_str_radix(value, 16).map_err(|err| CacheError::TraceParse {
+            details: format!("invalid U256 `0x{value}`: {err}"),
+        });
+    }
+    if value.is_empty() {
+        return Ok(U256::ZERO);
+    }
+    U256::from_str_radix(value, 10).map_err(|err| CacheError::TraceParse {
+        details: format!("invalid U256 `{value}`: {err}"),
+    })
+}
+
+fn parse_trace_u64(value: &serde_json::Value) -> Result<u64> {
+    match value {
+        serde_json::Value::Number(value) => value.as_u64().ok_or_else(|| CacheError::TraceParse {
+            details: format!("invalid u64 number `{value}`"),
+        }),
+        serde_json::Value::String(value) => {
+            if let Some(value) = value.strip_prefix("0x") {
+                if value.is_empty() {
+                    return Ok(0);
+                }
+                return u64::from_str_radix(value, 16).map_err(|err| CacheError::TraceParse {
+                    details: format!("invalid u64 `0x{value}`: {err}"),
+                });
+            }
+            if value.is_empty() {
+                return Ok(0);
+            }
+            value.parse().map_err(|err| CacheError::TraceParse {
+                details: format!("invalid u64 `{value}`: {err}"),
+            })
+        }
+        other => Err(CacheError::TraceParse {
+            details: format!("expected u64 string/number, got {other:?}"),
+        }),
+    }
+}
+
+fn parse_trace_bytes(value: &serde_json::Value) -> Result<Bytes> {
+    let Some(value) = value.as_str() else {
+        return Err(CacheError::TraceParse {
+            details: format!("expected bytecode string, got {value:?}"),
+        });
+    };
+    let value = value.strip_prefix("0x").unwrap_or(value);
+    let bytes = alloy_primitives::hex::decode(value).map_err(|err| CacheError::TraceParse {
+        details: format!("invalid bytecode hex: {err}"),
+    })?;
+    Ok(Bytes::from(bytes))
 }
 
 pub(crate) fn unix_timestamp_secs_saturating(time: SystemTime) -> u64 {
@@ -183,16 +521,14 @@ fn account_patch_is_empty(patch: &AccountPatch) -> bool {
     patch.balance.is_none() && patch.nonce.is_none() && patch.code.is_none()
 }
 
-static CACHE_SPEED_MODE: AtomicU8 = AtomicU8::new(CacheSpeedMode::Slow as u8);
-
-/// Runtime tuning profile for cache-side batch storage fetches.
+/// Preset runtime tuning profile for cache-side batch storage fetches.
 ///
-/// Selects the per-batch size and concurrency used by [`StorageBatchFetchFn`]:
-/// faster modes send larger batches with more in-flight HTTP requests, slower
-/// modes throttle to avoid RPC rate-limiting (e.g. HTTP 429 on Base). The
-/// selected mode is **process-global** state, set via [`set_cache_speed_mode`]
-/// and read via [`cache_speed_mode`]; it affects every cache in the process.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Converts into [`StorageBatchConfig`]: faster modes send larger batches with
+/// more in-flight HTTP requests, slower modes throttle to avoid RPC rate-limiting
+/// (e.g. HTTP 429 on Base). Configure a preset per cache with
+/// [`EvmCacheBuilder::speed_mode`], or supply exact values with
+/// [`EvmCacheBuilder::storage_batch_config`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[repr(u8)]
 pub enum CacheSpeedMode {
     /// Largest batches, highest concurrency — fastest, most likely to trip rate limits.
@@ -200,39 +536,285 @@ pub enum CacheSpeedMode {
     /// Moderate batch size and concurrency.
     Normal = 1,
     /// Conservative batch size and concurrency. The default.
+    #[default]
     Slow = 2,
     /// Smallest batches, single in-flight request — slowest, gentlest on the RPC provider.
     XSlow = 3,
 }
 
-impl CacheSpeedMode {
-    fn from_u8(value: u8) -> Self {
-        match value {
-            0 => Self::Fast,
-            1 => Self::Normal,
-            2 => Self::Slow,
-            3 => Self::XSlow,
-            _ => Self::Slow,
+/// Concrete tuning knobs for the provider-backed [`StorageBatchFetchFn`].
+///
+/// `slots_per_batch` controls how many `eth_getStorageAt` calls are packed into
+/// each JSON-RPC batch request. `max_concurrent_batches` controls how many of
+/// those HTTP batch requests may be in flight at once. Larger values can improve
+/// cold-start / verification throughput on tolerant RPC endpoints; smaller
+/// values are gentler on rate-limited providers.
+///
+/// This config only affects the fetcher created by the cache constructors. If a
+/// caller installs a custom fetcher with
+/// [`set_storage_batch_fetcher`](EvmCache::set_storage_batch_fetcher), that
+/// fetcher owns its own batching and throttling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StorageBatchConfig {
+    /// Number of storage slots to include in one JSON-RPC batch request.
+    pub slots_per_batch: usize,
+    /// Maximum number of JSON-RPC batch requests in flight at once.
+    pub max_concurrent_batches: usize,
+}
+
+impl StorageBatchConfig {
+    /// Construct a config, normalizing zero values to one.
+    pub fn new(slots_per_batch: usize, max_concurrent_batches: usize) -> Self {
+        Self {
+            slots_per_batch,
+            max_concurrent_batches,
+        }
+        .normalized()
+    }
+
+    fn normalized(self) -> Self {
+        Self {
+            slots_per_batch: self.slots_per_batch.max(1),
+            max_concurrent_batches: self.max_concurrent_batches.max(1),
         }
     }
 }
 
-/// Set the process-global cache batch-fetch speed profile.
-///
-/// This mutates a single static shared by every cache in the process, so it
-/// affects all in-flight and future batch fetches, not just one [`EvmCache`].
-/// Read the current value with [`cache_speed_mode`].
-pub fn set_cache_speed_mode(mode: CacheSpeedMode) {
-    CACHE_SPEED_MODE.store(mode as u8, Ordering::Relaxed);
+impl Default for StorageBatchConfig {
+    fn default() -> Self {
+        CacheSpeedMode::default().into()
+    }
 }
 
-/// Return the current process-global cache batch-fetch speed profile.
+impl From<CacheSpeedMode> for StorageBatchConfig {
+    fn from(mode: CacheSpeedMode) -> Self {
+        match mode {
+            CacheSpeedMode::Fast => Self::new(150, 8),
+            CacheSpeedMode::Normal => Self::new(100, 6),
+            CacheSpeedMode::Slow => Self::new(75, 4),
+            CacheSpeedMode::XSlow => Self::new(25, 1),
+        }
+    }
+}
+
+/// How a cache's batch storage fetcher loads slots.
 ///
-/// Defaults to [`CacheSpeedMode::Slow`] until changed via
-/// [`set_cache_speed_mode`]. The value is shared across all caches in the
-/// process.
-pub fn cache_speed_mode() -> CacheSpeedMode {
-    CacheSpeedMode::from_u8(CACHE_SPEED_MODE.load(Ordering::Relaxed))
+/// The default is [`BulkCall`](Self::BulkCall): bulk `eth_call` state-override
+/// extraction (one call covers thousands of slots) with the classic
+/// point-read fetcher as its fallback and repair path. Requests below the
+/// bulk config's `point_read_threshold`, providers without state-override
+/// support, and precompile targets all degrade gracefully to point reads.
+/// See the [`bulk_storage`](crate::bulk_storage) module and
+/// `docs/bulk-storage-extraction.md` for mechanism and measured economics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StorageFetchStrategy {
+    /// Bulk `eth_call` extraction with point-read fallback (the default).
+    BulkCall(crate::bulk_storage::BulkCallConfig),
+    /// Classic JSON-RPC-batched `eth_getStorageAt` point reads only
+    /// (pre-0.2.0 behavior), tuned by [`StorageBatchConfig`].
+    PointRead,
+}
+
+impl Default for StorageFetchStrategy {
+    fn default() -> Self {
+        Self::BulkCall(crate::bulk_storage::BulkCallConfig::default())
+    }
+}
+
+/// Build the classic point-read [`StorageBatchFetchFn`]: JSON-RPC batches of
+/// `eth_getStorageAt`, sized and throttled by [`StorageBatchConfig`].
+///
+/// This is the default fetcher's *fallback* path (see
+/// [`StorageFetchStrategy`]) and the whole fetcher under
+/// [`StorageFetchStrategy::PointRead`]. It is public so callers composing
+/// their own fetchers — e.g.
+/// [`bulk_call_storage_fetcher_with_fallback`](crate::bulk_storage::bulk_call_storage_fetcher_with_fallback)
+/// over a differently-tuned repair path — can reuse it.
+pub fn point_read_storage_fetcher<P>(
+    provider: Arc<P>,
+    config: StorageBatchConfig,
+) -> StorageBatchFetchFn
+where
+    P: Provider<AnyNetwork> + 'static,
+{
+    let config = config.normalized();
+    Arc::new(
+        move |requests: Vec<(Address, U256)>, current_block: BlockId| {
+            use futures::stream::{self, StreamExt};
+            // Max items per JSON-RPC batch. RPC providers typically limit batch
+            // size to ~1000 items. Kept conservative to avoid 429s on Base.
+            let batch_size = config.slots_per_batch;
+            // Max concurrent HTTP batch requests. Each batch contains batch_size
+            // individual eth_getStorageAt calls. Limiting concurrency prevents
+            // thundering herd when prefetching thousands of storage slots.
+            let max_concurrent = config.max_concurrent_batches;
+
+            // Guard against panicking inside `block_in_place` on a
+            // current-thread runtime (or when no runtime is present): return
+            // an `Err` result for every requested slot instead.
+            let handle = match block_in_place_handle() {
+                Ok(handle) => handle,
+                Err(e) => {
+                    return requests
+                        .into_iter()
+                        .map(|(addr, slot)| {
+                            (
+                                addr,
+                                slot,
+                                Err(StorageFetchError::Runtime(RuntimeError::MissingRuntime {
+                                    details: e.to_string(),
+                                })),
+                            )
+                        })
+                        .collect();
+                }
+            };
+            // The caller supplies the exact block this fetch must observe.
+            // Capturing it at the call site is what lets the deferred
+            // freshness validator fetch at the snapshot's block despite a
+            // later `set_block`.
+            tokio::task::block_in_place(|| {
+                handle.block_on(async {
+                    let mut results = Vec::with_capacity(requests.len());
+
+                    // Build and send JSON-RPC batches (each batch = one HTTP request)
+                    let batch_futs: Vec<_> = requests
+                        .chunks(batch_size)
+                        .map(|chunk| {
+                            let client = provider.client();
+                            let mut batch = alloy_rpc_client::BatchRequest::new(client);
+                            let mut waiters = Vec::with_capacity(chunk.len());
+
+                            for &(addr, slot) in chunk {
+                                let params = (addr, slot, current_block);
+                                match batch.add_call::<_, U256>("eth_getStorageAt", &params) {
+                                    Ok(waiter) => waiters.push((addr, slot, Ok(waiter))),
+                                    Err(e) => {
+                                        // Serialization error — rare, treat as failure
+                                        tracing::warn!(
+                                            ?addr,
+                                            ?slot,
+                                            "batch request serialization failed: {}",
+                                            e
+                                        );
+                                        waiters.push((
+                                            addr,
+                                            slot,
+                                            Err(StorageFetchError::serialization(e)),
+                                        ));
+                                    }
+                                }
+                            }
+
+                            async move {
+                                // Send the batch as a single HTTP request
+                                let send_result = batch.send().await;
+                                let mut chunk_results = Vec::with_capacity(waiters.len());
+
+                                let batch_error =
+                                    send_result.as_ref().err().map(|err| err.to_string());
+                                for (addr, slot, waiter) in waiters {
+                                    match waiter {
+                                        Ok(waiter) => {
+                                            if let Some(source) = &batch_error {
+                                                chunk_results.push((
+                                                    addr,
+                                                    slot,
+                                                    Err(StorageFetchError::batch_send(source)),
+                                                ));
+                                                continue;
+                                            }
+                                            match waiter.await {
+                                                Ok(value) => {
+                                                    chunk_results.push((addr, slot, Ok(value)));
+                                                }
+                                                Err(e) => {
+                                                    chunk_results.push((
+                                                        addr,
+                                                        slot,
+                                                        Err(StorageFetchError::provider(
+                                                            "eth_getStorageAt",
+                                                            e,
+                                                        )),
+                                                    ));
+                                                }
+                                            }
+                                        }
+                                        Err(err) => {
+                                            chunk_results.push((addr, slot, Err(err)));
+                                        }
+                                    }
+                                }
+                                chunk_results
+                            }
+                        })
+                        .collect();
+
+                    // Fire batches with bounded concurrency (`max_concurrent`) to avoid
+                    // a thundering herd; per-batch size is the configured `batch_size`
+                    // chosen above, so throughput scales without overwhelming RPC providers.
+                    let all_batch_results: Vec<Vec<_>> = stream::iter(batch_futs)
+                        .buffer_unordered(max_concurrent)
+                        .collect()
+                        .await;
+                    for batch_results in all_batch_results {
+                        results.extend(batch_results);
+                    }
+                    results
+                })
+            })
+        },
+    )
+}
+
+/// Outcome of [`EvmCache::prewarm_slots`].
+#[derive(Debug, Default)]
+pub struct PrewarmReport {
+    /// Slots fetched and injected into the cache.
+    pub loaded: usize,
+    /// Pairs the fetcher failed to load, with the per-slot error.
+    pub failed: Vec<(Address, U256, StorageFetchError)>,
+}
+
+/// Outcome of [`EvmCache::verify_code_seeds`]: how each `Pending` canonical
+/// code claim resolved against the chain at the pinned block.
+///
+/// Fail-closed on trust, fail-safe on transport: `mismatched` /
+/// `not_deployed` / `codeless` entries were **purged** (both cache layers and
+/// the mark — the next touch refetches authoritative chain state), while
+/// `unverifiable` entries are **still `Pending`** (a failed read proves
+/// nothing, so the seed is neither promoted nor destroyed).
+#[derive(Clone, Debug, Default)]
+pub struct CodeVerifyReport {
+    /// Claims confirmed: marked [`CodeSeedState::Verified`], real balance
+    /// injected from the same response.
+    pub verified: Vec<Address>,
+    /// Claims contradicted by on-chain code — purged. Usually a wrong
+    /// template or immutable-patch offset; the mismatching hashes are
+    /// included for debugging.
+    pub mismatched: Vec<CodeMismatch>,
+    /// `EXTCODEHASH == 0`: no account at the pinned block — purged. This is
+    /// the live-registration race (the deployment is newer than the pin);
+    /// re-pin forward and re-seed rather than debugging the template.
+    pub not_deployed: Vec<Address>,
+    /// `EXTCODEHASH == keccak256("")`: the address exists but holds no code
+    /// (an EOA) — purged.
+    pub codeless: Vec<Address>,
+    /// The fetch failed (transport error, omitted address, or the
+    /// [`MULTICALL3_ADDRESS`](crate::multicall::MULTICALL3_ADDRESS) host
+    /// caveat) — each still `Pending`, with the reason.
+    pub unverifiable: Vec<(Address, String)>,
+}
+
+/// One contradicted code claim from [`EvmCache::verify_code_seeds`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CodeMismatch {
+    /// The seeded address.
+    pub address: Address,
+    /// The hash the seed claimed (keccak256 of the seeded bytes).
+    pub expected: B256,
+    /// The on-chain `EXTCODEHASH` observed at the pinned block.
+    pub actual: B256,
 }
 
 /// Behavior when overriding code at a target account that is not known to the cache/backend.
@@ -272,6 +854,97 @@ pub struct TxConfig {
     pub access_list: Option<AccessList>,
 }
 
+/// Which block-context header fields a cache requires to be present.
+///
+/// Block-env fields (`NUMBER` / `BASEFEE` / `COINBASE` / `PREVRANDAO` /
+/// `GASLIMIT`) are populated from a fetched block header. When a field is
+/// absent — because a fetch failed or the chain does not carry it — the EVM
+/// silently defaults it, which can steer contracts that branch on block context
+/// down a different code path and produce quietly-wrong simulations.
+///
+/// These per-field requirements let a caller opt into failing loudly instead.
+/// [`strict()`](Self::strict) requires every field; [`lenient()`](Self::lenient)
+/// (the [`Default`]) requires none and reproduces the historical
+/// silently-default behavior. A chain without EIP-1559, for example, can start
+/// from [`strict()`](Self::strict) and clear [`require_basefee`](Self::require_basefee).
+///
+/// Requirements are checked by [`validate_header`](Self::validate_header), which
+/// [`EvmCache::advance_block`] and [`EvmCacheBuilder::try_build`] call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BlockContextRequirements {
+    /// Require the header to carry a block number (`NUMBER`).
+    pub require_number: bool,
+    /// Require the header to carry an EIP-1559 base fee (`BASEFEE`).
+    pub require_basefee: bool,
+    /// Require the header to carry a beneficiary (`COINBASE`).
+    pub require_coinbase: bool,
+    /// Require the header to carry a `prevrandao` / mix hash (`PREVRANDAO`).
+    pub require_prevrandao: bool,
+    /// Require the header to carry a gas limit (`GASLIMIT`).
+    pub require_gas_limit: bool,
+}
+
+impl Default for BlockContextRequirements {
+    fn default() -> Self {
+        Self::lenient()
+    }
+}
+
+impl BlockContextRequirements {
+    /// Require every block-context field to be present.
+    ///
+    /// Under this policy a header missing any required field is rejected rather
+    /// than silently defaulted.
+    pub const fn strict() -> Self {
+        Self {
+            require_number: true,
+            require_basefee: true,
+            require_coinbase: true,
+            require_prevrandao: true,
+            require_gas_limit: true,
+        }
+    }
+
+    /// Require no block-context field (the [`Default`]).
+    ///
+    /// Reproduces the historical behavior: a missing field is silently
+    /// defaulted by the EVM.
+    pub const fn lenient() -> Self {
+        Self {
+            require_number: false,
+            require_basefee: false,
+            require_coinbase: false,
+            require_prevrandao: false,
+            require_gas_limit: false,
+        }
+    }
+
+    /// Validate that a header carries every required block-context field.
+    ///
+    /// Only the two `Option`-typed header fields can actually be absent:
+    /// [`require_basefee`](Self::require_basefee) checks
+    /// [`base_fee_per_gas`](alloy_consensus::BlockHeader::base_fee_per_gas) and
+    /// [`require_prevrandao`](Self::require_prevrandao) checks
+    /// [`mix_hash`](alloy_consensus::BlockHeader::mix_hash). Number, beneficiary
+    /// and gas limit are non-`Option` on the [`BlockHeader`] trait, so those
+    /// requirement flags are satisfied whenever a header is present. Returns
+    /// `Ok(())` when all required fields are satisfied.
+    pub fn validate_header<H: BlockHeader>(&self, header: &H) -> Result<(), BlockContextError> {
+        // `number`, `coinbase` (beneficiary) and `gas_limit` are non-`Option` on
+        // the `BlockHeader` trait: they are always present when a header exists,
+        // so their requirement flags are trivially satisfied here.
+        if self.require_basefee && header.base_fee_per_gas().is_none() {
+            return Err(BlockContextError::MissingField { field: "basefee" });
+        }
+        if self.require_prevrandao && header.mix_hash().is_none() {
+            return Err(BlockContextError::MissingField {
+                field: "prevrandao",
+            });
+        }
+        Ok(())
+    }
+}
+
 /// Fluent builder for [`EvmCache`].
 ///
 /// A readable alternative to the positional [`EvmCache::with_cache`]
@@ -282,7 +955,7 @@ pub struct TxConfig {
 /// # use alloy_provider::{ProviderBuilder, network::AnyNetwork};
 /// # use revm::primitives::hardfork::SpecId;
 /// # use evm_fork_cache::cache::EvmCache;
-/// # async fn example() -> anyhow::Result<()> {
+/// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 /// let provider = ProviderBuilder::new()
 ///     .network::<AnyNetwork>()
 ///     .connect_http("https://example-rpc.invalid".parse()?);
@@ -301,7 +974,11 @@ pub struct EvmCacheBuilder<P> {
     cache_config: Option<CacheConfig>,
     spec_id: SpecId,
     shared_memory_capacity: SharedMemoryCapacity,
+    storage_batch_config: StorageBatchConfig,
+    storage_fetch_strategy: StorageFetchStrategy,
     chain_id: Option<u64>,
+    block_context_requirements: BlockContextRequirements,
+    max_concurrent_proofs: usize,
 }
 
 impl<P> EvmCacheBuilder<P>
@@ -316,8 +993,28 @@ where
             cache_config: None,
             spec_id: SpecId::CANCUN,
             shared_memory_capacity: SharedMemoryCapacity::default(),
+            storage_batch_config: StorageBatchConfig::default(),
+            storage_fetch_strategy: StorageFetchStrategy::default(),
             chain_id: None,
+            block_context_requirements: BlockContextRequirements::lenient(),
+            max_concurrent_proofs: DEFAULT_MAX_CONCURRENT_PROOFS,
         }
+    }
+
+    /// Cap the default account-proof fetcher's concurrent `eth_getProof`
+    /// fan-out (default 8, name-symmetric with
+    /// [`BulkCallConfig::max_concurrent_calls`](crate::bulk_storage::BulkCallConfig)).
+    ///
+    /// `eth_getProof` is single-address at the RPC level, so when the root
+    /// gate or an account resync probes N tracked accounts in one seam call,
+    /// concurrency is the only wall-clock lever: `N × RTT` serial becomes
+    /// `~ceil(N / cap) × RTT`. Values are clamped to at least 1. Custom
+    /// fetchers installed via
+    /// [`set_account_proof_fetcher`](EvmCache::set_account_proof_fetcher)
+    /// ignore this knob.
+    pub fn max_concurrent_proofs(mut self, cap: usize) -> Self {
+        self.max_concurrent_proofs = cap.max(1);
+        self
     }
 
     /// Pin simulations and RPC fetches to a specific block.
@@ -384,19 +1081,102 @@ where
         self
     }
 
+    /// Set the concrete storage batch-fetch configuration for this cache instance.
+    ///
+    /// The config controls the batch size and concurrency used by the
+    /// provider-backed [`StorageBatchFetchFn`]. Defaults to
+    /// [`StorageBatchConfig::default`] (the [`CacheSpeedMode::Slow`] preset).
+    /// Different cache instances can use different values in the same process.
+    /// Zero values are normalized to one.
+    pub fn storage_batch_config(mut self, config: impl Into<StorageBatchConfig>) -> Self {
+        self.storage_batch_config = config.into().normalized();
+        self
+    }
+
+    /// Set the storage batch-fetch profile from a preset.
+    ///
+    /// Shorthand for [`storage_batch_config`](Self::storage_batch_config) with
+    /// `mode.into()`.
+    pub fn speed_mode(self, mode: CacheSpeedMode) -> Self {
+        self.storage_batch_config(mode)
+    }
+
+    /// Choose how the cache's batch storage fetcher loads slots.
+    ///
+    /// Defaults to [`StorageFetchStrategy::BulkCall`] with
+    /// [`BulkCallConfig::default`](crate::bulk_storage::BulkCallConfig::default):
+    /// bulk `eth_call` state-override extraction, repaired by (and degrading
+    /// to) the point-read fetcher that [`storage_batch_config`](Self::storage_batch_config)
+    /// tunes. Use [`StorageFetchStrategy::PointRead`] to restore the classic
+    /// per-slot behavior.
+    pub fn storage_fetch_strategy(mut self, strategy: StorageFetchStrategy) -> Self {
+        self.storage_fetch_strategy = strategy;
+        self
+    }
+
+    /// Tune the bulk `eth_call` extraction path.
+    ///
+    /// Shorthand for [`storage_fetch_strategy`](Self::storage_fetch_strategy)
+    /// with [`StorageFetchStrategy::BulkCall`]`(config)` — e.g. raising
+    /// `max_slots_per_call` on a provider with a generous gas cap, or
+    /// selecting [`CallDispatch::CallMany`](crate::bulk_storage::CallDispatch::CallMany)
+    /// on Erigon-lineage endpoints.
+    pub fn bulk_call_config(self, config: crate::bulk_storage::BulkCallConfig) -> Self {
+        self.storage_fetch_strategy(StorageFetchStrategy::BulkCall(config))
+    }
+
+    /// Set which block-context header fields the cache requires.
+    ///
+    /// See [`BlockContextRequirements`]. Defaults to
+    /// [`lenient`](BlockContextRequirements::lenient). Only [`try_build`](Self::try_build)
+    /// enforces non-lenient requirements at construction; the infallible
+    /// [`build`](Self::build) always stays lenient.
+    pub fn block_context_requirements(mut self, reqs: BlockContextRequirements) -> Self {
+        self.block_context_requirements = reqs;
+        self
+    }
+
+    /// Convenience toggle: require every block-context field (`true`) or none
+    /// (`false`).
+    ///
+    /// Equivalent to
+    /// [`block_context_requirements`](Self::block_context_requirements) with
+    /// [`strict`](BlockContextRequirements::strict) /
+    /// [`lenient`](BlockContextRequirements::lenient). Enforced only by
+    /// [`try_build`](Self::try_build).
+    pub fn strict_block_context(mut self, strict: bool) -> Self {
+        self.block_context_requirements = if strict {
+            BlockContextRequirements::strict()
+        } else {
+            BlockContextRequirements::lenient()
+        };
+        self
+    }
+
     /// Build the [`EvmCache`], fetching the pinned block's header for context.
     ///
     /// If a chain ID was not set via [`chain_id`](Self::chain_id), it is inferred
     /// from the provider (`eth_chainId`); see [`chain_id`](Self::chain_id) for the
     /// full resolution order.
+    ///
+    /// This constructor is infallible and always uses
+    /// [`lenient`](BlockContextRequirements::lenient) enforcement (a missing
+    /// block-context field is silently defaulted). To enforce
+    /// [`BlockContextRequirements`] at construction, use
+    /// [`try_build`](Self::try_build) instead.
     pub async fn build(self) -> EvmCache {
         let explicit_chain_id = self.chain_id;
-        let mut cache = EvmCache::with_cache_capacity(
+        let provider = self.provider.clone();
+        let strategy = self.storage_fetch_strategy;
+        let storage_batch_config = self.storage_batch_config;
+        let mut cache = EvmCache::with_cache_capacity_and_storage_batch_config(
             self.provider,
             self.block,
             self.cache_config,
             self.spec_id,
             self.shared_memory_capacity,
+            self.storage_batch_config,
+            self.max_concurrent_proofs,
         )
         .await;
         // An explicit builder value is authoritative for the `CHAINID` opcode and
@@ -404,7 +1184,94 @@ where
         if let Some(chain_id) = explicit_chain_id {
             cache.set_chain_id(chain_id);
         }
+        apply_storage_fetch_strategy(&mut cache, provider, strategy, storage_batch_config);
         cache
+    }
+
+    /// Build the [`EvmCache`], enforcing the configured
+    /// [`BlockContextRequirements`] against the fetched block header.
+    ///
+    /// Builds the cache the same way [`build`](Self::build) does, then, if the
+    /// requirements are non-lenient, validates the pinned block's header:
+    /// - if the header could not be fetched (the provider errored or returned no
+    ///   block), returns [`BlockContextError::FetchFailed`];
+    /// - otherwise validates the fetched header via
+    ///   [`BlockContextRequirements::validate_header`] and propagates any
+    ///   [`BlockContextError::MissingField`].
+    ///
+    /// A [`lenient`](BlockContextRequirements::lenient) build never errors (it
+    /// does not fetch a header solely to validate). On success the requirements
+    /// are stored on the returned cache so a later
+    /// [`advance_block`](EvmCache::advance_block) enforces them too.
+    pub async fn try_build(self) -> Result<EvmCache, BlockContextError> {
+        let explicit_chain_id = self.chain_id;
+        let reqs = self.block_context_requirements;
+        let block = self.block;
+        let provider = self.provider.clone();
+        let strategy = self.storage_fetch_strategy;
+        let storage_batch_config = self.storage_batch_config;
+
+        let mut cache = EvmCache::with_cache_capacity_and_storage_batch_config(
+            self.provider,
+            self.block,
+            self.cache_config,
+            self.spec_id,
+            self.shared_memory_capacity,
+            self.storage_batch_config,
+            self.max_concurrent_proofs,
+        )
+        .await;
+        if let Some(chain_id) = explicit_chain_id {
+            cache.set_chain_id(chain_id);
+        }
+        cache.set_block_context_requirements(reqs);
+        apply_storage_fetch_strategy(&mut cache, provider.clone(), strategy, storage_batch_config);
+
+        // Only a non-lenient policy fetches a header to validate: a lenient
+        // build must never error and must not incur an extra RPC round-trip.
+        if reqs != BlockContextRequirements::lenient() {
+            match provider.get_block(block).await {
+                Ok(Some(blk)) => reqs.validate_header(blk.header())?,
+                Ok(None) => {
+                    return Err(BlockContextError::FetchFailed(format!(
+                        "no block header returned for {block:?}"
+                    )));
+                }
+                Err(e) => return Err(BlockContextError::FetchFailed(e.to_string())),
+            }
+        }
+
+        Ok(cache)
+    }
+}
+
+/// Install the fetcher a [`StorageFetchStrategy`] describes on a built cache.
+///
+/// The constructor already installs the default strategy (bulk extraction
+/// wrapping the point-read fetcher), so the default case is a no-op rather
+/// than a redundant re-wrap.
+fn apply_storage_fetch_strategy<P>(
+    cache: &mut EvmCache,
+    provider: Arc<P>,
+    strategy: StorageFetchStrategy,
+    batch_config: StorageBatchConfig,
+) where
+    P: Provider<AnyNetwork> + 'static,
+{
+    match strategy {
+        StorageFetchStrategy::BulkCall(config)
+            if config == crate::bulk_storage::BulkCallConfig::default() => {}
+        StorageFetchStrategy::BulkCall(config) => {
+            let fallback = point_read_storage_fetcher(provider.clone(), batch_config);
+            cache.set_storage_batch_fetcher(
+                crate::bulk_storage::bulk_call_storage_fetcher_with_fallback(
+                    provider, config, fallback,
+                ),
+            );
+        }
+        StorageFetchStrategy::PointRead => {
+            cache.set_storage_batch_fetcher(point_read_storage_fetcher(provider, batch_config));
+        }
     }
 }
 
@@ -421,6 +1288,10 @@ type InspectorCacheEvm<'a, INSP> = revm::MainnetEvm<
 /// revm default of 4 KiB) so simulations rarely reallocate. Exposed for tuning via
 /// [`SharedMemoryCapacity`].
 const DEFAULT_SHARED_MEMORY_CAPACITY: usize = 64 * 1024;
+
+/// Default cap on the default account-proof fetcher's concurrent
+/// `eth_getProof` fan-out (see [`EvmCacheBuilder::max_concurrent_proofs`]).
+const DEFAULT_MAX_CONCURRENT_PROOFS: usize = 8;
 
 /// How much EVM shared memory (per-context working memory) to pre-allocate for
 /// simulations.
@@ -514,6 +1385,13 @@ pub struct EvmCache {
     prevrandao: Option<B256>,
     /// Block gas limit for EVM simulations (GASLIMIT opcode).
     block_gas_limit: Option<u64>,
+    /// Which block-context header fields this cache requires to be present.
+    /// [`lenient`](BlockContextRequirements::lenient) by default; the strict
+    /// builder path sets it before returning. Enforced by
+    /// [`advance_block`](Self::advance_block).
+    block_context_requirements: BlockContextRequirements,
+    /// Cache-side batch-fetch configuration for this instance.
+    storage_batch_config: StorageBatchConfig,
     /// Shared memory buffer reused across EVM simulations.
     /// This avoids repeated allocations and allows measuring peak memory usage.
     shared_memory_buffer: Rc<RefCell<Vec<u8>>>,
@@ -523,10 +1401,28 @@ pub struct EvmCache {
     rpc_caller: Option<RpcCallFn>,
     /// Optional batch storage fetcher that bypasses SharedBackend.
     /// Captures a provider clone and fires concurrent `eth_getStorageAt` calls directly.
+    /// Monotonic snapshot-consistency generation (see
+    /// [`snapshot_generation`](Self::snapshot_generation)). Bumped by targeted
+    /// state writes (`apply_update` / `apply_updates` / `modify_slot`) and
+    /// block re-pins (`set_block` / `advance_block`); cold prefetch
+    /// (`inject_storage_batch`) does not bump it.
+    snapshot_generation: u64,
     storage_batch_fetcher: Option<StorageBatchFetchFn>,
-    /// Shared block ID for the batch storage fetcher closure.
-    /// Updated by `set_block()` so batch fetches always use the current block.
-    batch_block_id: Arc<Mutex<BlockId>>,
+    /// Optional account/root fetcher that bypasses SharedBackend.
+    /// Captures a provider clone and fires `eth_getProof` calls directly to fetch
+    /// authoritative account fields (balance/nonce/code hash) and `storageHash`.
+    account_proof_fetcher: Option<AccountProofFetchFn>,
+    /// Optional block state-diff fetcher backed by debug/trace RPC.
+    block_state_diff_fetcher: Option<BlockStateDiffFetchFn>,
+    /// Optional bulk account-fields fetcher (balance + `EXTCODEHASH` in one
+    /// `eth_call`), the read side of code-seed verification.
+    account_fields_fetcher: Option<AccountFieldsFetchFn>,
+    /// Provenance + trust marks for bytecode that did not arrive via the lazy
+    /// RPC backend (see [`CodeSeedState`]). Absence of a mark = RPC-origin.
+    /// Persisted to `code_seeds.bin` (saved before `bytecodes.bin`, full
+    /// replace) so a `Pending` claim never masquerades as chain-fetched
+    /// across restarts.
+    code_seeds: HashMap<Address, CodeSeedState>,
     /// Best-known ERC20 `balanceOf` mapping slot per token contract.
     ///
     /// Used by `set_erc20_balance_with_slot_scan` to avoid re-scanning slots
@@ -537,7 +1433,7 @@ pub struct EvmCache {
     /// in `chains.toml`.
     spec_id: SpecId,
     /// Memoized, `Arc`-shared flatten of the cold layer-2 index, reused across
-    /// successive [`create_snapshot`](Self::create_snapshot) calls (Pillar A).
+    /// successive [`snapshot`](Self::snapshot) calls (Pillar A).
     /// `None` until the first snapshot. Rebuilt copy-on-write by
     /// [`refresh_base`](Self::refresh_base); never mutated in place once shared.
     /// Not part of any public API and not serialized.
@@ -590,6 +1486,9 @@ pub enum SimStatus {
     },
 }
 
+/// Outcome of a simulated call: status, return data, gas used, and the touched
+/// access list. `#[non_exhaustive]` — construct via the simulation APIs and match
+/// with a wildcard arm.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct CallSimulationResult {
@@ -734,7 +1633,34 @@ impl EvmCache {
     where
         P: Provider<AnyNetwork> + 'static,
     {
+        Self::with_cache_capacity_and_storage_batch_config(
+            provider,
+            block,
+            cache_config,
+            spec_id,
+            shared_memory_capacity,
+            StorageBatchConfig::default(),
+            DEFAULT_MAX_CONCURRENT_PROOFS,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn with_cache_capacity_and_storage_batch_config<P>(
+        provider: Arc<P>,
+        block: BlockId,
+        cache_config: Option<CacheConfig>,
+        spec_id: SpecId,
+        shared_memory_capacity: SharedMemoryCapacity,
+        storage_batch_config: StorageBatchConfig,
+        max_concurrent_proofs: usize,
+    ) -> Self
+    where
+        P: Provider<AnyNetwork> + 'static,
+    {
         let block_id = block;
+        let storage_batch_config = storage_batch_config.normalized();
+        let max_concurrent_proofs = max_concurrent_proofs.max(1);
 
         // Fetch the pinned block header for accurate block context (NUMBER,
         // BASEFEE, COINBASE, PREVRANDAO, GASLIMIT opcodes). Without this, revm
@@ -850,6 +1776,36 @@ impl EvmCache {
             }
         }
 
+        // Restore code-seed marks. Pruning rule: a mark is kept only while the
+        // account it describes still holds code with the marked hash — a mark
+        // whose code did not survive (evicted, never persisted, or clobbered)
+        // is meaningless and must not outlive it. The reverse orphan
+        // (code-without-mark) is prevented by `flush()` writing
+        // `code_seeds.bin` BEFORE `bytecodes.bin`.
+        let code_seeds: HashMap<Address, CodeSeedState> = cache_config
+            .as_ref()
+            .and_then(|cfg| CodeSeedCache::load(&cfg.code_seeds_cache_path()))
+            .map(|cache| {
+                let accounts = blockchain_db.accounts().read();
+                let before = cache.entries.len();
+                let mut entries = cache.entries;
+                entries.retain(|addr, state| {
+                    accounts.get(addr).is_some_and(|info| {
+                        info.code.as_ref().is_some_and(|code| !code.is_empty())
+                            && info.code_hash == state.code_hash()
+                    })
+                });
+                if entries.len() < before {
+                    debug!(
+                        pruned = before - entries.len(),
+                        kept = entries.len(),
+                        "Pruned code-seed marks whose code did not survive the reload"
+                    );
+                }
+                entries
+            })
+            .unwrap_or_default();
+
         // Load immutable data cache (token decimals).
         // This is still needed for validation and metadata lookups
         let immutable_cache = cache_config
@@ -884,140 +1840,146 @@ impl EvmCache {
                     provider_for_rpc
                         .call(tx.into())
                         .await
-                        .map_err(|e| anyhow!("{}", e))
+                        .map_err(|e| RpcError::provider("eth_call", e))
                 })
             })
         });
 
-        // Create a batch storage fetcher that bypasses SharedBackend for bulk prefetch.
-        // Uses JSON-RPC batch requests to send multiple eth_getStorageAt calls in a
-        // single HTTP request, dramatically reducing round-trip overhead.
-        let provider_for_batch = provider.clone();
-        let batch_block_id = Arc::new(Mutex::new(block_id));
-        let batch_block_ref = batch_block_id.clone();
-        let storage_batch_fetcher: StorageBatchFetchFn = Arc::new(
-            move |requests: Vec<(Address, U256)>, block: Option<BlockId>| {
-                use futures::stream::{self, StreamExt};
-                // Max items per JSON-RPC batch. RPC providers typically limit batch
-                // size to ~1000 items. Reduced from 200 to avoid 429s on Base.
-                let batch_size: usize = match cache_speed_mode() {
-                    CacheSpeedMode::Fast => 150,
-                    CacheSpeedMode::Normal => 100,
-                    CacheSpeedMode::Slow => 75,
-                    CacheSpeedMode::XSlow => 25,
-                };
-                // Max concurrent HTTP batch requests. Each batch contains batch_size
-                // individual eth_getStorageAt calls. Limiting concurrency prevents
-                // thundering herd when prefetching thousands of storage slots.
-                let max_concurrent: usize = match cache_speed_mode() {
-                    CacheSpeedMode::Fast => 8,
-                    CacheSpeedMode::Normal => 6,
-                    CacheSpeedMode::Slow => 4,
-                    CacheSpeedMode::XSlow => 1,
-                };
+        // Batch storage fetcher: bulk `eth_call` state-override extraction by
+        // default, with the classic point-read fetcher as its fallback and
+        // repair path (see the `bulk_storage` module and
+        // docs/bulk-storage-extraction.md). `StorageBatchConfig` tunes the
+        // point-read path; `EvmCacheBuilder::storage_fetch_strategy` swaps or
+        // tunes the bulk path.
+        let storage_batch_fetcher: StorageBatchFetchFn =
+            crate::bulk_storage::bulk_call_storage_fetcher_with_fallback(
+                provider.clone(),
+                crate::bulk_storage::BulkCallConfig::default(),
+                point_read_storage_fetcher(provider.clone(), storage_batch_config),
+            );
 
+        // Create an account/root fetcher that bypasses SharedBackend, firing
+        // `eth_getProof` calls directly for authoritative account fields plus the
+        // account's `storageHash`. `eth_getProof` is single-address at the RPC
+        // level, so a multi-account seam call (the reactive root gate, account
+        // resyncs, cold-start probe_roots) fans out with bounded, order-
+        // preserving concurrency (`buffered`): wall clock drops from N × RTT to
+        // ~ceil(N / max_concurrent_proofs) × RTT.
+        let provider_for_proof = provider.clone();
+        let account_proof_fetcher: AccountProofFetchFn = Arc::new(
+            move |requests: Vec<(Address, Vec<U256>)>, current_block: BlockId| {
                 // Guard against panicking inside `block_in_place` on a
                 // current-thread runtime (or when no runtime is present): return
-                // an `Err` result for every requested slot instead.
+                // an `Err` result for every requested address instead.
                 let handle = match block_in_place_handle() {
                     Ok(handle) => handle,
                     Err(e) => {
-                        let msg = e.to_string();
                         return requests
                             .into_iter()
-                            .map(|(addr, slot)| (addr, slot, Err(anyhow!("{}", msg))))
+                            .map(|(addr, _keys)| {
+                                (
+                                    addr,
+                                    Err(StorageFetchError::Runtime(RuntimeError::MissingRuntime {
+                                        details: e.to_string(),
+                                    })),
+                                )
+                            })
                             .collect();
                     }
                 };
-                // Pin to the explicitly-requested block when given, else the
-                // cache's currently-pinned block. Capturing the block at the call
-                // site is what lets the deferred freshness validator fetch at the
-                // snapshot's block despite a later `set_block`.
-                let current_block = block.unwrap_or_else(|| *batch_block_ref.lock().unwrap());
+                let provider = provider_for_proof.clone();
+                // The caller supplies the exact block this proof fetch must observe.
                 tokio::task::block_in_place(|| {
                     handle.block_on(async {
-                        let mut results = Vec::with_capacity(requests.len());
-
-                        // Build and send JSON-RPC batches (each batch = one HTTP request)
-                        let batch_futs: Vec<_> = requests
-                            .chunks(batch_size)
-                            .map(|chunk| {
-                                let client = provider_for_batch.client();
-                                let mut batch = alloy_rpc_client::BatchRequest::new(client);
-                                let mut waiters = Vec::with_capacity(chunk.len());
-
-                                for &(addr, slot) in chunk {
-                                    let params = (addr, slot, current_block);
-                                    match batch.add_call::<_, U256>("eth_getStorageAt", &params) {
-                                        Ok(waiter) => waiters.push((addr, slot, Some(waiter))),
-                                        Err(e) => {
-                                            // Serialization error — rare, treat as failure
-                                            tracing::warn!(
-                                                ?addr,
-                                                ?slot,
-                                                "batch request serialization failed: {}",
-                                                e
-                                            );
-                                            waiters.push((addr, slot, None));
-                                        }
+                        use futures::StreamExt;
+                        futures::stream::iter(requests.into_iter().map(|(addr, keys)| {
+                            let provider = provider.clone();
+                            async move {
+                                // `eth_getProof` takes slot keys as 32-byte B256.
+                                let proof_keys: Vec<B256> =
+                                    keys.iter().map(|slot| B256::from(*slot)).collect();
+                                let outcome = provider
+                                    .get_proof(addr, proof_keys)
+                                    .block_id(current_block)
+                                    .await;
+                                match outcome {
+                                    Ok(response) => {
+                                        // Map proven storage-proof entries back to
+                                        // the requested `(slot, value)` pairs.
+                                        let slots = response
+                                            .storage_proof
+                                            .iter()
+                                            .map(|proof| {
+                                                (
+                                                    U256::from_be_bytes(proof.key.as_b256().0),
+                                                    proof.value,
+                                                )
+                                            })
+                                            .collect();
+                                        (
+                                            addr,
+                                            Ok(AccountProof {
+                                                storage_hash: response.storage_hash,
+                                                balance: response.balance,
+                                                nonce: response.nonce,
+                                                code_hash: response.code_hash,
+                                                slots,
+                                            }),
+                                        )
+                                    }
+                                    Err(e) => {
+                                        (addr, Err(StorageFetchError::provider("eth_getProof", e)))
                                     }
                                 }
-
-                                async move {
-                                    // Send the batch as a single HTTP request
-                                    let send_result = batch.send().await;
-                                    let mut chunk_results = Vec::with_capacity(waiters.len());
-
-                                    for (addr, slot, waiter) in waiters {
-                                        if let Some(waiter) = waiter {
-                                            if send_result.is_ok() {
-                                                match waiter.await {
-                                                    Ok(value) => {
-                                                        chunk_results.push((addr, slot, Ok(value)));
-                                                    }
-                                                    Err(e) => {
-                                                        chunk_results.push((
-                                                            addr,
-                                                            slot,
-                                                            Err(anyhow!("{}", e)),
-                                                        ));
-                                                    }
-                                                }
-                                            } else {
-                                                chunk_results.push((
-                                                    addr,
-                                                    slot,
-                                                    Err(anyhow!("batch send failed")),
-                                                ));
-                                            }
-                                        } else {
-                                            chunk_results.push((
-                                                addr,
-                                                slot,
-                                                Err(anyhow!("serialization failed")),
-                                            ));
-                                        }
-                                    }
-                                    chunk_results
-                                }
-                            })
-                            .collect();
-
-                        // Fire batches with bounded concurrency (`max_concurrent`) to avoid
-                        // a thundering herd; per-batch size is the speed-mode `batch_size`
-                        // chosen above, so throughput scales without overwhelming RPC providers.
-                        let all_batch_results: Vec<Vec<_>> = stream::iter(batch_futs)
-                            .buffer_unordered(max_concurrent)
-                            .collect()
-                            .await;
-                        for batch_results in all_batch_results {
-                            results.extend(batch_results);
-                        }
-                        results
+                            }
+                        }))
+                        .buffered(max_concurrent_proofs)
+                        .collect::<Vec<_>>()
+                        .await
                     })
                 })
             },
         );
+
+        // Create a bulk account-fields fetcher: balance + EXTCODEHASH for many
+        // addresses in ONE eth_call via the account-fields extractor program.
+        // This is the read side of code-seed verification; the call is
+        // all-or-nothing per the `AccountFieldsFetchFn` contract.
+        let provider_for_fields = provider.clone();
+        let account_fields_fetcher: AccountFieldsFetchFn =
+            Arc::new(move |addresses: Vec<Address>, block: BlockId| {
+                // Guard against panicking inside `block_in_place` on a
+                // current-thread runtime (or with no runtime present): degrade
+                // to a typed error, matching the sibling fetchers.
+                let handle = block_in_place_handle()?;
+                tokio::task::block_in_place(|| {
+                    handle.block_on(crate::bulk_storage::fetch_account_fields_bulk(
+                        provider_for_fields.as_ref(),
+                        &addresses,
+                        block,
+                    ))
+                })
+            });
+
+        // Create a block-level state-diff fetcher over debug trace RPC. The
+        // reactive runtime uses this as a trace-first accelerator before falling
+        // back to point reads for unresolved cold targets.
+        let provider_for_trace = provider.clone();
+        let block_state_diff_fetcher: BlockStateDiffFetchFn = Arc::new(move |block: BlockId| {
+            let handle = block_in_place_handle()?;
+            tokio::task::block_in_place(|| {
+                handle.block_on(async {
+                    let (method, params) = trace_rpc_method_and_params(block);
+                    let response = provider_for_trace
+                        .client()
+                        .request::<_, serde_json::Value>(method, params)
+                        .await
+                        .map_err(|e| StorageFetchError::provider(method, e))?;
+                    parse_block_state_diff_trace(&response)
+                        .map_err(|err| StorageFetchError::custom(err.to_string()))
+                })
+            })
+        });
 
         // Resolve the chain ID reported to simulations (the `CHAINID` opcode). A
         // disk `CacheConfig` is authoritative (its `chain_id` also namespaces the
@@ -1074,10 +2036,16 @@ impl EvmCache {
             coinbase,
             prevrandao,
             block_gas_limit,
+            block_context_requirements: BlockContextRequirements::lenient(),
+            storage_batch_config,
             shared_memory_buffer: Rc::new(RefCell::new(Vec::with_capacity(shared_memory_capacity))),
+            snapshot_generation: 0,
             rpc_caller: Some(rpc_caller),
             storage_batch_fetcher: Some(storage_batch_fetcher),
-            batch_block_id,
+            account_proof_fetcher: Some(account_proof_fetcher),
+            block_state_diff_fetcher: Some(block_state_diff_fetcher),
+            account_fields_fetcher: Some(account_fields_fetcher),
+            code_seeds,
             erc20_balance_slots: HashMap::new(),
             spec_id,
             base: None,
@@ -1156,12 +2124,18 @@ impl EvmCache {
             coinbase: None,
             prevrandao: None,
             block_gas_limit: None,
+            block_context_requirements: BlockContextRequirements::lenient(),
+            storage_batch_config: StorageBatchConfig::default(),
+            snapshot_generation: 0,
             shared_memory_buffer: Rc::new(RefCell::new(Vec::with_capacity(
                 DEFAULT_SHARED_MEMORY_CAPACITY,
             ))),
             rpc_caller: None,
             storage_batch_fetcher: None,
-            batch_block_id: Arc::new(Mutex::new(block)),
+            account_proof_fetcher: None,
+            block_state_diff_fetcher: None,
+            account_fields_fetcher: None,
+            code_seeds: HashMap::new(),
             erc20_balance_slots: HashMap::new(),
             spec_id,
             base: None,
@@ -1186,16 +2160,29 @@ impl EvmCache {
         if let Some(cfg) = &self.cache_config {
             // Save EVM state to binary cache (bincode format)
             let binary_path = cfg.binary_state_cache_path();
-            binary_state::save_binary_state(&self.blockchain_db, &binary_path)
-                .with_context(|| format!("failed to save binary state cache to {binary_path:?}"))?;
+            binary_state::save_binary_state(&self.blockchain_db, &binary_path)?;
+
+            // Save code-seed marks BEFORE bytecodes (fail-closed ordering: a
+            // mark without code is pruned on load and harmless; code without
+            // its mark would let a Pending seed masquerade as RPC-origin).
+            // Full replace, not merge: marks are mutable trust state, and a
+            // merge would resurrect marks purged this session.
+            let code_seeds_path = cfg.code_seeds_cache_path();
+            CodeSeedCache {
+                entries: self.code_seeds.clone(),
+            }
+            .save(&code_seeds_path)?;
+            debug!(
+                count = self.code_seeds.len(),
+                path = ?code_seeds_path,
+                "Updated code-seed mark cache (binary format)"
+            );
 
             // Save bytecode cache
             let bytecode_path = cfg.bytecode_cache_path();
             let mut bytecode_cache = BytecodeCache::load(&bytecode_path).unwrap_or_default();
             bytecode_cache.merge_from_db(&self.blockchain_db);
-            bytecode_cache
-                .save(&bytecode_path)
-                .with_context(|| format!("failed to save bytecode cache to {bytecode_path:?}"))?;
+            bytecode_cache.save(&bytecode_path)?;
             debug!(
                 count = bytecode_cache.contracts.len(),
                 path = ?bytecode_path,
@@ -1204,11 +2191,7 @@ impl EvmCache {
 
             // Save the immutable data cache
             let immutable_path = cfg.immutable_cache_path();
-            self.immutable_cache
-                .save(&immutable_path)
-                .with_context(|| {
-                    format!("failed to save immutable data cache to {immutable_path:?}")
-                })?;
+            self.immutable_cache.save(&immutable_path)?;
             debug!(
                 token_decimals = self.immutable_cache.token_decimals.len(),
                 path = ?immutable_path,
@@ -1255,7 +2238,7 @@ impl EvmCache {
     /// # Snapshot base
     /// Writing layer 2 directly through this unchecked handle also bypasses the
     /// memoized copy-on-write snapshot base (Pillar A). The next
-    /// [`create_snapshot`](Self::create_snapshot) only performs a count/absence
+    /// [`snapshot`](Self::snapshot) only performs a count/absence
     /// growth scan over layer 2, which catches lazy RPC-populated accounts/slots
     /// because that path only appends at a fixed block. It does **not** catch
     /// direct in-place changes where cardinality is unchanged: overwriting an
@@ -1289,7 +2272,7 @@ impl EvmCache {
     /// handler by reading back the updated account/slot through `SharedBackend`
     /// (for example via `basic_ref` / `storage_ref`), then call
     /// [`invalidate_snapshot_base`](Self::invalidate_snapshot_base) before the next
-    /// [`create_snapshot`](Self::create_snapshot). Calling
+    /// [`snapshot`](Self::snapshot). Calling
     /// `invalidate_snapshot_base` immediately after `insert_or_update_*` is not, by
     /// itself, a guarantee that the queued update has been applied before the next
     /// snapshot.
@@ -1321,7 +2304,7 @@ impl EvmCache {
     /// runtime), the callback degrades to an `Err` rather than panicking, but
     /// `block_in_place` itself will panic if invoked from a non-worker thread of
     /// a multi-thread runtime.
-    pub fn rpc_call(&self, to: Address, calldata: Bytes) -> Option<Result<Bytes>> {
+    pub fn rpc_call(&self, to: Address, calldata: Bytes) -> Option<Result<Bytes, RpcError>> {
         self.rpc_caller
             .as_ref()
             .map(|caller| (caller)(to, calldata))
@@ -1341,6 +2324,32 @@ impl EvmCache {
     /// a multi-thread runtime.
     pub fn storage_batch_fetcher(&self) -> Option<&StorageBatchFetchFn> {
         self.storage_batch_fetcher.as_ref()
+    }
+
+    /// Get the account/root proof fetcher, if available.
+    ///
+    /// Returns `None` when constructed via `from_backend` (no provider
+    /// available) unless a fetcher was injected via
+    /// [`set_account_proof_fetcher`](Self::set_account_proof_fetcher).
+    ///
+    /// # Panics
+    /// The returned [`AccountProofFetchFn`] must be invoked from within a
+    /// **multi-thread** tokio runtime: it drives `eth_getProof` calls to
+    /// completion via `tokio::task::block_in_place`. On a current-thread runtime
+    /// (or with no runtime) it degrades to an `Err` result for every requested
+    /// address rather than panicking, but `block_in_place` itself will panic if
+    /// invoked from a non-worker thread of a multi-thread runtime.
+    pub fn account_proof_fetcher(&self) -> Option<&AccountProofFetchFn> {
+        self.account_proof_fetcher.as_ref()
+    }
+
+    /// Get the block state-diff fetcher, if available.
+    ///
+    /// Returns `None` when constructed via `from_backend` (no provider
+    /// available) unless a fetcher was injected via
+    /// [`set_block_state_diff_fetcher`](Self::set_block_state_diff_fetcher).
+    pub fn block_state_diff_fetcher(&self) -> Option<&BlockStateDiffFetchFn> {
+        self.block_state_diff_fetcher.as_ref()
     }
 
     /// Inject batch-fetched storage values directly into BlockchainDb (layer 2).
@@ -1373,7 +2382,7 @@ impl EvmCache {
     /// address that *already* has a CacheDB overlay entry (layer 1), it writes
     /// the slot into that overlay too.
     ///
-    /// This matters because both [`create_snapshot`](Self::create_snapshot) and
+    /// This matters because both [`snapshot`](Self::snapshot) and
     /// the synchronous EVM SLOAD path let the overlay win over the backend. A
     /// correction written only to layer 2 would be shadowed by a stale layer-1
     /// slot, so the cache could never converge — the freshness validator would
@@ -1393,6 +2402,53 @@ impl EvmCache {
             .map(|&(addr, slot, value)| StateUpdate::slot(addr, slot, value))
             .collect();
         let _ = self.apply_updates(&updates);
+    }
+
+    /// Bulk-load the given slots into the cache at its pinned block.
+    ///
+    /// Fetches through the installed [`StorageBatchFetchFn`] — bulk `eth_call`
+    /// extraction by default, so thousands of slots (across many contracts)
+    /// arrive in a handful of calls — and injects every successfully fetched
+    /// value into layer 2 via
+    /// [`inject_storage_batch`](Self::inject_storage_batch), the cold-prefetch
+    /// write. Use it to prewarm a declared working set (an AMM pool's tick
+    /// range, a protocol's config slots) before entering a simulation or
+    /// reactive loop, complementing the *recorded* working sets that
+    /// [`prefetch_registry`](crate::prefetch_registry) replays.
+    ///
+    /// Duplicate pairs are fetched once each and injected idempotently.
+    /// Returns how many slots loaded and which pairs failed; failures leave
+    /// the cache unchanged (those slots lazily point-read later as usual).
+    pub fn prewarm_slots(&mut self, requests: &[(Address, U256)]) -> PrewarmReport {
+        let Some(fetcher) = self.storage_batch_fetcher.clone() else {
+            return PrewarmReport {
+                loaded: 0,
+                failed: requests
+                    .iter()
+                    .map(|&(addr, slot)| {
+                        (
+                            addr,
+                            slot,
+                            StorageFetchError::custom("no storage batch fetcher installed"),
+                        )
+                    })
+                    .collect(),
+            };
+        };
+        let results = fetcher(requests.to_vec(), self.block);
+        let mut to_inject = Vec::with_capacity(results.len());
+        let mut failed = Vec::new();
+        for (addr, slot, result) in results {
+            match result {
+                Ok(value) => to_inject.push((addr, slot, value)),
+                Err(e) => failed.push((addr, slot, e)),
+            }
+        }
+        self.inject_storage_batch(&to_inject);
+        PrewarmReport {
+            loaded: to_inject.len(),
+            failed,
+        }
     }
 
     /// Apply a single targeted [`StateUpdate`], returning a [`StateDiff`] of what
@@ -1450,6 +2506,7 @@ impl EvmCache {
     /// # }
     /// ```
     pub fn apply_update(&mut self, update: &StateUpdate) -> StateDiff {
+        self.bump_snapshot_generation();
         let mut diff = StateDiff::default();
         match update {
             StateUpdate::Slot {
@@ -1578,6 +2635,9 @@ impl EvmCache {
     /// [`StateDiff::len`]. After a batch with relative updates, check
     /// [`StateDiff::has_skipped`].
     pub fn apply_updates(&mut self, updates: &[StateUpdate]) -> StateDiff {
+        if !updates.is_empty() {
+            self.bump_snapshot_generation();
+        }
         let mut diff = StateDiff::default();
         let mut i = 0;
         while i < updates.len() {
@@ -1765,6 +2825,7 @@ impl EvmCache {
         let current = self.cached_storage_value(address, slot);
         let new = f(current)?;
 
+        self.bump_snapshot_generation();
         self.write_slot_through(address, slot, new);
 
         let old = current.unwrap_or(U256::ZERO);
@@ -2018,8 +3079,52 @@ impl EvmCache {
     /// This is the seam the freshness controller and tests use to drive
     /// re-verification without a live provider: a stubbed
     /// [`StorageBatchFetchFn`] can be injected over a mocked-provider cache.
+    /// Production callers can also inject their own transport, retry, batching,
+    /// or rate-limiting strategy here. Once replaced, the cache's
+    /// [`StorageBatchConfig`] no longer controls batching; the custom fetcher is
+    /// responsible for honoring the [`StorageBatchFetchFn`] contract.
     pub fn set_storage_batch_fetcher(&mut self, f: StorageBatchFetchFn) {
         self.storage_batch_fetcher = Some(f);
+    }
+
+    /// Set (or replace) the account/root proof fetcher.
+    ///
+    /// This is the seam account-target resyncs and account-level freshness use to
+    /// drive `eth_getProof` fetches without a live provider: a stubbed
+    /// [`AccountProofFetchFn`] can be injected over a mocked-provider cache,
+    /// mirroring [`set_storage_batch_fetcher`](Self::set_storage_batch_fetcher).
+    pub fn set_account_proof_fetcher(&mut self, f: AccountProofFetchFn) {
+        self.account_proof_fetcher = Some(f);
+    }
+
+    /// Set (or replace) the block state-diff fetcher.
+    ///
+    /// This is the seam trace-backed reactive resync uses to resolve matching
+    /// targets from one block-level debug trace before falling back to storage or
+    /// account proof point reads.
+    pub fn set_block_state_diff_fetcher(&mut self, f: BlockStateDiffFetchFn) {
+        self.block_state_diff_fetcher = Some(f);
+    }
+
+    /// Set (or replace) the bulk account-fields fetcher.
+    ///
+    /// This is the seam [`verify_code_seeds`](Self::verify_code_seeds) (and
+    /// the cold-start `verify_code` phase) reads through: a stubbed
+    /// [`AccountFieldsFetchFn`] can be injected over a mocked-provider cache,
+    /// mirroring [`set_storage_batch_fetcher`](Self::set_storage_batch_fetcher).
+    pub fn set_account_fields_fetcher(&mut self, f: AccountFieldsFetchFn) {
+        self.account_fields_fetcher = Some(f);
+    }
+
+    /// The installed bulk account-fields fetcher, if any.
+    ///
+    /// `Some` on provider-backed caches (default-wired to
+    /// [`fetch_account_fields_bulk`](crate::bulk_storage::fetch_account_fields_bulk));
+    /// `None` on [`from_backend`](Self::from_backend) caches until one is
+    /// installed via
+    /// [`set_account_fields_fetcher`](Self::set_account_fields_fetcher).
+    pub fn account_fields_fetcher(&self) -> Option<&AccountFieldsFetchFn> {
+        self.account_fields_fetcher.as_ref()
     }
 
     /// Return the currently-cached value for a storage slot, if any.
@@ -2101,7 +3206,7 @@ impl EvmCache {
     /// Shared with the cold-start probe phase
     /// ([`execute_cold_start_round`](Self::execute_cold_start_round)) so the
     /// single classification is reused rather than duplicated.
-    pub(crate) fn classify(fetched: Result<U256>) -> SlotFetch {
+    pub(crate) fn classify(fetched: StorageFetchResult<U256>) -> SlotFetch {
         match fetched {
             Ok(v) if v != U256::ZERO => SlotFetch::Value(v),
             Ok(_) => SlotFetch::Zero,
@@ -2140,7 +3245,7 @@ impl EvmCache {
         let fetcher = self
             .storage_batch_fetcher
             .as_ref()
-            .ok_or_else(|| anyhow!("verify_slots requires a storage batch fetcher"))?
+            .ok_or(CacheError::MissingStorageBatchFetcher)?
             .clone();
 
         // Snapshot the cached values before fetching so we compare against a
@@ -2150,7 +3255,7 @@ impl EvmCache {
             .map(|&(addr, slot)| ((addr, slot), self.cached_storage_value(addr, slot)))
             .collect();
 
-        let results = (fetcher)(slots.to_vec(), Some(self.block));
+        let results = (fetcher)(slots.to_vec(), self.block);
 
         let mut changed = Vec::new();
         let mut outcomes = Vec::with_capacity(results.len());
@@ -2159,7 +3264,7 @@ impl EvmCache {
             // Read 1: classify the fetch outcome for every slot, failed or not.
             let fetch = Self::classify(match &fetched {
                 Ok(v) => Ok(*v),
-                Err(e) => Err(anyhow!("{e}")),
+                Err(e) => Err(StorageFetchError::custom(e.to_string())),
             });
             outcomes.push(SlotOutcome {
                 address: addr,
@@ -2230,11 +3335,9 @@ impl EvmCache {
     pub fn reconcile_slots(&mut self, slots: &[(Address, U256)]) -> Result<Vec<SlotChange>> {
         let (changed, fetched_ok) = self.verify_slots_inner(slots)?;
         if !slots.is_empty() && fetched_ok == 0 {
-            return Err(anyhow!(
-                "reconcile could not fetch any of the {} requested slot(s) \
-                 (no usable storage fetcher / provider unreachable)",
-                slots.len()
-            ));
+            return Err(CacheError::ReconcileFetchFailed {
+                requested: slots.len(),
+            });
         }
         Ok(changed)
     }
@@ -2259,6 +3362,13 @@ impl EvmCache {
     /// `(backend_slots_removed, account_removed)` where `account_removed` is true
     /// if an account entry was removed from either account layer.
     fn purge_account_inner(&mut self, addr: Address) -> (usize, bool) {
+        // An account-scope purge also discards any code-seed mark: whatever
+        // trust state the code carried, the code itself is gone, and the next
+        // touch refetches authoritative chain state (which is unmarked
+        // RPC-origin by definition). This is also the documented escape hatch
+        // for re-seeding after a believed redeploy.
+        self.code_seeds.remove(&addr);
+
         // Layer 1: CacheDB overlay (accounts + their storage live together).
         let overlay_removed = self.db.cache.accounts.remove(&addr).is_some();
 
@@ -2299,13 +3409,13 @@ impl EvmCache {
     /// Prefer setting this at construction through
     /// [`EvmCacheBuilder::chain_id`]. This setter exists for cases where the
     /// chain ID must change after construction. It takes effect on the next
-    /// [`create_snapshot`](Self::create_snapshot) / `build_evm`; existing
+    /// [`snapshot`](Self::snapshot) / `build_evm`; existing
     /// snapshots and overlays keep the chain ID captured when they were created.
     pub fn set_chain_id(&mut self, chain_id: u64) {
         self.chain_id = chain_id;
     }
 
-    /// Take a low-level, same-thread snapshot of the CacheDB overlay for
+    /// Take a low-level, same-thread checkpoint of the CacheDB overlay for
     /// in-place restore.
     ///
     /// Clones the inner [`revm::database::Cache`] (the layer-1 overlay's
@@ -2314,23 +3424,23 @@ impl EvmCache {
     /// overlay back on the same `EvmCache` after speculative mutations (this is
     /// how the balance-slot scan probes and rewinds).
     ///
-    /// For cross-thread fan-out use [`create_snapshot`](Self::create_snapshot)
+    /// For cross-thread fan-out use [`snapshot`](Self::snapshot)
     /// instead: it merges both layers into an `Arc<`[`EvmSnapshot`]`>` that is
     /// `Send + Sync` and can be shared with parallel simulators via
     /// [`EvmOverlay`].
-    pub fn snapshot(&self) -> revm::database::Cache {
+    pub fn checkpoint(&self) -> revm::database::Cache {
         self.db.cache.clone()
     }
 
-    /// Restore the CacheDB overlay from a snapshot taken with
-    /// [`snapshot`](Self::snapshot).
+    /// Restore the CacheDB overlay from a checkpoint taken with
+    /// [`checkpoint`](Self::checkpoint).
     ///
-    /// Overwrites the layer-1 overlay wholesale with `snapshot`, discarding any
+    /// Overwrites the layer-1 overlay wholesale with `checkpoint`, discarding any
     /// overlay mutations made since it was taken. The BlockchainDb backend is
     /// untouched. This is the in-place counterpart to the cross-thread
-    /// [`create_snapshot`](Self::create_snapshot) / [`EvmOverlay`] path.
-    pub fn restore(&mut self, snapshot: revm::database::Cache) {
-        self.db.cache = snapshot;
+    /// [`snapshot`](Self::snapshot) / [`EvmOverlay`] path.
+    pub fn restore(&mut self, checkpoint: revm::database::Cache) {
+        self.db.cache = checkpoint;
     }
 
     /// Create a new session for executing multiple operations.
@@ -2354,13 +3464,13 @@ impl EvmCache {
     /// delta over it. Layer-1 values shadow the base on reads, reproducing the
     /// live cache's layered semantics; the resulting [`EvmSnapshot`] is shared
     /// across threads via `Arc`. Its cost tracks *changed* state, not *total*
-    /// state. (The retained [`create_snapshot_deep_clone`](Self::create_snapshot_deep_clone)
+    /// state. (The retained [`snapshot_deep_clone`](Self::snapshot_deep_clone)
     /// is the read-equivalent O(total) reference, kept for benchmarking/testing.)
     ///
     /// Takes `&mut self` because it refreshes and memoizes the base. For cheap
     /// same-thread save/restore of just the overlay, prefer
-    /// [`snapshot`](Self::snapshot) / [`restore`](Self::restore) instead.
-    pub fn create_snapshot(&mut self) -> Arc<snapshot::EvmSnapshot> {
+    /// [`checkpoint`](Self::checkpoint) / [`restore`](Self::restore) instead.
+    pub fn snapshot(&mut self) -> Arc<snapshot::EvmSnapshot> {
         // 1. Refresh / memoize the cold layer-2 base, then take a cheap Arc handle
         //    (O(1) when layer 2 is unchanged since the last snapshot).
         self.refresh_base();
@@ -2432,7 +3542,7 @@ impl EvmCache {
         })
     }
 
-    /// Force the next [`create_snapshot`](Self::create_snapshot) to rebuild the
+    /// Force the next [`snapshot`](Self::snapshot) to rebuild the
     /// memoized copy-on-write base from scratch (Pillar A).
     ///
     /// The crate's own mutators keep the base honest automatically. This is the
@@ -2461,7 +3571,7 @@ impl EvmCache {
     /// Refresh the memoized cold layer-2 [`BaseState`](snapshot::BaseState),
     /// reusing the previous `Arc` wherever layer 2 is unchanged (Pillar A).
     ///
-    /// Called at the top of [`create_snapshot`](Self::create_snapshot). It never
+    /// Called at the top of [`snapshot`](Self::snapshot). It never
     /// mutates an `Arc<BaseState>` that may already be shared with a live
     /// snapshot: on any change it builds a *new* `BaseState` that shares the `Arc`
     /// handles of unchanged accounts and rebuilds only the changed ones
@@ -2476,7 +3586,7 @@ impl EvmCache {
     ///    any address whose slot count differs from the recorded length, or any
     ///    account absent from the base, as dirty.
     /// 3. **Nothing dirty** → reuse the existing `Arc<BaseState>` unchanged (the
-    ///    common hot-loop case; the base side of `create_snapshot` is then O(1)).
+    ///    common hot-loop case; the base side of `snapshot` is then O(1)).
     /// 4. **Some addresses dirty** → build a new `BaseState` sharing the `Arc`s of
     ///    unchanged accounts and rebuilding only the dirty ones.
     fn refresh_base(&mut self) {
@@ -2564,7 +3674,7 @@ impl EvmCache {
 
         // Rebuild the code index from the refreshed accounts (NOT cloned from the
         // previous base): a purged or recoded dirty account must not leave a stale
-        // `code_by_hash` entry, which would diverge from `create_snapshot_deep_clone`
+        // `code_by_hash` entry, which would diverge from `snapshot_deep_clone`
         // on a direct `code_by_hash(old_hash)` lookup. Rebuilding from scratch also
         // handles shared code hashes correctly (a hash survives iff some present
         // account still carries it).
@@ -2582,7 +3692,7 @@ impl EvmCache {
     /// the deep-clone reference: a hash is present iff some account carries that
     /// code inline. Rebuilt from scratch on every base (re)build so a purged or
     /// recoded account never leaves a stale entry — preserving read-equivalence
-    /// with [`create_snapshot_deep_clone`](Self::create_snapshot_deep_clone).
+    /// with [`snapshot_deep_clone`](Self::snapshot_deep_clone).
     fn code_index(accounts: &HashMap<Address, AccountInfo>) -> HashMap<B256, Bytecode> {
         accounts
             .values()
@@ -2596,7 +3706,7 @@ impl EvmCache {
 
     /// Build a fresh [`BaseState`](snapshot::BaseState) by flattening all of layer
     /// 2, recording `base_storage_lens`. Shared by `refresh_base`'s full-rebuild
-    /// path and [`create_snapshot_deep_clone`](Self::create_snapshot_deep_clone).
+    /// path and [`snapshot_deep_clone`](Self::snapshot_deep_clone).
     fn build_base_full(&mut self) -> snapshot::BaseState {
         let mut accounts = HashMap::new();
         {
@@ -2627,16 +3737,16 @@ impl EvmCache {
     /// A/B benchmarking and as the read-equivalence reference (Decision D3).
     ///
     /// Produces the same two-tier [`EvmSnapshot`](snapshot::EvmSnapshot) shape as
-    /// [`create_snapshot`](Self::create_snapshot), but with `base` set to the
+    /// [`snapshot`](Self::snapshot), but with `base` set to the
     /// fully-merged flatten of **both** layers and **empty** overlay maps (the
     /// cleared / not-existing sets still in place). It is read-indistinguishable
-    /// from `create_snapshot` by construction (the `tests/cow_snapshot.rs`
+    /// from `snapshot` by construction (the `tests/cow_snapshot.rs`
     /// differential gate pins this), at the cost of an O(total state) deep copy
-    /// every call — exactly the cost `create_snapshot` now amortizes away.
+    /// every call — exactly the cost `snapshot` now amortizes away.
     ///
     /// Stays `&self`: it does not touch the memoized base.
     #[doc(hidden)]
-    pub fn create_snapshot_deep_clone(&self) -> Arc<snapshot::EvmSnapshot> {
+    pub fn snapshot_deep_clone(&self) -> Arc<snapshot::EvmSnapshot> {
         let mut accounts = HashMap::new();
         let mut storage: HashMap<Address, HashMap<U256, U256>> = HashMap::new();
         let mut code_by_hash = HashMap::new();
@@ -2661,7 +3771,7 @@ impl EvmCache {
 
         // 2. Overlay from CacheDB (Layer 1, takes precedence). Merge into the same
         //    flat maps, dropping shadowed entries, exactly as the original
-        //    `create_snapshot` did. A cleared account's storage is routed into
+        //    `snapshot` did. A cleared account's storage is routed into
         //    `overlay_storage` (not the base), because `EvmSnapshot::storage_value`
         //    only applies the cleared-as-ZERO rule for an address with an
         //    `overlay_storage` entry — so the cleared semantics must be expressed
@@ -2780,11 +3890,11 @@ impl EvmCache {
         };
         if changed {
             self.block = block;
+            self.bump_snapshot_generation();
             // Re-pinning replaces layer 2 wholesale (state at a new block): the
             // memoized base must be rebuilt from scratch on the next snapshot.
             self.invalidate_base();
             let _ = self.backend.set_pinned_block(block);
-            *self.batch_block_id.lock().unwrap() = block;
         }
         if changed || concrete_number.is_none() {
             self.basefee = None;
@@ -2799,6 +3909,49 @@ impl EvmCache {
     /// Get the block that RPC fetches are currently pinned to.
     pub fn block(&self) -> BlockId {
         self.block
+    }
+
+    /// Monotonic generation counter for snapshot consistency (G6).
+    ///
+    /// Increments on every targeted state write ([`apply_update`](Self::apply_update),
+    /// [`apply_updates`](Self::apply_updates), [`modify_slot`](Self::modify_slot)
+    /// — and therefore everything built on them: reactive ingestion, freshness
+    /// corrections, fresh injections) and on block re-pins
+    /// ([`set_block`](Self::set_block), [`advance_block`](Self::advance_block)).
+    /// Cold prefetch ([`inject_storage_batch`](Self::inject_storage_batch)) and
+    /// lazy backend fetches do **not** increment it: they materialize the pinned
+    /// block's existing state rather than changing it.
+    ///
+    /// The magnitude is opaque — how much one call increments it is
+    /// unspecified — so compare values for **equality only**.
+    ///
+    /// The fan-out pattern: read the generation, take the
+    /// [`snapshot`](Self::snapshot), read the generation again. If the two
+    /// reads differ, state mutated in between (e.g. your event loop applied
+    /// part of a block between the reads) — discard and re-snapshot to avoid
+    /// fanning out simulations over a mid-block state.
+    ///
+    /// ```no_run
+    /// # fn demo(cache: &mut evm_fork_cache::cache::EvmCache) {
+    /// let snapshot = loop {
+    ///     let generation = cache.snapshot_generation();
+    ///     let snapshot = cache.snapshot();
+    ///     if cache.snapshot_generation() == generation {
+    ///         break snapshot;
+    ///     }
+    ///     // A mutation interleaved: try again at the next stable point.
+    /// };
+    /// # let _ = snapshot;
+    /// # }
+    /// ```
+    pub fn snapshot_generation(&self) -> u64 {
+        self.snapshot_generation
+    }
+
+    /// Advance the snapshot-consistency generation (see
+    /// [`snapshot_generation`](Self::snapshot_generation)).
+    fn bump_snapshot_generation(&mut self) {
+        self.snapshot_generation = self.snapshot_generation.wrapping_add(1);
     }
 
     /// Set a custom timestamp for EVM simulations.
@@ -2855,7 +4008,7 @@ impl EvmCache {
     }
 
     /// Set the block base fee (the `BASEFEE` opcode) for subsequent simulations,
-    /// propagated into the next [`create_snapshot`](Self::create_snapshot).
+    /// propagated into the next [`snapshot`](Self::snapshot).
     ///
     /// Offline caches built over a mocked provider have no fetched block header,
     /// so the base fee is unset (and the `BASEFEE` opcode reads `0`). Use this to
@@ -2894,6 +4047,100 @@ impl EvmCache {
     /// revm use its default.
     pub fn set_block_gas_limit(&mut self, gas_limit: Option<u64>) {
         self.block_gas_limit = gas_limit;
+    }
+
+    /// Get the block beneficiary used for EVM simulations (the `COINBASE`
+    /// opcode).
+    ///
+    /// Fetched from the pinned block's header at construction, refreshed by
+    /// [`advance_block`](Self::advance_block), or overridden via
+    /// [`set_coinbase`](Self::set_coinbase). `None` means revm uses its default
+    /// beneficiary.
+    pub fn coinbase(&self) -> Option<Address> {
+        self.coinbase
+    }
+
+    /// Get `prevrandao` used for EVM simulations (the `PREVRANDAO` opcode, the
+    /// post-merge header mix hash).
+    ///
+    /// Fetched from the pinned block's header at construction, refreshed by
+    /// [`advance_block`](Self::advance_block), or overridden via
+    /// [`set_prevrandao`](Self::set_prevrandao). `None` leaves revm's default in
+    /// place.
+    pub fn prevrandao(&self) -> Option<B256> {
+        self.prevrandao
+    }
+
+    /// Get the block gas limit used for EVM simulations (the `GASLIMIT` opcode).
+    ///
+    /// Fetched from the pinned block's header at construction, refreshed by
+    /// [`advance_block`](Self::advance_block), or overridden via
+    /// [`set_block_gas_limit`](Self::set_block_gas_limit). `None` lets revm use
+    /// its default.
+    pub fn block_gas_limit(&self) -> Option<u64> {
+        self.block_gas_limit
+    }
+
+    /// Set which block-context header fields subsequent
+    /// [`advance_block`](Self::advance_block) calls require to be present.
+    ///
+    /// See [`BlockContextRequirements`]. Under
+    /// [`strict`](BlockContextRequirements::strict) enforcement,
+    /// [`advance_block`](Self::advance_block) rejects a header missing a required
+    /// field rather than silently defaulting it.
+    pub fn set_block_context_requirements(&mut self, reqs: BlockContextRequirements) {
+        self.block_context_requirements = reqs;
+    }
+
+    /// Engine-driven per-block env refresh from a canonical block header.
+    ///
+    /// First validates the header against the configured
+    /// [`BlockContextRequirements`] (set via
+    /// [`set_block_context_requirements`](Self::set_block_context_requirements)
+    /// or the strict builder path). Under strict/partial requirements a header
+    /// missing a required field is rejected with [`BlockContextError`] instead of
+    /// being silently defaulted; under the [`lenient`](BlockContextRequirements::lenient)
+    /// default this never errors.
+    ///
+    /// On success it refreshes the full EVM block env from the header — block
+    /// number (`NUMBER`), base fee (`BASEFEE`), beneficiary (`COINBASE`),
+    /// `prevrandao` (`PREVRANDAO`), gas limit (`GASLIMIT`) and timestamp — and
+    /// re-pins **every** RPC fetch path (the SharedBackend lazy fallback, the
+    /// batch storage fetcher, and the account-proof fetcher) to the header's
+    /// block number, so a lazy miss after the advance reads state at the
+    /// advanced block, in lockstep with the env. Intended to be driven once per
+    /// canonical block (e.g. by the reactive runtime as new headers arrive).
+    ///
+    /// Unlike [`set_block`](Self::set_block), this does **not** invalidate the
+    /// memoized COW snapshot base: an advance is a forward roll of the same live
+    /// view (canonical mutations flow through the write funnel, which already
+    /// marks the base dirty; lazy fetches stay insert-only-on-miss, which the
+    /// base's growth scan catches), whereas `set_block` is a wholesale re-fork
+    /// that must rebuild layer 2. Re-pinning to an *older* block is a re-fork,
+    /// not an advance — use `set_block` for that.
+    pub fn advance_block<H: BlockHeader>(&mut self, header: &H) -> Result<(), BlockContextError> {
+        self.block_context_requirements.validate_header(header)?;
+
+        self.block_number = Some(header.number());
+        self.basefee = header.base_fee_per_gas();
+        self.coinbase = Some(header.beneficiary());
+        self.prevrandao = header.mix_hash();
+        self.block_gas_limit = Some(header.gas_limit());
+        self.timestamp_override = Some(header.timestamp());
+
+        // Advance every fetch path to the new height in lockstep with the env:
+        // the SharedBackend lazy fallback (a miss must not serve state from the
+        // previously pinned block) and the pin accessor. Mirrors `set_block`'s
+        // pin updates, minus the base invalidation (see the method docs for why
+        // an advance keeps the memoized base).
+        let block = BlockId::number(header.number());
+        self.block = block;
+        let _ = self.backend.set_pinned_block(block);
+        // A snapshot spanning the env refresh would pair the new block context
+        // with pre-advance state — bump so consumers can detect it (G6).
+        self.bump_snapshot_generation();
+
+        Ok(())
     }
 
     /// Re-pin the cache to a specific block number.
@@ -2938,7 +4185,10 @@ impl EvmCache {
         let info = self
             .backend
             .basic_ref(address)
-            .map_err(|e| anyhow!("Failed to fetch account: {:?}", e))?;
+            .map_err(|e| CacheError::AccountFetch {
+                address,
+                details: format!("{e:?}"),
+            })?;
 
         if let Some(info) = info {
             self.db.insert_account_info(address, info);
@@ -2956,7 +4206,11 @@ impl EvmCache {
         use revm::database_interface::DatabaseRef;
         self.backend
             .storage_ref(address, slot)
-            .map_err(|e| anyhow!("storage read failed for {address} slot {slot}: {e}"))
+            .map_err(|e| CacheError::StorageRead {
+                address,
+                slot,
+                details: e.to_string(),
+            })
     }
 
     /// Write a raw storage slot value directly into the CacheDB layer.
@@ -2965,7 +4219,13 @@ impl EvmCache {
     /// without any RPC call. Used for hot-state injection where we already know the
     /// current on-chain value from WebSocket events.
     pub fn insert_storage_slot(&mut self, address: Address, slot: U256, value: U256) -> Result<()> {
-        self.db.insert_account_storage(address, slot, value)?;
+        self.db
+            .insert_account_storage(address, slot, value)
+            .map_err(|e| CacheError::StorageInsert {
+                address,
+                slot,
+                details: e.to_string(),
+            })?;
         Ok(())
     }
 
@@ -3004,7 +4264,12 @@ impl EvmCache {
     ) -> Result<()> {
         let hashed_balance_slot = keccak256((slot_address, slot).abi_encode());
         self.db
-            .insert_account_storage(contract, hashed_balance_slot.into(), value)?;
+            .insert_account_storage(contract, hashed_balance_slot.into(), value)
+            .map_err(|e| CacheError::StorageInsert {
+                address: contract,
+                slot: hashed_balance_slot.into(),
+                details: e.to_string(),
+            })?;
         Ok(())
     }
 
@@ -3054,7 +4319,7 @@ impl EvmCache {
             return Ok(Some(slot));
         }
 
-        let baseline_snapshot = self.snapshot();
+        let baseline_snapshot = self.checkpoint();
         let baseline_balance = self.erc20_balance_of(token, owner)?;
 
         // Choose a probe value distinct from baseline to avoid false positives.
@@ -3120,7 +4385,7 @@ impl EvmCache {
     /// # use alloy_primitives::Address;
     /// # use alloy_sol_types::sol;
     /// # use evm_fork_cache::cache::EvmCache;
-    /// # fn example(cache: &mut EvmCache, token: Address, owner: Address) -> anyhow::Result<()> {
+    /// # fn example(cache: &mut EvmCache, token: Address, owner: Address) -> Result<(), Box<dyn std::error::Error>> {
     /// sol! {
     ///     function balanceOf(address account) external view returns (uint256);
     /// }
@@ -3200,15 +4465,13 @@ impl EvmCache {
         let mut evm = self.build_evm();
 
         if commit {
-            return evm
-                .transact_commit(tx_env)
-                .map_err(|e| anyhow!("Failed to transact: {:?}", e));
+            return evm.transact_commit(tx_env).map_err(CacheError::transact);
         }
 
         let checkpoint = evm.journaled_state.checkpoint();
         let result = evm.transact_one(tx_env);
         evm.journaled_state.checkpoint_revert(checkpoint);
-        result.map_err(|e| anyhow!("Failed to transact: {:?}", e))
+        result.map_err(CacheError::transact)
     }
 
     /// Execute a non-committing call and extract the access list of touched
@@ -3245,7 +4508,7 @@ impl EvmCache {
                 // Revert the checkpoint even on a host/transact error so the EVM
                 // journal is not left dirty (mirrors `call_raw`).
                 evm.journaled_state.checkpoint_revert(checkpoint);
-                Err(anyhow!("Failed to transact: {:?}", e))
+                Err(CacheError::transact(e))
             }
         }
     }
@@ -3270,7 +4533,9 @@ impl EvmCache {
         if let ExecutionResult::Success { logs, gas_used, .. } = result {
             Ok((logs, gas_used))
         } else {
-            Err(anyhow!("Failed to call: {:?}", result))
+            Err(CacheError::CallNotSuccessful {
+                result: format!("{result:?}"),
+            })
         }
     }
 
@@ -3289,11 +4554,17 @@ impl EvmCache {
         match result {
             ExecutionResult::Success { output, .. } => {
                 let out = output.into_data();
-                let balance = IERC20::balanceOfCall::abi_decode_returns(&out)
-                    .map_err(|e| anyhow!("Failed to decode balanceOf: {:?}", e))?;
+                let balance = IERC20::balanceOfCall::abi_decode_returns(&out).map_err(|e| {
+                    CacheError::Decode {
+                        what: "ERC20 balanceOf return data",
+                        details: format!("{e:?}"),
+                    }
+                })?;
                 Ok(balance)
             }
-            _ => Err(anyhow!("balanceOf call failed: {:?}", result)),
+            _ => Err(CacheError::CallNotSuccessful {
+                result: format!("{result:?}"),
+            }),
         }
     }
 
@@ -3317,11 +4588,17 @@ impl EvmCache {
         match result {
             ExecutionResult::Success { output, .. } => {
                 let out = output.into_data();
-                let allowance = IERC20::allowanceCall::abi_decode_returns(&out)
-                    .map_err(|e| anyhow!("Failed to decode allowance: {:?}", e))?;
+                let allowance = IERC20::allowanceCall::abi_decode_returns(&out).map_err(|e| {
+                    CacheError::Decode {
+                        what: "ERC20 allowance return data",
+                        details: format!("{e:?}"),
+                    }
+                })?;
                 Ok(allowance)
             }
-            _ => Err(anyhow!("allowance call failed: {:?}", result)),
+            _ => Err(CacheError::CallNotSuccessful {
+                result: format!("{result:?}"),
+            }),
         }
     }
 
@@ -3351,14 +4628,20 @@ impl EvmCache {
         match result {
             ExecutionResult::Success { output, .. } => {
                 let out = output.into_data();
-                let decimals = IERC20::decimalsCall::abi_decode_returns(&out)
-                    .map_err(|e| anyhow!("Failed to decode decimals: {:?}", e))?;
+                let decimals = IERC20::decimalsCall::abi_decode_returns(&out).map_err(|e| {
+                    CacheError::Decode {
+                        what: "ERC20 decimals return data",
+                        details: format!("{e:?}"),
+                    }
+                })?;
                 self.token_decimals.insert(token, decimals);
                 // Also update immutable cache for persistence
                 self.immutable_cache.set_token_decimals(token, decimals);
                 Ok(decimals)
             }
-            _ => Err(anyhow!("decimals call failed: {:?}", result)),
+            _ => Err(CacheError::CallNotSuccessful {
+                result: format!("{result:?}"),
+            }),
         }
     }
 
@@ -3475,10 +4758,15 @@ impl EvmCache {
     /// [`EvmCacheBuilder`] resolved to a concrete size (with
     /// [`SharedMemoryCapacity::Auto`] resolved against the state loaded at
     /// construction), raised by any later [`reserve_shared_memory`](Self::reserve_shared_memory).
-    /// Each [`create_snapshot`](Self::create_snapshot) copies it onto the snapshot
+    /// Each [`snapshot`](Self::snapshot) copies it onto the snapshot
     /// so snapshot-backed [`EvmOverlay`]s pre-allocate the same amount.
     pub fn shared_memory_capacity(&self) -> usize {
         self.shared_memory_capacity
+    }
+
+    /// The cache-side storage batch-fetch configuration for this instance.
+    pub fn storage_batch_config(&self) -> StorageBatchConfig {
+        self.storage_batch_config
     }
 
     /// Purge all storage slots for a specific contract from both cache layers.
@@ -3792,9 +5080,7 @@ impl EvmCache {
         let mut evm = self.build_evm();
         let synthetic_beneficiary = Self::seed_synthetic_beneficiary(&mut evm);
         let target_checkpoint = evm.journaled_state.checkpoint();
-        let result = evm
-            .transact_one(tx)
-            .map_err(|e| anyhow!("Failed to transact: {:?}", e))?;
+        let result = evm.transact_one(tx).map_err(CacheError::transact)?;
         let (logs, gas_used, output) = match result {
             ExecutionResult::Success {
                 logs,
@@ -3805,7 +5091,9 @@ impl EvmCache {
             _ => {
                 evm.journaled_state.checkpoint_revert(target_checkpoint);
                 Self::remove_synthetic_beneficiary(&mut evm, synthetic_beneficiary);
-                return Err(anyhow!("Failed to call: {:?}", result));
+                return Err(CacheError::CallNotSuccessful {
+                    result: format!("{result:?}"),
+                });
             }
         };
         access_lists.push(extract_access_list(&evm.journaled_state.state));
@@ -3864,14 +5152,14 @@ impl EvmCache {
         tokens: Option<impl IntoIterator<Item = Address>>,
         commit: bool,
     ) -> SimulationResult<CallSimulationResult> {
-        let tx = Self::build_tx_env(from, to, calldata).map_err(SimError::Other)?;
+        let tx = Self::build_tx_env(from, to, calldata).map_err(SimError::from)?;
         let inspector = TransferInspector::new();
         let mut evm = self.build_evm_with_inspector(inspector);
         let checkpoint = evm.journaled_state.checkpoint();
 
         let result = evm
             .inspect_one_tx(tx)
-            .map_err(|e| SimError::Other(anyhow!("Failed to transact: {:?}", e)));
+            .map_err(|e| SimError::Other(SimHostError::transact(e)));
 
         match result {
             Ok(ExecutionResult::Success {
@@ -3975,7 +5263,7 @@ impl EvmCache {
         txs: &[crate::bundle::BundleTx],
         opts: &crate::bundle::BundleOptions,
     ) -> SimulationResult<crate::bundle::BundleResult> {
-        let snapshot = self.create_snapshot();
+        let snapshot = self.snapshot();
         let mut overlay = EvmOverlay::new(snapshot, None);
         overlay.simulate_bundle(txs, opts)
     }
@@ -3999,28 +5287,41 @@ impl EvmCache {
             .data(creation_code)
             .value(U256::ZERO)
             .build()
-            .map_err(|e| anyhow!("Failed to build CREATE tx: {:?}", e))?;
+            .map_err(CacheError::tx_env)?;
 
         // Use a relaxed contract size limit for deployment. Arbitrum supports
         // larger contracts than the EIP-170 24576-byte limit via ArbOS.
         let mut evm = self.build_evm();
         evm.cfg.limit_contract_code_size = Some(usize::MAX);
-        let result = evm
-            .transact_commit(tx)
-            .map_err(|e| anyhow!("Contract deployment failed: {:?}", e))?;
+        let result = evm.transact_commit(tx).map_err(CacheError::transact)?;
 
         match result {
-            ExecutionResult::Success { output, .. } => output
-                .address()
-                .copied()
-                .ok_or_else(|| anyhow!("Contract deployment succeeded but no address returned")),
-            ExecutionResult::Revert { output, .. } => Err(anyhow!(
-                "Contract deployment reverted: 0x{}",
-                alloy_primitives::hex::encode(&output)
-            )),
-            ExecutionResult::Halt { reason, .. } => {
-                Err(anyhow!("Contract deployment halted: {:?}", reason))
+            ExecutionResult::Success { output, .. } => {
+                let address = output
+                    .address()
+                    .copied()
+                    .ok_or(CacheError::DeploymentMissingAddress)?;
+                // A locally-deployed contract is divergence by construction:
+                // record it so `etched_accounts` reports every non-chain code
+                // site. The committed create left the runtime code in the
+                // overlay; hash from there.
+                let code_hash = self
+                    .db
+                    .cache
+                    .accounts
+                    .get(&address)
+                    .map(|account| account.info.code_hash)
+                    .unwrap_or(revm::primitives::KECCAK_EMPTY);
+                self.code_seeds
+                    .insert(address, CodeSeedState::Etched { code_hash });
+                Ok(address)
             }
+            ExecutionResult::Revert { output, .. } => Err(CacheError::DeploymentReverted {
+                output_hex: alloy_primitives::hex::encode(&output),
+            }),
+            ExecutionResult::Halt { reason, .. } => Err(CacheError::DeploymentHalted {
+                reason: format!("{reason:?}"),
+            }),
         }
     }
 
@@ -4083,7 +5384,9 @@ impl EvmCache {
             .accounts
             .get(&source)
             .and_then(|a| a.info.code.clone())
-            .ok_or_else(|| anyhow!("No bytecode found at source address {}", source))?;
+            .ok_or(CacheError::MissingSourceBytecode {
+                source_address: source,
+            })?;
         Self::ensure_runtime_code(source, Some(&source_code), "source")?;
 
         let code_hash = source_code.hash_slow();
@@ -4118,7 +5421,349 @@ impl EvmCache {
         // site (D2), so base correctness never relies on that shadowing invariant.
         self.mark_base_dirty(target);
 
+        // Every locally-divergent code write is visible in one place: the
+        // override target joins the etched set (see `etched_accounts`).
+        self.code_seeds
+            .insert(target, CodeSeedState::Etched { code_hash });
+
         Ok(())
+    }
+
+    /// Verify every [`CodeSeedState::Pending`] canonical code claim against
+    /// the chain at the pinned block — one bulk `eth_call` for the whole set.
+    ///
+    /// Per-address outcomes (see [`CodeVerifyReport`]):
+    /// - **match** ⇒ marked [`CodeSeedState::Verified`] (never re-checked;
+    ///   post-EIP-6780 code is immutable) and the account's real balance is
+    ///   patched in from the same response — pure materialization of
+    ///   pinned-block truth, so it does **not** bump the
+    ///   [snapshot generation](Self::snapshot_generation);
+    /// - **mismatch / not-deployed / code-less** ⇒
+    ///   [`purge_account`](Self::purge_account) (both layers **and** the
+    ///   mark; the purge path bumps the generation) — the next touch
+    ///   refetches authoritative chain state;
+    /// - **transport failure** (the whole call, an omitted address, or the
+    ///   `MULTICALL3_ADDRESS` extractor-host caveat) ⇒ still `Pending`,
+    ///   reported `unverifiable` — a failed read proves nothing, so it never
+    ///   promotes and never destroys a seed.
+    ///
+    /// With no pending seeds this is a no-op that needs no fetcher. Verified
+    /// seeds are skipped forever, so calling this repeatedly (or from every
+    /// cold-start round) costs nothing once the set is settled.
+    ///
+    /// # Errors
+    /// [`CacheError::MissingAccountFieldsFetcher`] when pending seeds exist
+    /// but no [`AccountFieldsFetchFn`] is installed (a
+    /// [`from_backend`](Self::from_backend) cache without
+    /// [`set_account_fields_fetcher`](Self::set_account_fields_fetcher)).
+    pub fn verify_code_seeds(&mut self) -> Result<CodeVerifyReport> {
+        let pending = self.pending_code_seeds();
+        if pending.is_empty() {
+            return Ok(CodeVerifyReport::default());
+        }
+        let fetcher = self
+            .account_fields_fetcher
+            .clone()
+            .ok_or(CacheError::MissingAccountFieldsFetcher)?;
+
+        let mut report = CodeVerifyReport::default();
+
+        // The extractor is hosted at MULTICALL3_ADDRESS under the eth_call
+        // override, so querying that address would report the extractor's own
+        // hash — a seed there is unverifiable by this path (use eth_getProof).
+        let (host, query): (Vec<Address>, Vec<Address>) = pending
+            .into_iter()
+            .partition(|address| *address == crate::multicall::MULTICALL3_ADDRESS);
+        for address in host {
+            report.unverifiable.push((
+                address,
+                "the account-fields extractor is hosted at this address under the eth_call \
+                 override; verify it via the eth_getProof path instead"
+                    .to_string(),
+            ));
+        }
+        if query.is_empty() {
+            return Ok(report);
+        }
+
+        let samples = match (fetcher)(query.clone(), self.block) {
+            Ok(samples) => samples,
+            Err(error) => {
+                // Fail-safe on transport: every seed stays Pending.
+                let reason = error.to_string();
+                report
+                    .unverifiable
+                    .extend(query.into_iter().map(|address| (address, reason.clone())));
+                return Ok(report);
+            }
+        };
+        let by_address: HashMap<Address, AccountFieldsSample> = samples.into_iter().collect();
+
+        let verified_at_block = self.block_number.unwrap_or_default();
+        for address in query {
+            let Some(CodeSeedState::Pending {
+                code_hash: expected,
+            }) = self.code_seeds.get(&address).cloned()
+            else {
+                // Unreachable in practice (the set was snapshotted above);
+                // skip rather than misclassify.
+                continue;
+            };
+            let Some(sample) = by_address.get(&address) else {
+                report.unverifiable.push((
+                    address,
+                    "account-fields fetcher returned no sample for this address".to_string(),
+                ));
+                continue;
+            };
+
+            if sample.code_hash == expected {
+                self.code_seeds.insert(
+                    address,
+                    CodeSeedState::Verified {
+                        code_hash: expected,
+                        verified_at_block,
+                    },
+                );
+                self.materialize_verified_balance(address, sample.balance);
+                report.verified.push(address);
+            } else if sample.code_hash == B256::ZERO {
+                self.purge_account(address);
+                report.not_deployed.push(address);
+            } else if sample.code_hash == revm::primitives::KECCAK_EMPTY {
+                self.purge_account(address);
+                report.codeless.push(address);
+            } else {
+                self.purge_account(address);
+                report.mismatched.push(CodeMismatch {
+                    address,
+                    expected,
+                    actual: sample.code_hash,
+                });
+            }
+        }
+        Ok(report)
+    }
+
+    /// Patch a just-verified seed's balance to the on-chain value from the
+    /// verification sample — in both layers, **without** a
+    /// snapshot-generation bump: confirming a claim and materializing
+    /// pinned-block truth is the prefetch class of write, not a mutation.
+    /// The overlay is only patched when the account already has an entry
+    /// there (it always does for a seeded account), mirroring the layer
+    /// policy of [`inject_storage_batch_fresh`](Self::inject_storage_batch_fresh).
+    fn materialize_verified_balance(&mut self, address: Address, balance: U256) {
+        if let Some(account) = self.db.cache.accounts.get_mut(&address) {
+            account.info.balance = balance;
+        }
+        {
+            let mut accounts = self.blockchain_db.accounts().write();
+            if let Some(info) = accounts.get_mut(&address) {
+                info.balance = balance;
+            }
+        }
+        self.mark_base_dirty(address);
+    }
+
+    /// Local (already-materialized) account info for `address` — CacheDB
+    /// overlay first, then the BlockchainDb backend. Never fetches: code-seed
+    /// decisions are made strictly against what the cache already holds.
+    fn local_account_info(&self, address: Address) -> Option<AccountInfo> {
+        if let Some(account) = self.db.cache.accounts.get(&address) {
+            return Some(account.info.clone());
+        }
+        self.blockchain_db.accounts().read().get(&address).cloned()
+    }
+
+    /// Dual-layer account write shared by [`seed_account_code_with`](Self::seed_account_code_with)
+    /// and [`etch_account_code`](Self::etch_account_code): CacheDB overlay
+    /// (the primary EVM read path) plus the BlockchainDb backend (shared with
+    /// parallel tasks), base invalidation, and a snapshot-generation bump —
+    /// a code write changes executable state (see
+    /// [`snapshot_generation`](Self::snapshot_generation)).
+    fn write_marked_code(&mut self, address: Address, info: AccountInfo) {
+        self.db.insert_account_info(address, info.clone());
+        {
+            let mut accounts = self.blockchain_db.accounts().write();
+            accounts.insert(address, info);
+        }
+        self.mark_base_dirty(address);
+        self.bump_snapshot_generation();
+    }
+
+    /// Seed canonical runtime code for `address` without fetching it.
+    ///
+    /// The claim is marked [`CodeSeedState::Pending`] until
+    /// [`verify_code_seeds`](Self::verify_code_seeds) confirms it against the
+    /// on-chain `EXTCODEHASH` (or the cold-start driver's `verify_code` phase
+    /// does). Because the account is materialized in both cache layers, the
+    /// lazy backend never fires its balance/nonce/code RPC triple for it.
+    ///
+    /// Defaults: nonce 1 (the EIP-161 contract minimum — exact for any
+    /// contract that never `CREATE`s) and balance `ZERO` until verification
+    /// patches the real value from the same response. Use
+    /// [`seed_account_code_with`](Self::seed_account_code_with) to supply
+    /// both explicitly.
+    ///
+    /// Conflict rules (chain-fetched state is authoritative over templates):
+    /// seeding an **unmarked** address that already holds RPC-origin code
+    /// with the same hash marks it `Verified` immediately (zero RPC — the
+    /// warm-cache fast path); a differing hash (including a code-less EOA) is
+    /// [`CacheError::CodeSeedConflict`] and leaves the cached code untouched.
+    /// Re-seeding a marked address overwrites and restarts the claim as
+    /// `Pending`.
+    ///
+    /// Returns the keccak256 hash recorded for the claim.
+    ///
+    /// # Errors
+    /// [`CacheError::CodeSeedEmpty`] for empty `code`;
+    /// [`CacheError::CodeSeedConflict`] as above.
+    pub fn seed_account_code(&mut self, address: Address, code: Bytes) -> Result<B256> {
+        self.seed_account_code_with(address, code, 1, U256::ZERO)
+    }
+
+    /// [`seed_account_code`](Self::seed_account_code) with explicit `nonce`
+    /// and provisional `balance` for the materialized account. Verification
+    /// still overwrites the balance with the on-chain value on a match; the
+    /// nonce keeps the supplied value (an exact nonce needs the
+    /// `eth_getProof` path and only matters for contracts that `CREATE`).
+    pub fn seed_account_code_with(
+        &mut self,
+        address: Address,
+        code: Bytes,
+        nonce: u64,
+        balance: U256,
+    ) -> Result<B256> {
+        if code.is_empty() {
+            return Err(CacheError::CodeSeedEmpty { address });
+        }
+        let bytecode = Bytecode::new_raw(code);
+        let code_hash = bytecode.hash_slow();
+
+        // Unmarked + locally present ⇒ RPC-origin, which is authoritative.
+        if !self.code_seeds.contains_key(&address)
+            && let Some(existing) = self.local_account_info(address)
+        {
+            if existing.code_hash == code_hash {
+                // Hash equality proves byte equality: the claim is already
+                // confirmed by chain-fetched state, zero RPC. If the restored
+                // account is missing its code *bytes* (binary state without a
+                // bytecodes.bin entry), the seed supplies exactly the bytes
+                // the recorded hash committed to — a free repair.
+                if existing
+                    .code
+                    .as_ref()
+                    .is_none_or(|existing_code| existing_code.is_empty())
+                {
+                    let mut info = existing;
+                    info.code = Some(bytecode);
+                    info.code_hash = code_hash;
+                    self.write_marked_code(address, info);
+                }
+                self.code_seeds.insert(
+                    address,
+                    CodeSeedState::Verified {
+                        code_hash,
+                        verified_at_block: self.block_number.unwrap_or_default(),
+                    },
+                );
+                return Ok(code_hash);
+            }
+            return Err(CacheError::CodeSeedConflict {
+                address,
+                cached: existing.code_hash,
+                seeded: code_hash,
+            });
+        }
+
+        // Absent, or an existing mark being re-seeded: write the claim.
+        // A marked account keeps its current balance/nonce; a fresh one gets
+        // the caller's provisional values.
+        let mut info = self.local_account_info(address).unwrap_or(AccountInfo {
+            balance,
+            nonce,
+            code_hash: revm::primitives::KECCAK_EMPTY,
+            code: None,
+            account_id: None,
+        });
+        info.code = Some(bytecode);
+        info.code_hash = code_hash;
+        self.write_marked_code(address, info);
+        self.code_seeds
+            .insert(address, CodeSeedState::Pending { code_hash });
+        Ok(code_hash)
+    }
+
+    /// Etch deliberately-local runtime code at `address` — the raw-bytes
+    /// sibling of [`override_or_create_account_code`](Self::override_or_create_account_code),
+    /// with no source account needed.
+    ///
+    /// Marks [`CodeSeedState::Etched`]: never verified, excluded from all
+    /// canonical machinery, and reported via
+    /// [`etched_accounts`](Self::etched_accounts) so local divergence stays
+    /// visible. Preserves the existing balance/nonce/storage when the account
+    /// is already present; creates a default account otherwise. Overwrites
+    /// any prior code or mark — divergence is the caller's explicit intent.
+    ///
+    /// Returns the keccak256 hash of the etched code.
+    ///
+    /// # Errors
+    /// [`CacheError::CodeSeedEmpty`] for empty `code`.
+    pub fn etch_account_code(&mut self, address: Address, code: Bytes) -> Result<B256> {
+        if code.is_empty() {
+            return Err(CacheError::CodeSeedEmpty { address });
+        }
+        let bytecode = Bytecode::new_raw(code);
+        let code_hash = bytecode.hash_slow();
+        let mut info = self.local_account_info(address).unwrap_or_default();
+        info.code = Some(bytecode);
+        info.code_hash = code_hash;
+        self.write_marked_code(address, info);
+        self.code_seeds
+            .insert(address, CodeSeedState::Etched { code_hash });
+        Ok(code_hash)
+    }
+
+    /// The code-seed mark for `address`, if any. `None` means RPC-origin:
+    /// the code (if present) was fetched from the provider and is trusted as
+    /// chain state.
+    pub fn code_seed_state(&self, address: &Address) -> Option<&CodeSeedState> {
+        self.code_seeds.get(address)
+    }
+
+    /// Addresses whose canonical code claims still await verification
+    /// ([`CodeSeedState::Pending`]), sorted for deterministic iteration.
+    /// This is the implicit work set of
+    /// [`verify_code_seeds`](Self::verify_code_seeds) and the cold-start
+    /// `verify_code` phase.
+    pub fn pending_code_seeds(&self) -> Vec<Address> {
+        let mut pending: Vec<Address> = self
+            .code_seeds
+            .iter()
+            .filter_map(|(addr, state)| {
+                matches!(state, CodeSeedState::Pending { .. }).then_some(*addr)
+            })
+            .collect();
+        pending.sort();
+        pending
+    }
+
+    /// Addresses whose code deliberately diverges from the chain
+    /// ([`CodeSeedState::Etched`]), sorted for deterministic iteration. This
+    /// is the health surface for local divergence: everything written through
+    /// [`etch_account_code`](Self::etch_account_code),
+    /// [`override_account_code`](Self::override_account_code) and friends, or
+    /// [`deploy_contract`](Self::deploy_contract) appears here.
+    pub fn etched_accounts(&self) -> Vec<Address> {
+        let mut etched: Vec<Address> = self
+            .code_seeds
+            .iter()
+            .filter_map(|(addr, state)| {
+                matches!(state, CodeSeedState::Etched { .. }).then_some(*addr)
+            })
+            .collect();
+        etched.sort();
+        etched
     }
 
     pub(crate) fn require_contract_target(&self, target: Address) -> Result<()> {
@@ -4146,13 +5791,11 @@ impl EvmCache {
                 use revm::database_interface::DatabaseRef;
                 self.backend
                     .basic_ref(target)
-                    .map_err(|e| anyhow!("Failed to fetch target account {}: {:?}", target, e))?
-                    .ok_or_else(|| {
-                        anyhow!(
-                            "Target account {} not found; use override_or_create_account_code for synthetic targets",
-                            target
-                        )
-                    })
+                    .map_err(|e| CacheError::TargetAccountFetch {
+                        target,
+                        details: format!("{e:?}"),
+                    })?
+                    .ok_or(CacheError::MissingTargetAccount { target })
             }
         }
     }
@@ -4162,11 +5805,14 @@ impl EvmCache {
             return Ok(());
         }
 
-        Err(anyhow!(
-            "{} account {} has no runtime bytecode",
-            role,
-            address
-        ))
+        Err(CacheError::MissingRuntimeCode {
+            role: match role {
+                "source" => "source",
+                "target" => "target",
+                _ => "account",
+            },
+            address,
+        })
     }
 }
 
@@ -4304,9 +5950,7 @@ impl EvmCache {
         if let Some(access_list) = &tx.access_list {
             builder = builder.access_list(access_list.clone());
         }
-        builder
-            .build()
-            .map_err(|e| anyhow!("Failed to build tx env: {:?}", e))
+        builder.build().map_err(CacheError::tx_env)
     }
 
     fn call_sol_with_commit<C>(
@@ -4321,14 +5965,7 @@ impl EvmCache {
         C: SolCall,
     {
         let calldata = Bytes::from(call.abi_encode());
-        let result = self
-            .call_raw_with(from, to, calldata, commit, tx)
-            .with_context(|| {
-                format!(
-                    "failed to execute Solidity call {} from {from:?} to {to:?}",
-                    C::SIGNATURE
-                )
-            })?;
+        let result = self.call_raw_with(from, to, calldata, commit, tx)?;
         Self::decode_sol_call_result::<C>(from, to, result)
     }
 
@@ -4343,20 +5980,20 @@ impl EvmCache {
         match result {
             ExecutionResult::Success { output, .. } => {
                 let output = output.into_data();
-                C::abi_decode_returns(&output).map_err(|error| {
-                    anyhow!(
-                        "failed to decode Solidity call {} return data from {from:?} to {to:?}: output_len={}, error: {:?}",
-                        C::SIGNATURE,
-                        output.len(),
-                        error
-                    )
+                C::abi_decode_returns(&output).map_err(|error| CacheError::SolCallDecode {
+                    signature: C::SIGNATURE,
+                    from,
+                    to,
+                    output_len: output.len(),
+                    details: format!("{error:?}"),
                 })
             }
-            other => Err(anyhow!(
-                "Solidity call {} from {from:?} to {to:?} did not succeed: {:?}",
-                C::SIGNATURE,
-                other
-            )),
+            other => Err(CacheError::SolCallFailed {
+                signature: C::SIGNATURE,
+                from,
+                to,
+                result: format!("{other:?}"),
+            }),
         }
     }
 
@@ -4368,18 +6005,22 @@ impl EvmCache {
     ) -> Result<U256> {
         let call = IERC20::balanceOfCall { target: owner };
         let tx = Self::build_tx_env(caller, token, Bytes::from(call.abi_encode()))?;
-        let result = evm
-            .transact_one(tx)
-            .map_err(|e| anyhow!("Failed to transact: {:?}", e))?;
+        let result = evm.transact_one(tx).map_err(CacheError::transact)?;
 
         match result {
             ExecutionResult::Success { output, .. } => {
                 let out = output.into_data();
-                let balance = IERC20::balanceOfCall::abi_decode_returns(&out)
-                    .map_err(|e| anyhow!("Failed to decode balanceOf: {:?}", e))?;
+                let balance = IERC20::balanceOfCall::abi_decode_returns(&out).map_err(|e| {
+                    CacheError::Decode {
+                        what: "ERC20 balanceOf return data",
+                        details: format!("{e:?}"),
+                    }
+                })?;
                 Ok(balance)
             }
-            _ => Err(anyhow!("balanceOf call failed: {:?}", result)),
+            _ => Err(CacheError::CallNotSuccessful {
+                result: format!("{result:?}"),
+            }),
         }
     }
 
@@ -4422,8 +6063,9 @@ impl EvmCache {
 /// persist changes to the underlying database, or simply drop the session to discard
 /// all changes.
 ///
-/// Note: For snapshot/restore functionality across multiple transactions, use `EvmCache::snapshot()`
-/// and `EvmCache::restore()` instead, as the EVM journal is cleared after each transaction.
+/// Note: For checkpoint/restore functionality across multiple transactions, use
+/// `EvmCache::checkpoint()` and `EvmCache::restore()` instead, as the EVM journal
+/// is cleared after each transaction.
 pub struct EvmSession<'a> {
     evm: CacheEvm<'a>,
 }
@@ -4446,14 +6088,12 @@ impl<'a> EvmSession<'a> {
         let tx = EvmCache::build_tx_env(from, to, calldata)?;
 
         if commit {
-            self.evm
-                .transact_one(tx)
-                .map_err(|e| anyhow!("Failed to transact: {:?}", e))
+            self.evm.transact_one(tx).map_err(CacheError::transact)
         } else {
             let checkpoint = self.evm.journaled_state.checkpoint();
             let result = self.evm.transact_one(tx);
             self.evm.journaled_state.checkpoint_revert(checkpoint);
-            result.map_err(|e| anyhow!("Failed to transact: {:?}", e))
+            result.map_err(CacheError::transact)
         }
     }
 
@@ -4521,6 +6161,210 @@ mod shared_memory_capacity_tests {
 #[cfg(test)]
 mod core_tests {
     use super::*;
+
+    #[test]
+    fn parses_prestate_diff_trace_values_and_cleared_slots() {
+        let trace = serde_json::json!([
+            {
+                "result": {
+                    "pre": {
+                        "0x4242424242424242424242424242424242424242": {
+                            "storage": {
+                                "0x01": "0x05",
+                                "0x02": "0x06"
+                            }
+                        }
+                    },
+                    "post": {
+                        "0x4242424242424242424242424242424242424242": {
+                            "balance": 10,
+                            "nonce": "0x0a",
+                            "code": "0x6001",
+                            "storage": {
+                                "0x01": "0x0b"
+                            }
+                        }
+                    }
+                }
+            }
+        ]);
+
+        let diff = parse_block_state_diff_trace(&trace).unwrap();
+
+        assert_eq!(diff.accounts.len(), 1);
+        let account = &diff.accounts[0];
+        assert_eq!(account.address, Address::repeat_byte(0x42));
+        assert_eq!(account.balance, Some(U256::from(10)));
+        assert_eq!(account.nonce, Some(10));
+        assert_eq!(account.code, Some(Bytes::from(vec![0x60, 0x01])));
+        assert_eq!(
+            account.storage,
+            vec![
+                BlockStateStorageDiff {
+                    slot: U256::from(1),
+                    value: U256::from(11),
+                },
+                BlockStateStorageDiff {
+                    slot: U256::from(2),
+                    value: U256::ZERO,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_prestate_diff_trace_account_deletion() {
+        // A SELFDESTRUCTed account appears in `pre` but is entirely absent
+        // from `post`. The merged diff must carry its explicit post-deletion
+        // fields (zero balance/nonce, empty code) — and, when the account had
+        // storage, zeroed slots — so account-target resyncs resolve from the
+        // trace instead of falling back to point reads.
+        let trace = serde_json::json!([
+            {
+                "result": {
+                    "pre": {
+                        // Deleted WITH storage history in the trace.
+                        "0x4242424242424242424242424242424242424242": {
+                            "balance": "0x64",
+                            "nonce": "0x01",
+                            "code": "0x6001",
+                            "storage": { "0x01": "0x05" }
+                        },
+                        // Deleted WITHOUT any storage entry (the previously
+                        // missed case).
+                        "0x1111111111111111111111111111111111111111": {
+                            "balance": "0x0a"
+                        }
+                    },
+                    "post": {}
+                }
+            }
+        ]);
+
+        let diff = parse_block_state_diff_trace(&trace).unwrap();
+        assert_eq!(diff.accounts.len(), 2);
+
+        let bare = &diff.accounts[0]; // 0x11.. sorts first
+        assert_eq!(bare.address, Address::repeat_byte(0x11));
+        assert_eq!(bare.balance, Some(U256::ZERO));
+        assert_eq!(bare.nonce, Some(0));
+        assert_eq!(bare.code, Some(Bytes::new()));
+        assert!(bare.storage.is_empty());
+
+        let stored = &diff.accounts[1];
+        assert_eq!(stored.address, Address::repeat_byte(0x42));
+        assert_eq!(stored.balance, Some(U256::ZERO));
+        assert_eq!(stored.nonce, Some(0));
+        assert_eq!(stored.code, Some(Bytes::new()));
+        assert_eq!(
+            stored.storage,
+            vec![BlockStateStorageDiff {
+                slot: U256::from(1),
+                value: U256::ZERO,
+            }]
+        );
+    }
+
+    #[test]
+    fn parses_prestate_diff_trace_deletion_then_recreation_keeps_final_state() {
+        // tx1 deletes the account; tx2 re-creates it. Entries merge in tx
+        // order, so the final post-block values must win over the synthesized
+        // deletion zeros.
+        let trace = serde_json::json!([
+            {
+                "result": {
+                    "pre": {
+                        "0x4242424242424242424242424242424242424242": { "balance": "0x64" }
+                    },
+                    "post": {}
+                }
+            },
+            {
+                "result": {
+                    "pre": {},
+                    "post": {
+                        "0x4242424242424242424242424242424242424242": {
+                            "balance": "0x07",
+                            "nonce": "0x01",
+                            "code": "0x6002"
+                        }
+                    }
+                }
+            }
+        ]);
+
+        let diff = parse_block_state_diff_trace(&trace).unwrap();
+        assert_eq!(diff.accounts.len(), 1);
+        let account = &diff.accounts[0];
+        assert_eq!(account.balance, Some(U256::from(7)));
+        assert_eq!(account.nonce, Some(1));
+        assert_eq!(account.code, Some(Bytes::from(vec![0x60, 0x02])));
+    }
+
+    #[test]
+    fn snapshot_generation_bumps_on_writes_and_repins_not_prefetch() {
+        use alloy_provider::RootProvider;
+        use alloy_rpc_client::RpcClient;
+        use alloy_transport::mock::Asserter;
+
+        let asserter = Asserter::new();
+        let client = RpcClient::mocked(asserter);
+        let provider = RootProvider::<AnyNetwork>::new(client);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut cache = rt.block_on(EvmCache::new(Arc::new(provider)));
+
+        let addr = Address::repeat_byte(0x77);
+        let g0 = cache.snapshot_generation();
+
+        // Targeted writes bump (magnitude is opaque; assert monotonic change).
+        cache.apply_updates(&[StateUpdate::slot(addr, U256::from(1), U256::from(10))]);
+        let g1 = cache.snapshot_generation();
+        assert!(g1 > g0, "apply_updates must bump the generation");
+
+        cache.apply_update(&StateUpdate::slot(addr, U256::from(2), U256::from(20)));
+        let g2 = cache.snapshot_generation();
+        assert!(g2 > g1, "apply_update must bump the generation");
+
+        // An empty batch is a no-op, not a mutation.
+        cache.apply_updates(&[]);
+        assert_eq!(cache.snapshot_generation(), g2);
+
+        // modify_slot on a warm slot bumps.
+        let change = cache.modify_slot(addr, U256::from(1), |v| {
+            Some(v.unwrap_or_default() + U256::from(1))
+        });
+        assert!(change.is_some());
+        let g3 = cache.snapshot_generation();
+        assert!(g3 > g2, "modify_slot must bump the generation");
+
+        // Cold prefetch materializes existing chain state — no bump.
+        cache.inject_storage_batch(&[(addr, U256::from(9), U256::from(90))]);
+        assert_eq!(
+            cache.snapshot_generation(),
+            g3,
+            "inject_storage_batch is prefetch, not mutation"
+        );
+
+        // Block re-pins bump; a same-block set_block is a no-op.
+        cache.set_block(BlockId::Number(BlockNumberOrTag::Number(5)));
+        let g4 = cache.snapshot_generation();
+        assert!(g4 > g3, "set_block to a new pin must bump the generation");
+        cache.set_block(BlockId::Number(BlockNumberOrTag::Number(5)));
+        assert_eq!(
+            cache.snapshot_generation(),
+            g4,
+            "re-pinning to the same block is not a mutation"
+        );
+
+        // advance_block refreshes the env — a spanning snapshot would be
+        // inconsistent, so it bumps too.
+        let header = alloy_consensus::Header::default();
+        cache.advance_block(&header).expect("lenient advance");
+        assert!(cache.snapshot_generation() > g4);
+    }
 
     #[test]
     fn test_address_to_u256_conversion() {

@@ -61,8 +61,8 @@ async fn main() -> Result<()> {
     // (An unmapped slot reads as zero, matching how a sim reads an unseen slot.)
     let fresh: HashMap<(Address, U256), U256> =
         HashMap::from([((token, owner_slot), U256::from(50))]);
-    let fetcher: StorageBatchFetchFn = Arc::new(
-        move |requests: Vec<(Address, U256)>, _block: Option<BlockId>| {
+    let fetcher: StorageBatchFetchFn =
+        Arc::new(move |requests: Vec<(Address, U256)>, _block: BlockId| {
             requests
                 .into_iter()
                 .map(|(addr, slot)| {
@@ -70,8 +70,7 @@ async fn main() -> Result<()> {
                     (addr, slot, Ok(value))
                 })
                 .collect()
-        },
-    );
+        });
     cache.set_storage_batch_fetcher(fetcher);
 
     // Classification: by default every slot is volatile (re-verified); we pin
@@ -118,13 +117,26 @@ async fn main() -> Result<()> {
     );
 
     // Now await the deferred validation verdict.
-    match sim.validate().await {
-        Validation::Confirmed => {
-            println!("validation: Confirmed — nothing the sim read had changed");
+    match sim.validate().await? {
+        Validation::ConfirmedStorage => {
+            println!(
+                "validation: ConfirmedStorage — no volatile storage slot the sim read \
+                 had changed (account-level balance/nonce/code was NOT verified)"
+            );
         }
-        Validation::Corrected { results, changed } => {
+        Validation::ConfirmedFull => {
+            println!(
+                "validation: ConfirmedFull — storage + account fields verified, \
+                 nothing the sim read had changed"
+            );
+        }
+        Validation::Corrected {
+            results,
+            changed_slots,
+            ..
+        } => {
             println!("validation: Corrected — a slot the sim read had changed:");
-            for c in &changed {
+            for c in &changed_slots {
                 println!("  {} slot {} : {} -> {}", c.address, c.slot, c.old, c.new);
             }
             let corrected = &results[0];

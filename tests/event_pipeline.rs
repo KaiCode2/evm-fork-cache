@@ -564,13 +564,12 @@ async fn ingest_keeps_state_fresh_with_zero_fetches() -> Result<()> {
     // A counting fetcher: `ingest_logs` must never invoke it.
     let fetches = Arc::new(AtomicUsize::new(0));
     let counter = fetches.clone();
-    let f: StorageBatchFetchFn =
-        Arc::new(move |reqs: Vec<(Address, U256)>, _b: Option<BlockId>| {
-            counter.fetch_add(reqs.len(), Ordering::Relaxed);
-            reqs.into_iter()
-                .map(|(a, s)| (a, s, Ok(U256::from(1_000))))
-                .collect()
-        });
+    let f: StorageBatchFetchFn = Arc::new(move |reqs: Vec<(Address, U256)>, _b: BlockId| {
+        counter.fetch_add(reqs.len(), Ordering::Relaxed);
+        reqs.into_iter()
+            .map(|(a, s)| (a, s, Ok(U256::from(1_000))))
+            .collect()
+    });
     cache.set_storage_batch_fetcher(f);
 
     let mut registry = DecoderRegistry::new();
@@ -605,6 +604,59 @@ async fn ingest_keeps_state_fresh_with_zero_fetches() -> Result<()> {
     // Correctness: state kept fresh from the logs alone equals the true post-state.
     for o in &owners {
         assert_eq!(balance_of(&mut cache, token, *o)?, U256::from(1_000));
+    }
+    Ok(())
+}
+
+/// WS-3 (manager-authored red-green): `derived_slots` must be bounded to the
+/// reorg horizon (`ReorgConfig::depth`), mirroring the `touched` ring, rather
+/// than growing unbounded across steady-state ingestion. With `depth = 3`,
+/// after ingesting 6 blocks that each touch a distinct `(address, slot)`, only
+/// the 3 most-recent blocks' derived slots may be retained; the aged-out ones
+/// must be evicted.
+#[tokio::test]
+async fn derived_slots_is_bounded_to_reorg_horizon() -> Result<()> {
+    let slot = U256::from(0);
+    let tokens: Vec<Address> = (0u8..6).map(|i| Address::repeat_byte(0x50 + i)).collect();
+
+    let mut cache = setup_cache().await?;
+    for t in &tokens {
+        install_mock_erc20(&mut cache, *t);
+    }
+
+    let mut registry = DecoderRegistry::new();
+    registry.register(Arc::new(MarkDecoder {
+        slot,
+        value: U256::from(77),
+    }));
+    let mut pipeline = EventPipeline::new(registry).with_reorg_config(ReorgConfig {
+        depth: 3,
+        scope: PurgeScope::AllStorage,
+    });
+
+    for (i, t) in tokens.iter().enumerate() {
+        pipeline.ingest_logs(&mut cache, 100 + i as u64, &[bare_log(*t, vec![])]);
+    }
+
+    let derived: std::collections::HashSet<(Address, U256)> = pipeline.derived_slots().collect();
+
+    assert_eq!(
+        derived.len(),
+        3,
+        "derived_slots must be bounded to the reorg horizon (depth = 3), was {}",
+        derived.len()
+    );
+    for t in &tokens[3..] {
+        assert!(
+            derived.contains(&(*t, slot)),
+            "recent block's derived slot must be retained"
+        );
+    }
+    for t in &tokens[..3] {
+        assert!(
+            !derived.contains(&(*t, slot)),
+            "aged-out derived slot must be evicted from the horizon"
+        );
     }
     Ok(())
 }

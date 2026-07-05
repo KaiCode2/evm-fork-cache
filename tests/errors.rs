@@ -10,9 +10,8 @@ use std::sync::Arc;
 
 use alloy_primitives::{Bytes, U256};
 use alloy_sol_types::{Panic, SolError, sol};
-use anyhow::anyhow;
 use evm_fork_cache::errors::{
-    PANIC_SELECTOR, RevertDecoder, RevertReason, SimError, SimulationError,
+    PANIC_SELECTOR, RevertDecoder, RevertReason, SimError, SimHostError, SimulationError,
 };
 
 sol! {
@@ -35,7 +34,10 @@ fn sim_error_classification() {
     assert!(!halt.is_revert());
     assert!(halt.as_revert().is_none());
 
-    let other: SimError = anyhow!("rpc exploded").into();
+    let other: SimError = SimHostError::Database {
+        details: "rpc exploded".to_string(),
+    }
+    .into();
     assert!(!other.is_revert());
     assert!(!other.is_halt());
     assert!(other.as_revert().is_none());
@@ -54,8 +56,11 @@ fn sim_error_display_distinguishes_variants() {
     assert!(shown.contains("halted"), "{shown}");
     assert!(shown.contains("StackOverflow"), "{shown}");
 
-    let other: SimError = anyhow!("boom").into();
-    assert_eq!(other.to_string(), "boom");
+    let other: SimError = SimHostError::Database {
+        details: "boom".to_string(),
+    }
+    .into();
+    assert_eq!(other.to_string(), "database operation failed: boom");
 }
 
 #[test]

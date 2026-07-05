@@ -7,28 +7,36 @@
 use std::time::Duration;
 
 use alloy_network::Ethereum;
+#[cfg(feature = "reactive-polling")]
+use alloy_primitives::U256;
+#[cfg(any(feature = "reactive-polling", feature = "reactive-ws"))]
 use alloy_primitives::{Address, keccak256};
-#[cfg(feature = "reactive-polling")]
-use alloy_primitives::{B256, Bytes, Log as PrimitiveLog, U256};
+#[cfg(any(feature = "reactive-polling", feature = "reactive-ws"))]
+use alloy_primitives::{B256, Bytes, Log as PrimitiveLog};
 use alloy_provider::ProviderBuilder;
+#[cfg(any(feature = "reactive-polling", feature = "reactive-ws"))]
 use alloy_rpc_types_eth::Filter;
-#[cfg(feature = "reactive-polling")]
+#[cfg(any(feature = "reactive-polling", feature = "reactive-ws"))]
 use alloy_rpc_types_eth::Log;
 use alloy_transport::mock::Asserter;
 use anyhow::Result;
-#[cfg(feature = "reactive-polling")]
+#[cfg(any(feature = "reactive-polling", feature = "reactive-ws"))]
 use anyhow::bail;
 
 #[cfg(feature = "reactive-ws")]
 use evm_fork_cache::reactive::BlockInterestMode;
 use evm_fork_cache::reactive::{
-    AlloySubscriber, BlockInterest, EventSubscriber, LogInterest, PendingTxInterest,
-    ReactiveInterest, SubscriberConfig, SubscriberError, SubscriberMode, SubscriberReconnectConfig,
+    AlloySubscriber, EventSubscriber, PendingTxInterest, ReactiveInterest, SubscriberConfig,
+    SubscriberError, SubscriberMode, SubscriberReconnectConfig,
 };
-#[cfg(feature = "reactive-polling")]
+#[cfg(any(feature = "reactive-polling", feature = "reactive-ws"))]
+use evm_fork_cache::reactive::{BlockInterest, LogInterest};
+#[cfg(any(feature = "reactive-polling", feature = "reactive-ws"))]
 use evm_fork_cache::reactive::{ChainStatus, InputSource, ReactiveInput};
+#[cfg(feature = "reactive-ws")]
+use evm_fork_cache::reactive::{HandlerId, SubscriberBackfill};
 
-#[cfg(feature = "reactive-polling")]
+#[cfg(any(feature = "reactive-polling", feature = "reactive-ws"))]
 fn rpc_log(address: Address, topic0: B256, block_number: u64, log_index: u64) -> Log {
     Log {
         inner: PrimitiveLog::new_unchecked(address, vec![topic0], Bytes::new()),
@@ -116,6 +124,188 @@ fn alloy_subscriber_pubsub_accepts_logs_pending_hashes_and_block_headers() -> Re
     ])?;
 
     assert_eq!(subscriber.registered_interests().len(), 3);
+
+    Ok(())
+}
+
+#[test]
+#[cfg(feature = "reactive-ws")]
+fn alloy_subscriber_owner_interests_add_and_remove_incrementally() -> Result<()> {
+    let pool_a = Address::repeat_byte(0xa1);
+    let pool_b = Address::repeat_byte(0xb2);
+    let topic_a = keccak256(b"PoolA(uint256)");
+    let topic_b = keccak256(b"PoolB(uint256)");
+
+    let mut subscriber = mock_subscriber(SubscriberMode::PubSub);
+    subscriber.add_interest_owner(
+        HandlerId::new("pool-a"),
+        &[ReactiveInterest::Logs(LogInterest {
+            provider_filter: Filter::new().address(pool_a).event_signature(topic_a),
+            local_matcher: None,
+            route_key: None,
+        })],
+    )?;
+    subscriber.add_interest_owner(
+        HandlerId::new("pool-b"),
+        &[ReactiveInterest::Logs(LogInterest {
+            provider_filter: Filter::new().address(pool_b).event_signature(topic_b),
+            local_matcher: None,
+            route_key: None,
+        })],
+    )?;
+
+    assert_eq!(subscriber.registered_interests().len(), 2);
+    assert_eq!(
+        subscriber
+            .owner_interests(&HandlerId::new("pool-a"))
+            .expect("pool-a interests")
+            .len(),
+        1
+    );
+
+    let removed = subscriber
+        .remove_interest_owner(&HandlerId::new("pool-a"))
+        .expect("pool-a should be removed");
+    assert_eq!(removed.len(), 1);
+    assert!(
+        subscriber
+            .owner_interests(&HandlerId::new("pool-a"))
+            .is_none()
+    );
+    assert_eq!(subscriber.registered_interests().len(), 1);
+    assert_eq!(
+        subscriber
+            .owner_interests(&HandlerId::new("pool-b"))
+            .expect("pool-b interests")
+            .len(),
+        1
+    );
+    assert!(
+        subscriber
+            .remove_interest_owner(&HandlerId::new("missing"))
+            .is_none()
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg(feature = "reactive-ws")]
+async fn alloy_subscriber_owner_backfill_yields_before_live_streams() -> Result<()> {
+    let asserter = Asserter::new();
+    let pool = Address::repeat_byte(0xcd);
+    let topic = keccak256(b"DiscoveredPool(uint256)");
+    let log = rpc_log(pool, topic, 42, 3);
+    asserter.push_success(&vec![log.clone()]);
+
+    let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+    let mut subscriber = AlloySubscriber::new(
+        provider,
+        SubscriberMode::PubSub,
+        SubscriberConfig {
+            hydrate_pending_transactions: false,
+            max_batch_size: 16,
+            ..SubscriberConfig::default()
+        },
+    );
+    subscriber.add_interest_owner_with_backfill(
+        HandlerId::new("pool-cd"),
+        &[ReactiveInterest::Logs(LogInterest {
+            provider_filter: Filter::new().address(pool).event_signature(topic),
+            local_matcher: None,
+            route_key: None,
+        })],
+        SubscriberBackfill::range(40, 42),
+    )?;
+
+    let Some(batch) = subscriber.next_batch().await? else {
+        bail!("expected owner-scoped backfill batch before live subscription");
+    };
+    let records = batch.records();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].context.source, InputSource::Backfill);
+    assert!(
+        matches!(records[0].context.chain_status, ChainStatus::Included { ref block, confirmations: 0 } if block.number == 42)
+    );
+    assert!(matches!(&records[0].input, ReactiveInput::Log(actual) if actual == &log));
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg(feature = "reactive-ws")]
+async fn alloy_subscriber_owner_growth_backfills_continuity_gap_end_to_end() -> Result<()> {
+    // An established owner (pool A) has delivered up to block 100. Growing it to
+    // also watch pool B changes the merged filter shape; the subscriber must
+    // automatically backfill the new shape from the prior anchor so nothing is
+    // lost across the change. Driven entirely through the public API.
+    let pool_a = Address::repeat_byte(0xaa);
+    let pool_b = Address::repeat_byte(0xbb);
+
+    let asserter = Asserter::new();
+    // (1) Establish pool A's anchor at 100 via an explicit range backfill that
+    //     returns a log — the returned record makes next_batch yield before it
+    //     ever reaches live-stream init.
+    let anchor_log = rpc_log(pool_a, keccak256(b"Swap()"), 100, 0);
+    asserter.push_success(&vec![anchor_log.clone()]);
+    // (2) Continuity backfill for the grown {A,B} shape is open-ended from the
+    //     prior anchor: get_block_number, then get_logs over [100, 105].
+    asserter.push_success(&105u64);
+    let gap_log = rpc_log(pool_b, keccak256(b"Swap()"), 103, 0);
+    asserter.push_success(&vec![gap_log.clone()]);
+
+    let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+    let mut subscriber = AlloySubscriber::new(
+        provider,
+        SubscriberMode::PubSub,
+        SubscriberConfig {
+            hydrate_pending_transactions: false,
+            max_batch_size: 16,
+            ..SubscriberConfig::default()
+        },
+    );
+
+    // Establish pool A with an explicit backfill through block 100.
+    subscriber.add_interest_owner_with_backfill(
+        HandlerId::new("amm"),
+        &[ReactiveInterest::Logs(LogInterest {
+            provider_filter: Filter::new().address(pool_a),
+            local_matcher: None,
+            route_key: None,
+        })],
+        SubscriberBackfill::range(90, 100),
+    )?;
+    let Some(first) = subscriber.next_batch().await? else {
+        bail!("expected the establishing backfill batch");
+    };
+    assert!(
+        matches!(&first.records()[0].input, ReactiveInput::Log(actual) if actual == &anchor_log)
+    );
+
+    // Grow the owner to A+B (same block option -> merged shape changes).
+    subscriber.add_interest_owner(
+        HandlerId::new("amm"),
+        &[
+            ReactiveInterest::Logs(LogInterest {
+                provider_filter: Filter::new().address(pool_a),
+                local_matcher: None,
+                route_key: None,
+            }),
+            ReactiveInterest::Logs(LogInterest {
+                provider_filter: Filter::new().address(pool_b),
+                local_matcher: None,
+                route_key: None,
+            }),
+        ],
+    )?;
+
+    let Some(batch) = subscriber.next_batch().await? else {
+        bail!("expected a continuity backfill batch for the grown owner");
+    };
+    let records = batch.records();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].context.source, InputSource::Backfill);
+    assert!(matches!(&records[0].input, ReactiveInput::Log(actual) if actual == &gap_log));
 
     Ok(())
 }

@@ -1,7 +1,7 @@
 use serde::{Serialize, de::DeserializeOwned};
 use tracing::warn;
 
-use anyhow::{Context as _, Result};
+use crate::errors::PersistenceError;
 
 const VERSION_BYTES: usize = 4;
 
@@ -10,9 +10,9 @@ pub(crate) fn encode<T: Serialize>(
     version: u32,
     value: &T,
     label: &'static str,
-) -> Result<Vec<u8>> {
+) -> Result<Vec<u8>, PersistenceError> {
     let payload =
-        bincode::serialize(value).with_context(|| format!("failed to serialize {label}"))?;
+        bincode::serialize(value).map_err(|err| PersistenceError::serialize(label, err))?;
     let mut data = Vec::with_capacity(magic.len() + VERSION_BYTES + payload.len());
     data.extend_from_slice(magic);
     data.extend_from_slice(&version.to_le_bytes());

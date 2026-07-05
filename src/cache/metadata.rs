@@ -10,12 +10,12 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use alloy_primitives::{Address, U256};
-use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 use std::collections::HashSet;
 
 use super::versioned;
+use crate::errors::PersistenceError;
 
 const IMMUTABLE_CACHE_MAGIC: &[u8; 8] = b"EFCMETA\0";
 const IMMUTABLE_CACHE_VERSION: u32 = 2;
@@ -79,6 +79,14 @@ impl CacheConfig {
         self.chain_dir().join("immutable_data.bin")
     }
 
+    /// Get the path for the code-seed mark cache file (binary format).
+    ///
+    /// Saved by `flush()` strictly before `bytecodes.bin` so persisted code
+    /// can never outrun the trust marks describing it.
+    pub(crate) fn code_seeds_cache_path(&self) -> PathBuf {
+        self.chain_dir().join("code_seeds.bin")
+    }
+
     /// Get the path for the EVM state cache file (bincode format).
     ///
     /// This cache stores the complete EVM state (accounts + storage) in
@@ -126,9 +134,10 @@ impl ImmutableDataCache {
     ///
     /// Returns an error if the parent directory cannot be created, if bincode
     /// serialization fails, or if writing the file fails.
-    pub fn save(&self, path: &Path) -> Result<()> {
+    pub fn save(&self, path: &Path) -> Result<(), PersistenceError> {
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+            std::fs::create_dir_all(parent)
+                .map_err(|err| PersistenceError::create_dir(parent, err))?;
         }
         let data = versioned::encode(
             IMMUTABLE_CACHE_MAGIC,
@@ -136,7 +145,7 @@ impl ImmutableDataCache {
             self,
             "immutable data cache",
         )?;
-        std::fs::write(path, data)?;
+        std::fs::write(path, data).map_err(|err| PersistenceError::write(path, err))?;
         Ok(())
     }
 
