@@ -65,6 +65,9 @@ use crate::errors::{
 };
 use crate::freshness::{SlotChange, SlotFetch, SlotOutcome};
 use crate::inspector::TransferInspector;
+use crate::mapping_probe::{
+    HashSlotAccess, HashStorageProbe, SlotLayout, TrackedBalances, TrackedMapping,
+};
 use crate::state_update::{
     AccountChange, AccountPatch, PurgeRecord, PurgeScope, SkippedAccountPatch, SkippedBalanceDelta,
     SkippedDelta, SkippedMask, SlotDelta, StateDiff, StateUpdate,
@@ -1423,11 +1426,13 @@ pub struct EvmCache {
     /// replace) so a `Pending` claim never masquerades as chain-fetched
     /// across restarts.
     code_seeds: HashMap<Address, CodeSeedState>,
-    /// Best-known ERC20 `balanceOf` mapping slot per token contract.
+    /// Best-known ERC20 `balanceOf` mapping descriptor per token contract,
+    /// carrying both the base slot and the detected [`SlotLayout`] so writes
+    /// honor Vyper/Solady byte order — not just Solidity's `keccak(key‖slot)`.
     ///
-    /// Used by `set_erc20_balance_with_slot_scan` to avoid re-scanning slots
-    /// repeatedly for the same token.
-    erc20_balance_slots: HashMap<Address, U256>,
+    /// Populated by discovery (or seeding) and used by
+    /// `set_erc20_balance_with_slot_scan` to avoid re-discovering per token.
+    erc20_balance_slots: HashMap<Address, TrackedMapping>,
     /// EVM hardfork spec for simulations. Must match the chain's current execution
     /// layer hardfork for accurate gas accounting. Configured per-chain via `evm_spec`
     /// in `chains.toml`.
@@ -4234,13 +4239,35 @@ impl EvmCache {
     /// Each `(token, slot)` records the storage slot of the token's
     /// `mapping(address => uint256) balances`, letting
     /// [`set_erc20_balance_with_slot_scan`](Self::set_erc20_balance_with_slot_scan)
-    /// skip its `0..=max_slot` probing pass for that token and write the balance
-    /// directly. Seeding a wrong slot is self-correcting: the scan verifies the
-    /// write and falls back to a fresh probe (evicting the bad seed) if it
+    /// skip its discovery pass for that token and write the balance directly.
+    /// Seeded slots are assumed to use Solidity's `keccak(key‖slot)` layout
+    /// (use [`seed_erc20_balance_layouts`](Self::seed_erc20_balance_layouts) for
+    /// Vyper/Solady tokens). Seeding a wrong slot is self-correcting: the write
+    /// is verified and a fresh discovery pass runs (evicting the bad seed) if it
     /// fails. Later entries overwrite earlier ones for the same token.
     pub fn seed_erc20_balance_slots(&mut self, slots: impl IntoIterator<Item = (Address, U256)>) {
         for (token, slot) in slots {
-            self.erc20_balance_slots.insert(token, slot);
+            self.erc20_balance_slots.insert(
+                token,
+                TrackedMapping::new(token, slot, SlotLayout::SolidityMapping),
+            );
+        }
+    }
+
+    /// Pre-seed known ERC20 balance mapping *descriptors* (base slot **and**
+    /// layout), keyed by [`TrackedMapping::contract`].
+    ///
+    /// The layout-aware companion to
+    /// [`seed_erc20_balance_slots`](Self::seed_erc20_balance_slots): use this for
+    /// Vyper (`keccak(slot‖key)`) or Solady (packed) tokens whose layout is known
+    /// up front, so [`set_erc20_balance_with_slot_scan`](Self::set_erc20_balance_with_slot_scan)
+    /// writes the correct slot without a discovery pass.
+    pub fn seed_erc20_balance_layouts(
+        &mut self,
+        mappings: impl IntoIterator<Item = TrackedMapping>,
+    ) {
+        for tracked in mappings {
+            self.erc20_balance_slots.insert(tracked.contract, tracked);
         }
     }
 
@@ -4273,11 +4300,283 @@ impl EvmCache {
         Ok(())
     }
 
-    /// Set an ERC20 balance by probing storage mapping slots until `balanceOf(owner)` reflects
-    /// a probe value, then writing `amount` to the discovered slot.
+    /// Run a call with a composable [`revm::Inspector`] attached, **without
+    /// committing** state (the journal is reverted after execution), returning
+    /// the execution result and the inspector moved back out so you can read what
+    /// it captured.
     ///
-    /// Returns `Ok(true)` if the balance was set and verified, `Ok(false)` if no slot in
-    /// `0..=max_slot` matched, and `Err` on EVM/cache failures.
+    /// This is the cache-level counterpart to
+    /// [`EvmOverlay::call_raw_with_inspector`](crate::cache::EvmOverlay::call_raw_with_inspector).
+    /// Unlike the overlay form it runs directly against the cache's database, so
+    /// any missing state is fetched lazily during the call — discovery works on a
+    /// cold fork with no pre-warming.
+    pub fn call_raw_with_inspector<I>(
+        &mut self,
+        from: Address,
+        to: Address,
+        calldata: Bytes,
+        tx: &TxConfig,
+        inspector: I,
+    ) -> Result<(ExecutionResult, I)>
+    where
+        I: for<'a> revm::Inspector<
+                Context<
+                    BlockEnv,
+                    TxEnv,
+                    CfgEnv,
+                    &'a mut ForkCacheDB,
+                    Journal<&'a mut ForkCacheDB>,
+                    (),
+                >,
+            >,
+    {
+        let tx_env = Self::build_tx_env_with(from, to, calldata, tx)?;
+        let mut evm = self.build_evm_with_inspector(inspector);
+        let checkpoint = evm.journaled_state.checkpoint();
+        let result = evm.inspect_one_tx(tx_env);
+        evm.journaled_state.checkpoint_revert(checkpoint);
+        let inspector = evm.inspector;
+        result.map(|r| (r, inspector)).map_err(CacheError::transact)
+    }
+
+    /// Discover every hash-derived storage slot a call reads, factored into
+    /// [`HashSlotAccess`]es (mapping keys, base slot, layout, exact slot, value).
+    ///
+    /// This is the general, ERC-20-agnostic entry point: it works for any mapping
+    /// (balances, allowances, protocol positions, …) and any layout
+    /// (Solidity / Vyper / Solady / nested), in a single simulation.
+    /// `known_keys` are words — typically addresses via [`Address::into_word`] —
+    /// used to anchor key/slot disambiguation; pass `&[]` to rely on the
+    /// magnitude heuristic.
+    ///
+    /// # Limitations
+    ///
+    /// Discovery only sees slots the call actually `SLOAD`s. A getter that
+    /// returns a *computed* value without reading a per-key backing slot — a
+    /// rebasing balance derived from shares (stETH, Aave aTokens), or a value
+    /// served purely from memory/calldata — yields no matching access. Callers
+    /// that need a slot regardless (e.g. `set_erc20_balance_with_slot_scan`)
+    /// fall through to a brute-force fallback rather than acting on a wrong slot.
+    pub fn trace_hashed_slots(
+        &mut self,
+        from: Address,
+        to: Address,
+        calldata: Bytes,
+        known_keys: &[B256],
+    ) -> Result<Vec<HashSlotAccess>> {
+        let (_result, probe) = self.call_raw_with_inspector(
+            from,
+            to,
+            calldata,
+            &TxConfig::default(),
+            HashStorageProbe::new(),
+        )?;
+        Ok(probe.accesses(known_keys))
+    }
+
+    /// Discover a token's `balanceOf` mapping slot for `owner` from a single
+    /// simulated call — layout-agnostic (Solidity / Vyper / Solady), with no
+    /// `max_slot` bound and no repeated probing.
+    ///
+    /// Returns the [`HashSlotAccess`] whose loaded value matches the getter's
+    /// return and whose key is `owner`, or `None` if the token exposes no hashed
+    /// balance read — a rebasing/computed getter that does not `SLOAD` a
+    /// per-owner slot (stETH, aTokens), or unavailable code. Capture the
+    /// result with [`HashSlotAccess::as_tracked`] to reuse the layout for other
+    /// holders without re-simulating.
+    pub fn discover_erc20_balance_slot(
+        &mut self,
+        token: Address,
+        owner: Address,
+    ) -> Result<Option<HashSlotAccess>> {
+        let calldata = Bytes::from(IERC20::balanceOfCall { target: owner }.abi_encode());
+        let (result, probe) = self.call_raw_with_inspector(
+            owner,
+            token,
+            calldata,
+            &TxConfig::default(),
+            HashStorageProbe::new(),
+        )?;
+        let ret = match result {
+            ExecutionResult::Success { output, .. } => output.into_data(),
+            _ => return Ok(None),
+        };
+        let ret_val = if ret.len() >= 32 {
+            U256::from_be_slice(&ret[..32])
+        } else {
+            U256::from_be_slice(&ret)
+        };
+        let owner_word = owner.into_word();
+        // Prefer the hit whose value equals the return, then higher confidence,
+        // then the shallowest derivation.
+        let best = probe
+            .accesses(&[owner_word])
+            .into_iter()
+            .filter(|a| a.keyed_by(owner_word))
+            .max_by_key(|a| (a.value == ret_val, a.confidence, std::cmp::Reverse(a.depth)));
+        Ok(best)
+    }
+
+    /// Derive a token's balance mapping layout once, then compute the exact
+    /// storage slot for each of `holders` — the "discover, then track these
+    /// addresses" primitive.
+    ///
+    /// Reuses a cached/seeded [`TrackedMapping`] for `token` if present;
+    /// otherwise discovers it from a single `balanceOf` simulation (using the
+    /// first holder as the probe) and caches it. Returns the reusable descriptor
+    /// plus `(holder, slot)` pairs — feed the slots to a
+    /// [`FreshnessRegistry`](crate::freshness::FreshnessRegistry)
+    /// (`pin_slot`/`mark_volatile_slot`) or a
+    /// [`PrefetchRegistry`](crate::prefetch_registry::PrefetchRegistry) to keep
+    /// them warm and fresh. Returns `None` if the layout can't be discovered
+    /// (e.g. an empty `holders` set with no cached descriptor, or a token with no
+    /// hashed balance read).
+    pub fn track_erc20_balances(
+        &mut self,
+        token: Address,
+        holders: impl IntoIterator<Item = Address>,
+    ) -> Result<Option<TrackedBalances>> {
+        let holders: Vec<Address> = holders.into_iter().collect();
+
+        let tracked = if let Some(t) = self.erc20_balance_slots.get(&token).copied() {
+            t
+        } else {
+            let Some(&probe_holder) = holders.first() else {
+                return Ok(None);
+            };
+            let Some(tracked) = self
+                .discover_erc20_balance_slot(token, probe_holder)?
+                .and_then(|access| access.as_tracked(token))
+            else {
+                return Ok(None);
+            };
+            self.erc20_balance_slots.insert(token, tracked);
+            tracked
+        };
+
+        let pairs = tracked
+            .slots_for(holders.iter().map(|h| h.into_word()))
+            .into_iter()
+            .map(|(key, slot)| (Address::from_word(key), slot))
+            .collect();
+        Ok(Some((tracked, pairs)))
+    }
+
+    /// Forge an ERC-20 allowance: discover the (nested) `allowance` mapping entry
+    /// for `(owner, spender)` from a single traced `allowance` call, write
+    /// `amount` to the exact slot, and verify.
+    ///
+    /// This is the approval counterpart to
+    /// [`set_erc20_balance_with_slot_scan`](Self::set_erc20_balance_with_slot_scan)
+    /// — newly feasible because nested-mapping discovery can locate
+    /// `keccak(spender ‖ keccak(owner ‖ base))` (and its Vyper/packed variants)
+    /// without a scan. Pass `U256::MAX` for an "unlimited" approval.
+    ///
+    /// Returns `Ok(true)` if set and verified, `Ok(false)` if the token exposes
+    /// no discoverable hashed allowance entry keyed by `(owner, spender)`.
+    pub fn set_erc20_allowance(
+        &mut self,
+        token: Address,
+        owner: Address,
+        spender: Address,
+        amount: U256,
+    ) -> Result<bool> {
+        let calldata = Bytes::from(IERC20::allowanceCall { owner, spender }.abi_encode());
+        let known = [owner.into_word(), spender.into_word()];
+        let (owner_word, spender_word) = (owner.into_word(), spender.into_word());
+
+        // The allowance entry is the hashed read keyed by BOTH owner and spender;
+        // prefer the deepest/highest-confidence such access.
+        let target = self
+            .trace_hashed_slots(owner, token, calldata, &known)?
+            .into_iter()
+            .filter(|a| a.keyed_by(owner_word) && a.keyed_by(spender_word))
+            .max_by_key(|a| (a.depth, a.confidence));
+
+        let Some(target) = target else {
+            return Ok(false);
+        };
+
+        self.insert_storage_slot(token, U256::from_be_slice(target.slot.as_slice()), amount)?;
+        Ok(self.erc20_allowance(token, owner, spender)? == amount)
+    }
+
+    /// Write `value` into a mapping entry using a **discovered**
+    /// [`TrackedMapping`] layout, returning the exact storage slot written.
+    ///
+    /// Unlike [`insert_mapping_storage_slot`](Self::insert_mapping_storage_slot),
+    /// which always assumes Solidity `keccak(key‖slot)` order, this honors the
+    /// tracked layout, so it writes the correct slot for Vyper and Solady tokens
+    /// too. The `(contract, layout, base slot)` all come from the `tracked`
+    /// descriptor.
+    pub fn write_mapping_entry(
+        &mut self,
+        tracked: &TrackedMapping,
+        key: B256,
+        value: U256,
+    ) -> Result<B256> {
+        let slot = tracked
+            .slot_for(key)
+            .ok_or_else(|| CacheError::StorageInsert {
+                address: tracked.contract,
+                slot: U256::ZERO,
+                details: format!(
+                    "layout {} does not support single-key slot derivation",
+                    tracked.layout
+                ),
+            })?;
+        self.insert_storage_slot(
+            tracked.contract,
+            U256::from_be_slice(slot.as_slice()),
+            value,
+        )?;
+        Ok(slot)
+    }
+
+    /// Create a throwaway [`EvmOverlay`] over the current snapshot, wired to this
+    /// cache's backend for lazy fetch.
+    ///
+    /// This is the entry point for **overlay-scoped mocking**: mock balances,
+    /// approvals, and getter returns on the returned overlay
+    /// ([`EvmOverlay::mock_balance`], [`EvmOverlay::mock_allowance`],
+    /// [`EvmOverlay::mock_call`]) and run your simulations *on that overlay*. The
+    /// mocks live only in the overlay's dirty layer and are dropped with it — the
+    /// cache is never mutated, so a mocked balance can't leak into a later
+    /// simulation. (For a persistent cache-level balance override, use
+    /// [`set_erc20_balance_with_slot_scan`](Self::set_erc20_balance_with_slot_scan).)
+    ///
+    /// ```no_run
+    /// # use alloy_primitives::{Address, U256};
+    /// # use evm_fork_cache::cache::{EvmCache, TxConfig};
+    /// # use alloy_primitives::Bytes;
+    /// # fn ex(cache: &mut EvmCache, usdc: Address, alice: Address, router: Address, swap: Bytes)
+    /// #     -> Result<(), Box<dyn std::error::Error>> {
+    /// let mut sim = cache.mock_overlay();
+    /// sim.mock_balance(usdc, alice, U256::from(1_000_000_000_000u64))?; // 1M USDC (6 dp)
+    /// sim.mock_allowance(usdc, alice, router, U256::MAX)?;              // unlimited approve
+    /// let out = sim.call_raw(alice, router, swap)?;  // simulate against the mocked state
+    /// // drop `sim` → mocks discarded; `cache` is untouched.
+    /// # let _ = out; Ok(()) }
+    /// ```
+    pub fn mock_overlay(&mut self) -> EvmOverlay {
+        EvmOverlay::new(self.snapshot(), Some(self.backend.clone()))
+    }
+
+    /// Set an ERC20 balance, discovering the token's balance mapping slot and
+    /// layout if not already known, then writing `amount` there.
+    ///
+    /// Resolution order:
+    /// 1. A cached/seeded [`TrackedMapping`] for the token (fast path).
+    /// 2. **Trace-based discovery** — a single simulated `balanceOf(owner)`,
+    ///    layout-agnostic (Solidity / Vyper / Solady) and unbounded by `max_slot`
+    ///    (see [`discover_erc20_balance_slot`](Self::discover_erc20_balance_slot)).
+    /// 3. The legacy brute-force **scan** of `0..=max_slot` (Solidity order only),
+    ///    kept as a fallback for the rare token whose `balanceOf` reads no hashed
+    ///    slot the trace can attribute.
+    ///
+    /// Every path verifies the write via `balanceOf` before caching, so a wrong
+    /// guess is self-correcting. Returns `Ok(true)` if set and verified,
+    /// `Ok(false)` if nothing worked, and `Err` on EVM/cache failures.
     pub fn set_erc20_balance_with_slot_scan(
         &mut self,
         token: Address,
@@ -4285,24 +4584,43 @@ impl EvmCache {
         amount: U256,
         max_slot: u16,
     ) -> Result<bool> {
-        if let Some(slot) = self.erc20_balance_slots.get(&token).copied() {
-            self.insert_mapping_storage_slot(token, slot, owner, amount)?;
+        let owner_word = owner.into_word();
+
+        // 1. Cached/seeded descriptor — write with its (layout-aware) slot.
+        if let Some(tracked) = self.erc20_balance_slots.get(&token).copied() {
+            self.write_mapping_entry(&tracked, owner_word, amount)?;
             if self.erc20_balance_of(token, owner)? == amount {
                 return Ok(true);
             }
             self.erc20_balance_slots.remove(&token);
         }
 
+        // 2. Trace-based discovery: one sim, layout-aware, no max_slot bound.
+        if let Some(tracked) = self
+            .discover_erc20_balance_slot(token, owner)?
+            .and_then(|access| access.as_tracked(token))
+        {
+            self.write_mapping_entry(&tracked, owner_word, amount)?;
+            if self.erc20_balance_of(token, owner)? == amount {
+                self.erc20_balance_slots.insert(token, tracked);
+                return Ok(true);
+            }
+            // Discovered slot didn't drive the balance (rebasing/computed getter,
+            // or a same-key non-balance mapping): fall through to the scan.
+        }
+
+        // 3. Legacy brute-force scan (Solidity order only) as a last resort.
         let Some(discovered_slot) =
             self.discover_erc20_balance_slot_with_scan(token, owner, max_slot)?
         else {
             return Ok(false);
         };
 
-        self.insert_mapping_storage_slot(token, discovered_slot, owner, amount)?;
+        let tracked = TrackedMapping::new(token, discovered_slot, SlotLayout::SolidityMapping);
+        self.write_mapping_entry(&tracked, owner_word, amount)?;
         let verified = self.erc20_balance_of(token, owner)? == amount;
         if verified {
-            self.erc20_balance_slots.insert(token, discovered_slot);
+            self.erc20_balance_slots.insert(token, tracked);
         } else {
             self.erc20_balance_slots.remove(&token);
         }
@@ -4315,8 +4633,8 @@ impl EvmCache {
         owner: Address,
         max_slot: u16,
     ) -> Result<Option<U256>> {
-        if let Some(slot) = self.erc20_balance_slots.get(&token).copied() {
-            return Ok(Some(slot));
+        if let Some(tracked) = self.erc20_balance_slots.get(&token) {
+            return Ok(Some(tracked.base_slot));
         }
 
         let baseline_snapshot = self.checkpoint();
@@ -4337,7 +4655,10 @@ impl EvmCache {
             self.insert_mapping_storage_slot(token, slot, owner, probe)?;
             if self.erc20_balance_of(token, owner)? == probe {
                 self.restore(baseline_snapshot);
-                self.erc20_balance_slots.insert(token, slot);
+                self.erc20_balance_slots.insert(
+                    token,
+                    TrackedMapping::new(token, slot, SlotLayout::SolidityMapping),
+                );
                 return Ok(Some(slot));
             }
         }

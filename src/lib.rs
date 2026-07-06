@@ -85,6 +85,10 @@
 //! - [`deploy`] / [`create3`] — contract deployment and CREATE3 address math.
 //! - [`prefetch_registry`] — two-stage storage-slot pre-warming
 //!   (complemented by the declarative [`cache::EvmCache::prewarm_slots`]).
+//! - [`mapping_probe`] — trace-based discovery of hash-derived storage slots:
+//!   derive a mapping's base slot and byte-order layout (Solidity / Vyper /
+//!   Solady / nested) from one simulation, via `EvmCache::trace_hashed_slots` /
+//!   `discover_erc20_balance_slot` / `track_erc20_balances`.
 //!
 //! # Requirements
 //!
@@ -101,9 +105,12 @@
 //! async fn my_test() { /* ... */ }
 //! ```
 //!
-//! Running on a current-thread runtime panics when a fetch is attempted. The
-//! offline examples and integration tests build the cache over a mocked provider
-//! and never reach the network, so they are exempt.
+//! On a current-thread runtime, fetch paths do **not** panic: the synchronous
+//! bridge checks the runtime flavor up front and returns a typed
+//! [`RuntimeError`] (`CurrentThreadRuntime`) instead, so a
+//! misconfigured runtime surfaces as a handled error rather than a panic deep in
+//! a callback. The offline examples and integration tests build the cache over a
+//! mocked provider and never reach the network, so they are exempt.
 //!
 //! # Error handling
 //!
@@ -144,6 +151,7 @@ pub mod errors;
 pub mod events;
 pub mod freshness;
 pub mod inspector;
+pub mod mapping_probe;
 pub mod multicall;
 pub mod prefetch_registry;
 #[cfg(feature = "reactive")]
@@ -155,10 +163,10 @@ pub use access_set::StorageAccessList;
 // Bulk storage extraction over eth_call state overrides — the default batch
 // storage fetcher since 0.2.0 (see docs/bulk-storage-extraction.md).
 pub use bulk_storage::{
-    AccountFieldsSample, BlockContextSample, BulkCallConfig, CallDispatch, StorageProgram,
-    bulk_call_storage_fetcher, bulk_call_storage_fetcher_with_fallback, fetch_account_fields_bulk,
-    fetch_block_context, fetch_slots_bulk, planned_call_count, run_storage_program,
-    run_storage_programs,
+    AccountFieldsSample, BlockContextSample, BulkCallConfig, BulkFetcherStatus, CallDispatch,
+    StorageProgram, bulk_call_storage_fetcher, bulk_call_storage_fetcher_with_fallback,
+    bulk_call_storage_fetcher_with_status, fetch_account_fields_bulk, fetch_block_context,
+    fetch_slots_bulk, planned_call_count, run_storage_program, run_storage_programs,
 };
 // Phase 6 Track A+B: bundle simulation + coinbase accounting public vocabulary.
 pub use bundle::{BundleOptions, BundleResult, BundleTx, RevertPolicy, TxOutcome};
@@ -193,6 +201,10 @@ pub use freshness::{
     AlwaysVerify, BlockClock, FreshnessClock, FreshnessController, FreshnessParams,
     FreshnessPolicy, FreshnessRegistry, NeverVerify, ObservationDriven, SimRequest, SlotChange,
     SlotFetch, SlotOutcome, SpeculativeSim, Validation, Validity, WallClock,
+};
+// Trace-based hash-derived storage-slot discovery (v0.2.1).
+pub use mapping_probe::{
+    Confidence, HashSlotAccess, HashStorageProbe, SlotLayout, TrackedBalances, TrackedMapping,
 };
 #[cfg(feature = "reactive")]
 pub use reactive::{

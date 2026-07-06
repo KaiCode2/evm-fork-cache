@@ -17,11 +17,112 @@ polish remainder (a toy constant-product AMM example and the end-to-end
 reactive integration tests enumerated in
 [`docs/KNOWN_ISSUES.md`](docs/KNOWN_ISSUES.md)).
 
+## [0.2.1] - 2026-07-06
+
+Trace-based discovery of hash-derived storage slots: derive a mapping's base
+slot and byte-order **layout** from a single simulated call, instead of
+brute-force probing. Works across Solidity (`keccak(key‖slot)`), Vyper
+(`keccak(slot‖key)`), Solady/assembly packed layouts, and nested mappings
+(e.g. allowances). All additions are backward compatible.
+
+### Added
+
+- New [`mapping_probe`](src/mapping_probe.rs) module: `HashStorageProbe` (a
+  composable `revm::Inspector` recording `KECCAK256` preimages and hashed
+  `SLOAD`s), `HashSlotAccess` (keys, base slot, exact slot, layout, value,
+  confidence), `SlotLayout`, `Confidence`, and `TrackedMapping` — a reusable
+  descriptor whose `slot_for(key)` recomputes any entry's slot from the
+  discovered layout. Re-exported at the crate root.
+- `EvmCache::call_raw_with_inspector` — cache-level, lazily-fetching,
+  non-committing inspector run (the counterpart to
+  `EvmOverlay::call_raw_with_inspector`).
+- `EvmCache::trace_hashed_slots` — general, ERC-20-agnostic slot discovery for
+  any call; `EvmCache::discover_erc20_balance_slot` — balance-slot convenience;
+  `EvmCache::write_mapping_entry` — layout-aware write (correct for Vyper/Solady,
+  unlike `insert_mapping_storage_slot`).
+- `EvmCache::track_erc20_balances` — "discover once, then track these
+  addresses": returns a `TrackedMapping` plus each holder's exact slot to pin
+  into a `FreshnessRegistry` / `PrefetchRegistry`.
+- `EvmCache::seed_erc20_balance_layouts` and
+  `Erc20TransferDecoder::with_tracked` — seed/configure a known non-Solidity
+  layout up front.
+- `EvmCache::set_erc20_allowance` — forge an ERC-20 allowance by discovering the
+  nested `allowance` mapping entry for `(owner, spender)` and writing/verifying
+  it. The approval counterpart to the balance setter, newly feasible via
+  nested-mapping discovery (the old scan could not reach nested slots).
+- **Overlay-scoped mocking** — `EvmCache::mock_overlay` returns a throwaway
+  [`EvmOverlay`] (wired to the cache backend for lazy fetch) carrying
+  `mock_balance`, `mock_allowance`, `mock_call`, and `mock_view`. Each discovers
+  the driving slot, writes it to the overlay's dirty layer, and verifies — so
+  mocks live only for that overlay and **never persist to the cache** (no leak
+  into later simulations). `mock_call`/`mock_view` generalize to any single-slot
+  getter (balances, allowances, `totalSupply`, …) via
+  `HashStorageProbe::slots_returning` (which now records plain SLOADs too).
+  Zero-address balance/owner writes are refused.
+- `EvmOverlay::call_sol` / `call_sol_from` — non-committing typed Solidity calls
+  on the overlay (the counterpart to `EvmCache::call_sol`), so simulated reads
+  decode natively: `overlay.call_sol(token, IErc20::balanceOfCall { account })?`
+  returns the `U256` directly instead of decoding raw `call_raw` output. Adds
+  `OverlayError::SolCallFailed` / `SolCallDecode`.
+- `bulk_call_storage_fetcher_with_status` + `BulkFetcherStatus` — build a bulk
+  storage fetcher together with a cheap, cloneable handle that reports whether it
+  has latched to its point-read fallback (`fallback_latched()`) and the running
+  provider-failure streak (`consecutive_override_failures()`). Makes silent
+  bulk→point-read degradation — e.g. a provider that stops honoring `eth_call`
+  state overrides — observable and alertable. Purely additive: the existing
+  `bulk_call_storage_fetcher` / `bulk_call_storage_fetcher_with_fallback`
+  constructors are unchanged.
+
+[`EvmOverlay`]: https://docs.rs/evm-fork-cache/latest/evm_fork_cache/cache/struct.EvmOverlay.html
+
+### Changed
+
+- `set_erc20_balance_with_slot_scan` is now **discover-first**: a single
+  layout-aware simulation replaces the `0..=max_slot` probe loop, with the
+  brute-force scan kept as a fallback. This fixes silent failures on Vyper and
+  Solady tokens, whose slots the Solidity-order scan could never match. The
+  public signature is unchanged; every path still verifies the write.
+  **Behavior note:** `max_slot` now bounds only the fallback scan — discovery is
+  unbounded, so a token whose balance slot exceeds `max_slot` (or uses a
+  namespaced/large slot) is now found where it previously returned `false`.
+- `Erc20TransferDecoder` balance-slot computation is now layout-aware (via
+  `with_tracked`); `new`/`with_token` remain Solidity-order and behave
+  identically.
+
+### Documentation
+
+- Corrected the `ConfirmedFull` freshness story. The README safety checklist and
+  `docs/KNOWN_ISSUES.md` previously implied that opting an account into
+  `TrackingPolicy::WholeAccount`/`Scalars` upgrades a freshness verdict to
+  `Validation::ConfirmedFull`. It does not: account-field tracking lives in the
+  reactive runtime's root gate and keeps the **cache** fresh, while the
+  speculative freshness validator still emits only `ConfirmedStorage`.
+  `ConfirmedFull` (and `Corrected.changed_accounts`) remain defined-but-unemitted
+  pending validator-side account verification — matching what `freshness`'s own
+  rustdoc already stated.
+- Corrected the crate-level "Requirements" rustdoc: fetch paths on a
+  current-thread runtime return a typed `RuntimeError::CurrentThreadRuntime`, they
+  do not panic (the `block_in_place` guard has done this since it was introduced;
+  the doc was stale).
+- Clarified the deep-reorg wording in the README safety checklist to match
+  `docs/KNOWN_ISSUES.md`: reorgs beyond `ReactiveConfig::journal_depth` are not
+  auto-purged; they escalate health to `Unhealthy` and rely on freshness
+  validation as the backstop (resync before trusting sims).
+
+### Internal
+
+- The `test_save_load_round_trip` (and sibling `corrupt`/`legacy`/`write_error`)
+  persistence tests in `binary_state`, `slot_observations`, and
+  `prefetch_registry` now write to pid-keyed unique temp dirs (matching the idiom
+  already used in `bytecode`/`code_seeds`), so overlapping `cargo test`
+  invocations can't clobber each other's fixtures. Test-only; no effect on the
+  shipped crate.
+
 ## [0.2.0] - 2026-07-05
 
-Closes the top publication-review gaps (account-level freshness, strict
-block-context, bounded `derived_slots`, conservative deep-reorg behavior) and
-lands the full Phase-8 liveness plan (spec steps 1–6). Breaking changes are
+Closes the top publication-review gaps (account-level *cache* freshness via the
+reactive root gate, strict block-context, bounded `derived_slots`, deep-reorg
+health escalation) and lands the full Phase-8 liveness plan (spec steps 1–6). Breaking changes are
 grouped under **Changed**; they are permitted pre-1.0 (see the policy above).
 
 ### Performance
@@ -204,9 +305,13 @@ hedged picture):
 
 - **Freshness verdict taxonomy is honest about scope.** `Validation::Confirmed` is
   renamed `ConfirmedStorage` (it only ever meant "no volatile storage slot changed",
-  not account-level state); a new `ConfirmedFull` covers storage **and** verified
-  account fields; `Validation::Corrected`'s `changed` field is renamed
-  `changed_slots` and gains `changed_accounts: Vec<AccountChange>`.
+  not account-level state); a new `ConfirmedFull` variant is *defined* for storage
+  **and** verified account fields (but not yet emitted — validator-side account
+  verification is a tracked follow-up, so a storage-only success stays
+  `ConfirmedStorage`); `Validation::Corrected`'s `changed` field is renamed
+  `changed_slots` and gains `changed_accounts: Vec<AccountChange>` (also empty
+  until that follow-up lands). Account-level freshness that *is* shipped lives in
+  the reactive runtime's root gate (below), not the speculative validator.
 - **`ResyncFailureKind::UnsupportedAccountTarget` removed**, replaced by
   `MissingAccountFetcher` / `AccountFetchFailed` / `AccountFetchOmitted` now that
   account resync is supported.

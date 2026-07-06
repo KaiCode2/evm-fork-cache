@@ -192,11 +192,23 @@ mod tests {
     use super::*;
     use foundry_fork_db::cache::BlockchainDbMeta;
 
+    /// A unique, freshly-created temp dir keyed by pid so concurrent `cargo
+    /// test` processes never share (and never `remove_dir_all`) each other's
+    /// directory; each test passes a distinct `tag`. Returns the file path to
+    /// write within it.
+    fn temp_path(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "evm_fork_cache_binary_state_{tag}_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir.join("state.bin")
+    }
+
     #[test]
     fn test_save_load_round_trip() {
-        let dir = std::env::temp_dir().join("evm_fork_cache_test_binary_state");
-        let path = dir.join("test_state.bin");
-        let _ = std::fs::remove_file(&path);
+        let path = temp_path("round_trip");
 
         // Create a BlockchainDb with some data
         let meta = BlockchainDbMeta::default();
@@ -285,14 +297,16 @@ mod tests {
                 U256::from(777)
             );
         }
-
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_dir(&dir);
     }
 
     #[test]
     fn save_binary_state_reports_write_failures() {
-        let dir = std::env::temp_dir().join("evm_fork_cache_test_binary_state_write_error");
+        // Deliberately a *file* (not a dir) at a pid-unique path, so saving into
+        // a child path fails with "not a directory".
+        let dir = std::env::temp_dir().join(format!(
+            "evm_fork_cache_binary_state_write_error_{}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_file(&dir);
         std::fs::write(&dir, b"not a directory").expect("create file path conflict");
@@ -320,24 +334,17 @@ mod tests {
 
     #[test]
     fn test_load_corrupt_file_returns_false() {
-        let dir = std::env::temp_dir().join("evm_fork_cache_test_binary_state_corrupt");
-        let path = dir.join("corrupt.bin");
-        let _ = std::fs::create_dir_all(&dir);
+        let path = temp_path("corrupt");
         std::fs::write(&path, b"not valid bincode").unwrap();
 
         let meta = BlockchainDbMeta::default();
         let db = BlockchainDb::new(meta, None);
         assert!(!load_binary_state(&db, &path));
-
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_dir(&dir);
     }
 
     #[test]
     fn load_legacy_raw_bincode_returns_false() {
-        let dir = std::env::temp_dir().join("evm_fork_cache_test_binary_state_legacy");
-        let path = dir.join("legacy.bin");
-        let _ = std::fs::create_dir_all(&dir);
+        let path = temp_path("legacy");
         let legacy = BinaryEvmState {
             accounts: Vec::new(),
             storage: Vec::new(),
@@ -349,8 +356,5 @@ mod tests {
             !load_binary_state(&db, &path),
             "unversioned legacy bincode must be treated as a cache miss"
         );
-
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_dir(&dir);
     }
 }

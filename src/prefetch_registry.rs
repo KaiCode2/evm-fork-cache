@@ -340,11 +340,23 @@ mod tests {
         );
     }
 
+    /// A unique, freshly-created temp dir keyed by pid so concurrent `cargo
+    /// test` processes never share (and never `remove_dir_all`) each other's
+    /// directory; each test passes a distinct `tag`. Returns the file path to
+    /// write within it.
+    fn temp_path(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "evm_fork_cache_prefetch_registry_{tag}_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir.join("registry.bin")
+    }
+
     #[test]
     fn test_save_load_round_trip() {
-        let dir = std::env::temp_dir().join("evm_fork_cache_test_prefetch_registry");
-        let path = dir.join("test_registry.bin");
-        let _ = std::fs::remove_file(&path);
+        let path = temp_path("round_trip");
 
         let mut registry = PrefetchRegistry::default();
         let addr = Address::repeat_byte(0xAA);
@@ -380,14 +392,16 @@ mod tests {
                 .slots
                 .contains(&(key, U256::from(99)))
         );
-
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_dir(&dir);
     }
 
     #[test]
     fn save_reports_write_failures() {
-        let dir = std::env::temp_dir().join("evm_fork_cache_test_prefetch_registry_write_error");
+        // Deliberately a *file* (not a dir) at a pid-unique path, so saving into
+        // a child path fails with "not a directory".
+        let dir = std::env::temp_dir().join(format!(
+            "evm_fork_cache_prefetch_registry_write_error_{}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_file(&dir);
         std::fs::write(&dir, b"not a directory").expect("create file path conflict");
@@ -407,10 +421,7 @@ mod tests {
 
     #[test]
     fn legacy_raw_bincode_loads_as_default() {
-        let dir = std::env::temp_dir().join("evm_fork_cache_test_prefetch_registry_legacy");
-        let path = dir.join("legacy_registry.bin");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = temp_path("legacy");
 
         let mut registry = PrefetchRegistry::default();
         let addr = Address::repeat_byte(0xAA);
@@ -425,8 +436,6 @@ mod tests {
             loaded.phases.is_empty() && loaded.keyed_phases.is_empty(),
             "legacy raw bincode must be treated as a cache miss"
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

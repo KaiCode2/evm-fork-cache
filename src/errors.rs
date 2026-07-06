@@ -1027,6 +1027,35 @@ pub enum OverlayError {
         /// revm/database error text.
         details: String,
     },
+    /// A typed Solidity call ([`EvmOverlay::call_sol`](crate::cache::EvmOverlay::call_sol))
+    /// did not `Success` (it reverted or halted).
+    #[error("Solidity call {signature} from {from:?} to {to:?} did not succeed: {result}")]
+    SolCallFailed {
+        /// The call's Solidity signature.
+        signature: &'static str,
+        /// Caller address.
+        from: Address,
+        /// Callee address.
+        to: Address,
+        /// Debug rendering of the non-`Success` result.
+        result: String,
+    },
+    /// A typed Solidity call succeeded but its return data could not be decoded.
+    #[error(
+        "failed to decode return of {signature} from {from:?} to {to:?} ({output_len} bytes): {details}"
+    )]
+    SolCallDecode {
+        /// The call's Solidity signature.
+        signature: &'static str,
+        /// Caller address.
+        from: Address,
+        /// Callee address.
+        to: Address,
+        /// Length of the undecodable return data.
+        output_len: usize,
+        /// Decoder error text.
+        details: String,
+    },
 }
 
 impl OverlayError {

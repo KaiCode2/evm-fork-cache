@@ -737,6 +737,53 @@ pub fn planned_call_count(requests: &[(Address, U256)], config: &BulkCallConfig)
     plan_calls(requests, &config.normalized()).len()
 }
 
+/// A cheap, cloneable handle to a running bulk fetcher's fallback state.
+///
+/// Returned alongside the fetcher by [`bulk_call_storage_fetcher_with_status`];
+/// the handle and the fetcher closure share one counter, so polling the handle
+/// observes the live fetcher with no extra plumbing. Cloning is `Arc`-cheap and
+/// every clone reflects the same state.
+///
+/// It surfaces the one runtime **silent-degradation** signal the fetcher can
+/// hit: a bulk fetcher whose provider turns out not to support `eth_call` state
+/// overrides latches to its point-read fallback after
+/// [`latch_threshold`](Self::latch_threshold) consecutive batches in which
+/// *every* slot failed with a provider-level error (a `warn!` fires once at that
+/// point). Without observability a searcher can slide from "10,000 slots per
+/// call" to "10,000 point reads" and notice only via latency or CU spend; poll
+/// [`fallback_latched`](Self::fallback_latched) to alert on it directly.
+#[derive(Clone, Debug)]
+pub struct BulkFetcherStatus {
+    consecutive_failures: Arc<std::sync::atomic::AtomicUsize>,
+    latch_threshold: usize,
+}
+
+impl BulkFetcherStatus {
+    /// Consecutive batches so far in which **every** slot failed with a
+    /// provider-level error; any batch with at least one success resets it to
+    /// zero. Equals [`latch_threshold`](Self::latch_threshold) once the fetcher
+    /// has latched (and does not climb past it — latched batches skip the bulk
+    /// attempt, so the counter is not touched again).
+    pub fn consecutive_override_failures(&self) -> usize {
+        self.consecutive_failures
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The number of consecutive all-provider-error batches that trips the latch.
+    pub fn latch_threshold(&self) -> usize {
+        self.latch_threshold
+    }
+
+    /// Whether the fetcher has latched to its point-read fallback. Sticky: once
+    /// `true` it stays `true` for the fetcher's lifetime — install a fresh
+    /// fetcher to retry bulk extraction. Only ever `true` for a fetcher built
+    /// with a fallback (via [`bulk_call_storage_fetcher_with_status`]); without
+    /// one there is nothing to latch to and the bulk path is always attempted.
+    pub fn fallback_latched(&self) -> bool {
+        self.consecutive_override_failures() >= self.latch_threshold
+    }
+}
+
 /// Build a [`StorageBatchFetchFn`] backed by call-override bulk extraction.
 ///
 /// Install it with [`EvmCache::set_storage_batch_fetcher`](crate::cache::EvmCache::set_storage_batch_fetcher);
@@ -752,7 +799,7 @@ pub fn bulk_call_storage_fetcher<P: Provider<AnyNetwork> + 'static>(
     provider: Arc<P>,
     config: BulkCallConfig,
 ) -> StorageBatchFetchFn {
-    make_fetcher(provider, config, None)
+    make_fetcher(provider, config, None).0
 }
 
 /// [`bulk_call_storage_fetcher`] with a repair path.
@@ -769,6 +816,23 @@ pub fn bulk_call_storage_fetcher_with_fallback<P: Provider<AnyNetwork> + 'static
     config: BulkCallConfig,
     fallback: StorageBatchFetchFn,
 ) -> StorageBatchFetchFn {
+    make_fetcher(provider, config, Some(fallback)).0
+}
+
+/// [`bulk_call_storage_fetcher_with_fallback`] that also returns a
+/// [`BulkFetcherStatus`] handle for observing the fallback latch at runtime.
+///
+/// Use this instead of [`bulk_call_storage_fetcher_with_fallback`] when you want
+/// to alert on silent bulk→point-read degradation (e.g. a provider that stops
+/// honoring state overrides). Keep the returned handle — or a clone — and poll
+/// [`BulkFetcherStatus::fallback_latched`]; treat `true` as "bulk extraction is
+/// off, expect higher latency/CU until a fresh fetcher is installed". The
+/// fetcher itself behaves identically to the plain fallback constructor.
+pub fn bulk_call_storage_fetcher_with_status<P: Provider<AnyNetwork> + 'static>(
+    provider: Arc<P>,
+    config: BulkCallConfig,
+    fallback: StorageBatchFetchFn,
+) -> (StorageBatchFetchFn, BulkFetcherStatus) {
     make_fetcher(provider, config, Some(fallback))
 }
 
@@ -776,7 +840,7 @@ fn make_fetcher<P: Provider<AnyNetwork> + 'static>(
     provider: Arc<P>,
     config: BulkCallConfig,
     fallback: Option<StorageBatchFetchFn>,
-) -> StorageBatchFetchFn {
+) -> (StorageBatchFetchFn, BulkFetcherStatus) {
     let config = config.normalized();
     // After this many *consecutive* batches where every slot failed with a
     // provider-level error (the signature of an endpoint without
@@ -786,76 +850,82 @@ fn make_fetcher<P: Provider<AnyNetwork> + 'static>(
     // exists; without one the bulk attempt is the only option anyway.
     const OVERRIDE_FAILURE_LATCH: usize = 2;
     let consecutive_failures = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    Arc::new(move |requests: Vec<(Address, U256)>, block: BlockId| {
-        use std::sync::atomic::Ordering;
-        if requests.is_empty() {
-            return Vec::new();
-        }
-        if let Some(fallback) = &fallback
-            && (requests.len() < config.point_read_threshold
-                || consecutive_failures.load(Ordering::Relaxed) >= OVERRIDE_FAILURE_LATCH)
-        {
-            return fallback(requests, block);
-        }
+    let status = BulkFetcherStatus {
+        consecutive_failures: Arc::clone(&consecutive_failures),
+        latch_threshold: OVERRIDE_FAILURE_LATCH,
+    };
+    let fetcher: StorageBatchFetchFn =
+        Arc::new(move |requests: Vec<(Address, U256)>, block: BlockId| {
+            use std::sync::atomic::Ordering;
+            if requests.is_empty() {
+                return Vec::new();
+            }
+            if let Some(fallback) = &fallback
+                && (requests.len() < config.point_read_threshold
+                    || consecutive_failures.load(Ordering::Relaxed) >= OVERRIDE_FAILURE_LATCH)
+            {
+                return fallback(requests, block);
+            }
 
-        // Guard against panicking inside `block_in_place` on a current-thread
-        // runtime (or when no runtime is present): report an `Err` result for
-        // every requested slot instead, mirroring the default fetcher. The
-        // guard errors still flow through the fallback repair below — a
-        // synchronous fallback can serve them even where the bulk path can't
-        // run.
-        let bulk_results = match block_in_place_handle() {
-            Ok(handle) => tokio::task::block_in_place(|| {
-                handle.block_on(fetch_slots_bulk(provider.as_ref(), requests, block, config))
-            }),
-            Err(e) => requests
-                .into_iter()
-                .map(|(addr, slot)| (addr, slot, Err(StorageFetchError::Runtime(e.clone()))))
-                .collect(),
-        };
+            // Guard against panicking inside `block_in_place` on a current-thread
+            // runtime (or when no runtime is present): report an `Err` result for
+            // every requested slot instead, mirroring the default fetcher. The
+            // guard errors still flow through the fallback repair below — a
+            // synchronous fallback can serve them even where the bulk path can't
+            // run.
+            let bulk_results = match block_in_place_handle() {
+                Ok(handle) => tokio::task::block_in_place(|| {
+                    handle.block_on(fetch_slots_bulk(provider.as_ref(), requests, block, config))
+                }),
+                Err(e) => requests
+                    .into_iter()
+                    .map(|(addr, slot)| (addr, slot, Err(StorageFetchError::Runtime(e.clone()))))
+                    .collect(),
+            };
 
-        let Some(fallback) = &fallback else {
-            return bulk_results;
-        };
+            let Some(fallback) = &fallback else {
+                return bulk_results;
+            };
 
-        // Latch bookkeeping: any success resets the streak; a batch where
-        // *everything* failed at the provider level counts toward latching.
-        if bulk_results.iter().any(|(_, _, r)| r.is_ok()) {
-            consecutive_failures.store(0, Ordering::Relaxed);
-        } else if bulk_results
-            .iter()
-            .any(|(_, _, r)| matches!(r, Err(StorageFetchError::Provider { .. })))
-        {
-            let streak = consecutive_failures.fetch_add(1, Ordering::Relaxed) + 1;
-            if streak == OVERRIDE_FAILURE_LATCH {
-                warn!(
-                    streak,
-                    "bulk storage extraction failed consecutive batches with provider errors; \
+            // Latch bookkeeping: any success resets the streak; a batch where
+            // *everything* failed at the provider level counts toward latching.
+            if bulk_results.iter().any(|(_, _, r)| r.is_ok()) {
+                consecutive_failures.store(0, Ordering::Relaxed);
+            } else if bulk_results
+                .iter()
+                .any(|(_, _, r)| matches!(r, Err(StorageFetchError::Provider { .. })))
+            {
+                let streak = consecutive_failures.fetch_add(1, Ordering::Relaxed) + 1;
+                if streak == OVERRIDE_FAILURE_LATCH {
+                    warn!(
+                        streak,
+                        "bulk storage extraction failed consecutive batches with provider errors; \
                      latching this fetcher to the point-read fallback (install a fresh fetcher \
                      to retry bulk extraction)"
-                );
+                    );
+                }
             }
-        }
 
-        // Repair failed pairs (with multiplicity) through the fallback,
-        // preserving the one-result-per-request contract.
-        let mut repaired = Vec::with_capacity(bulk_results.len());
-        let mut failed: Vec<(Address, U256)> = Vec::new();
-        for (addr, slot, result) in bulk_results {
-            match result {
-                Ok(value) => repaired.push((addr, slot, Ok(value))),
-                Err(_) => failed.push((addr, slot)),
+            // Repair failed pairs (with multiplicity) through the fallback,
+            // preserving the one-result-per-request contract.
+            let mut repaired = Vec::with_capacity(bulk_results.len());
+            let mut failed: Vec<(Address, U256)> = Vec::new();
+            for (addr, slot, result) in bulk_results {
+                match result {
+                    Ok(value) => repaired.push((addr, slot, Ok(value))),
+                    Err(_) => failed.push((addr, slot)),
+                }
             }
-        }
-        if !failed.is_empty() {
-            warn!(
-                failed = failed.len(),
-                "bulk storage extraction failed for some slots; repairing via fallback fetcher"
-            );
-            repaired.extend(fallback(failed, block));
-        }
-        repaired
-    })
+            if !failed.is_empty() {
+                warn!(
+                    failed = failed.len(),
+                    "bulk storage extraction failed for some slots; repairing via fallback fetcher"
+                );
+                repaired.extend(fallback(failed, block));
+            }
+            repaired
+        });
+    (fetcher, status)
 }
 
 // ---------------------------------------------------------------------------

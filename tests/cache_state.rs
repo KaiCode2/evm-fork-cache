@@ -431,7 +431,7 @@ async fn set_erc20_balance_with_slot_scan_finds_balance_slot() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn set_erc20_balance_with_slot_scan_honors_max_slot_bound() -> Result<()> {
+async fn set_erc20_balance_discovers_slot_beyond_max_slot_bound() -> Result<()> {
     let mut cache = setup_cache().await?;
     let token = Address::repeat_byte(0x92);
     let owner = Address::repeat_byte(0x93);
@@ -440,8 +440,11 @@ async fn set_erc20_balance_with_slot_scan_honors_max_slot_bound() -> Result<()> 
     install_default_account(&mut cache, owner);
     install_mock_erc20(&mut cache, token);
 
-    // Real balance slot is 3; scanning only 0..=2 must fail and leave the
-    // original balance untouched.
+    // Real balance slot is 3. Since v0.2.1 `set_erc20_balance_with_slot_scan` is
+    // discover-first: a single traced `balanceOf` locates slot 3 regardless of
+    // `max_slot`, which now only bounds the legacy fallback scan. So even
+    // `max_slot = 2` — which the old brute-force scan could not reach past —
+    // succeeds and updates the balance.
     let initial_balance = U256::from(456u64);
     cache.insert_mapping_storage_slot(
         token,
@@ -451,10 +454,10 @@ async fn set_erc20_balance_with_slot_scan_honors_max_slot_bound() -> Result<()> 
     )?;
     let updated = cache.set_erc20_balance_with_slot_scan(token, owner, U256::from(999u64), 2)?;
     assert!(
-        !updated,
-        "slot scan should fail when slot 3 is out of range"
+        updated,
+        "discovery locates slot 3 even though it is beyond max_slot=2"
     );
-    assert_eq!(balance_of(&mut cache, token, owner)?, initial_balance);
+    assert_eq!(balance_of(&mut cache, token, owner)?, U256::from(999u64));
 
     Ok(())
 }

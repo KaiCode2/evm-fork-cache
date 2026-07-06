@@ -26,11 +26,11 @@ use alloy_sol_types::SolCall;
 use alloy_transport::mock::Asserter;
 use anyhow::{Result, anyhow};
 use evm_fork_cache::bulk_storage::{
-    ACCOUNT_FIELDS_EXTRACTOR_CODE, BLOCK_CONTEXT_EXTRACTOR_CODE, BulkCallConfig, CallDispatch,
-    STORAGE_EXTRACTOR_CODE, STORAGE_EXTRACTOR_CODE_PRE_SHANGHAI, StorageProgram,
+    ACCOUNT_FIELDS_EXTRACTOR_CODE, BLOCK_CONTEXT_EXTRACTOR_CODE, BulkCallConfig, BulkFetcherStatus,
+    CallDispatch, STORAGE_EXTRACTOR_CODE, STORAGE_EXTRACTOR_CODE_PRE_SHANGHAI, StorageProgram,
     bulk_call_storage_fetcher, bulk_call_storage_fetcher_with_fallback,
-    decode_multi_target_response, decode_packed_values, encode_multi_target_calldata,
-    multicall3_runtime_code, pack_slots_calldata,
+    bulk_call_storage_fetcher_with_status, decode_multi_target_response, decode_packed_values,
+    encode_multi_target_calldata, multicall3_runtime_code, pack_slots_calldata,
 };
 use evm_fork_cache::cache::{EvmCache, StorageBatchFetchFn};
 use evm_fork_cache::multicall::{IMulticall3, MULTICALL3_ADDRESS};
@@ -362,6 +362,118 @@ async fn fetcher_routes_tiny_requests_to_fallback_without_rpc() {
     assert_eq!(point_reads.load(Ordering::Relaxed), 1);
     assert!(matches!(results[0].2, Ok(v) if v == U256::from(5u64)));
     assert!(asserter.read_q().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn status_reports_fallback_latch_after_consecutive_provider_failures() {
+    let (provider, asserter) = mocked_provider();
+    // Two batches, each a single eth_call that fails at the provider level —
+    // the signature of an endpoint without state-override support.
+    asserter.push_failure_msg("state overrides not supported");
+    asserter.push_failure_msg("state overrides not supported");
+
+    let repaired = Arc::new(AtomicUsize::new(0));
+    let (fetcher, status) = bulk_call_storage_fetcher_with_status(
+        provider,
+        BulkCallConfig::default(), // point_read_threshold = 2, latch threshold = 2
+        counting_stub_fallback(repaired.clone(), 42),
+    );
+    // A clone observes the very same live counter (documented Arc-sharing).
+    let observer: BulkFetcherStatus = status.clone();
+
+    assert_eq!(status.latch_threshold(), 2);
+    assert!(
+        !status.fallback_latched(),
+        "not latched before any failures"
+    );
+    assert_eq!(status.consecutive_override_failures(), 0);
+
+    // A 2-slot single-target batch clears point_read_threshold, so it attempts
+    // the bulk path rather than routing straight to the fallback.
+    let batch = vec![
+        (target(0x1a), U256::from(1u64)),
+        (target(0x1a), U256::from(2u64)),
+    ];
+
+    // First all-provider-error batch: repaired by the fallback, streak = 1.
+    let r1 = fetcher(batch.clone(), BlockId::latest());
+    assert!(
+        r1.iter()
+            .all(|(_, _, r)| matches!(r, Ok(v) if *v == U256::from(42u64))),
+        "failed slots repaired by the fallback"
+    );
+    assert_eq!(status.consecutive_override_failures(), 1);
+    assert!(
+        !status.fallback_latched(),
+        "one failure is below the threshold"
+    );
+
+    // Second consecutive all-provider-error batch: streak hits the threshold.
+    let _r2 = fetcher(batch.clone(), BlockId::latest());
+    assert_eq!(status.consecutive_override_failures(), 2);
+    assert!(
+        status.fallback_latched(),
+        "latched after two consecutive all-provider-error batches"
+    );
+    assert!(observer.fallback_latched(), "the clone sees the same latch");
+    assert!(
+        asserter.read_q().is_empty(),
+        "both bulk attempts consumed their queued eth_call"
+    );
+
+    // Once latched, further batches skip the bulk attempt entirely and go
+    // straight to the fallback — no eth_call is issued (nothing is queued, yet
+    // the batch still succeeds via the fallback).
+    let r3 = fetcher(batch.clone(), BlockId::latest());
+    assert!(
+        r3.iter()
+            .all(|(_, _, r)| matches!(r, Ok(v) if *v == U256::from(42u64))),
+        "latched fetcher serves via the fallback"
+    );
+    assert!(
+        asserter.read_q().is_empty(),
+        "a latched fetcher issues no eth_call"
+    );
+    // Latched streak does not climb past the threshold (latched batches skip
+    // the bulk bookkeeping).
+    assert_eq!(status.consecutive_override_failures(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn status_streak_resets_after_a_successful_batch() {
+    let (provider, asserter) = mocked_provider();
+    let token = target(0x2b);
+    let batch = vec![(token, U256::from(1u64)), (token, U256::from(2u64))];
+
+    // Batch 1 fails at the provider level (streak → 1); batch 2 succeeds.
+    asserter.push_failure_msg("state overrides not supported");
+    asserter.push_success(&pack_slots_calldata(&[U256::from(9u64), U256::from(8u64)]));
+
+    let repaired = Arc::new(AtomicUsize::new(0));
+    let (fetcher, status) = bulk_call_storage_fetcher_with_status(
+        provider,
+        BulkCallConfig::default(),
+        counting_stub_fallback(repaired.clone(), 42),
+    );
+
+    let _ = fetcher(batch.clone(), BlockId::latest());
+    assert_eq!(status.consecutive_override_failures(), 1);
+
+    let r2 = fetcher(batch.clone(), BlockId::latest());
+    assert!(
+        r2.iter().all(|(_, _, r)| r.is_ok()),
+        "second batch served by the bulk path"
+    );
+    assert_eq!(
+        status.consecutive_override_failures(),
+        0,
+        "any successful batch resets the streak"
+    );
+    assert!(!status.fallback_latched());
+    assert!(
+        asserter.read_q().is_empty(),
+        "two eth_calls consumed, none latched away"
+    );
 }
 
 #[tokio::test]

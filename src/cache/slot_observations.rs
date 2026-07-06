@@ -448,11 +448,23 @@ mod tests {
         assert!(tracker.take_skipped().is_empty());
     }
 
+    /// A unique, freshly-created temp dir keyed by pid so concurrent `cargo
+    /// test` processes never share (and never `remove_dir_all`) each other's
+    /// directory; each test passes a distinct `tag`. Returns the file path to
+    /// write within it.
+    fn temp_path(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "evm_fork_cache_slot_obs_{tag}_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir.join("observations.bin")
+    }
+
     #[test]
     fn test_save_load_round_trip() {
-        let dir = std::env::temp_dir().join("evm_fork_cache_test_slot_obs");
-        let path = dir.join("test_observations.bin");
-        let _ = std::fs::remove_file(&path);
+        let path = temp_path("round_trip");
 
         let mut tracker = SlotObservationTracker::new();
         let a = addr(1);
@@ -469,17 +481,11 @@ mod tests {
         assert_eq!(loaded.len(), 2);
         assert_eq!(loaded.last_value(a, U256::from(0)), Some(U256::from(100)));
         assert_eq!(loaded.last_value(a, U256::from(4)), Some(U256::from(200)));
-
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_dir(&dir);
     }
 
     #[test]
     fn legacy_raw_bincode_loads_as_default() {
-        let dir = std::env::temp_dir().join("evm_fork_cache_test_slot_obs_legacy");
-        let path = dir.join("legacy_observations.bin");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = temp_path("legacy");
 
         let a = addr(1);
         let slot = U256::from(4);
@@ -502,8 +508,6 @@ mod tests {
             loaded.is_empty(),
             "legacy raw bincode must be treated as a cache miss"
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

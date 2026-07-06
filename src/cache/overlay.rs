@@ -24,7 +24,7 @@ use revm::{
 };
 
 use super::snapshot::EvmSnapshot;
-use super::{CallSimulationResult, SimStatus, TxConfig, unix_timestamp_secs_saturating};
+use super::{CallSimulationResult, IERC20, SimStatus, TxConfig, unix_timestamp_secs_saturating};
 use crate::access_set::StorageAccessList;
 use crate::bundle::{BundleOptions, BundleResult, BundleTx, RevertPolicy, TxOutcome};
 use crate::errors::{
@@ -32,6 +32,8 @@ use crate::errors::{
     SimulationResult,
 };
 use crate::inspector::TransferInspector;
+use crate::mapping_probe::HashStorageProbe;
+use alloy_sol_types::SolCall;
 
 type OverlayEvm<'a> = revm::MainnetEvm<
     Context<BlockEnv, TxEnv, CfgEnv, &'a mut EvmOverlay, Journal<&'a mut EvmOverlay>, ()>,
@@ -1027,6 +1029,219 @@ impl EvmOverlay {
             .entry(address)
             .or_default()
             .insert(slot, value);
+    }
+
+    /// Execute a non-committing typed Solidity call from [`Address::ZERO`],
+    /// decoding the return — the overlay counterpart to
+    /// [`EvmCache::call_sol`](super::EvmCache::call_sol).
+    ///
+    /// ```no_run
+    /// # use std::sync::Arc;
+    /// # use alloy_primitives::Address;
+    /// # use alloy_sol_types::sol;
+    /// # use evm_fork_cache::cache::{EvmOverlay, EvmSnapshot};
+    /// # sol! { interface IErc20 { function balanceOf(address account) returns (uint256); } }
+    /// # fn run(mut overlay: EvmOverlay, token: Address, alice: Address) -> Result<(), Box<dyn std::error::Error>> {
+    /// let bal = overlay.call_sol(token, IErc20::balanceOfCall { account: alice })?;
+    /// # let _ = bal; Ok(()) }
+    /// ```
+    pub fn call_sol<C: SolCall>(&mut self, to: Address, call: C) -> Result<C::Return> {
+        self.call_sol_from(Address::ZERO, to, call)
+    }
+
+    /// Execute a non-committing typed Solidity call from an explicit sender,
+    /// decoding the return.
+    pub fn call_sol_from<C: SolCall>(
+        &mut self,
+        from: Address,
+        to: Address,
+        call: C,
+    ) -> Result<C::Return> {
+        let result = self.call_raw(from, to, Bytes::from(call.abi_encode()))?;
+        match result {
+            ExecutionResult::Success { output, .. } => {
+                let output = output.into_data();
+                C::abi_decode_returns(&output).map_err(|error| OverlayError::SolCallDecode {
+                    signature: C::SIGNATURE,
+                    from,
+                    to,
+                    output_len: output.len(),
+                    details: format!("{error:?}"),
+                })
+            }
+            other => Err(OverlayError::SolCallFailed {
+                signature: C::SIGNATURE,
+                from,
+                to,
+                result: format!("{other:?}"),
+            }),
+        }
+    }
+
+    /// Mock `holder`'s ERC-20 balance of `token` to `amount` — **overlay-local**.
+    ///
+    /// Discovers the balance mapping slot and layout (Solidity / Vyper / Solady)
+    /// from a single `balanceOf(holder)` simulation, writes `amount` to that slot
+    /// in this overlay's dirty layer via [`override_slot`](Self::override_slot),
+    /// and verifies. The cache and snapshot are never mutated; the mock is
+    /// dropped with the overlay.
+    ///
+    /// Returns `Ok(true)` if set and verified, `Ok(false)` if no balance slot was
+    /// discoverable or the write did not drive the return (e.g. a rebasing token,
+    /// or `holder == Address::ZERO`, which is refused). A failed attempt leaves no
+    /// stray write.
+    pub fn mock_balance(
+        &mut self,
+        token: Address,
+        holder: Address,
+        amount: U256,
+    ) -> SimulationResult<bool> {
+        if holder == Address::ZERO {
+            return Ok(false);
+        }
+        let calldata = Bytes::from(IERC20::balanceOfCall { target: holder }.abi_encode());
+        let holder_word = holder.into_word();
+        self.mock_slot_driving(token, calldata, amount, move |probe, ret| {
+            probe
+                .accesses(&[holder_word])
+                .into_iter()
+                .filter(|a| a.keyed_by(holder_word))
+                .max_by_key(|a| (a.value == ret, a.confidence))
+                .map(|a| (a.slot, a.value))
+        })
+    }
+
+    /// Mock `owner`'s ERC-20 allowance to `spender` on `token` — overlay-local.
+    ///
+    /// Discovers the (nested) `allowance` mapping entry keyed by both addresses,
+    /// writes `amount` (pass `U256::MAX` for "unlimited"), and verifies. Refuses
+    /// `owner == Address::ZERO`. Same isolation and failure semantics as
+    /// [`mock_balance`](Self::mock_balance).
+    pub fn mock_allowance(
+        &mut self,
+        token: Address,
+        owner: Address,
+        spender: Address,
+        amount: U256,
+    ) -> SimulationResult<bool> {
+        if owner == Address::ZERO {
+            return Ok(false);
+        }
+        let calldata = Bytes::from(IERC20::allowanceCall { owner, spender }.abi_encode());
+        let (owner_word, spender_word) = (owner.into_word(), spender.into_word());
+        self.mock_slot_driving(token, calldata, amount, move |probe, _ret| {
+            probe
+                .accesses(&[owner_word, spender_word])
+                .into_iter()
+                .filter(|a| a.keyed_by(owner_word) && a.keyed_by(spender_word))
+                .max_by_key(|a| (a.depth, a.confidence))
+                .map(|a| (a.slot, a.value))
+        })
+    }
+
+    /// Mock the return value of a single-word view call by finding the storage
+    /// slot that drives it and overriding that slot — overlay-local.
+    ///
+    /// Runs `to.calldata`, identifies the `SLOAD` whose loaded value equals the
+    /// call's returned word (see
+    /// [`HashStorageProbe::slots_returning`](crate::mapping_probe::HashStorageProbe::slots_returning)),
+    /// writes `desired` there, and verifies the call now returns `desired`. Works
+    /// for balances, allowances, `totalSupply`, and any getter that returns a
+    /// single stored word. Returns `Ok(false)` (leaving no stray write) when the
+    /// return is computed from more than one slot, so it can't be set by a single
+    /// override.
+    pub fn mock_view(
+        &mut self,
+        to: Address,
+        calldata: Bytes,
+        desired: U256,
+    ) -> SimulationResult<bool> {
+        self.mock_slot_driving(to, calldata, desired, |probe, ret| {
+            probe
+                .slots_returning(ret)
+                .into_iter()
+                .next()
+                .map(|slot| (slot, ret))
+        })
+    }
+
+    /// Typed [`mock_view`](Self::mock_view): mock the `desired` return of a
+    /// [`SolCall`] getter that returns a single word.
+    ///
+    /// ```no_run
+    /// # use std::sync::Arc;
+    /// # use alloy_primitives::{Address, U256};
+    /// # use alloy_sol_types::sol;
+    /// # use evm_fork_cache::cache::{EvmOverlay, EvmSnapshot};
+    /// # sol! { interface IErc20 { function totalSupply() returns (uint256); } }
+    /// # fn run(mut overlay: EvmOverlay, token: Address) -> Result<(), Box<dyn std::error::Error>> {
+    /// overlay.mock_call(token, IErc20::totalSupplyCall {}, U256::from(1_000u64))?;
+    /// # Ok(()) }
+    /// ```
+    pub fn mock_call<C: SolCall>(
+        &mut self,
+        to: Address,
+        call: C,
+        desired: U256,
+    ) -> SimulationResult<bool> {
+        self.mock_view(to, Bytes::from(call.abi_encode()), desired)
+    }
+
+    /// Extract the leading 32-byte word of a successful call's return data.
+    fn success_word(result: &ExecutionResult) -> Option<U256> {
+        match result {
+            ExecutionResult::Success { output, .. } => {
+                let data = output.data();
+                (data.len() >= 32).then(|| U256::from_be_slice(&data[..32]))
+            }
+            _ => None,
+        }
+    }
+
+    /// Shared core for the `mock_*` methods: discover the slot driving
+    /// `to.calldata`'s return via `choose`, override it to `desired`, verify, and
+    /// restore the slot on a failed verify so a mis-pick leaves no stray write.
+    fn mock_slot_driving<F>(
+        &mut self,
+        to: Address,
+        calldata: Bytes,
+        desired: U256,
+        choose: F,
+    ) -> SimulationResult<bool>
+    where
+        F: FnOnce(&HashStorageProbe, U256) -> Option<(B256, U256)>,
+    {
+        let (result, probe) = self.call_raw_with_inspector(
+            Address::ZERO,
+            to,
+            calldata.clone(),
+            &TxConfig::default(),
+            HashStorageProbe::new(),
+            false,
+        )?;
+        let Some(ret) = Self::success_word(&result) else {
+            return Ok(false);
+        };
+        let Some((slot, prev)) = choose(&probe, ret) else {
+            return Ok(false);
+        };
+        let slot_u = U256::from_be_bytes(slot.0);
+        self.override_slot(to, slot_u, desired);
+
+        let (verify, _) = self.call_raw_with_inspector(
+            Address::ZERO,
+            to,
+            calldata,
+            &TxConfig::default(),
+            HashStorageProbe::new(),
+            false,
+        )?;
+        if Self::success_word(&verify) == Some(desired) {
+            Ok(true)
+        } else {
+            self.override_slot(to, slot_u, prev); // undo the mis-pick
+            Ok(false)
+        }
     }
 }
 

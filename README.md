@@ -129,8 +129,23 @@ around three capabilities that target exactly this workload:
   `ColdStartPlanner` (discover slots via a view-call, then verify them), returning
   a structured `ColdStartRunReport`. This is how a consumer adopts a working set
   (pools, feeds) into the fork before going reactive. (Reactive-gated.)
-- **ERC20 helpers** — balances, allowances, decimals, and controlled balance
-  mutation (including automatic balance-slot discovery) for simulations.
+- **ERC20 helpers** — balances, allowances, decimals, and controlled balance /
+  allowance mutation for simulations — layout-aware across Solidity, Vyper, and
+  Solady/assembly token storage (not just Solidity-order tokens).
+- **Trace-based storage-slot discovery** — derive a mapping's base slot *and*
+  its byte-order **layout** from a single instrumented `eth_call`, by matching
+  the `KECCAK256` preimage that feeds each hashed `SLOAD` against the value the
+  call returns — no `0..n` slot brute-forcing. Works across Solidity
+  (`keccak(key‖slot)`), Vyper (`keccak(slot‖key)`), Solady packed layouts, and
+  nested mappings such as allowances (`keccak(k2 ‖ keccak(k1‖slot))`). The
+  `HashStorageProbe` inspector is token-agnostic — `trace_hashed_slots` derives
+  any hash-keyed slot for any call — and reusable `TrackedMapping` descriptors
+  recompute any key's exact slot for freshness/prefetch pinning.
+- **Overlay-scoped mocking** — `EvmCache::mock_overlay()` hands you a throwaway
+  `EvmOverlay` carrying `mock_balance` / `mock_allowance` / `mock_call`; each
+  derives the driving slot via discovery, writes it to the overlay's dirty
+  layer, and verifies — so mocked state lives only for that simulation and
+  **never persists to the cache**. Zero-address balance/owner writes are refused.
 - **Transfer-inspector simulation** that reports per-token balance deltas
   straight from the `Transfer` event stream, no extra pre/post balance queries.
 - **Call-frame tracing** — `CallTracer` reconstructs the nested `CALL`/`CREATE`
@@ -300,6 +315,8 @@ and inject all state directly:
 | `create3_addresses` | Basic | Derive CREATE3 deployment addresses off-chain. |
 | `storage_access_list` | Basic | Merge touch sets, estimate EIP-2929 savings, build an EIP-2930 list. |
 | `erc20_balance_override` | Basic | Set an ERC20 balance by scanning for its storage slot. |
+| `discover_and_track` | Advanced | Trace-derive a token's balance-slot layout (Solidity/Vyper/Solady), forge balances via the discovered layout, trace a nested allowance, and pin tracked holders into a `FreshnessRegistry`. Offline; also sweeps real tokens when an RPC is reachable. |
+| `mock_and_simulate` | Intermediate | Fork → `mock_overlay()` → mock a balance, an unlimited approval, and a `totalSupply` return → simulate a `transferFrom`. Overlay-scoped (cache never mutated) and zero-address-safe. |
 | `snapshot_and_restore` | Intermediate | In-place `checkpoint()`/`restore()` rollback on one cache. |
 | `parallel_overlays` | Intermediate | Fan one `snapshot()` out to many isolated `EvmOverlay` simulations. |
 | `transfer_inspector` | Intermediate | Report per-token balance deltas from a simulation. |
@@ -510,22 +527,34 @@ deployments should opt into the strict/observable variants deliberately:
   `Degraded`/`Unhealthy` as "stop trading until resynced"; export
   `metrics()` counters (`deep_reorgs`, `resync_failures`, `coverage_gaps`,
   `missed_ranges`) to your dashboards.
-- [ ] **Track balance/nonce-sensitive accounts.** `track_account` with
-  `TrackingPolicy::WholeAccount`/`Scalars` — storage-only freshness cannot see
-  a native-balance move, and only tracked accounts upgrade verdicts to
-  `ConfirmedFull` (see the verdict taxonomy in `freshness`).
+- [ ] **Track balance/nonce-sensitive accounts.** Storage-only freshness cannot
+  see a native-balance/nonce/code move that shifts no storage slot. Root-gate
+  such accounts with `ReactiveRuntime::track_account` +
+  `TrackingPolicy::WholeAccount`/`Scalars`: an `eth_getProof` root probe catches
+  the drift and reactive resync repairs it, keeping the **cache** fresh. This is
+  the reactive runtime's account-freshness path — it is *separate* from the
+  speculative freshness validator, whose success verdict is `ConfirmedStorage`
+  (storage slots only). `ConfirmedFull` (storage **and** verified account fields)
+  is defined but **not yet emitted** — validator-side account verification is a
+  tracked follow-up (see the verdict taxonomy in `freshness`).
 - [ ] **Gate on code-seed verification.** If you seed bytecode
   (`seed_account_code`), require the round's `CodeVerifyReport.unverifiable`
   bucket to be empty and `pending_code_seeds()` drained before serving sims;
   audit deliberate divergence via `etched_accounts()`.
 - [ ] **Size reorg horizons deliberately.** `ReorgConfig::depth` and
-  `ReactiveConfig::journal_depth` bound purge/rollback reach; deeper reorgs
-  degrade health and purge conservatively rather than replaying.
+  `ReactiveConfig::journal_depth` bound purge/rollback reach: a reorg *within* the
+  journal is rolled back precisely, but effects from blocks that have already aged
+  out of the journal are **not** auto-purged. A reorg that deep escalates health
+  to `Unhealthy` (with a `warn!`) and leans on freshness validation as the
+  backstop — treat it as "resync before trusting sims" and size the horizons above
+  the deepest reorg you intend to recover precisely.
 - [ ] **Know your provider.** The default bulk storage loader needs `eth_call`
   state-override support (major providers have it; the fetcher latches to
-  point reads after two fully-failed batches — a `warn!` you should alert on);
-  the trace resync accelerator needs the `debug` namespace and falls back to
-  point reads without it. Enable gzip on the HTTP client for both
+  point reads after two fully-failed batches — a `warn!` you should alert on, or
+  poll it directly by building the fetcher via
+  `bulk_call_storage_fetcher_with_status` and checking
+  `BulkFetcherStatus::fallback_latched`); the trace resync accelerator needs the
+  `debug` namespace and falls back to point reads without it. Enable gzip on the HTTP client for both
   ([`docs/bulk-storage-extraction.md`](docs/bulk-storage-extraction.md)).
 - [ ] **Persisted state is trust-gated, not trusted.** Load disk state with a
   `RootBaseline` (`roots.bin`) so restart drift is detected via root probes
@@ -549,6 +578,7 @@ provider) so they are reproducible:
 | `access_list` | Touch-set merge and EIP-2930 list construction. |
 | `revert_decoding` | Built-in (`Error`/`Panic`) and custom-error revert decoding, and decoder dispatch over a registered custom error. |
 | `create3` | CREATE3 address derivation. |
+| `mapping_probe` | **Trace-based slot discovery.** `discover_erc20_balance_slot` across Solidity/Vyper/Solady (near-identical — the sim dominates, layout detection is a few hash checks); end-to-end balance forging **cold vs. descriptor-cached**; overlay `mock_balance`; and typed `call_sol` vs. `call_raw` + manual decode (within noise). |
 
 ```sh
 cargo bench                      # all offline benches

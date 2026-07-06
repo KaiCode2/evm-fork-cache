@@ -106,19 +106,26 @@ surface was moved out of this crate.
 
 ## Limitations by design / roadmap
 
-- **Storage-only freshness verification is the default; account-level
-  verification is opt-in.** The optimistic verify-and-rerun loop builds its
-  verify set from the volatile storage *slots* in each sim's read set, and the
-  default verdict says exactly that: `Validation::ConfirmedStorage` guarantees
-  only that no volatile storage slot the sims read had changed — a sim whose
-  result depends on a `BALANCE`/`SELFBALANCE` (or nonce/code) that moved
-  on-chain without a co-changing storage slot can still be
-  `ConfirmedStorage`. Since 0.2.0, opting accounts into account-field
-  verification (`TrackingPolicy::WholeAccount`/`Scalars` + the `eth_getProof`
-  fetcher seam) upgrades the verdict to `ConfirmedFull` (storage **and**
-  verified account fields). The residual limitation is that account
-  verification remains per-tracked-account opt-in rather than derived
-  automatically from each sim's `BALANCE`/`CODE` read set.
+- **Storage-only freshness verification; `ConfirmedFull` is defined but not yet
+  emitted.** The optimistic verify-and-rerun loop builds its verify set from the
+  volatile storage *slots* in each sim's read set, and its success verdict says
+  exactly that: `Validation::ConfirmedStorage` guarantees only that no volatile
+  storage slot the sims read had changed — a sim whose result depends on a
+  `BALANCE`/`SELFBALANCE` (or nonce/code) that moved on-chain without a
+  co-changing storage slot can still be `ConfirmedStorage`. The
+  `Validation::ConfirmedFull` verdict (storage **and** verified account fields)
+  and the `changed_accounts` field of `Validation::Corrected` are **defined but
+  not yet emitted** by the validator; wiring validator-side account verification
+  that populates them is a tracked follow-up. Account-level freshness *does*
+  exist today, but in a **separate subsystem** — the reactive runtime's root
+  gate, not the speculative validator. Opting an account into
+  `TrackingPolicy::WholeAccount`/`Scalars` via `ReactiveRuntime::track_account`
+  root-probes it with `eth_getProof` and repairs balance/nonce/code drift through
+  resync, keeping the **cache** fresh. That reactive tracking does **not** feed
+  the speculative freshness verdict, so it does not turn a `ConfirmedStorage`
+  result into a `ConfirmedFull` one. Deriving a validator verify set from each
+  sim's `BALANCE`/`CODE` read set (rather than per-tracked-account opt-in) is the
+  further step that same follow-up covers.
 - **`Verified` code seeds are never re-verified (EIP-6780 assumption).** A
   canonical code seed confirmed once against on-chain `EXTCODEHASH` is marked
   `CodeSeedState::Verified` durably, including across restarts. Post-Cancun
