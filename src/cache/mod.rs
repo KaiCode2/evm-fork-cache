@@ -57,11 +57,13 @@ use revm::{
 };
 use tracing::{debug, instrument, trace, warn};
 
+use crate::access_list::AccessListCall;
 use crate::access_set::StorageAccessList;
 use crate::bulk_storage::AccountFieldsSample;
 use crate::errors::{
-    BlockContextError, CacheError, CacheResult as Result, RpcError, RuntimeError, SimError,
-    SimHostError, SimulationError, SimulationResult, StorageFetchError, StorageFetchResult,
+    AccessListError, BlockContextError, CacheError, CacheResult as Result, RpcError, RuntimeError,
+    SimError, SimHostError, SimulationError, SimulationResult, StorageFetchError,
+    StorageFetchResult,
 };
 use crate::freshness::{SlotChange, SlotFetch, SlotOutcome};
 use crate::inspector::TransferInspector;
@@ -113,6 +115,16 @@ pub type RpcCallFn = Arc<dyn Fn(Address, Bytes) -> Result<Bytes, RpcError> + Sen
 /// requested slot" guarantee those APIs document.
 pub type StorageBatchFetchFn = Arc<
     dyn Fn(Vec<(Address, U256)>, BlockId) -> Vec<(Address, U256, StorageFetchResult<U256>)>
+        + Send
+        + Sync,
+>;
+
+/// Callback for deriving a call's storage read set via `eth_createAccessList`.
+///
+/// Provider-backed caches install one by default. Tests or custom transports can
+/// replace it via [`EvmCache::set_access_list_fetcher`].
+pub type AccessListFetchFn = Arc<
+    dyn Fn(AccessListCall, BlockId) -> std::result::Result<StorageAccessList, AccessListError>
         + Send
         + Sync,
 >;
@@ -779,6 +791,15 @@ pub struct PrewarmReport {
     pub failed: Vec<(Address, U256, StorageFetchError)>,
 }
 
+/// Outcome of [`EvmCache::prewarm_access_list_call`].
+#[derive(Debug)]
+pub struct AccessListPrewarmReport {
+    /// Account/storage touch set returned by `eth_createAccessList`.
+    pub access_list: StorageAccessList,
+    /// Result of bulk-loading the access list's storage pairs.
+    pub prewarm: PrewarmReport,
+}
+
 /// Outcome of [`EvmCache::verify_code_seeds`]: how each `Pending` canonical
 /// code claim resolved against the chain at the pinned block.
 ///
@@ -1411,6 +1432,9 @@ pub struct EvmCache {
     /// (`inject_storage_batch`) does not bump it.
     snapshot_generation: u64,
     storage_batch_fetcher: Option<StorageBatchFetchFn>,
+    /// Optional fetcher for deriving a call's read set with
+    /// `eth_createAccessList`.
+    access_list_fetcher: Option<AccessListFetchFn>,
     /// Optional account/root fetcher that bypasses SharedBackend.
     /// Captures a provider clone and fires `eth_getProof` calls directly to fetch
     /// authoritative account fields (balance/nonce/code hash) and `storageHash`.
@@ -1863,6 +1887,23 @@ impl EvmCache {
                 point_read_storage_fetcher(provider.clone(), storage_batch_config),
             );
 
+        // Access-list read-set discovery: derive the storage touched by one
+        // read-only call with `eth_createAccessList`. Higher-level crates can
+        // then warm the returned slots through this cache's own batch fetcher.
+        let provider_for_access_list = provider.clone();
+        let access_list_fetcher: AccessListFetchFn =
+            Arc::new(move |call: AccessListCall, block: BlockId| {
+                let handle =
+                    block_in_place_handle().map_err(|e| AccessListError::query("runtime", e))?;
+                tokio::task::block_in_place(|| {
+                    handle.block_on(crate::access_list::create_access_list_read_set(
+                        provider_for_access_list.as_ref(),
+                        block,
+                        &call,
+                    ))
+                })
+            });
+
         // Create an account/root fetcher that bypasses SharedBackend, firing
         // `eth_getProof` calls directly for authoritative account fields plus the
         // account's `storageHash`. `eth_getProof` is single-address at the RPC
@@ -2047,6 +2088,7 @@ impl EvmCache {
             snapshot_generation: 0,
             rpc_caller: Some(rpc_caller),
             storage_batch_fetcher: Some(storage_batch_fetcher),
+            access_list_fetcher: Some(access_list_fetcher),
             account_proof_fetcher: Some(account_proof_fetcher),
             block_state_diff_fetcher: Some(block_state_diff_fetcher),
             account_fields_fetcher: Some(account_fields_fetcher),
@@ -2137,6 +2179,7 @@ impl EvmCache {
             ))),
             rpc_caller: None,
             storage_batch_fetcher: None,
+            access_list_fetcher: None,
             account_proof_fetcher: None,
             block_state_diff_fetcher: None,
             account_fields_fetcher: None,
@@ -2331,6 +2374,15 @@ impl EvmCache {
         self.storage_batch_fetcher.as_ref()
     }
 
+    /// Get the access-list read-set fetcher, if available.
+    ///
+    /// Returns `None` when constructed via [`from_backend`](Self::from_backend)
+    /// unless a fetcher was injected via
+    /// [`set_access_list_fetcher`](Self::set_access_list_fetcher).
+    pub fn access_list_fetcher(&self) -> Option<&AccessListFetchFn> {
+        self.access_list_fetcher.as_ref()
+    }
+
     /// Get the account/root proof fetcher, if available.
     ///
     /// Returns `None` when constructed via `from_backend` (no provider
@@ -2454,6 +2506,35 @@ impl EvmCache {
             loaded: to_inject.len(),
             failed,
         }
+    }
+
+    /// Derive a call's read set with `eth_createAccessList`, then bulk-load it.
+    ///
+    /// The first shot runs the supplied call on the provider backing this cache
+    /// and captures the accounts/storage slots it touches. The second shot warms
+    /// all returned storage pairs through [`prewarm_slots`](Self::prewarm_slots),
+    /// so it respects the cache's configured storage fetch strategy (bulk
+    /// extraction by default, point-read fallback when needed).
+    ///
+    /// This is best-effort warming: a successful access-list probe can still
+    /// return storage pairs whose fetches fail. Those failures are reported in
+    /// [`AccessListPrewarmReport::prewarm`] and leave the cache unchanged for
+    /// those slots, so later EVM execution can still lazy-load them normally.
+    pub fn prewarm_access_list_call(
+        &mut self,
+        call: AccessListCall,
+    ) -> std::result::Result<AccessListPrewarmReport, AccessListError> {
+        let fetcher = self.access_list_fetcher.clone().ok_or_else(|| {
+            AccessListError::query("eth_createAccessList", "no access-list fetcher installed")
+        })?;
+        let access_list = fetcher(call, self.block)?;
+        let mut requests: Vec<(Address, U256)> = access_list.slots.iter().copied().collect();
+        requests.sort_unstable();
+        let prewarm = self.prewarm_slots(&requests);
+        Ok(AccessListPrewarmReport {
+            access_list,
+            prewarm,
+        })
     }
 
     /// Apply a single targeted [`StateUpdate`], returning a [`StateDiff`] of what
@@ -3090,6 +3171,15 @@ impl EvmCache {
     /// responsible for honoring the [`StorageBatchFetchFn`] contract.
     pub fn set_storage_batch_fetcher(&mut self, f: StorageBatchFetchFn) {
         self.storage_batch_fetcher = Some(f);
+    }
+
+    /// Set (or replace) the access-list read-set fetcher.
+    ///
+    /// This is the seam [`prewarm_access_list_call`](Self::prewarm_access_list_call)
+    /// uses to derive a call's storage read set without exposing the provider
+    /// itself. A mocked fetcher can be injected for offline tests.
+    pub fn set_access_list_fetcher(&mut self, f: AccessListFetchFn) {
+        self.access_list_fetcher = Some(f);
     }
 
     /// Set (or replace) the account/root proof fetcher.
@@ -6482,6 +6572,47 @@ mod shared_memory_capacity_tests {
 #[cfg(test)]
 mod core_tests {
     use super::*;
+
+    #[test]
+    fn prewarm_access_list_call_uses_cache_owned_fetchers() {
+        use alloy_provider::RootProvider;
+        use alloy_rpc_client::RpcClient;
+        use alloy_transport::mock::Asserter;
+
+        let provider = RootProvider::<AnyNetwork>::new(RpcClient::mocked(Asserter::new()));
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut cache = rt.block_on(EvmCache::new(Arc::new(provider)));
+
+        let target = Address::repeat_byte(0x22);
+        let slot = U256::from(7);
+        let value = U256::from(99);
+        cache.set_access_list_fetcher(Arc::new(move |_call, _block| {
+            let mut access = StorageAccessList::default();
+            access.accounts.insert(target);
+            access.slots.insert((target, slot));
+            Ok(access)
+        }));
+        cache.set_storage_batch_fetcher(Arc::new(move |requests, _block| {
+            assert_eq!(requests, vec![(target, slot)]);
+            requests
+                .into_iter()
+                .map(|(addr, slot)| (addr, slot, Ok(value)))
+                .collect()
+        }));
+
+        let report = cache
+            .prewarm_access_list_call(AccessListCall::new(Address::ZERO, target, Bytes::new()))
+            .expect("access-list prewarm should use injected cache fetchers");
+
+        assert_eq!(report.access_list.account_count(), 1);
+        assert_eq!(report.access_list.slot_count(), 1);
+        assert_eq!(report.prewarm.loaded, 1);
+        assert!(report.prewarm.failed.is_empty());
+        assert_eq!(cache.cached_storage_value(target, slot), Some(value));
+    }
 
     #[test]
     fn parses_prestate_diff_trace_values_and_cleared_slots() {

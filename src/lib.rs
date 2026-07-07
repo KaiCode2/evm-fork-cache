@@ -159,6 +159,7 @@ pub mod reactive;
 pub mod state_update;
 pub mod tracing;
 
+pub use access_list::{AccessListCall, DEFAULT_CREATE_ACCESS_LIST_GAS_CAP};
 pub use access_set::StorageAccessList;
 // Bulk storage extraction over eth_call state overrides — the default batch
 // storage fetcher since 0.2.0 (see docs/bulk-storage-extraction.md).
@@ -174,11 +175,12 @@ pub use bundle::{BundleOptions, BundleResult, BundleTx, RevertPolicy, TxOutcome}
 // fully-qualified module paths (`cache::EvmCache`, `reactive::ReactiveRuntime`,
 // …) remain valid, so this is purely additive.
 pub use cache::{
-    AccountFieldsFetchFn, AccountProof, AccountProofFetchFn, BlockContextRequirements,
-    BlockStateAccountDiff, BlockStateDiff, BlockStateDiffFetchFn, BlockStateStorageDiff,
-    CacheSpeedMode, CallSimulationResult, CodeMismatch, CodeSeedState, CodeVerifyReport, EvmCache,
-    EvmCacheBuilder, EvmOverlay, EvmSnapshot, PrewarmReport, StorageBatchConfig,
-    StorageFetchStrategy, TxConfig, point_read_storage_fetcher,
+    AccessListFetchFn, AccessListPrewarmReport, AccountFieldsFetchFn, AccountProof,
+    AccountProofFetchFn, BlockContextRequirements, BlockStateAccountDiff, BlockStateDiff,
+    BlockStateDiffFetchFn, BlockStateStorageDiff, CacheSpeedMode, CallSimulationResult,
+    CodeMismatch, CodeSeedState, CodeVerifyReport, EvmCache, EvmCacheBuilder, EvmOverlay,
+    EvmSnapshot, PrewarmReport, StorageBatchConfig, StorageFetchStrategy, TxConfig,
+    point_read_storage_fetcher,
 };
 #[cfg(feature = "reactive")]
 pub use cold_start::{

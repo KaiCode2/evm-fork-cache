@@ -20,11 +20,11 @@
 //! so use `into_access_list_always()` to skip the profitability check.
 
 use alloy_eips::{
-    BlockNumberOrTag,
+    BlockId, BlockNumberOrTag,
     eip2930::{AccessList, AccessListItem},
 };
-use alloy_network::Network;
-use alloy_primitives::{Address, B256, Bytes, U256, address};
+use alloy_network::{AnyNetwork, Network};
+use alloy_primitives::{Address, B256, Bytes, TxKind, U256, address};
 use alloy_provider::Provider;
 use alloy_rlp::Encodable;
 use alloy_rpc_types_eth::{TransactionInput, TransactionRequest};
@@ -32,6 +32,7 @@ use alloy_sol_types::{SolCall, sol};
 use revm::context::result::ExecutionResult;
 use tracing::{debug, info};
 
+use crate::access_set::StorageAccessList;
 use crate::cache::EvmCache;
 use crate::errors::{AccessListError, AccessListResult as Result};
 
@@ -44,6 +45,77 @@ const ARB_GAS_INFO: Address = address!("000000000000000000000000000000000000006C
 /// ([`query_l1_base_fee_for_chain`]) and the full Ecotone L1 data fee
 /// ([`compute_op_l1_fee`]).
 pub const OP_GAS_PRICE_ORACLE: Address = address!("420000000000000000000000000000000000000F");
+
+/// Default gas cap for an `eth_createAccessList` probe.
+///
+/// The probe is a read-only call, but clients still run normal transaction
+/// validation. This cap is intentionally generous for storage-heavy view calls
+/// while keeping `gas * gasPrice` sender-funding checks bounded.
+pub const DEFAULT_CREATE_ACCESS_LIST_GAS_CAP: u64 = 30_000_000;
+
+/// Read-only call whose storage read set should be discovered with
+/// `eth_createAccessList`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AccessListCall {
+    /// Simulated sender.
+    pub from: Address,
+    /// Call target.
+    pub to: Address,
+    /// ABI-encoded call data.
+    pub input: Bytes,
+    /// Gas cap sent with the access-list probe.
+    pub gas: u64,
+    /// Optional gas price override. When unset, the probe uses the pinned
+    /// block's `baseFeePerGas`, falling back to 1 gwei if it cannot be read.
+    pub gas_price: Option<u128>,
+}
+
+impl AccessListCall {
+    /// Build a probe request using [`DEFAULT_CREATE_ACCESS_LIST_GAS_CAP`].
+    pub fn new(from: Address, to: Address, input: impl Into<Bytes>) -> Self {
+        Self {
+            from,
+            to,
+            input: input.into(),
+            gas: DEFAULT_CREATE_ACCESS_LIST_GAS_CAP,
+            gas_price: None,
+        }
+    }
+
+    /// Override the gas cap used by the probe.
+    pub fn with_gas(mut self, gas: u64) -> Self {
+        self.gas = gas;
+        self
+    }
+
+    /// Override the gas price used by the probe.
+    pub fn with_gas_price(mut self, gas_price: u128) -> Self {
+        self.gas_price = Some(gas_price);
+        self
+    }
+}
+
+/// Null-tolerant view of the `eth_createAccessList` response.
+///
+/// Some clients return `"storageKeys": null` for accounts a call touches
+/// without reading storage. Alloy's EIP-2930 `AccessListItem` requires a vector,
+/// so this RPC mirror accepts null and preserves the account-only touch.
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateAccessListProbe {
+    #[serde(default)]
+    access_list: Vec<CreateAccessListProbeItem>,
+    #[serde(default)]
+    error: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateAccessListProbeItem {
+    address: Address,
+    #[serde(default)]
+    storage_keys: Option<Vec<B256>>,
+}
 
 /// Chain fee model used by helpers that only need to identify the chain's L1
 /// base-fee oracle.
@@ -71,6 +143,70 @@ pub enum AccessListPricing {
         /// Serialized unsigned transaction bytes with the candidate access list.
         tx_with_access_list: Bytes,
     },
+}
+
+/// Ask a provider to derive the account/storage touch set for `call` at `block`.
+///
+/// This is a generic wrapper over `eth_createAccessList`. It returns the
+/// execution touch set as [`StorageAccessList`] so callers can prefetch the
+/// storage pairs or convert it back to EIP-2930 form. Client execution errors
+/// (for example a reverted view call) are surfaced as [`AccessListError`] rather
+/// than being confused with an empty touch set.
+pub async fn create_access_list_read_set<P>(
+    provider: &P,
+    block: BlockId,
+    call: &AccessListCall,
+) -> Result<StorageAccessList>
+where
+    P: Provider<AnyNetwork>,
+{
+    let gas_price = match call.gas_price {
+        Some(gas_price) => gas_price,
+        None => pinned_base_fee(provider, block)
+            .await
+            .unwrap_or(1_000_000_000),
+    };
+    let request = TransactionRequest {
+        from: Some(call.from),
+        to: Some(TxKind::Call(call.to)),
+        input: TransactionInput::new(call.input.clone()),
+        gas: Some(call.gas),
+        gas_price: Some(gas_price),
+        ..Default::default()
+    };
+
+    let result: CreateAccessListProbe = provider
+        .client()
+        .request("eth_createAccessList", (request, block))
+        .await
+        .map_err(|e| AccessListError::query("eth_createAccessList", e))?;
+    if let Some(error) = result.error {
+        return Err(AccessListError::query(
+            "eth_createAccessList execution",
+            error,
+        ));
+    }
+
+    let mut access = StorageAccessList::default();
+    for item in result.access_list {
+        access.accounts.insert(item.address);
+        if let Some(storage_keys) = item.storage_keys {
+            access.slots.extend(
+                storage_keys
+                    .into_iter()
+                    .map(|key| (item.address, U256::from_be_slice(key.as_slice()))),
+            );
+        }
+    }
+    Ok(access)
+}
+
+async fn pinned_base_fee<P>(provider: &P, block: BlockId) -> Option<u128>
+where
+    P: Provider<AnyNetwork>,
+{
+    let block = provider.get_block(block).await.ok().flatten()?;
+    block.header.base_fee_per_gas.map(u128::from)
 }
 
 sol! {
