@@ -327,6 +327,67 @@ impl EvmOverlay {
         result
     }
 
+    /// Execute one non-committing call with temporary account-code overrides.
+    ///
+    /// Overrides live only for this call: the previous dirty-layer account (or
+    /// its absence) is restored before this method returns, including when the
+    /// EVM returns an execution error. The shared snapshot is never mutated.
+    /// This is useful for execution helpers whose control flow depends on an
+    /// external call but whose result does not depend on that callee's state;
+    /// for example, a revert-based V3 quoter transfers the output token before
+    /// deliberately reverting with the quote payload.
+    ///
+    /// Each supplied runtime bytecode replaces only the account's code and code
+    /// hash. Its balance, nonce, and account id continue to come from the
+    /// overlay/snapshot account when present.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if an overridden account cannot be loaded, the
+    /// transaction environment cannot be built, or revm cannot transact the
+    /// call. Empty bytecode is accepted and behaves like an EOA.
+    pub fn call_raw_with_code_overrides(
+        &mut self,
+        from: Address,
+        to: Address,
+        calldata: Bytes,
+        overrides: &[(Address, Bytes)],
+    ) -> Result<ExecutionResult> {
+        let mut prior = Vec::with_capacity(overrides.len());
+        for (address, runtime_bytecode) in overrides {
+            let old_dirty = self.dirty_accounts.get(address).cloned();
+            let mut info = match self.basic(*address) {
+                Ok(info) => info.unwrap_or_default(),
+                Err(error) => {
+                    for (prior_address, prior_info) in prior.into_iter().rev() {
+                        if let Some(info) = prior_info {
+                            self.dirty_accounts.insert(prior_address, info);
+                        } else {
+                            self.dirty_accounts.remove(&prior_address);
+                        }
+                    }
+                    return Err(OverlayError::transact(error));
+                }
+            };
+            let bytecode = Bytecode::new_raw(runtime_bytecode.clone());
+            info.code_hash = bytecode.hash_slow();
+            info.code = Some(bytecode);
+            self.dirty_accounts.insert(*address, info);
+            prior.push((*address, old_dirty));
+        }
+
+        let result = self.call_raw(from, to, calldata);
+
+        for (address, old_dirty) in prior.into_iter().rev() {
+            if let Some(info) = old_dirty {
+                self.dirty_accounts.insert(address, info);
+            } else {
+                self.dirty_accounts.remove(&address);
+            }
+        }
+        result
+    }
+
     /// Reclaim the recycled shared-memory buffer after the EVM (and its
     /// `LocalContext` clone of the `Rc`) has been dropped, clearing it for the
     /// next call.
@@ -972,7 +1033,7 @@ impl EvmOverlay {
                     for (address, account) in evm.journaled_state.state.iter() {
                         if account.is_touched() {
                             access_list.accounts.insert(*address);
-                            for (slot_key, _) in account.storage.iter() {
+                            for slot_key in account.storage.keys() {
                                 access_list.slots.insert((*address, *slot_key));
                             }
                         }

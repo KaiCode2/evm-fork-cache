@@ -11,6 +11,13 @@
 //! [`SlotOutcome`] / [`SlotFetch`] surface lives ungated in
 //! [`crate::freshness`] and is re-exported here for consumer ergonomics.
 //!
+//! Background schedulers can split provider work from canonical mutation with
+//! [`StorageRoundFetcher`] and [`AccountProofRoundFetcher`]. Both operate on
+//! exact canonical block hashes without borrowing an
+//! [`EvmCache`](crate::cache::EvmCache); their
+//! [`PreparedStoragePatch`] / [`PreparedAccountPatch`] artifacts are applied
+//! later by the cache owner through stale-baseline-checked atomic write seams.
+//!
 //! # Design
 //!
 //! - The driver performs every fetch and call; planners are pure and IO-free,
@@ -66,6 +73,7 @@
 //! # }
 //! ```
 
+mod account_round;
 mod config;
 mod driver;
 mod error;
@@ -73,13 +81,23 @@ mod plan;
 mod planner;
 mod results;
 pub mod roots;
+mod storage_round;
 
+pub use account_round::{
+    AccountCodeClaim, AccountProofOutcome, AccountProofRoundFetch, AccountProofRoundFetchError,
+    AccountProofRoundFetcher, AccountProofRoundRequest, PreparedAccountPatch,
+    PreparedAccountPatchError, PreparedAccountValue,
+};
 pub use config::{ColdStartConfig, ColdStartPin, ColdStartRoundSummary, ColdStartRunReport};
 pub use error::ColdStartError;
 pub use plan::{ColdStartCall, ColdStartPlan};
 pub use planner::{ColdStartPlanner, ColdStartStep};
 pub use results::{ColdStartCallResult, ColdStartResults, RoundOutcome};
 pub use roots::{RootBaseline, RootBaselinePlanner, RootProbeOutcome};
+pub use storage_round::{
+    PreparedStoragePatch, PreparedStoragePatchError, PreparedStorageValue, StorageRoundFetch,
+    StorageRoundFetchError, StorageRoundFetcher, StorageRoundRequest, StorageSlotRequest,
+};
 
 // The per-slot fetch surface is ungated in `freshness`; re-export so
 // `evm_fork_cache::cold_start::SlotFetch` resolves for consumers.

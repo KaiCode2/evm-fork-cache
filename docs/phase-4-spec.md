@@ -22,12 +22,9 @@ the decoder, the protocol adapters, and the orchestration that drives them.
 
 ## 0. Ground rules (non-negotiable)
 
-- **Branch:** create `phase-4-event-pipeline` off the current
-  `phase-3-state-updates` HEAD. Commit there in logical steps. Do **not** push,
-  do **not** tag, do **not** open a PR (the overseer does that). Commits must be
-  **unsigned**: `git -c commit.gpgsign=false commit …` (the 1Password signing
-  agent is unavailable here). End every commit message with exactly:
-  `Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>`
+- **Historical workflow:** the pre-release branch and commit instructions used
+  during this phase are no longer applicable; current work follows the
+  repository's normal contribution and signing policy.
 - **Generic core vs `protocols`.** The pipeline, the `EventDecoder`/`StateView`
   traits, the `DecoderRegistry`, the ERC-20 decoder, and the `SlotMasked`
   vocabulary addition are **generic core** — they must compile and lint with

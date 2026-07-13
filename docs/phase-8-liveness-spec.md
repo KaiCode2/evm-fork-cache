@@ -38,7 +38,8 @@ current pull-based, footprint-bounded model cannot see.
   default-on `reactive` feature; `src/freshness.rs` is the generic (ungated)
   core. New liveness wiring that touches the runtime is `reactive`-gated; the
   probe seam on `EvmCache` and any `Validity` coupling stay in the generic core.
-- Unsigned commits, `Co-Authored-By` trailer, no force-push to `main`.
+- Follow the repository's normal commit-signing and attribution policy; never
+  force-push `main`.
 
 ## 1. Objective & scope
 

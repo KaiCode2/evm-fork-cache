@@ -199,6 +199,13 @@ pub struct BulkCallConfig {
     /// Alchemy rejects ~2.5 MB with HTTP 413. The default (25,000 ≈ 1.6 MB)
     /// stays inside that.
     pub max_slots_per_request: usize,
+    /// Conservative JSON-RPC request-body planning budget. Slot calldata is
+    /// represented as 64 hex characters per key; planning reserves 512 bytes
+    /// for fixed overhead, then clamps both per-call and per-request slot
+    /// ceilings to this budget. This is not a byte-exact transport cap because
+    /// target-specific transaction and state-override overhead varies. Leave
+    /// margin below a provider's measured hard limit.
+    pub max_request_bytes: usize,
 }
 
 impl Default for BulkCallConfig {
@@ -211,17 +218,29 @@ impl Default for BulkCallConfig {
             pre_shanghai_extractor: false,
             dispatch: CallDispatch::PerCall,
             max_slots_per_request: 25_000,
+            max_request_bytes: 2_400_000,
         }
     }
 }
 
 impl BulkCallConfig {
     fn normalized(self) -> Self {
+        const JSON_RPC_ENVELOPE_RESERVE: usize = 512;
+        const JSON_HEX_BYTES_PER_SLOT: usize = 64;
+        let byte_limited_slots = self
+            .max_request_bytes
+            .saturating_sub(JSON_RPC_ENVELOPE_RESERVE)
+            .checked_div(JSON_HEX_BYTES_PER_SLOT)
+            .unwrap_or(0)
+            .max(1);
         Self {
-            max_slots_per_call: self.max_slots_per_call.max(1),
+            max_slots_per_call: self.max_slots_per_call.max(1).min(byte_limited_slots),
             max_targets_per_call: self.max_targets_per_call.max(1),
             max_concurrent_calls: self.max_concurrent_calls.max(1),
-            max_slots_per_request: self.max_slots_per_request.max(1),
+            max_slots_per_request: self.max_slots_per_request.max(1).min(byte_limited_slots),
+            max_request_bytes: self
+                .max_request_bytes
+                .max(JSON_RPC_ENVELOPE_RESERVE.saturating_add(JSON_HEX_BYTES_PER_SLOT)),
             ..self
         }
     }
@@ -1402,6 +1421,64 @@ mod tests {
             .map(CallPlan::request_slot_count)
             .sum();
         assert_eq!(total, 14);
+    }
+
+    #[test]
+    fn request_byte_budget_clamps_slot_limits() {
+        let config = BulkCallConfig {
+            max_slots_per_call: 25_000,
+            max_slots_per_request: 25_000,
+            max_request_bytes: 640_512,
+            ..BulkCallConfig::default()
+        }
+        .normalized();
+
+        assert_eq!(config.max_slots_per_call, 10_000);
+        assert_eq!(config.max_slots_per_request, 10_000);
+    }
+
+    #[test]
+    fn default_call_many_plan_fits_measured_request_budget_at_target_limit() {
+        let config = BulkCallConfig {
+            dispatch: CallDispatch::CallMany,
+            ..BulkCallConfig::default()
+        }
+        .normalized();
+        let requests: Vec<_> = (1..=config.max_targets_per_call as u64)
+            .flat_map(|target| {
+                let address = Address::from_word(U256::from(target).into());
+                (0..100_u64).map(move |slot| (address, U256::from(slot)))
+            })
+            .collect();
+        let plans = plan_calls(&requests, &config);
+        let groups = group_plans_for_call_many(plans, config.max_slots_per_request);
+        assert_eq!(groups.len(), 1);
+
+        let extractor = config.extractor();
+        let mut overrides = StateOverride::default();
+        let mut transactions = Vec::new();
+        for plan in &groups[0] {
+            overrides.extend(overrides_for_plan(plan, &extractor));
+            let (to, data) = plan_call_parts(plan);
+            transactions.push(serde_json::json!({ "to": to, "data": data }));
+        }
+        let bundles = serde_json::json!([{ "transactions": transactions }]);
+        let context =
+            serde_json::json!({ "blockNumber": "0xffffffffffffffff", "transactionIndex": -1 });
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": u64::MAX,
+            "method": "eth_callMany",
+            "params": [bundles, context, overrides],
+        });
+        let serialized = serde_json::to_vec(&request).unwrap();
+
+        assert!(
+            serialized.len() <= config.max_request_bytes,
+            "default worst-case request was {} bytes, over the {} byte planning budget",
+            serialized.len(),
+            config.max_request_bytes
+        );
     }
 
     #[test]

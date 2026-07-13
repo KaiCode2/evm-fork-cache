@@ -83,9 +83,15 @@ verify/probe, reactive resync point reads, `prefetch_registry`, and the new
 Opt-out and tuning via the builder:
 
 ```rust
-// Tune the bulk path (chunk size, concurrency, dispatch mode):
+// Tune the bulk path (chunk size, byte budget, concurrency, dispatch mode):
 EvmCache::builder(provider.clone())
-    .bulk_call_config(BulkCallConfig { max_slots_per_call: 15_000, ..Default::default() })
+    .bulk_call_config(BulkCallConfig {
+        max_slots_per_call: 25_000,
+        max_slots_per_request: 25_000,
+        max_request_bytes: 2_400_000,
+        max_concurrent_calls: 4,
+        ..Default::default()
+    })
     .build().await;
 
 // Or restore the classic pre-0.2.0 point-read behavior:
@@ -261,19 +267,28 @@ Two findings, stable across runs:
 
 1. **Alchemy's `eth_call` gas allowance exceeds Geth's 50M default** — 30k
    slots (~80M estimated gas) executed fine.
-2. **The binding constraint on Alchemy is the request body, not gas.**
-   40,000 slot keys ≈ 2.56 MB of hex calldata → HTTP 413. Practical per-call
-   ceiling ≈ 30k slots (~1.9 MB). The defaults
+2. **The binding constraint on Alchemy is the request body, not gas.** A later
+   byte-exact sweep of this extractor envelope found 39,058 slots
+   (`2,499,951 B`) accepted and 39,059 (`2,500,015 B`) rejected. QuickNode's
+   corresponding boundary was 81,916/81,917 slots around 5 MiB. These are
+   envelope-specific byte limits, not stable universal slot counts. The defaults
    (`max_slots_per_call = 10_000`, `max_slots_per_request = 25_000` for
-   `CallMany`) stay well inside both this and Geth-default gas caps.
+   `CallMany`, `max_request_bytes = 2_400_000`) stay inside Alchemy's measured
+   body cap and the per-call default stays inside Geth's gas cap.
 
 ## Limitations and issues encountered
 
 1. **Request-payload cap (HTTP 413).** Slot keys travel as incompressible hex
-   calldata (~64 bytes each in JSON); Alchemy rejects bodies somewhere between
-   1.9 MB and 2.6 MB. Request bodies are not compressed (`Accept-Encoding`
-   negotiation is response-only), so chunking is the only mitigation — handled
-   by the planner.
+   calldata (~64 bytes each in JSON). Request bodies are not compressed
+   (`Accept-Encoding` negotiation is response-only), so chunking is the only
+   mitigation. `max_request_bytes` is a conservative planning budget: it
+   reserves fixed envelope overhead and clamps both `max_slots_per_call` and
+   `max_slots_per_request`, but it is not a byte-exact cap because transaction
+   and state-override overhead varies with the number of targets. The offline
+   suite serializes the default 25,000-slot, 250-target `eth_callMany` shape and
+   verifies that it remains below the 2.4 MB default. Applications should still
+   leave margin below the smallest measured provider body cap in a
+   non-capability-aware pool.
 2. **Provider support required.** State overrides are Geth-lineage/Reth/Erigon
    standard and verified on Alchemy, but not guaranteed everywhere. The
    default fetcher repairs failures through point reads and **latches** to

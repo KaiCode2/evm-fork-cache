@@ -14,7 +14,7 @@
 use std::{
     any::Any,
     borrow::Cow,
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     fmt,
     future::Future,
     hash::Hash,
@@ -29,7 +29,7 @@ use std::{
 };
 
 use alloy_consensus::{BlockHeader as _, Transaction as _};
-use alloy_eips::BlockId;
+use alloy_eips::{BlockId, BlockNumberOrTag};
 use alloy_network::{
     Ethereum, Network,
     primitives::{
@@ -42,7 +42,10 @@ use alloy_provider::Provider;
 use alloy_rpc_types_eth::{Filter, FilterSet, Log};
 #[cfg(any(feature = "reactive-ws", feature = "reactive-polling", test))]
 use futures::{StreamExt, stream};
-use futures::{future::poll_fn, stream::BoxStream};
+use futures::{
+    future::{Either, poll_fn, select, try_join_all},
+    stream::BoxStream,
+};
 
 use crate::{
     cache::{AccountProof, BlockStateDiff, EvmCache},
@@ -342,6 +345,16 @@ pub trait ReactiveHandler<N: Network = Ethereum>: Send + Sync {
     /// Interests used by subscribers and the local router.
     fn interests(&self) -> Vec<ReactiveInterest<N>>;
 
+    /// Exhaustive exact keys for log inputs this handler can accept.
+    ///
+    /// Returning `None` keeps the handler on the compatibility fallback path.
+    /// Returning an index promises that every matching log has at least one of
+    /// its keys; the registry still re-checks the handler's original
+    /// [`LogInterest`]s and local matchers before dispatch.
+    fn log_route_index(&self) -> Option<LogRouteIndex> {
+        None
+    }
+
     /// Handle one input against a read-only cache view.
     fn handle(
         &self,
@@ -496,6 +509,57 @@ pub enum RouteKey {
     Bytes32(B256),
     /// Arbitrary bytes key.
     Bytes(Vec<u8>),
+}
+
+/// Exact protocol-neutral key used to select candidate log handlers.
+#[non_exhaustive]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum LogRouteKey {
+    /// Emitting contract address.
+    Emitter(Address),
+    /// Exact indexed topic.
+    Topic {
+        /// Topic position in the log.
+        index: usize,
+        /// Expected topic value.
+        value: B256,
+    },
+    /// Exact byte slice in the log data.
+    DataSlice {
+        /// Byte offset in the data payload.
+        offset: usize,
+        /// Expected bytes.
+        value: Vec<u8>,
+    },
+}
+
+/// Non-empty exhaustive OR-set of exact log route keys.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LogRouteIndex {
+    keys: Vec<LogRouteKey>,
+}
+
+impl LogRouteIndex {
+    /// Construct an index from one required key and optional additional keys.
+    pub fn new(primary: LogRouteKey, additional: impl IntoIterator<Item = LogRouteKey>) -> Self {
+        let mut keys = vec![primary];
+        for key in additional {
+            if !keys.contains(&key) {
+                keys.push(key);
+            }
+        }
+        Self { keys }
+    }
+
+    /// Construct a single-key index.
+    pub fn single(key: LogRouteKey) -> Self {
+        Self { keys: vec![key] }
+    }
+
+    /// Exact keys in declaration order.
+    pub fn keys(&self) -> &[LogRouteKey] {
+        &self.keys
+    }
 }
 
 /// Exact log route selected by [`ReactiveRegistry::route_log`].
@@ -1538,13 +1602,20 @@ struct BlockJournal<N: Network = Ethereum> {
 /// may be safe supersets; [`Self::route_log`] always re-checks the original
 /// [`LogInterest`] and its local matcher before returning a route.
 pub struct ReactiveRegistry<N: Network = Ethereum> {
-    handlers: Vec<RegisteredHandler<N>>,
+    handlers: BTreeMap<u128, RegisteredHandler<N>>,
+    handler_positions: HashMap<HandlerId, u128>,
+    next_handler_position: u128,
+    indexed_log_handlers: HashMap<LogRouteKey, BTreeSet<u128>>,
+    fallback_log_handlers: BTreeSet<u128>,
+    data_slice_shapes: HashMap<(usize, usize), usize>,
 }
 
 struct RegisteredHandler<N: Network = Ethereum> {
     id: HandlerId,
     handler: Arc<dyn ReactiveHandler<N>>,
     interests: Vec<ReactiveInterest<N>>,
+    has_log_interests: bool,
+    log_route_index: Option<LogRouteIndex>,
 }
 
 impl<N: Network> Default for ReactiveRegistry<N> {
@@ -1557,7 +1628,12 @@ impl<N: Network> ReactiveRegistry<N> {
     /// Create an empty registry.
     pub fn new() -> Self {
         Self {
-            handlers: Vec::new(),
+            handlers: BTreeMap::new(),
+            handler_positions: HashMap::new(),
+            next_handler_position: 0,
+            indexed_log_handlers: HashMap::new(),
+            fallback_log_handlers: BTreeSet::new(),
+            data_slice_shapes: HashMap::new(),
         }
     }
 
@@ -1570,15 +1646,46 @@ impl<N: Network> ReactiveRegistry<N> {
         handler: Arc<dyn ReactiveHandler<N>>,
     ) -> Result<(), RegisterError> {
         let id = handler.id();
-        if self.handlers.iter().any(|registered| registered.id == id) {
+        if self.handler_positions.contains_key(&id) {
             return Err(RegisterError::DuplicateHandler(id));
         }
         let interests = handler.interests();
-        self.handlers.push(RegisteredHandler {
-            id,
-            handler,
-            interests,
-        });
+        let has_log_interests = interests
+            .iter()
+            .any(|interest| matches!(interest, ReactiveInterest::Logs(_)));
+        let log_route_index = handler.log_route_index();
+        if self.next_handler_position == u128::MAX {
+            self.compact_handler_positions();
+        }
+        let position = self.next_handler_position;
+        self.next_handler_position += 1;
+        self.handler_positions.insert(id.clone(), position);
+        if let Some(index) = &log_route_index {
+            for key in index.keys() {
+                if let LogRouteKey::DataSlice { offset, value } = key {
+                    *self
+                        .data_slice_shapes
+                        .entry((*offset, value.len()))
+                        .or_default() += 1;
+                }
+                self.indexed_log_handlers
+                    .entry(key.clone())
+                    .or_default()
+                    .insert(position);
+            }
+        } else if has_log_interests {
+            self.fallback_log_handlers.insert(position);
+        }
+        self.handlers.insert(
+            position,
+            RegisteredHandler {
+                id,
+                handler,
+                interests,
+                has_log_interests,
+                log_route_index,
+            },
+        );
         Ok(())
     }
 
@@ -1588,38 +1695,63 @@ impl<N: Network> ReactiveRegistry<N> {
     /// intentionally outside this API: unregistering stops future routing and
     /// decode for the handler only.
     pub fn unregister_handler(&mut self, id: &HandlerId) -> Option<Arc<dyn ReactiveHandler<N>>> {
-        let index = self
-            .handlers
-            .iter()
-            .position(|registered| &registered.id == id)?;
-        Some(self.handlers.remove(index).handler)
+        let position = self.handler_positions.remove(id)?;
+        let registered = self.handlers.remove(&position)?;
+        if let Some(index) = &registered.log_route_index {
+            for key in index.keys() {
+                let remove_bucket = self
+                    .indexed_log_handlers
+                    .get_mut(key)
+                    .is_some_and(|owners| {
+                        owners.remove(&position);
+                        owners.is_empty()
+                    });
+                if remove_bucket {
+                    self.indexed_log_handlers.remove(key);
+                }
+                if let LogRouteKey::DataSlice { offset, value } = key {
+                    let shape = (*offset, value.len());
+                    let remove_shape =
+                        self.data_slice_shapes.get_mut(&shape).is_some_and(|count| {
+                            *count -= 1;
+                            *count == 0
+                        });
+                    if remove_shape {
+                        self.data_slice_shapes.remove(&shape);
+                    }
+                }
+            }
+        } else {
+            self.fallback_log_handlers.remove(&position);
+        }
+        Some(registered.handler)
     }
 
     /// Return true when `id` is currently registered.
     pub fn contains_handler(&self, id: &HandlerId) -> bool {
-        self.handlers.iter().any(|registered| &registered.id == id)
+        self.handler_positions.contains_key(id)
     }
 
     /// Ids of all registered handlers, in registration (= routing) order.
     pub fn handler_ids(&self) -> Vec<HandlerId> {
         self.handlers
-            .iter()
-            .map(|registered| registered.id.clone())
+            .values()
+            .map(|handler| handler.id.clone())
             .collect()
     }
 
     /// Borrow the interests owned by one handler.
     pub fn handler_interests(&self, id: &HandlerId) -> Option<&[ReactiveInterest<N>]> {
-        self.handlers
-            .iter()
-            .find(|registered| &registered.id == id)
+        self.handler_positions
+            .get(id)
+            .and_then(|position| self.handlers.get(position))
             .map(|registered| registered.interests.as_slice())
     }
 
     /// Return all registered interests in handler registration order.
     pub fn interests(&self) -> Vec<ReactiveInterest<N>> {
         self.handlers
-            .iter()
+            .values()
             .flat_map(|handler| handler.interests.clone())
             .collect()
     }
@@ -1644,18 +1776,76 @@ impl<N: Network> ReactiveRegistry<N> {
     /// at most once for a log, using the first matching log interest declared by
     /// that handler.
     pub fn route_log(&self, log: &Log) -> Vec<ReactiveLogRoute> {
-        self.handlers
-            .iter()
+        self.log_handler_candidates(log)
+            .into_iter()
             .filter_map(|handler| handler.route_log(log))
             .collect()
     }
 
-    fn handlers(&self) -> &[RegisteredHandler<N>] {
-        &self.handlers
+    fn log_handler_candidates(&self, log: &Log) -> Vec<&RegisteredHandler<N>> {
+        let mut indexed_positions = Vec::new();
+        if let Some(indexed) = self
+            .indexed_log_handlers
+            .get(&LogRouteKey::Emitter(log.address()))
+        {
+            indexed_positions.extend(indexed.iter().copied());
+        }
+        for (index, value) in log.topics().iter().copied().enumerate() {
+            if let Some(indexed) = self
+                .indexed_log_handlers
+                .get(&LogRouteKey::Topic { index, value })
+            {
+                indexed_positions.extend(indexed.iter().copied());
+            }
+        }
+        let data = log.inner.data.data.as_ref();
+        for &(offset, len) in self.data_slice_shapes.keys() {
+            let Some(end) = offset.checked_add(len) else {
+                continue;
+            };
+            let Some(value) = data.get(offset..end) else {
+                continue;
+            };
+            if let Some(indexed) = self.indexed_log_handlers.get(&LogRouteKey::DataSlice {
+                offset,
+                value: value.to_vec(),
+            }) {
+                indexed_positions.extend(indexed.iter().copied());
+            }
+        }
+        if indexed_positions.is_empty() {
+            if self.fallback_log_handlers.is_empty() {
+                return Vec::new();
+            }
+            if !self.indexed_log_handlers.is_empty() {
+                return self
+                    .fallback_log_handlers
+                    .iter()
+                    .filter_map(|position| self.handlers.get(position))
+                    .collect();
+            }
+            return self
+                .handlers
+                .values()
+                .filter(|handler| handler.has_log_interests && handler.log_route_index.is_none())
+                .collect();
+        }
+
+        indexed_positions.extend(self.fallback_log_handlers.iter().copied());
+        indexed_positions.sort_unstable();
+        indexed_positions.dedup();
+        indexed_positions
+            .into_iter()
+            .filter_map(|position| self.handlers.get(&position))
+            .collect()
+    }
+
+    fn handlers(&self) -> impl Iterator<Item = &RegisteredHandler<N>> {
+        self.handlers.values()
     }
 
     fn log_interests(&self) -> impl Iterator<Item = &LogInterest> {
-        self.handlers.iter().flat_map(|handler| {
+        self.handlers.values().flat_map(|handler| {
             handler
                 .interests
                 .iter()
@@ -1664,6 +1854,37 @@ impl<N: Network> ReactiveRegistry<N> {
                     ReactiveInterest::Blocks(_) | ReactiveInterest::PendingTransactions(_) => None,
                 })
         })
+    }
+
+    fn compact_handler_positions(&mut self) {
+        let handlers = std::mem::take(&mut self.handlers);
+        self.handler_positions.clear();
+        self.indexed_log_handlers.clear();
+        self.fallback_log_handlers.clear();
+        self.data_slice_shapes.clear();
+
+        for (position, (_, handler)) in handlers.into_iter().enumerate() {
+            let position = position as u128;
+            self.handler_positions.insert(handler.id.clone(), position);
+            if let Some(index) = &handler.log_route_index {
+                for key in index.keys() {
+                    if let LogRouteKey::DataSlice { offset, value } = key {
+                        *self
+                            .data_slice_shapes
+                            .entry((*offset, value.len()))
+                            .or_default() += 1;
+                    }
+                    self.indexed_log_handlers
+                        .entry(key.clone())
+                        .or_default()
+                        .insert(position);
+                }
+            } else if handler.has_log_interests {
+                self.fallback_log_handlers.insert(position);
+            }
+            self.handlers.insert(position, handler);
+        }
+        self.next_handler_position = self.handlers.len() as u128;
     }
 }
 
@@ -1881,16 +2102,83 @@ impl<N: Network> ReactiveRuntime<N> {
         self.journal.back().map(|entry| entry.block.clone())
     }
 
+    /// Return whether the retained reorg journal still contains an applied
+    /// record for `handler_id`.
+    ///
+    /// The record is retained even when the handler emitted only resync work,
+    /// so an owner can keep an explicit cache-eviction fence active for exactly
+    /// as long as a later rollback could restore effects from that handler
+    /// generation. This query is bounded by [`ReactiveConfig::journal_depth`].
+    pub fn has_journaled_handler_effects(&self, handler_id: &HandlerId) -> bool {
+        self.journal.iter().any(|entry| {
+            entry
+                .applied
+                .iter()
+                .any(|applied| &applied.handler_id == handler_id)
+        })
+    }
+
+    /// Return the distinct handler generations represented in the retained
+    /// reorg journal.
+    ///
+    /// This scans the bounded journal once, allowing a lifecycle owner to age a
+    /// large set of cache-eviction fences without rescanning the journal for
+    /// every handler.
+    pub fn journaled_handler_ids(&self) -> HashSet<HandlerId> {
+        self.journal
+            .iter()
+            .flat_map(|entry| entry.applied.iter())
+            .map(|applied| applied.handler_id.clone())
+            .collect()
+    }
+
     /// Queued resync requests: surfaced by handlers but not yet executed by an
     /// [`ingest_batch_with_resync`](Self::ingest_batch_with_resync) pass.
     ///
     /// Callers driving resync execution themselves (plain
     /// [`ingest_batch`](Self::ingest_batch) loops) can read the ledger here;
     /// reorg recovery cancels entries whose pinned blocks were dropped, and
+    /// [`cancel_pending_resync`](Self::cancel_pending_resync) drops exact
+    /// generation-owned work, while
     /// [`cancel_pending_resyncs`](Self::cancel_pending_resyncs) drops entries
-    /// for torn-down accounts.
+    /// for exclusively torn-down accounts.
     pub fn pending_resyncs(&self) -> &[ResyncRequest] {
         &self.pending_resyncs
+    }
+
+    /// Cancel every queued request with the exact logical `id`.
+    ///
+    /// Unlike [`cancel_pending_resyncs`](Self::cancel_pending_resyncs), this
+    /// removes whole requests and never touches other work merely because it
+    /// targets the same account. It is therefore the safe primitive for
+    /// generation-scoped owner teardown when the caller maintains an
+    /// owner-to-[`ResyncId`] index. Requests already returned to the caller in
+    /// an earlier batch report cannot be recalled.
+    pub fn cancel_pending_resync(&mut self, id: &ResyncId) -> Vec<ResyncRequest> {
+        self.cancel_pending_resyncs_by_id(std::slice::from_ref(id))
+    }
+
+    /// Cancel queued requests whose logical ids occur in `ids` in one queue pass.
+    ///
+    /// Duplicate and unknown ids are harmless. Cancelled requests retain their
+    /// pending-queue order, independent of caller id order. This is the batch
+    /// teardown primitive for owners that can have many pending repairs; it
+    /// avoids rescanning the complete pending queue once per owned id.
+    pub fn cancel_pending_resyncs_by_id(&mut self, ids: &[ResyncId]) -> Vec<ResyncRequest> {
+        if ids.is_empty() {
+            return Vec::new();
+        }
+        let ids: HashSet<&ResyncId> = ids.iter().collect();
+        let mut cancelled = Vec::new();
+        self.pending_resyncs.retain(|request| {
+            if ids.contains(&request.id) {
+                cancelled.push(request.clone());
+                false
+            } else {
+                true
+            }
+        });
+        cancelled
     }
 
     /// Cancel queued resync work that targets `address`, returning the
@@ -1902,11 +2190,11 @@ impl<N: Network> ReactiveRuntime<N> {
     /// request mirrors the original id/reason/block/priority and carries only
     /// the targets that were cancelled.
     ///
-    /// This is part of the adapter-teardown recipe (see
-    /// [`ReactiveEngine::unregister_handler`]): it clears the pending ledger so
-    /// a dropped pool's queued repairs stop occupying memory and stop
-    /// surfacing as cancellations in reorg reports. It cannot recall requests
-    /// already returned to the caller in earlier batch reports.
+    /// This is appropriate only when the caller owns the complete account. For
+    /// a pool sharing a vault or emitter with other owners, cancel its exact
+    /// request IDs through
+    /// [`cancel_pending_resync`](Self::cancel_pending_resync) instead. It cannot
+    /// recall requests already returned to the caller in earlier batch reports.
     pub fn cancel_pending_resyncs(&mut self, address: Address) -> Vec<ResyncRequest> {
         let mut cancelled = Vec::new();
         self.pending_resyncs.retain_mut(|request| {
@@ -2385,7 +2673,14 @@ impl<N: Network> ReactiveRuntime<N> {
         input_ref: InputRef,
     ) -> Result<Vec<HandlerExecution>, ReactiveError> {
         let mut executions = Vec::new();
-        for registered in self.registry.handlers() {
+        let candidates: Vec<_> = match &record.input {
+            ReactiveInput::Log(log) => self.registry.log_handler_candidates(log),
+            ReactiveInput::BlockHeader(_)
+            | ReactiveInput::FullBlock(_)
+            | ReactiveInput::PendingTxHash(_)
+            | ReactiveInput::PendingTx(_) => self.registry.handlers().collect(),
+        };
+        for registered in candidates {
             if !registered.matches(&record.input) {
                 continue;
             }
@@ -3816,6 +4111,11 @@ pub type SubscriberNextBatch<'a, N> = Pin<
     Box<dyn Future<Output = Result<Option<ReactiveInputBatch<N>>, SubscriberError>> + Send + 'a>,
 >;
 
+/// Boxed future returned by [`AlloySubscriber::next_scoped_batch`].
+pub type SubscriberNextScopedBatch<'a, N> = Pin<
+    Box<dyn Future<Output = Result<Option<SubscriberInputBatch<N>>, SubscriberError>> + Send + 'a>,
+>;
+
 /// Subscriber mode requested for the Alloy subscriber.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum SubscriberMode {
@@ -3839,6 +4139,10 @@ pub struct SubscriberConfig {
     pub hydrate_pending_transactions: bool,
     /// Maximum records to emit per batch.
     pub max_batch_size: usize,
+    /// Maximum distinct contract addresses placed in one provider-side log
+    /// subscription. Compatible logical owner filters are fanned into address
+    /// supersets up to this limit; exact owner routing still happens locally.
+    pub max_log_addresses_per_subscription: usize,
     /// Reconnect policy for WebSocket/pubsub streams.
     pub reconnect: SubscriberReconnectConfig,
 }
@@ -3848,6 +4152,7 @@ impl Default for SubscriberConfig {
         Self {
             hydrate_pending_transactions: false,
             max_batch_size: 1024,
+            max_log_addresses_per_subscription: 1024,
             reconnect: SubscriberReconnectConfig::default(),
         }
     }
@@ -3930,6 +4235,254 @@ impl SubscriberBackfill {
     pub fn end_block(&self) -> Option<u64> {
         self.to_block
     }
+}
+
+/// Opaque generation for one transaction-aware subscriber interest owner.
+///
+/// Epochs are allocated monotonically by [`AlloySubscriber`] and are never
+/// reused, including after an aborted stage or a full interest replacement.
+/// Lifecycle operations require the complete token so a delayed command for an
+/// older registration cannot affect a replacement using the same [`HandlerId`].
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct SubscriberOwnerEpoch {
+    owner: HandlerId,
+    sequence: u64,
+}
+
+/// Delivery audience retained with a subscriber input record.
+///
+/// Canonical inputs are forwarded once to the runtime actor and may also name
+/// staged epochs that need a buffered copy. Owner-only inputs are catch-up or
+/// overlap records that must never be routed through existing canonical
+/// handlers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SubscriberInputScope {
+    /// One canonical input plus any staged owners that matched at enqueue time.
+    Canonical {
+        /// Staged owner epochs that require a buffered copy.
+        owners: Vec<SubscriberOwnerEpoch>,
+    },
+    /// Input delivered only to the listed staged owners.
+    OwnerOnly {
+        /// Exact staged owner epochs receiving the input.
+        owners: Vec<SubscriberOwnerEpoch>,
+    },
+}
+
+impl SubscriberInputScope {
+    /// Exact staged owner epochs attached to this input.
+    pub fn owners(&self) -> &[SubscriberOwnerEpoch] {
+        match self {
+            Self::Canonical { owners } | Self::OwnerOnly { owners } => owners,
+        }
+    }
+
+    /// Whether this input must be forwarded once through canonical routing.
+    pub const fn is_canonical(&self) -> bool {
+        matches!(self, Self::Canonical { .. })
+    }
+}
+
+/// Reactive input together with its canonical/owner-scoped delivery audience.
+#[derive(Clone, Debug)]
+pub struct SubscriberInputRecord<N: Network = Ethereum> {
+    record: ReactiveInputRecord<N>,
+    scope: SubscriberInputScope,
+}
+
+impl<N: Network> SubscriberInputRecord<N> {
+    /// Borrow the reactive input record.
+    pub const fn record(&self) -> &ReactiveInputRecord<N> {
+        &self.record
+    }
+
+    /// Delivery audience captured when the record was enqueued.
+    pub const fn scope(&self) -> &SubscriberInputScope {
+        &self.scope
+    }
+
+    /// Consume the scoped value into its reactive input record.
+    pub fn into_record(self) -> ReactiveInputRecord<N> {
+        self.record
+    }
+}
+
+impl<N: Network> std::ops::Deref for SubscriberInputRecord<N> {
+    type Target = ReactiveInputRecord<N>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.record
+    }
+}
+
+/// Batch of subscriber inputs with enqueue-time owner provenance.
+#[derive(Clone, Debug)]
+pub struct SubscriberInputBatch<N: Network = Ethereum> {
+    records: Vec<SubscriberInputRecord<N>>,
+}
+
+/// Result of polling a scoped subscriber batch against one driver control
+/// future.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum SubscriberDriverPoll<C, N: Network = Ethereum> {
+    /// The control future completed first; subscriber delivery remains intact.
+    Control(C),
+    /// Subscriber polling completed first.
+    Batch(Option<SubscriberInputBatch<N>>),
+}
+
+impl<N: Network> SubscriberInputBatch<N> {
+    /// Borrow every scoped record in delivery order.
+    pub fn records(&self) -> &[SubscriberInputRecord<N>] {
+        &self.records
+    }
+
+    /// Consume the batch into its scoped records.
+    pub fn into_records(self) -> Vec<SubscriberInputRecord<N>> {
+        self.records
+    }
+
+    fn into_reactive_batch(self) -> ReactiveInputBatch<N> {
+        ReactiveInputBatch::new(
+            self.records
+                .into_iter()
+                .map(SubscriberInputRecord::into_record)
+                .collect(),
+        )
+    }
+}
+
+impl SubscriberOwnerEpoch {
+    /// Logical subscriber owner represented by this epoch.
+    pub const fn owner(&self) -> &HandlerId {
+        &self.owner
+    }
+
+    /// Monotonic subscriber-local epoch sequence.
+    pub const fn sequence(&self) -> u64 {
+        self.sequence
+    }
+}
+
+/// Catch-up policy applied when staging a transaction-aware interest owner.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SubscriberOwnerStart {
+    /// Start with live delivery only.
+    Live,
+    /// Start strictly after an already-applied post-block baseline.
+    ///
+    /// A baseline at block `N` schedules backfill from `N + 1`; block `N`
+    /// itself is never replayed. Transaction-aware callers explicitly call
+    /// [`AlloySubscriber::reconcile_interest_owner`] before activation; staged
+    /// owners never use the legacy lazy-backfill queue.
+    PostBlock(BlockRef),
+}
+
+/// Transaction state of one epoch-scoped subscriber owner.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum SubscriberOwnerState {
+    /// Desired interests and owner-scoped buffering are installed but canonical
+    /// routing has not yet committed.
+    Staged,
+    /// Canonical runtime routing has committed for this owner.
+    Active,
+    /// Removal is prepared behind a delivery fence but remains reversible.
+    Removing,
+}
+
+/// Hash-certified catch-up position reached by one subscriber owner epoch.
+///
+/// Progress means every owner-only record through this point has been fetched
+/// and queued inside the subscriber. It does not mean the downstream actor has
+/// drained or committed those records; that requires a separate delivery fence.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SubscriberOwnerProgress {
+    owner: SubscriberOwnerEpoch,
+    through: BlockRef,
+}
+
+impl SubscriberOwnerProgress {
+    /// Exact owner epoch whose catch-up was reconciled.
+    pub const fn owner(&self) -> &SubscriberOwnerEpoch {
+        &self.owner
+    }
+
+    /// Verified canonical block through which owner input was fetched.
+    pub const fn through(&self) -> &BlockRef {
+        &self.through
+    }
+}
+
+/// Error staging a transaction-aware subscriber owner.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum SubscriberOwnerError {
+    /// Subscriber configuration or interest validation failed.
+    #[error(transparent)]
+    Subscriber(#[from] SubscriberError),
+    /// The logical owner already has desired interests installed.
+    #[error("subscriber interest owner `{0}` is already registered")]
+    AlreadyRegistered(HandlerId),
+    /// A post-block baseline cannot be advanced to its first unapplied block.
+    #[error("post-block subscriber baseline {0} has no following block")]
+    PostBlockOverflow(u64),
+    /// The monotonic subscriber owner epoch sequence was exhausted.
+    #[error("subscriber owner epoch sequence exhausted")]
+    EpochExhausted,
+    /// The exact owner epoch is unknown or no longer staged.
+    #[error("subscriber owner epoch is not staged")]
+    NotStaged,
+    /// Live-only staging has no historical baseline to reconcile.
+    #[error("subscriber owner was staged live-only and has no catch-up baseline")]
+    MissingBaseline,
+    /// Post-block reconciliation currently covers log interests only.
+    #[error("post-block subscriber owners support log interests only")]
+    UnsupportedPostBlockInterest,
+    /// The target block was absent from the provider.
+    #[error("subscriber reconcile target block {0} was not found")]
+    BlockUnavailable(u64),
+    /// The provider's canonical identity did not match the requested target.
+    #[error(
+        "subscriber reconcile target mismatch: expected block {expected_number} {expected_hash}, got block {actual_number} {actual_hash}"
+    )]
+    BlockMismatch {
+        /// Requested block number.
+        expected_number: u64,
+        /// Requested block hash.
+        expected_hash: B256,
+        /// Provider block number.
+        actual_number: u64,
+        /// Provider block hash.
+        actual_hash: B256,
+    },
+    /// A reconcile target was older than the retained baseline/progress.
+    #[error("subscriber reconcile target block {target} precedes current owner position {current}")]
+    ProgressRegression {
+        /// Retained baseline or progress block.
+        current: u64,
+        /// Rejected target block.
+        target: u64,
+    },
+    /// A reconcile attempted to replace a retained block identity at the same
+    /// height or cross an immediate parent that does not extend it.
+    #[error(
+        "subscriber reconcile conflicts with retained block {number} {current_hash}: target chain references {target_hash}"
+    )]
+    ProgressConflict {
+        /// Retained baseline or progress block number.
+        number: u64,
+        /// Retained baseline or progress block hash.
+        current_hash: B256,
+        /// Conflicting target hash or immediate parent hash.
+        target_hash: B256,
+    },
+    /// A provider returned a malformed or out-of-range catch-up log.
+    #[error("subscriber reconcile returned an invalid catch-up log: {0}")]
+    InvalidBackfillLog(&'static str),
 }
 
 /// Extension trait for subscribers that can add and remove handler-owned
@@ -4224,11 +4777,13 @@ where
     ///
     /// ```text
     /// engine.unregister_handler(&id);
-    /// for address in handler_addresses {
-    ///     // stop root-gate eth_getProof probes for the account
+    /// for request_id in handler_request_ids {
+    ///     // Drop only this handler generation's queued repair work.
+    ///     engine.runtime_mut().cancel_pending_resync(&request_id);
+    /// }
+    /// for address in exclusively_owned_addresses {
+    ///     // Shared accounts require caller-side owner reference counting.
     ///     engine.runtime_mut().untrack_account(address);
-    ///     // drop its queued (unexecuted) repair work from the pending ledger
-    ///     engine.runtime_mut().cancel_pending_resyncs(address);
     /// }
     /// // optional: evict cached state via StateUpdate::purge / cache purge APIs
     /// ```
@@ -4258,10 +4813,11 @@ pub struct AlloySubscriber<P, N: Network = Ethereum> {
     config: SubscriberConfig,
     base_interests: Vec<ReactiveInterest<N>>,
     owned_interests: Vec<OwnedSubscriberInterests<N>>,
+    next_owner_epoch: u64,
     interests: Vec<ReactiveInterest<N>>,
-    /// Stable source id per distinct live log filter. Ids key delivery anchors
-    /// and live `SubscriberEvent`s; entries are retired (and their anchors
-    /// pruned) when no base or owner interest references the filter anymore, so
+    /// Stable source id per distinct provider-facing log filter. Ids key
+    /// delivery anchors and live `SubscriberEvent`s; entries are retired (and
+    /// their anchors pruned) when no planned stream references the filter, so
     /// long-lived owner churn cannot grow this map unboundedly.
     log_source_ids: HashMap<Filter, usize>,
     next_log_source_id: usize,
@@ -4269,21 +4825,62 @@ pub struct AlloySubscriber<P, N: Network = Ethereum> {
     /// Set when interest bookkeeping changed since the last successful stream
     /// reconcile, so steady-state polling skips the desired-vs-live diff.
     sources_dirty: bool,
+    /// Conservative generation of desired/live stream topology. Successful
+    /// owner progress is activatable only against the same clean revision.
+    stream_revision: u64,
     state: AlloySubscriberState<N>,
-    pending_records: VecDeque<ReactiveInputRecord<N>>,
+    pending_records: VecDeque<SubscriberInputRecord<N>>,
+    /// Owner copies of live records consumed during an in-flight reconcile.
+    /// These remain hidden from subscriber output until the owning reconcile
+    /// commits and survive cancellation so subscribe-first adoption cannot
+    /// lose an event at an await boundary.
+    pending_reconcile_owner_records: VecDeque<BufferedSubscriberOwnerRecord<N>>,
     last_seen_log_blocks: HashMap<usize, u64>,
     recent_input_refs: VecDeque<InputRef>,
     recent_input_ref_set: HashSet<InputRef>,
+    recent_owner_input_refs: HashMap<SubscriberOwnerEpoch, VecDeque<InputRef>>,
+    recent_owner_input_ref_sets: HashMap<SubscriberOwnerEpoch, HashSet<InputRef>>,
     _network: PhantomData<N>,
 }
 
 struct OwnedSubscriberInterests<N: Network = Ethereum> {
     owner: HandlerId,
     interests: Vec<ReactiveInterest<N>>,
+    epoch: Option<SubscriberOwnerEpoch>,
+    state: SubscriberOwnerState,
+    baseline: Option<BlockRef>,
+    progress: Option<SubscriberOwnerProgress>,
+    progress_stream_revision: Option<u64>,
 }
+
+#[derive(Clone)]
+struct SubscriberOwnerReconcilePlan<N: Network = Ethereum> {
+    epoch: SubscriberOwnerEpoch,
+    interests: Vec<ReactiveInterest<N>>,
+    retained: BlockRef,
+    from_block: u64,
+}
+
+struct SubscriberOwnerCatchup {
+    logs: Vec<Log>,
+    certified: BlockRef,
+}
+
+struct SubscriberOwnerReconcileFilter {
+    filter: Filter,
+    from_block: u64,
+}
+
+struct BufferedSubscriberOwnerRecord<N: Network = Ethereum> {
+    record: ReactiveInputRecord<N>,
+    owners: Vec<SubscriberOwnerEpoch>,
+}
+
+const OWNER_RECONCILE_FILTERS_PER_CHUNK: usize = 256;
 
 struct QueuedSubscriberBackfill {
     owner: HandlerId,
+    epoch: Option<SubscriberOwnerEpoch>,
     filter: Filter,
     backfill: SubscriberBackfill,
 }
@@ -4313,16 +4910,21 @@ impl<P, N: Network> AlloySubscriber<P, N> {
             config,
             base_interests: Vec::new(),
             owned_interests: Vec::new(),
+            next_owner_epoch: 0,
             interests: Vec::new(),
             log_source_ids: HashMap::new(),
             next_log_source_id: 0,
             pending_backfills: VecDeque::new(),
             sources_dirty: true,
+            stream_revision: 0,
             state: AlloySubscriberState::Uninitialized,
             pending_records: VecDeque::new(),
+            pending_reconcile_owner_records: VecDeque::new(),
             last_seen_log_blocks: HashMap::new(),
             recent_input_refs: VecDeque::new(),
             recent_input_ref_set: HashSet::new(),
+            recent_owner_input_refs: HashMap::new(),
+            recent_owner_input_ref_sets: HashMap::new(),
             _network: PhantomData,
         }
     }
@@ -4345,6 +4947,345 @@ impl<P, N: Network> AlloySubscriber<P, N> {
     /// Registered interests across base and owner-scoped registrations.
     pub fn registered_interests(&self) -> &[ReactiveInterest<N>] {
         &self.interests
+    }
+
+    /// Stage a fresh, epoch-scoped interest owner without making its inputs
+    /// canonically routable yet.
+    ///
+    /// The returned token is required by every later lifecycle operation. A
+    /// staged owner participates in provider subscription planning immediately,
+    /// while its matching input remains owner-scoped until
+    /// [`activate_interest_owner`](Self::activate_interest_owner) succeeds.
+    /// Post-block owners require hash-certified
+    /// [`reconcile_interest_owner`](Self::reconcile_interest_owner) progress on
+    /// the current clean stream revision before activation.
+    pub fn stage_interest_owner(
+        &mut self,
+        owner: HandlerId,
+        interests: &[ReactiveInterest<N>],
+        start: SubscriberOwnerStart,
+    ) -> Result<SubscriberOwnerEpoch, SubscriberOwnerError> {
+        validate_subscriber_config(&self.config)?;
+        if matches!(&start, SubscriberOwnerStart::PostBlock(_))
+            && interests
+                .iter()
+                .any(|interest| !matches!(interest, ReactiveInterest::Logs(_)))
+        {
+            return Err(SubscriberOwnerError::UnsupportedPostBlockInterest);
+        }
+        if self
+            .owned_interests
+            .iter()
+            .any(|entry| entry.owner == owner)
+        {
+            return Err(SubscriberOwnerError::AlreadyRegistered(owner));
+        }
+
+        let mut next_owned = self.clone_owned_interests();
+        next_owned.push(OwnedSubscriberInterests {
+            owner: owner.clone(),
+            interests: interests.to_vec(),
+            epoch: None,
+            state: SubscriberOwnerState::Staged,
+            baseline: None,
+            progress: None,
+            progress_stream_revision: None,
+        });
+        let next_registered = aggregate_interests(&self.base_interests, &next_owned);
+        validate_supported_interests(self.mode, &self.config, &next_registered)?;
+
+        let baseline = match start {
+            SubscriberOwnerStart::Live => None,
+            SubscriberOwnerStart::PostBlock(block) => {
+                block
+                    .number
+                    .checked_add(1)
+                    .ok_or(SubscriberOwnerError::PostBlockOverflow(block.number))?;
+                Some(block)
+            }
+        };
+        let sequence = self
+            .next_owner_epoch
+            .checked_add(1)
+            .ok_or(SubscriberOwnerError::EpochExhausted)?;
+        let epoch = SubscriberOwnerEpoch {
+            owner: owner.clone(),
+            sequence,
+        };
+
+        self.next_owner_epoch = sequence;
+        let entry = next_owned
+            .last_mut()
+            .expect("staged owner was appended during preflight");
+        entry.epoch = Some(epoch.clone());
+        entry.baseline = baseline;
+        self.owned_interests = next_owned;
+        self.interests = next_registered;
+        self.sources_dirty = true;
+
+        Ok(epoch)
+    }
+
+    /// Stage replacement interests for one currently active logical owner.
+    ///
+    /// The active epoch remains canonical while the replacement reconciles.
+    /// Commit both epochs atomically with
+    /// [`commit_interest_owner_replacement`](Self::commit_interest_owner_replacement),
+    /// or abort the staged epoch with [`abort_interest_owner`](Self::abort_interest_owner).
+    pub fn stage_interest_owner_replacement(
+        &mut self,
+        owner: HandlerId,
+        interests: &[ReactiveInterest<N>],
+        start: SubscriberOwnerStart,
+    ) -> Result<SubscriberOwnerEpoch, SubscriberOwnerError> {
+        validate_subscriber_config(&self.config)?;
+        if matches!(&start, SubscriberOwnerStart::PostBlock(_))
+            && interests
+                .iter()
+                .any(|interest| !matches!(interest, ReactiveInterest::Logs(_)))
+        {
+            return Err(SubscriberOwnerError::UnsupportedPostBlockInterest);
+        }
+        let active_count = self
+            .owned_interests
+            .iter()
+            .filter(|entry| entry.owner == owner && entry.state == SubscriberOwnerState::Active)
+            .count();
+        if active_count != 1
+            || self
+                .owned_interests
+                .iter()
+                .any(|entry| entry.owner == owner && entry.state != SubscriberOwnerState::Active)
+        {
+            return Err(SubscriberOwnerError::AlreadyRegistered(owner));
+        }
+
+        let mut next_owned = self.clone_owned_interests();
+        next_owned.push(OwnedSubscriberInterests {
+            owner: owner.clone(),
+            interests: interests.to_vec(),
+            epoch: None,
+            state: SubscriberOwnerState::Staged,
+            baseline: None,
+            progress: None,
+            progress_stream_revision: None,
+        });
+        let next_registered = aggregate_interests(&self.base_interests, &next_owned);
+        validate_supported_interests(self.mode, &self.config, &next_registered)?;
+
+        let baseline = match start {
+            SubscriberOwnerStart::Live => None,
+            SubscriberOwnerStart::PostBlock(block) => {
+                block
+                    .number
+                    .checked_add(1)
+                    .ok_or(SubscriberOwnerError::PostBlockOverflow(block.number))?;
+                Some(block)
+            }
+        };
+        let sequence = self
+            .next_owner_epoch
+            .checked_add(1)
+            .ok_or(SubscriberOwnerError::EpochExhausted)?;
+        let epoch = SubscriberOwnerEpoch {
+            owner: owner.clone(),
+            sequence,
+        };
+
+        self.next_owner_epoch = sequence;
+        let entry = next_owned
+            .last_mut()
+            .expect("staged replacement owner was appended during preflight");
+        entry.epoch = Some(epoch.clone());
+        entry.baseline = baseline;
+        self.owned_interests = next_owned;
+        self.interests = next_registered;
+        self.sources_dirty = true;
+        Ok(epoch)
+    }
+
+    /// Current transaction state for an exact owner epoch.
+    pub fn interest_owner_state(
+        &self,
+        epoch: &SubscriberOwnerEpoch,
+    ) -> Option<SubscriberOwnerState> {
+        self.owned_interests
+            .iter()
+            .find(|entry| entry.epoch.as_ref() == Some(epoch))
+            .map(|entry| entry.state)
+    }
+
+    /// Latest hash-certified reconcile progress for an exact owner epoch.
+    pub fn interest_owner_progress(
+        &self,
+        epoch: &SubscriberOwnerEpoch,
+    ) -> Option<&SubscriberOwnerProgress> {
+        self.owned_interests
+            .iter()
+            .find(|entry| entry.epoch.as_ref() == Some(epoch))
+            .and_then(|entry| entry.progress.as_ref())
+    }
+
+    /// Make a staged owner canonical after its actor-side installation commits.
+    ///
+    /// Returns `false` for stale tokens and owners not currently staged.
+    pub fn activate_interest_owner(&mut self, epoch: &SubscriberOwnerEpoch) -> bool {
+        let stream_revision = self.stream_revision;
+        let sources_dirty = self.sources_dirty;
+        let Some(entry) = self
+            .owned_interests
+            .iter_mut()
+            .find(|entry| entry.epoch.as_ref() == Some(epoch))
+        else {
+            return false;
+        };
+        if entry.state != SubscriberOwnerState::Staged
+            || (entry.baseline.is_some()
+                && (entry.progress.is_none()
+                    || entry.progress_stream_revision != Some(stream_revision)
+                    || sources_dirty))
+        {
+            return false;
+        }
+        entry.state = SubscriberOwnerState::Active;
+        true
+    }
+
+    /// Atomically replace one active owner epoch with one reconciled staged epoch.
+    pub fn commit_interest_owner_replacement(
+        &mut self,
+        active: &SubscriberOwnerEpoch,
+        replacement: &SubscriberOwnerEpoch,
+    ) -> bool {
+        let Some(active_index) = self
+            .owned_interests
+            .iter()
+            .position(|entry| entry.epoch.as_ref() == Some(active))
+        else {
+            return false;
+        };
+        let Some(replacement_index) = self
+            .owned_interests
+            .iter()
+            .position(|entry| entry.epoch.as_ref() == Some(replacement))
+        else {
+            return false;
+        };
+        if active_index == replacement_index
+            || active.owner() != replacement.owner()
+            || self.owned_interests[active_index].state != SubscriberOwnerState::Active
+            || self.owned_interests[replacement_index].state != SubscriberOwnerState::Staged
+            || (self.owned_interests[replacement_index].baseline.is_some()
+                && (self.owned_interests[replacement_index].progress.is_none()
+                    || self.owned_interests[replacement_index].progress_stream_revision
+                        != Some(self.stream_revision)
+                    || self.sources_dirty))
+        {
+            return false;
+        }
+
+        self.owned_interests[replacement_index].state = SubscriberOwnerState::Active;
+        self.owned_interests.remove(active_index);
+        self.purge_owner_epoch(active);
+        self.rebuild_registered_interests();
+        self.retire_unreferenced_filters();
+        self.sources_dirty = true;
+        true
+    }
+
+    /// Prepare an exact active owner for removal without changing desired
+    /// interests, streams, anchors, or queued canonical input.
+    ///
+    /// The caller establishes its delivery fence after this transition. Use
+    /// [`abort_interest_owner`](Self::abort_interest_owner) to restore the owner
+    /// on actor-side failure, or
+    /// [`finalize_interest_owner_removal`](Self::finalize_interest_owner_removal)
+    /// once canonical routing has been removed.
+    pub fn prepare_interest_owner_removal(&mut self, epoch: &SubscriberOwnerEpoch) -> bool {
+        let Some(entry) = self
+            .owned_interests
+            .iter_mut()
+            .find(|entry| entry.epoch.as_ref() == Some(epoch))
+        else {
+            return false;
+        };
+        if entry.state != SubscriberOwnerState::Active {
+            return false;
+        }
+        entry.state = SubscriberOwnerState::Removing;
+        true
+    }
+
+    /// Finalize a previously prepared exact owner removal.
+    ///
+    /// Returns the removed interests, or `None` for stale tokens and owners not
+    /// currently in [`SubscriberOwnerState::Removing`]. Repeating finalization
+    /// is therefore idempotent.
+    pub fn finalize_interest_owner_removal(
+        &mut self,
+        epoch: &SubscriberOwnerEpoch,
+    ) -> Option<Vec<ReactiveInterest<N>>> {
+        let index = self.owned_interests.iter().position(|entry| {
+            entry.epoch.as_ref() == Some(epoch) && entry.state == SubscriberOwnerState::Removing
+        })?;
+        let removed = self.owned_interests.remove(index).interests;
+        self.purge_owner_epoch(epoch);
+        self.rebuild_registered_interests();
+        self.retire_unreferenced_filters();
+        self.sources_dirty = true;
+        Some(removed)
+    }
+
+    /// Abort an epoch-scoped owner lifecycle operation.
+    ///
+    /// A staged owner is removed completely. A prepared removal is restored to
+    /// active. Active and unknown epochs are unchanged. Repeating the same
+    /// abort is therefore safe and returns `false` after the first effect.
+    pub fn abort_interest_owner(&mut self, epoch: &SubscriberOwnerEpoch) -> bool {
+        let Some(index) = self
+            .owned_interests
+            .iter()
+            .position(|entry| entry.epoch.as_ref() == Some(epoch))
+        else {
+            return false;
+        };
+        match self.owned_interests[index].state {
+            SubscriberOwnerState::Staged => {
+                self.owned_interests.remove(index);
+                self.purge_owner_epoch(epoch);
+                self.rebuild_registered_interests();
+                self.retire_unreferenced_filters();
+                self.sources_dirty = true;
+                true
+            }
+            SubscriberOwnerState::Removing => {
+                self.owned_interests[index].state = SubscriberOwnerState::Active;
+                true
+            }
+            SubscriberOwnerState::Active => false,
+        }
+    }
+
+    fn purge_owner_epoch(&mut self, epoch: &SubscriberOwnerEpoch) {
+        self.pending_backfills
+            .retain(|backfill| backfill.epoch.as_ref() != Some(epoch));
+        self.pending_records
+            .retain_mut(|pending| match &mut pending.scope {
+                SubscriberInputScope::Canonical { owners } => {
+                    owners.retain(|owner| owner != epoch);
+                    true
+                }
+                SubscriberInputScope::OwnerOnly { owners } => {
+                    owners.retain(|owner| owner != epoch);
+                    !owners.is_empty()
+                }
+            });
+        self.pending_reconcile_owner_records.retain_mut(|pending| {
+            pending.owners.retain(|owner| owner != epoch);
+            !pending.owners.is_empty()
+        });
+        self.recent_owner_input_refs.remove(epoch);
+        self.recent_owner_input_ref_sets.remove(epoch);
     }
 
     /// Add or replace the interests owned by `owner`.
@@ -4374,10 +5315,10 @@ impl<P, N: Network> AlloySubscriber<P, N> {
     /// Add or replace owner interests and schedule log backfill for that owner.
     ///
     /// Backfill is queued only for log interests; block and pending transaction
-    /// interests are live-only. Queued backfill is drained before live stream
-    /// initialization, its resolved upper bound seeds the filter's delivery
-    /// anchor, and the anchored filter is caught up again right after its live
-    /// stream connects — so the discovery boundary is closed end to end as long
+    /// interests are live-only. Queued records can be delivered immediately;
+    /// the subsequent provider stream is then caught up from the seeded
+    /// delivery anchor, and overlap is deduplicated — so the discovery boundary
+    /// is closed end to end as long
     /// as `backfill` starts at (or before) the block the interest was
     /// discovered in. Continuity backfill for a replaced owner (see
     /// [`add_interest_owner`](Self::add_interest_owner)) is queued in addition,
@@ -4405,13 +5346,17 @@ impl<P, N: Network> AlloySubscriber<P, N> {
             .owned_interests
             .iter()
             .position(|entry| &entry.owner == owner)?;
-        let removed = self.owned_interests.remove(index).interests;
-        self.pending_backfills
-            .retain(|backfill| &backfill.owner != owner);
+        let removed = self.owned_interests.remove(index);
+        if let Some(epoch) = &removed.epoch {
+            self.purge_owner_epoch(epoch);
+        } else {
+            self.pending_backfills
+                .retain(|backfill| &backfill.owner != owner);
+        }
         self.rebuild_registered_interests();
         self.retire_unreferenced_filters();
         self.sources_dirty = true;
-        Some(removed)
+        Some(removed.interests)
     }
 
     /// Borrow the interests currently owned by `owner`.
@@ -4431,13 +5376,28 @@ impl<P, N: Network> AlloySubscriber<P, N> {
         validate_subscriber_config(&self.config)?;
 
         let mut next_owned = self.clone_owned_interests();
-        match next_owned.iter_mut().find(|entry| entry.owner == owner) {
-            Some(entry) => entry.interests = interests.to_vec(),
-            None => next_owned.push(OwnedSubscriberInterests {
-                owner: owner.clone(),
-                interests: interests.to_vec(),
-            }),
-        }
+        let replaced_epoch = match next_owned.iter_mut().find(|entry| entry.owner == owner) {
+            Some(entry) => {
+                entry.interests = interests.to_vec();
+                entry.state = SubscriberOwnerState::Active;
+                entry.baseline = None;
+                entry.progress = None;
+                entry.progress_stream_revision = None;
+                entry.epoch.take()
+            }
+            None => {
+                next_owned.push(OwnedSubscriberInterests {
+                    owner: owner.clone(),
+                    interests: interests.to_vec(),
+                    epoch: None,
+                    state: SubscriberOwnerState::Active,
+                    baseline: None,
+                    progress: None,
+                    progress_stream_revision: None,
+                });
+                None
+            }
+        };
         let next_registered = aggregate_interests(&self.base_interests, &next_owned);
         validate_supported_interests(self.mode, &self.config, &next_registered)?;
 
@@ -4458,6 +5418,9 @@ impl<P, N: Network> AlloySubscriber<P, N> {
 
         self.owned_interests = next_owned;
         self.interests = next_registered;
+        if let Some(epoch) = replaced_epoch {
+            self.purge_owner_epoch(&epoch);
+        }
         self.retire_unreferenced_filters();
         self.sources_dirty = true;
 
@@ -4469,6 +5432,7 @@ impl<P, N: Network> AlloySubscriber<P, N> {
             if let Some(backfill) = backfill {
                 self.pending_backfills.push_back(QueuedSubscriberBackfill {
                     owner: owner.clone(),
+                    epoch: None,
                     filter: filter.clone(),
                     backfill,
                 });
@@ -4489,6 +5453,7 @@ impl<P, N: Network> AlloySubscriber<P, N> {
             {
                 self.pending_backfills.push_back(QueuedSubscriberBackfill {
                     owner: owner.clone(),
+                    epoch: None,
                     filter,
                     backfill: SubscriberBackfill::from_block(anchor),
                 });
@@ -4503,6 +5468,11 @@ impl<P, N: Network> AlloySubscriber<P, N> {
             .map(|entry| OwnedSubscriberInterests {
                 owner: entry.owner.clone(),
                 interests: entry.interests.clone(),
+                epoch: entry.epoch.clone(),
+                state: entry.state,
+                baseline: entry.baseline.clone(),
+                progress: entry.progress.clone(),
+                progress_stream_revision: entry.progress_stream_revision,
             })
             .collect()
     }
@@ -4514,19 +5484,31 @@ impl<P, N: Network> AlloySubscriber<P, N> {
     /// Delivery anchor (last block known fully delivered) for `filter`, if the
     /// filter has a source id and has seen delivery.
     fn log_anchor(&self, filter: &Filter) -> Option<u64> {
-        let id = self.log_source_ids.get(filter)?;
-        self.last_seen_log_blocks.get(id).copied()
+        if let Some(anchor) = self
+            .log_source_ids
+            .get(filter)
+            .and_then(|id| self.last_seen_log_blocks.get(id))
+        {
+            return Some(*anchor);
+        }
+
+        // Logical owner filters may be represented by a broader provider
+        // stream after fan-in. Its oldest live watermark is a conservative
+        // continuity anchor: it can cause extra backfill, never a missed log.
+        self.log_source_ids
+            .values()
+            .filter_map(|id| self.last_seen_log_blocks.get(id).copied())
+            .min()
     }
 
-    /// Every live log filter across base and owner interests — merged within
-    /// each origin (owner boundaries are preserved so one owner's churn cannot
-    /// rewrite another's subscription), then deduplicated across origins so an
-    /// identical shape shared by several owners maps to exactly one stream and
-    /// one delivery anchor.
+    /// Every logical log filter across base and owner interests, merged within
+    /// each origin and deduplicated across origins. These shapes remain the
+    /// exact routing and owner-continuity boundary; provider subscriptions may
+    /// fan several of them into one broader filter.
     // `Filter` derives `Hash`/`Eq` and has no interior mutability; the
     // `mutable_key_type` lint is a known false positive for it.
     #[allow(clippy::mutable_key_type)]
-    fn log_stream_filters(&self) -> Vec<Filter> {
+    fn logical_log_filters(&self) -> Vec<Filter> {
         let mut filters = log_filters(&self.base_interests);
         for entry in &self.owned_interests {
             filters.extend(log_filters(&entry.interests));
@@ -4534,6 +5516,38 @@ impl<P, N: Network> AlloySubscriber<P, N> {
         let mut seen = HashSet::new();
         filters.retain(|filter| seen.insert(filter.clone()));
         filters
+    }
+
+    /// Provider-facing log filters. Compatible logical filters fan into a
+    /// small number of address/topic supersets, then split only when the
+    /// configured address ceiling requires it. Exact matching remains local in
+    /// `enqueue_event`, so this reduces subscriptions without broadening owner
+    /// delivery.
+    fn log_stream_filters(&self) -> Vec<Filter> {
+        let mut merged = Vec::new();
+        for filter in self.logical_log_filters() {
+            merge_log_subscription_filter(&mut merged, &filter);
+        }
+
+        let max_addresses = self.config.max_log_addresses_per_subscription.max(1);
+        let mut planned = Vec::new();
+        for filter in merged {
+            let mut addresses: Vec<_> = filter.address.iter().copied().collect();
+            if addresses.len() <= max_addresses {
+                planned.push(filter);
+                continue;
+            }
+            addresses.sort_unstable();
+            for chunk in addresses.chunks(max_addresses) {
+                let mut split = filter.clone();
+                split.address = FilterSet::default();
+                for address in chunk {
+                    split.address.insert(*address);
+                }
+                planned.push(split);
+            }
+        }
+        planned
     }
 
     /// Drop source-id and anchor bookkeeping for filters no longer referenced
@@ -4544,7 +5558,20 @@ impl<P, N: Network> AlloySubscriber<P, N> {
     // `mutable_key_type` lint is a known false positive for it.
     #[allow(clippy::mutable_key_type)]
     fn retire_unreferenced_filters(&mut self) {
-        let live: HashSet<Filter> = self.log_stream_filters().into_iter().collect();
+        let mut live: HashSet<Filter> = self.log_stream_filters().into_iter().collect();
+        if let AlloySubscriberState::Active(streams) = &self.state {
+            for entry in &streams.entries {
+                match &entry.source {
+                    SubscriberStreamSource::PubSubLog { filter, .. }
+                    | SubscriberStreamSource::PollingLog { filter } => {
+                        live.insert(filter.clone());
+                    }
+                    SubscriberStreamSource::PubSubPendingHashes
+                    | SubscriberStreamSource::PubSubBlockHeaders
+                    | SubscriberStreamSource::PollingPendingHashes => {}
+                }
+            }
+        }
         self.log_source_ids
             .retain(|filter, _| live.contains(filter));
         let live_ids: HashSet<usize> = self.log_source_ids.values().copied().collect();
@@ -4552,25 +5579,32 @@ impl<P, N: Network> AlloySubscriber<P, N> {
             .retain(|id, _| live_ids.contains(id));
     }
 
-    fn drain_next_batch(&mut self) -> Option<ReactiveInputBatch<N>> {
+    fn drain_next_scoped_batch(&mut self) -> Option<SubscriberInputBatch<N>> {
         if self.pending_records.is_empty() {
             return None;
         }
 
         let len = self.config.max_batch_size.min(self.pending_records.len());
         let records = self.pending_records.drain(..len).collect();
-        Some(ReactiveInputBatch::new(records))
+        Some(SubscriberInputBatch { records })
     }
 
     fn reset_delivery_state(&mut self) {
         self.pending_records.clear();
+        self.pending_reconcile_owner_records.clear();
         self.last_seen_log_blocks.clear();
         self.recent_input_refs.clear();
         self.recent_input_ref_set.clear();
+        self.recent_owner_input_refs.clear();
+        self.recent_owner_input_ref_sets.clear();
         self.pending_backfills.clear();
         self.log_source_ids.clear();
         self.next_log_source_id = 0;
         self.sources_dirty = true;
+    }
+
+    fn bump_stream_revision(&mut self) {
+        self.stream_revision = self.stream_revision.saturating_add(1);
     }
 }
 
@@ -4801,17 +5835,284 @@ where
 
     fn next_batch(&mut self) -> SubscriberNextBatch<'_, N> {
         Box::pin(async {
-            if let Some(batch) = self.drain_next_batch() {
+            Ok(self
+                .next_scoped_batch()
+                .await?
+                .map(SubscriberInputBatch::into_reactive_batch))
+        })
+    }
+}
+
+impl<P, N> AlloySubscriber<P, N>
+where
+    P: Provider<N> + Send + Sync,
+    N: Network + 'static,
+    N::HeaderResponse: Send + 'static,
+{
+    /// Subscribe first, then catch an exact staged owner up through a verified
+    /// canonical block.
+    ///
+    /// This compatibility wrapper delegates to
+    /// [`reconcile_interest_owners`](Self::reconcile_interest_owners), so a
+    /// driver adopting several owners should call the bulk API once rather than
+    /// invoking this method in a loop.
+    pub async fn reconcile_interest_owner(
+        &mut self,
+        epoch: &SubscriberOwnerEpoch,
+        through: BlockRef,
+    ) -> Result<SubscriberOwnerProgress, SubscriberOwnerError>
+    where
+        P: Clone,
+    {
+        self.reconcile_interest_owners(std::slice::from_ref(epoch), through)
+            .await?
+            .pop()
+            .ok_or(SubscriberOwnerError::NotStaged)
+    }
+
+    /// Subscribe first, then atomically catch staged owners up through one
+    /// verified canonical block.
+    ///
+    /// All epochs are preflighted before provider I/O. Live streams are
+    /// reconciled once, compatible provider filters are merged into bounded
+    /// chunks, and every historical request shares one double target-header
+    /// certification. Provider-filter supersets are routed back through each
+    /// owner's exact interests, retaining owner-scoped delivery provenance.
+    /// Duplicate epoch tokens in `epochs` are coalesced in first-seen order.
+    ///
+    /// Live events are continuously drained while an independent provider
+    /// clone performs catch-up. Fetched owner records and progress become
+    /// visible only after every request and the final certification succeed. A
+    /// failure leaves every target staged with its prior progress unchanged;
+    /// live canonical delivery consumed during the attempt is preserved while
+    /// excluding the failed target epochs from its staged-owner audience.
+    pub async fn reconcile_interest_owners(
+        &mut self,
+        epochs: &[SubscriberOwnerEpoch],
+        through: BlockRef,
+    ) -> Result<Vec<SubscriberOwnerProgress>, SubscriberOwnerError>
+    where
+        P: Clone,
+    {
+        if epochs.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut seen = HashSet::new();
+        let mut plans = Vec::with_capacity(epochs.len());
+        for epoch in epochs {
+            if !seen.insert(epoch.clone()) {
+                continue;
+            }
+            let entry = self
+                .owned_interests
+                .iter()
+                .find(|entry| {
+                    entry.epoch.as_ref() == Some(epoch)
+                        && entry.state == SubscriberOwnerState::Staged
+                })
+                .ok_or(SubscriberOwnerError::NotStaged)?;
+            let position = entry
+                .progress
+                .as_ref()
+                .map(|progress| &progress.through)
+                .or(entry.baseline.as_ref())
+                .ok_or(SubscriberOwnerError::MissingBaseline)?;
+            let baseline = position.number;
+            if through.number < baseline {
+                return Err(SubscriberOwnerError::ProgressRegression {
+                    current: baseline,
+                    target: through.number,
+                });
+            }
+            let from_block = baseline
+                .checked_add(1)
+                .ok_or(SubscriberOwnerError::PostBlockOverflow(baseline))?;
+            if through.number == baseline && through.hash != position.hash {
+                return Err(SubscriberOwnerError::ProgressConflict {
+                    number: baseline,
+                    current_hash: position.hash,
+                    target_hash: through.hash,
+                });
+            }
+            if through.number == from_block
+                && through
+                    .parent_hash
+                    .is_some_and(|parent| parent != position.hash)
+            {
+                return Err(SubscriberOwnerError::ProgressConflict {
+                    number: baseline,
+                    current_hash: position.hash,
+                    target_hash: through.parent_hash.expect("checked as present above"),
+                });
+            }
+            if entry
+                .interests
+                .iter()
+                .any(|interest| !matches!(interest, ReactiveInterest::Logs(_)))
+            {
+                return Err(SubscriberOwnerError::UnsupportedPostBlockInterest);
+            }
+            plans.push(SubscriberOwnerReconcilePlan {
+                epoch: epoch.clone(),
+                interests: entry.interests.clone(),
+                retained: position.clone(),
+                from_block,
+            });
+        }
+
+        // The ordering is intentional and part of the public continuity
+        // contract: connect first, then fetch the bounded historical window.
+        self.ensure_streams().await?;
+        let provider = self.provider.clone();
+        let filters = merged_owner_reconcile_filters(&plans, through.number);
+        let retained = plans.iter().map(|plan| plan.retained.clone()).collect();
+        let target_epochs: HashSet<_> = plans.iter().map(|plan| plan.epoch.clone()).collect();
+        let fetch = fetch_owner_catchup::<P, N>(provider, filters, retained, through);
+        let SubscriberOwnerCatchup { logs, certified } =
+            self.drive_reconcile_fetch(fetch, &target_epochs).await?;
+
+        self.pending_backfills.retain(|queued| {
+            queued
+                .epoch
+                .as_ref()
+                .is_none_or(|epoch| !target_epochs.contains(epoch))
+        });
+        let records = logs
+            .into_iter()
+            .map(|log| log_input_record(log, InputSource::Backfill))
+            .collect();
+        for record in dedupe_records(sort_records(records)) {
+            let block_number = match &record.input {
+                ReactiveInput::Log(log) => log
+                    .block_number
+                    .expect("bulk catch-up logs were validated before commit"),
+                _ => unreachable!("bulk owner catch-up contains log records only"),
+            };
+            let owners = plans
+                .iter()
+                .filter(|plan| block_number >= plan.from_block)
+                .filter(|plan| {
+                    plan.interests
+                        .iter()
+                        .any(|interest| interest_matches(interest, &record.input))
+                })
+                .map(|plan| plan.epoch.clone())
+                .collect();
+            self.enqueue_owner_record_for_owners_unmerged(record, owners);
+        }
+        self.promote_reconcile_owner_records(&target_epochs);
+        self.seed_reconciled_filter_anchors(&plans, certified.number);
+
+        let stream_revision = self.stream_revision;
+        let mut progress = Vec::with_capacity(plans.len());
+        for plan in plans {
+            let item = SubscriberOwnerProgress {
+                owner: plan.epoch.clone(),
+                through: certified.clone(),
+            };
+            let entry = self
+                .owned_interests
+                .iter_mut()
+                .find(|entry| entry.epoch.as_ref() == Some(&plan.epoch))
+                .expect("bulk reconcile holds exclusive access after epoch preflight");
+            entry.progress = Some(item.clone());
+            entry.progress_stream_revision = Some(stream_revision);
+            progress.push(item);
+        }
+        Ok(progress)
+    }
+
+    async fn drive_reconcile_fetch<T, F>(
+        &mut self,
+        fetch: F,
+        target_epochs: &HashSet<SubscriberOwnerEpoch>,
+    ) -> Result<T, SubscriberOwnerError>
+    where
+        F: Future<Output = Result<T, SubscriberOwnerError>>,
+    {
+        if !matches!(&self.state, AlloySubscriberState::Active(_)) {
+            return fetch.await;
+        }
+        let mut fetch = Box::pin(fetch);
+        loop {
+            let event = {
+                let live = Box::pin(self.next_event());
+                match select(fetch, live).await {
+                    Either::Left((result, pending_live)) => {
+                        drop(pending_live);
+                        return result;
+                    }
+                    Either::Right((event, pending_fetch)) => {
+                        fetch = pending_fetch;
+                        event
+                    }
+                }
+            };
+            let event = event?.ok_or_else(|| {
+                SubscriberError::Provider(
+                    "Alloy subscriber streams ended during owner reconcile".to_owned(),
+                )
+            })?;
+            self.buffer_reconcile_event_for_owners(&event, target_epochs);
+            self.enqueue_event_excluding_owners(event, target_epochs);
+        }
+    }
+
+    /// Poll one driver control future with priority over the next scoped batch.
+    ///
+    /// This is the supported control-interleaving primitive for a subscriber
+    /// driver. `control` is borrowed rather than consumed, so a batch win leaves
+    /// the caller's pending control future alive. When control wins, the
+    /// in-progress subscriber poll is cancelled at a documented safe boundary:
+    /// queued records are removed only when a complete batch is returned,
+    /// successful backfill steps are committed before the next await, provider
+    /// streams created but not installed are dropped, and installed streams
+    /// remain owned by the subscriber for the next call.
+    ///
+    /// The control future is polled first. Therefore a ready shutdown/removal
+    /// command cannot starve behind a continuously ready subscriber queue.
+    pub async fn next_scoped_batch_or<C, F>(
+        &mut self,
+        control: Pin<&mut F>,
+    ) -> Result<SubscriberDriverPoll<C, N>, SubscriberError>
+    where
+        C: Send,
+        F: Future<Output = C> + Send,
+    {
+        let batch = self.next_scoped_batch();
+        match select(control, batch).await {
+            Either::Left((control, pending_batch)) => {
+                drop(pending_batch);
+                Ok(SubscriberDriverPoll::Control(control))
+            }
+            Either::Right((batch, _pending_control)) => batch.map(SubscriberDriverPoll::Batch),
+        }
+    }
+
+    /// Return the next subscriber batch while retaining staged-owner delivery
+    /// provenance captured at enqueue time.
+    ///
+    /// Transaction-aware drivers must use this method. The compatibility
+    /// [`EventSubscriber::next_batch`] method flattens the same queue and keeps
+    /// its historical behavior for existing callers.
+    ///
+    /// For command interleaving, prefer
+    /// [`next_scoped_batch_or`](Self::next_scoped_batch_or), which preserves the
+    /// cancellation-safety invariants of this poll and prioritizes ready control.
+    pub fn next_scoped_batch(&mut self) -> SubscriberNextScopedBatch<'_, N> {
+        Box::pin(async {
+            if let Some(batch) = self.drain_next_scoped_batch() {
                 return Ok(Some(batch));
             }
 
             self.drain_pending_backfills().await?;
-            if let Some(batch) = self.drain_next_batch() {
+            if let Some(batch) = self.drain_next_scoped_batch() {
                 return Ok(Some(batch));
             }
 
             self.ensure_streams().await?;
-            if let Some(batch) = self.drain_next_batch() {
+            if let Some(batch) = self.drain_next_scoped_batch() {
                 return Ok(Some(batch));
             }
 
@@ -4825,20 +6126,13 @@ where
                 };
 
                 self.enqueue_event(event);
-                if let Some(batch) = self.drain_next_batch() {
+                if let Some(batch) = self.drain_next_scoped_batch() {
                     return Ok(Some(batch));
                 }
             }
         })
     }
-}
 
-impl<P, N> AlloySubscriber<P, N>
-where
-    P: Provider<N> + Send + Sync,
-    N: Network + 'static,
-    N::HeaderResponse: Send + 'static,
-{
     /// Bring live streams in line with the current interest set.
     ///
     /// Runs incrementally: the desired-vs-live diff only happens when interest
@@ -4857,10 +6151,13 @@ where
         if !self.sources_dirty {
             return Ok(());
         }
-        // An interest-less subscriber stays Uninitialized and never touches the
-        // provider ([`EventSubscriber::next_batch`] returns `Ok(None)`),
-        // matching setup-before-interests behavior.
+        // An interest-less subscriber never touches the provider
+        // ([`EventSubscriber::next_batch`] returns `Ok(None)`). Still certify
+        // the empty desired topology as clean so a deliberately empty staged
+        // epoch can reconcile and activate instead of remaining dirty forever.
         if matches!(self.state, AlloySubscriberState::Uninitialized) && self.interests.is_empty() {
+            self.bump_stream_revision();
+            self.sources_dirty = false;
             return Ok(());
         }
 
@@ -4910,7 +6207,9 @@ where
             }
         }
 
+        self.bump_stream_revision();
         self.sources_dirty = false;
+        self.retire_unreferenced_filters();
         Ok(())
     }
 
@@ -4928,7 +6227,12 @@ where
     async fn drain_pending_backfills(&mut self) -> Result<(), SubscriberError> {
         while let Some(queued) = self.pending_backfills.front() {
             // Owner was removed while its backfill was queued.
-            if self.owner_interests(&queued.owner).is_none() {
+            let epoch = queued.epoch.clone();
+            let owner_exists = match &epoch {
+                Some(epoch) => self.interest_owner_state(epoch).is_some(),
+                None => self.owner_interests(&queued.owner).is_some(),
+            };
+            if !owner_exists {
                 self.pending_backfills.pop_front();
                 continue;
             }
@@ -4964,12 +6268,14 @@ where
             // anchor through the fetched bound.
             self.pending_backfills.pop_front();
             let source_id = self.log_source_id(&filter);
-            self.enqueue_backfilled_logs(logs, Some(source_id));
-            let anchor = self
-                .last_seen_log_blocks
-                .entry(source_id)
-                .or_insert(to_block);
-            *anchor = (*anchor).max(to_block);
+            self.enqueue_backfilled_logs(logs, Some(source_id), epoch.as_ref(), Some(backfill));
+            if epoch.is_none() {
+                let anchor = self
+                    .last_seen_log_blocks
+                    .entry(source_id)
+                    .or_insert(to_block);
+                *anchor = (*anchor).max(to_block);
+            }
 
             if !self.pending_records.is_empty() {
                 break;
@@ -4987,9 +6293,13 @@ where
 
     fn pubsub_stream_sources(&mut self) -> Vec<SubscriberStreamSource> {
         let mut sources = Vec::new();
+        let inherited_anchor = self.last_seen_log_blocks.values().copied().min();
 
         for filter in self.log_stream_filters() {
             let id = self.log_source_id(&filter);
+            if let Some(anchor) = inherited_anchor {
+                self.last_seen_log_blocks.entry(id).or_insert(anchor);
+            }
             sources.push(SubscriberStreamSource::PubSubLog { id, filter });
         }
 
@@ -5211,9 +6521,16 @@ where
 
             match event {
                 SubscriberEvent::StreamTerminated(source) => {
+                    // Persist the missing-source intent before the first await.
+                    // If a control command cancels this poll during reconnect,
+                    // the next poll will reconcile the desired/live diff.
+                    self.sources_dirty = true;
+                    self.bump_stream_revision();
                     if let Some(backfill_event) = self.reconnect_source_stream(source).await? {
+                        self.sources_dirty = false;
                         return Ok(Some(backfill_event));
                     }
+                    self.sources_dirty = false;
                 }
                 event => return Ok(Some(event)),
             }
@@ -5221,49 +6538,204 @@ where
     }
 
     fn enqueue_event(&mut self, event: SubscriberEvent<N>) {
+        self.enqueue_event_with_excluded_owners(event, None);
+    }
+
+    fn buffer_reconcile_event_for_owners(
+        &mut self,
+        event: &SubscriberEvent<N>,
+        target_epochs: &HashSet<SubscriberOwnerEpoch>,
+    ) {
+        match event {
+            SubscriberEvent::Log { log, .. } => {
+                self.buffer_reconcile_log_for_owners(log, InputSource::Subscription, target_epochs)
+            }
+            SubscriberEvent::BackfilledLogs { logs, .. } => {
+                for log in logs {
+                    self.buffer_reconcile_log_for_owners(log, InputSource::Backfill, target_epochs);
+                }
+            }
+            SubscriberEvent::Logs(logs) => {
+                for log in logs {
+                    self.buffer_reconcile_log_for_owners(log, InputSource::Poll, target_epochs);
+                }
+            }
+            SubscriberEvent::BlockHeader(_)
+            | SubscriberEvent::PendingHash(_)
+            | SubscriberEvent::PendingHashes(_)
+            | SubscriberEvent::StreamTerminated(_) => {}
+        }
+    }
+
+    fn buffer_reconcile_log_for_owners(
+        &mut self,
+        log: &Log,
+        source: InputSource,
+        target_epochs: &HashSet<SubscriberOwnerEpoch>,
+    ) {
+        let record = log_input_record(log.clone(), source);
+        let owners = self
+            .staged_owners_for_record(&record)
+            .into_iter()
+            .filter(|owner| target_epochs.contains(owner))
+            .collect::<Vec<_>>();
+        if !owners.is_empty() {
+            self.pending_reconcile_owner_records
+                .push_back(BufferedSubscriberOwnerRecord { record, owners });
+        }
+    }
+
+    fn promote_reconcile_owner_records(&mut self, target_epochs: &HashSet<SubscriberOwnerEpoch>) {
+        let mut retained = VecDeque::new();
+        while let Some(mut buffered) = self.pending_reconcile_owner_records.pop_front() {
+            let mut promoted = Vec::new();
+            buffered.owners.retain(|owner| {
+                if target_epochs.contains(owner) {
+                    promoted.push(owner.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+            if promoted.is_empty() {
+                retained.push_back(buffered);
+                continue;
+            }
+            let promoted_record = if buffered.owners.is_empty() {
+                buffered.record
+            } else {
+                let record = buffered.record.clone();
+                retained.push_back(buffered);
+                record
+            };
+            self.enqueue_owner_record_for_owners_unmerged(promoted_record, promoted);
+        }
+        self.pending_reconcile_owner_records = retained;
+    }
+
+    fn seed_reconciled_filter_anchors(
+        &mut self,
+        plans: &[SubscriberOwnerReconcilePlan<N>],
+        through: u64,
+    ) {
+        for filter in plans.iter().flat_map(|plan| log_filters(&plan.interests)) {
+            let Some(source_id) = self.log_source_ids.get(&filter).copied() else {
+                continue;
+            };
+            let anchor = self
+                .last_seen_log_blocks
+                .entry(source_id)
+                .or_insert(through);
+            *anchor = (*anchor).max(through);
+        }
+    }
+
+    fn enqueue_event_excluding_owners(
+        &mut self,
+        event: SubscriberEvent<N>,
+        excluded: &HashSet<SubscriberOwnerEpoch>,
+    ) {
+        self.enqueue_event_with_excluded_owners(event, Some(excluded));
+    }
+
+    fn enqueue_event_with_excluded_owners(
+        &mut self,
+        event: SubscriberEvent<N>,
+        excluded: Option<&HashSet<SubscriberOwnerEpoch>>,
+    ) {
         match event {
             SubscriberEvent::Log { source_id, log } => {
                 if log_matches_any_interest(&log, &self.interests) {
                     let record = log_input_record(log, InputSource::Subscription);
                     self.note_log_block(source_id, &record);
-                    self.enqueue_record(record);
+                    self.enqueue_record_with_excluded_owners(record, excluded);
                 }
             }
             SubscriberEvent::BackfilledLogs { source_id, logs } => {
-                self.enqueue_backfilled_logs(logs, Some(source_id));
+                self.enqueue_backfilled_logs_with_excluded_owners(
+                    logs,
+                    Some(source_id),
+                    None,
+                    None,
+                    excluded,
+                );
             }
-            SubscriberEvent::Logs(logs) => self.pending_records.extend(
-                logs.into_iter()
-                    .filter(|log| log_matches_any_interest(log, &self.interests))
-                    .map(|log| log_input_record(log, InputSource::Poll)),
-            ),
+            SubscriberEvent::Logs(logs) => {
+                for log in logs {
+                    if log_matches_any_interest(&log, &self.interests) {
+                        self.enqueue_record_with_excluded_owners(
+                            log_input_record(log, InputSource::Poll),
+                            excluded,
+                        );
+                    }
+                }
+            }
             SubscriberEvent::BlockHeader(header) => {
                 if needs_header_block_stream(&self.interests) {
                     let record = block_header_input_record::<N>(header);
-                    self.enqueue_record(record);
+                    self.enqueue_record_with_excluded_owners(record, excluded);
                 }
             }
             SubscriberEvent::PendingHash(hash) => {
                 let record = pending_hash_input_record::<N>(hash, InputSource::Subscription);
-                self.enqueue_record(record);
+                self.enqueue_record_with_excluded_owners(record, excluded);
             }
-            SubscriberEvent::PendingHashes(hashes) => self.pending_records.extend(
-                hashes
-                    .into_iter()
-                    .map(|hash| pending_hash_input_record::<N>(hash, InputSource::Poll)),
-            ),
+            SubscriberEvent::PendingHashes(hashes) => {
+                for hash in hashes {
+                    self.enqueue_record_with_excluded_owners(
+                        pending_hash_input_record::<N>(hash, InputSource::Poll),
+                        excluded,
+                    );
+                }
+            }
             SubscriberEvent::StreamTerminated(_) => {}
         }
     }
 
-    fn enqueue_backfilled_logs(&mut self, logs: Vec<Log>, source_id: Option<usize>) {
+    fn enqueue_backfilled_logs(
+        &mut self,
+        logs: Vec<Log>,
+        source_id: Option<usize>,
+        owner: Option<&SubscriberOwnerEpoch>,
+        range: Option<SubscriberBackfill>,
+    ) {
+        self.enqueue_backfilled_logs_with_excluded_owners(logs, source_id, owner, range, None);
+    }
+
+    fn enqueue_backfilled_logs_with_excluded_owners(
+        &mut self,
+        logs: Vec<Log>,
+        source_id: Option<usize>,
+        owner: Option<&SubscriberOwnerEpoch>,
+        range: Option<SubscriberBackfill>,
+        excluded: Option<&HashSet<SubscriberOwnerEpoch>>,
+    ) {
         for log in logs {
-            if log_matches_any_interest(&log, &self.interests) {
+            if range.is_some_and(|range| {
+                log.block_number.is_some_and(|block| {
+                    block < range.start_block() || range.end_block().is_some_and(|end| block > end)
+                })
+            }) {
+                continue;
+            }
+            let matches = match owner {
+                Some(epoch) => self
+                    .owned_interests
+                    .iter()
+                    .find(|entry| entry.epoch.as_ref() == Some(epoch))
+                    .is_some_and(|entry| log_matches_any_interest(&log, &entry.interests)),
+                None => log_matches_any_interest(&log, &self.interests),
+            };
+            if matches {
                 let record = log_input_record(log, InputSource::Backfill);
-                if let Some(source_id) = source_id {
-                    self.note_log_block(source_id, &record);
+                if let Some(epoch) = owner {
+                    self.enqueue_owner_record(record, epoch.clone());
+                } else {
+                    if let Some(source_id) = source_id {
+                        self.note_log_block(source_id, &record);
+                    }
+                    self.enqueue_record_with_excluded_owners(record, excluded);
                 }
-                self.enqueue_record(record);
             }
         }
     }
@@ -5372,12 +6844,146 @@ where
         }
     }
 
-    fn enqueue_record(&mut self, record: ReactiveInputRecord<N>) {
-        if self.should_skip_recent_duplicate(&record) {
+    fn enqueue_record_with_excluded_owners(
+        &mut self,
+        record: ReactiveInputRecord<N>,
+        excluded: Option<&HashSet<SubscriberOwnerEpoch>>,
+    ) {
+        let mut owners = self.staged_owners_for_record(&record);
+        if let Some(excluded) = excluded {
+            owners.retain(|owner| !excluded.contains(owner));
+        }
+        let canonical_duplicate = self.should_skip_recent_duplicate(&record);
+        let owners = self.filter_recent_owner_duplicates(&record, owners);
+        if canonical_duplicate {
+            if !owners.is_empty() {
+                self.pending_records.push_back(SubscriberInputRecord {
+                    record,
+                    scope: SubscriberInputScope::OwnerOnly { owners },
+                });
+            }
             return;
         }
         self.remember_record(&record);
-        self.pending_records.push_back(record);
+        self.pending_records.push_back(SubscriberInputRecord {
+            record,
+            scope: SubscriberInputScope::Canonical { owners },
+        });
+    }
+
+    fn enqueue_owner_record(
+        &mut self,
+        record: ReactiveInputRecord<N>,
+        owner: SubscriberOwnerEpoch,
+    ) {
+        self.enqueue_owner_record_for_owners(record, vec![owner]);
+    }
+
+    fn enqueue_owner_record_for_owners(
+        &mut self,
+        record: ReactiveInputRecord<N>,
+        owners: Vec<SubscriberOwnerEpoch>,
+    ) {
+        self.enqueue_owner_record_for_owners_inner(record, owners, true);
+    }
+
+    fn enqueue_owner_record_for_owners_unmerged(
+        &mut self,
+        record: ReactiveInputRecord<N>,
+        owners: Vec<SubscriberOwnerEpoch>,
+    ) {
+        self.enqueue_owner_record_for_owners_inner(record, owners, false);
+    }
+
+    fn enqueue_owner_record_for_owners_inner(
+        &mut self,
+        record: ReactiveInputRecord<N>,
+        owners: Vec<SubscriberOwnerEpoch>,
+        merge_pending: bool,
+    ) {
+        let owners = self.filter_recent_owner_duplicates(&record, owners);
+        if owners.is_empty() {
+            return;
+        }
+        if merge_pending
+            && should_dedupe_record(&record)
+            && self.config.reconnect.dedupe_window != 0
+        {
+            let input_ref = record.input_ref();
+            if let Some(pending) = self
+                .pending_records
+                .iter_mut()
+                .rev()
+                .find(|pending| pending.record.input_ref() == input_ref)
+            {
+                let pending_owners = match &mut pending.scope {
+                    SubscriberInputScope::Canonical { owners }
+                    | SubscriberInputScope::OwnerOnly { owners } => owners,
+                };
+                for owner in owners {
+                    if !pending_owners.contains(&owner) {
+                        pending_owners.push(owner);
+                    }
+                }
+                return;
+            }
+        }
+        self.pending_records.push_back(SubscriberInputRecord {
+            record,
+            scope: SubscriberInputScope::OwnerOnly { owners },
+        });
+    }
+
+    fn staged_owners_for_record(
+        &self,
+        record: &ReactiveInputRecord<N>,
+    ) -> Vec<SubscriberOwnerEpoch> {
+        self.owned_interests
+            .iter()
+            .filter(|entry| entry.state == SubscriberOwnerState::Staged)
+            .filter(|entry| {
+                entry
+                    .interests
+                    .iter()
+                    .any(|interest| interest_matches(interest, &record.input))
+            })
+            .filter_map(|entry| entry.epoch.clone())
+            .collect()
+    }
+
+    fn filter_recent_owner_duplicates(
+        &mut self,
+        record: &ReactiveInputRecord<N>,
+        owners: Vec<SubscriberOwnerEpoch>,
+    ) -> Vec<SubscriberOwnerEpoch> {
+        if !should_dedupe_record(record) || self.config.reconnect.dedupe_window == 0 {
+            return owners;
+        }
+        let input_ref = record.input_ref();
+        let window = self.config.reconnect.dedupe_window;
+        owners
+            .into_iter()
+            .filter(|owner| {
+                let seen = self
+                    .recent_owner_input_ref_sets
+                    .entry(owner.clone())
+                    .or_default();
+                if !seen.insert(input_ref) {
+                    return false;
+                }
+                let recent = self
+                    .recent_owner_input_refs
+                    .entry(owner.clone())
+                    .or_default();
+                recent.push_back(input_ref);
+                while recent.len() > window {
+                    if let Some(evicted) = recent.pop_front() {
+                        seen.remove(&evicted);
+                    }
+                }
+                true
+            })
+            .collect()
     }
 
     fn should_skip_recent_duplicate(&self, record: &ReactiveInputRecord<N>) -> bool {
@@ -5532,6 +7138,483 @@ mod subscriber_helper_tests {
 
         assert!(should_dedupe_record(&included));
         assert!(!should_dedupe_record(&removed));
+    }
+
+    #[test]
+    fn active_owner_replacement_commits_atomically_to_one_new_epoch() {
+        let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::Polling,
+            SubscriberConfig::default(),
+        );
+        let owner = HandlerId::new("replace-owner");
+        let original = ReactiveInterest::Logs(LogInterest {
+            provider_filter: Filter::new().address(Address::repeat_byte(0x41)),
+            local_matcher: None,
+            route_key: None,
+        });
+        let replacement_interest = ReactiveInterest::Logs(LogInterest {
+            provider_filter: Filter::new().address(Address::repeat_byte(0x42)),
+            local_matcher: None,
+            route_key: None,
+        });
+        let active = subscriber
+            .stage_interest_owner(owner.clone(), &[original], SubscriberOwnerStart::Live)
+            .unwrap();
+        assert!(subscriber.activate_interest_owner(&active));
+        let replacement = subscriber
+            .stage_interest_owner_replacement(
+                owner,
+                &[replacement_interest],
+                SubscriberOwnerStart::Live,
+            )
+            .unwrap();
+
+        assert!(subscriber.commit_interest_owner_replacement(&active, &replacement));
+        assert_eq!(subscriber.interest_owner_state(&active), None);
+        assert_eq!(
+            subscriber.interest_owner_state(&replacement),
+            Some(SubscriberOwnerState::Active)
+        );
+        assert_eq!(subscriber.registered_interests().len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[cfg(feature = "reactive-ws")]
+    async fn aborting_staged_epoch_purges_only_its_buffered_delivery() {
+        let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig::default(),
+        );
+        let interest = ReactiveInterest::Logs(LogInterest {
+            provider_filter: Filter::new().address(Address::repeat_byte(0x42)),
+            local_matcher: None,
+            route_key: None,
+        });
+        let owner_a = subscriber
+            .stage_interest_owner(
+                HandlerId::new("owner-a"),
+                std::slice::from_ref(&interest),
+                SubscriberOwnerStart::Live,
+            )
+            .unwrap();
+        let owner_b = subscriber
+            .stage_interest_owner(
+                HandlerId::new("owner-b"),
+                &[interest],
+                SubscriberOwnerStart::Live,
+            )
+            .unwrap();
+
+        subscriber.enqueue_event(SubscriberEvent::Log {
+            source_id: 0,
+            log: rpc_log(false),
+        });
+        assert!(subscriber.abort_interest_owner(&owner_a));
+
+        let batch = subscriber
+            .next_scoped_batch()
+            .await
+            .unwrap()
+            .expect("shared canonical delivery remains queued");
+        assert_eq!(batch.records.len(), 1);
+        assert_eq!(
+            batch.records[0].scope,
+            SubscriberInputScope::Canonical {
+                owners: vec![owner_b]
+            }
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[cfg(feature = "reactive-ws")]
+    async fn owner_backfill_dedupe_never_suppresses_canonical_delivery() {
+        let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig::default(),
+        );
+        let epoch = subscriber
+            .stage_interest_owner(
+                HandlerId::new("owner"),
+                &[ReactiveInterest::Logs(LogInterest {
+                    provider_filter: Filter::new().address(Address::repeat_byte(0x42)),
+                    local_matcher: None,
+                    route_key: None,
+                })],
+                SubscriberOwnerStart::Live,
+            )
+            .unwrap();
+        let log = rpc_log(false);
+
+        subscriber.enqueue_owner_record(
+            log_input_record(log.clone(), InputSource::Backfill),
+            epoch.clone(),
+        );
+        subscriber.enqueue_event(SubscriberEvent::Log { source_id: 0, log });
+
+        let batch = subscriber
+            .next_scoped_batch()
+            .await
+            .unwrap()
+            .expect("owner backfill and canonical live delivery");
+        assert_eq!(batch.records.len(), 2);
+        assert_eq!(
+            batch.records[0].scope,
+            SubscriberInputScope::OwnerOnly {
+                owners: vec![epoch]
+            }
+        );
+        assert_eq!(
+            batch.records[1].scope,
+            SubscriberInputScope::Canonical { owners: Vec::new() },
+            "owner replay dedupe must not suppress the global live record"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[cfg(feature = "reactive-polling")]
+    async fn reconcile_fetch_drains_live_burst_beyond_output_batch_capacity() {
+        let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::Polling,
+            SubscriberConfig {
+                max_batch_size: 2,
+                ..SubscriberConfig::default()
+            },
+        );
+        let interest = ReactiveInterest::Logs(LogInterest {
+            provider_filter: Filter::new().address(Address::repeat_byte(0x42)),
+            local_matcher: None,
+            route_key: None,
+        });
+        let epoch = subscriber
+            .stage_interest_owner(
+                HandlerId::new("owner"),
+                std::slice::from_ref(&interest),
+                SubscriberOwnerStart::Live,
+            )
+            .unwrap();
+        subscriber.sources_dirty = false;
+
+        let mut duplicate = rpc_log(false);
+        duplicate.transaction_hash = Some(B256::repeat_byte(1));
+        duplicate.log_index = Some(0);
+        let events = (0u8..10).map(|index| {
+            let mut log = rpc_log(false);
+            log.transaction_hash = Some(B256::repeat_byte(index.saturating_add(1)));
+            log.log_index = Some(index as u64);
+            SubscriberEvent::Log { source_id: 0, log }
+        });
+        let filter = log_filters(std::slice::from_ref(&interest)).pop().unwrap();
+        let mut streams = SubscriberStreams::new();
+        streams.push(
+            SubscriberStreamSource::PollingLog { filter },
+            stream::iter(events).boxed(),
+        );
+        subscriber.state = AlloySubscriberState::Active(streams);
+
+        let mut polls = 0usize;
+        let fetched_duplicate = duplicate.clone();
+        let fetch = poll_fn(move |cx| {
+            polls += 1;
+            if polls > 10 {
+                std::task::Poll::Ready(Ok::<_, SubscriberOwnerError>(fetched_duplicate.clone()))
+            } else {
+                cx.waker().wake_by_ref();
+                std::task::Poll::Pending
+            }
+        });
+        let target_epochs = HashSet::from([epoch.clone()]);
+        let fetched_duplicate = subscriber
+            .drive_reconcile_fetch(fetch, &target_epochs)
+            .await
+            .unwrap();
+        subscriber.enqueue_owner_record_for_owners_unmerged(
+            log_input_record(fetched_duplicate, InputSource::Backfill),
+            vec![epoch.clone()],
+        );
+        subscriber.promote_reconcile_owner_records(&target_epochs);
+
+        assert_eq!(subscriber.pending_records.len(), 20);
+        assert!(subscriber.pending_records.iter().take(10).all(|record| {
+            record.scope == SubscriberInputScope::Canonical { owners: Vec::new() }
+        }));
+        assert!(subscriber.pending_records.iter().skip(10).all(|record| {
+            record.scope
+                == SubscriberInputScope::OwnerOnly {
+                    owners: vec![epoch.clone()],
+                }
+        }));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[cfg(feature = "reactive-polling")]
+    async fn reconcile_fetch_waits_for_provider_when_live_topology_is_empty() {
+        let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::Polling,
+            SubscriberConfig::default(),
+        );
+        subscriber.sources_dirty = false;
+        let mut first_poll = true;
+        let fetch = poll_fn(move |cx| {
+            if first_poll {
+                first_poll = false;
+                cx.waker().wake_by_ref();
+                std::task::Poll::Pending
+            } else {
+                std::task::Poll::Ready(Ok::<_, SubscriberOwnerError>("certified"))
+            }
+        });
+
+        let result = subscriber
+            .drive_reconcile_fetch(fetch, &HashSet::new())
+            .await
+            .expect("an empty live topology must not be mistaken for termination");
+        assert_eq!(result, "certified");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[cfg(all(feature = "reactive-polling", feature = "reactive-ws"))]
+    async fn successful_owner_reconcile_seeds_its_live_filter_reconnect_anchor() {
+        use alloy_rpc_types_eth::{Block, Header};
+
+        let asserter = Asserter::new();
+        let baseline = BlockRef {
+            number: 100,
+            hash: B256::repeat_byte(0x64),
+            parent_hash: Some(B256::repeat_byte(0x63)),
+            timestamp: Some(1_700_000_100),
+        };
+        let through = BlockRef {
+            number: 101,
+            hash: B256::repeat_byte(0x65),
+            parent_hash: Some(baseline.hash),
+            timestamp: Some(1_700_000_101),
+        };
+        let rpc_block = || -> Block {
+            Block::empty(Header {
+                hash: through.hash,
+                inner: alloy_consensus::Header {
+                    number: through.number,
+                    parent_hash: through.parent_hash.unwrap(),
+                    timestamp: through.timestamp.unwrap(),
+                    ..Default::default()
+                },
+                total_difficulty: None,
+                size: None,
+            })
+        };
+        asserter.push_success(&Some(rpc_block()));
+        asserter.push_success(&Vec::<Log>::new());
+        asserter.push_success(&Some(rpc_block()));
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig::default(),
+        );
+        let interest = ReactiveInterest::Logs(LogInterest {
+            provider_filter: Filter::new().address(Address::repeat_byte(0xac)),
+            local_matcher: None,
+            route_key: None,
+        });
+        let epoch = subscriber
+            .stage_interest_owner(
+                HandlerId::new("reconnect-anchor"),
+                std::slice::from_ref(&interest),
+                SubscriberOwnerStart::PostBlock(baseline),
+            )
+            .unwrap();
+        let filter = log_filters(std::slice::from_ref(&interest)).pop().unwrap();
+        let source = SubscriberStreamSource::PubSubLog {
+            id: subscriber.log_source_id(&filter),
+            filter: filter.clone(),
+        };
+        let mut streams = SubscriberStreams::new();
+        streams.push(source, stream::pending().boxed());
+        subscriber.state = AlloySubscriberState::Active(streams);
+        subscriber.sources_dirty = false;
+
+        subscriber
+            .reconcile_interest_owner(&epoch, through.clone())
+            .await
+            .unwrap();
+        assert_eq!(subscriber.log_anchor(&filter), Some(through.number));
+        assert!(asserter.read_q().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[cfg(feature = "reactive-polling")]
+    async fn cancelled_reconcile_retains_hidden_owner_live_delivery_for_retry() {
+        let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::Polling,
+            SubscriberConfig::default(),
+        );
+        let interest = ReactiveInterest::Logs(LogInterest {
+            provider_filter: Filter::new().address(Address::repeat_byte(0x42)),
+            local_matcher: None,
+            route_key: None,
+        });
+        let epoch = subscriber
+            .stage_interest_owner(
+                HandlerId::new("owner"),
+                std::slice::from_ref(&interest),
+                SubscriberOwnerStart::PostBlock(BlockRef {
+                    number: 100,
+                    hash: B256::repeat_byte(0x64),
+                    parent_hash: None,
+                    timestamp: None,
+                }),
+            )
+            .unwrap();
+        subscriber.sources_dirty = false;
+
+        let filter = log_filters(std::slice::from_ref(&interest)).pop().unwrap();
+        let event = SubscriberEvent::Log {
+            source_id: 0,
+            log: rpc_log(false),
+        };
+        let mut streams = SubscriberStreams::new();
+        streams.push(
+            SubscriberStreamSource::PollingLog { filter },
+            stream::once(async move { event })
+                .chain(stream::pending())
+                .boxed(),
+        );
+        subscriber.state = AlloySubscriberState::Active(streams);
+
+        let targets = HashSet::from([epoch.clone()]);
+        {
+            let fetch = futures::future::pending::<Result<(), SubscriberOwnerError>>();
+            let drive = subscriber.drive_reconcile_fetch(fetch, &targets);
+            futures::pin_mut!(drive);
+            poll_fn(|cx| {
+                assert!(drive.as_mut().poll(cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+        }
+
+        assert_eq!(subscriber.pending_records.len(), 1);
+        assert_eq!(
+            subscriber.pending_records[0].scope,
+            SubscriberInputScope::Canonical { owners: Vec::new() },
+            "canonical delivery commits immediately at a cancellation-safe boundary"
+        );
+        assert_eq!(subscriber.pending_reconcile_owner_records.len(), 1);
+
+        subscriber
+            .drive_reconcile_fetch(futures::future::ready(Ok(())), &targets)
+            .await
+            .unwrap();
+        subscriber.promote_reconcile_owner_records(&targets);
+        assert!(subscriber.pending_reconcile_owner_records.is_empty());
+        assert_eq!(subscriber.pending_records.len(), 2);
+        assert_eq!(
+            subscriber.pending_records[0].scope,
+            SubscriberInputScope::Canonical { owners: Vec::new() },
+            "canonical delivery remains target-excluded"
+        );
+        assert_eq!(
+            subscriber.pending_records[1].scope,
+            SubscriberInputScope::OwnerOnly {
+                owners: vec![epoch]
+            },
+            "retry commit appends hidden owner delivery after historical catch-up"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[cfg(feature = "reactive-ws")]
+    async fn control_cancellation_preserves_terminated_source_reconcile_intent() {
+        let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig {
+                reconnect: SubscriberReconnectConfig {
+                    initial_delay: Duration::from_secs(60),
+                    ..SubscriberReconnectConfig::default()
+                },
+                ..SubscriberConfig::default()
+            },
+        );
+        let interest = ReactiveInterest::Logs(LogInterest {
+            provider_filter: Filter::new().address(Address::repeat_byte(0x42)),
+            local_matcher: None,
+            route_key: None,
+        });
+        let epoch = subscriber
+            .stage_interest_owner(
+                HandlerId::new("owner"),
+                std::slice::from_ref(&interest),
+                SubscriberOwnerStart::PostBlock(BlockRef {
+                    number: 7,
+                    hash: B256::repeat_byte(0x07),
+                    parent_hash: Some(B256::repeat_byte(0x06)),
+                    timestamp: Some(1_700_000_007),
+                }),
+            )
+            .unwrap();
+        subscriber.sources_dirty = false;
+        subscriber.stream_revision = 1;
+        let entry = subscriber
+            .owned_interests
+            .iter_mut()
+            .find(|entry| entry.epoch.as_ref() == Some(&epoch))
+            .unwrap();
+        entry.progress = Some(SubscriberOwnerProgress {
+            owner: epoch.clone(),
+            through: entry.baseline.clone().unwrap(),
+        });
+        entry.progress_stream_revision = Some(1);
+
+        let filter = log_filters(std::slice::from_ref(&interest)).pop().unwrap();
+        let source = SubscriberStreamSource::PubSubLog {
+            id: subscriber.log_source_id(&filter),
+            filter,
+        };
+        let mut streams = SubscriberStreams::new();
+        streams.push(
+            source.clone(),
+            stream::iter([SubscriberEvent::StreamTerminated(source)]).boxed(),
+        );
+        subscriber.state = AlloySubscriberState::Active(streams);
+        let prior_revision = subscriber.stream_revision;
+
+        let mut first_poll = true;
+        let control = poll_fn(move |cx| {
+            if first_poll {
+                first_poll = false;
+                cx.waker().wake_by_ref();
+                std::task::Poll::Pending
+            } else {
+                std::task::Poll::Ready("stop")
+            }
+        });
+        futures::pin_mut!(control);
+        let outcome = subscriber
+            .next_scoped_batch_or(control.as_mut())
+            .await
+            .unwrap();
+
+        assert!(matches!(outcome, SubscriberDriverPoll::Control("stop")));
+        assert!(subscriber.sources_dirty);
+        assert!(subscriber.stream_revision > prior_revision);
+        assert!(
+            !subscriber.activate_interest_owner(&epoch),
+            "progress certified against the terminated stream revision is stale"
+        );
     }
 
     #[test]
@@ -5723,11 +7806,17 @@ mod subscriber_helper_tests {
 
         // Allocate source ids the way live stream setup would (pool-a -> id 0),
         // so the injected delivery anchor hangs off a referenced filter.
-        let _ = subscriber.stream_sources().expect("stream sources");
+        let sources = subscriber.stream_sources().expect("stream sources");
         subscriber.enqueue_event(SubscriberEvent::Log {
             source_id: 0,
             log: rpc_log(false),
         });
+        let mut streams = SubscriberStreams::new();
+        streams.push(
+            sources[0].clone(),
+            stream::pending::<SubscriberEvent<Ethereum>>().boxed(),
+        );
+        subscriber.state = AlloySubscriberState::Active(streams);
         assert_eq!(subscriber.pending_records.len(), 1);
         assert_eq!(subscriber.recent_input_refs.len(), 1);
         assert_eq!(subscriber.last_seen_log_blocks.get(&0), Some(&7));
@@ -5755,7 +7844,7 @@ mod subscriber_helper_tests {
 
     #[test]
     #[cfg(feature = "reactive-ws")]
-    fn owner_log_sources_do_not_merge_across_owners() {
+    fn owner_log_sources_fan_in_across_owners() {
         let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
         let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
             provider,
@@ -5793,12 +7882,14 @@ mod subscriber_helper_tests {
             .expect("register pool-b owner");
 
         let expanded_sources = subscriber.stream_sources().expect("expanded sources");
-        assert_eq!(expanded_sources.len(), 2);
+        assert_eq!(
+            expanded_sources.len(),
+            1,
+            "compatible owner filters should share one provider subscription"
+        );
         assert!(
-            expanded_sources
-                .iter()
-                .any(|source| source.same_key(&pool_a_source)),
-            "adding pool-b should not rewrite pool-a's stream source"
+            !expanded_sources[0].same_key(&pool_a_source),
+            "the provider-facing superset changes while owner routing remains exact"
         );
 
         subscriber
@@ -5807,6 +7898,40 @@ mod subscriber_helper_tests {
         let trimmed_sources = subscriber.stream_sources().expect("trimmed sources");
         assert_eq!(trimmed_sources.len(), 1);
         assert!(trimmed_sources[0].same_key(&pool_a_source));
+    }
+
+    #[test]
+    #[cfg(feature = "reactive-ws")]
+    fn provider_log_fan_in_respects_address_ceiling() {
+        let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig {
+                max_log_addresses_per_subscription: 2,
+                ..SubscriberConfig::default()
+            },
+        );
+        for index in 0..5 {
+            subscriber
+                .add_interest_owner(
+                    HandlerId::new(format!("pool-{index}")),
+                    &[log_interest_for(index + 1)],
+                )
+                .expect("register pool owner");
+        }
+
+        let sources = subscriber.stream_sources().expect("stream sources");
+        assert_eq!(sources.len(), 3);
+        let mut address_counts: Vec<_> = sources
+            .iter()
+            .map(|source| match source {
+                SubscriberStreamSource::PubSubLog { filter, .. } => filter.address.iter().count(),
+                _ => panic!("expected log source"),
+            })
+            .collect();
+        address_counts.sort_unstable();
+        assert_eq!(address_counts, vec![1, 2, 2]);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -6121,7 +8246,11 @@ mod subscriber_helper_tests {
         let id_b = subscriber.log_source_id(&filter_b);
         subscriber.last_seen_log_blocks.insert(id_a, 10);
         subscriber.last_seen_log_blocks.insert(id_b, 20);
-        assert_eq!(subscriber.log_source_ids.len(), 2);
+        assert_eq!(
+            subscriber.log_source_ids.len(),
+            3,
+            "one provider fan-in id plus two explicitly seeded logical ids"
+        );
 
         subscriber
             .remove_interest_owner(&HandlerId::new("pool-b"))
@@ -6343,6 +8472,11 @@ fn validate_subscriber_config(config: &SubscriberConfig) -> Result<(), Subscribe
             "SubscriberConfig::max_batch_size must be greater than zero",
         ));
     }
+    if config.max_log_addresses_per_subscription == 0 {
+        return Err(SubscriberError::InvalidConfig(
+            "SubscriberConfig::max_log_addresses_per_subscription must be greater than zero",
+        ));
+    }
     if config.reconnect.enabled {
         if config.reconnect.retry_delay > config.reconnect.max_delay {
             return Err(SubscriberError::InvalidConfig(
@@ -6431,6 +8565,229 @@ fn log_matches_any_interest<N: Network>(log: &Log, interests: &[ReactiveInterest
             ReactiveInterest::Logs(interest) if interest.matches(log)
         )
     })
+}
+
+fn validate_owner_backfill_logs(
+    logs: &[Log],
+    from_block: u64,
+    through: &BlockRef,
+) -> Result<(), SubscriberOwnerError> {
+    for log in logs {
+        if log.removed {
+            return Err(SubscriberOwnerError::InvalidBackfillLog(
+                "removed log in canonical catch-up",
+            ));
+        }
+        let number = log
+            .block_number
+            .ok_or(SubscriberOwnerError::InvalidBackfillLog(
+                "log missing block number",
+            ))?;
+        let hash = log
+            .block_hash
+            .ok_or(SubscriberOwnerError::InvalidBackfillLog(
+                "log missing block hash",
+            ))?;
+        log.transaction_hash
+            .ok_or(SubscriberOwnerError::InvalidBackfillLog(
+                "log missing transaction hash",
+            ))?;
+        log.transaction_index
+            .ok_or(SubscriberOwnerError::InvalidBackfillLog(
+                "log missing transaction index",
+            ))?;
+        log.log_index
+            .ok_or(SubscriberOwnerError::InvalidBackfillLog(
+                "log missing log index",
+            ))?;
+        if number < from_block || number > through.number {
+            return Err(SubscriberOwnerError::InvalidBackfillLog(
+                "log outside requested block range",
+            ));
+        }
+        if number == through.number && hash != through.hash {
+            return Err(SubscriberOwnerError::InvalidBackfillLog(
+                "target-block log hash mismatch",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_owner_backfill_log_set(logs: &[Log]) -> Result<(), SubscriberOwnerError> {
+    let mut positions = HashMap::new();
+    let mut block_hashes = HashMap::new();
+    let mut transaction_hashes = HashMap::new();
+    let mut transaction_positions = HashMap::new();
+    let mut ordering = BTreeMap::<u64, Vec<(u64, u64)>>::new();
+    for log in logs {
+        let number = log
+            .block_number
+            .expect("individual owner catch-up logs are validated before set validation");
+        let block_hash = log
+            .block_hash
+            .expect("individual owner catch-up logs are validated before set validation");
+        let transaction_hash = log
+            .transaction_hash
+            .expect("individual owner catch-up logs are validated before set validation");
+        let transaction_index = log
+            .transaction_index
+            .expect("individual owner catch-up logs are validated before set validation");
+        let log_index = log
+            .log_index
+            .expect("individual owner catch-up logs are validated before set validation");
+        if block_hashes
+            .insert(number, block_hash)
+            .is_some_and(|prior| prior != block_hash)
+        {
+            return Err(SubscriberOwnerError::InvalidBackfillLog(
+                "conflicting block identity in canonical catch-up",
+            ));
+        }
+        if let Some(previous) = positions.insert((number, log_index), log)
+            && previous != log
+        {
+            return Err(SubscriberOwnerError::InvalidBackfillLog(
+                "conflicting logs at one canonical block position",
+            ));
+        }
+        let conflicting_transaction = transaction_hashes
+            .insert((number, transaction_index), transaction_hash)
+            .is_some_and(|prior| prior != transaction_hash)
+            || transaction_positions
+                .insert((number, transaction_hash), transaction_index)
+                .is_some_and(|prior| prior != transaction_index);
+        if conflicting_transaction {
+            return Err(SubscriberOwnerError::InvalidBackfillLog(
+                "conflicting transaction identity at one canonical block position",
+            ));
+        }
+        ordering
+            .entry(number)
+            .or_default()
+            .push((log_index, transaction_index));
+    }
+    for positions in ordering.values_mut() {
+        positions.sort_unstable();
+        if positions.windows(2).any(|pair| pair[0].1 > pair[1].1) {
+            return Err(SubscriberOwnerError::InvalidBackfillLog(
+                "transaction and log positions disagree on canonical order",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn merged_owner_reconcile_filters<N: Network>(
+    plans: &[SubscriberOwnerReconcilePlan<N>],
+    through: u64,
+) -> Vec<SubscriberOwnerReconcileFilter> {
+    let mut by_start = BTreeMap::<u64, Vec<Filter>>::new();
+    for plan in plans.iter().filter(|plan| plan.from_block <= through) {
+        let filters = by_start.entry(plan.from_block).or_default();
+        filters.extend(
+            log_filters(&plan.interests)
+                .into_iter()
+                .map(|filter| filter.from_block(plan.from_block).to_block(through)),
+        );
+    }
+
+    let mut chunks = Vec::new();
+    for (from_block, filters) in by_start {
+        for filters in filters.chunks(OWNER_RECONCILE_FILTERS_PER_CHUNK) {
+            let mut merged = Vec::new();
+            for filter in filters {
+                merge_log_subscription_filter(&mut merged, filter);
+            }
+            chunks.extend(
+                merged
+                    .into_iter()
+                    .map(|filter| SubscriberOwnerReconcileFilter { filter, from_block }),
+            );
+        }
+    }
+    chunks
+}
+
+async fn fetch_owner_catchup<P, N>(
+    provider: P,
+    filters: Vec<SubscriberOwnerReconcileFilter>,
+    retained: Vec<BlockRef>,
+    through: BlockRef,
+) -> Result<SubscriberOwnerCatchup, SubscriberOwnerError>
+where
+    P: Provider<N> + Send + Sync,
+    N: Network,
+{
+    let _ = verify_provider_reconcile_target::<P, N>(&provider, &through).await?;
+    let mut certified_positions = HashSet::new();
+    for position in retained {
+        let target_certifies_position = position == through
+            || (position.number.checked_add(1) == Some(through.number)
+                && through.parent_hash == Some(position.hash));
+        if !target_certifies_position && certified_positions.insert(position.clone()) {
+            let _ = verify_provider_reconcile_target::<P, N>(&provider, &position).await?;
+        }
+    }
+    let mut logs = Vec::new();
+    let requests = filters.into_iter().map(|filter| {
+        let provider = &provider;
+        async move {
+            let logs = provider
+                .get_logs(&filter.filter)
+                .await
+                .map_err(provider_error)?;
+            Ok::<_, SubscriberOwnerError>((filter.from_block, logs))
+        }
+    });
+    for (from_block, fetched) in try_join_all(requests).await? {
+        validate_owner_backfill_logs(&fetched, from_block, &through)?;
+        logs.extend(fetched);
+    }
+    validate_owner_backfill_log_set(&logs)?;
+    let certified = verify_provider_reconcile_target::<P, N>(&provider, &through).await?;
+    Ok(SubscriberOwnerCatchup { logs, certified })
+}
+
+async fn verify_provider_reconcile_target<P, N>(
+    provider: &P,
+    expected: &BlockRef,
+) -> Result<BlockRef, SubscriberOwnerError>
+where
+    P: Provider<N> + Send + Sync,
+    N: Network,
+{
+    let block = provider
+        .get_block_by_number(BlockNumberOrTag::Number(expected.number))
+        .await
+        .map_err(provider_error)?
+        .ok_or(SubscriberOwnerError::BlockUnavailable(expected.number))?;
+    let header = block.header();
+    let actual = BlockRef {
+        number: header.number(),
+        hash: header.hash(),
+        parent_hash: Some(header.parent_hash()),
+        timestamp: Some(header.timestamp()),
+    };
+    let exact_parent = expected
+        .parent_hash
+        .is_none_or(|parent| Some(parent) == actual.parent_hash);
+    let exact_timestamp = expected
+        .timestamp
+        .is_none_or(|timestamp| Some(timestamp) == actual.timestamp);
+    if actual.number != expected.number
+        || actual.hash != expected.hash
+        || !exact_parent
+        || !exact_timestamp
+    {
+        return Err(SubscriberOwnerError::BlockMismatch {
+            expected_number: expected.number,
+            expected_hash: expected.hash,
+            actual_number: actual.number,
+            actual_hash: actual.hash,
+        });
+    }
+    Ok(actual)
 }
 
 fn log_input_record<N: Network>(log: Log, source: InputSource) -> ReactiveInputRecord<N> {

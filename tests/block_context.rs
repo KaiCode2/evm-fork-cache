@@ -18,6 +18,7 @@
 mod common;
 
 use alloy_consensus::Header;
+use alloy_eips::BlockId;
 use alloy_primitives::{Address, B256};
 use anyhow::Result;
 
@@ -148,6 +149,29 @@ use evm_fork_cache::reactive::{
 fn mock_provider() -> Arc<RootProvider<AnyNetwork>> {
     let client = RpcClient::mocked(Asserter::new());
     Arc::new(RootProvider::<AnyNetwork>::new(client))
+}
+
+/// A cache built at a concrete block must retain the complete header context
+/// fetched for that pin. Otherwise a downstream consumer can pair state from
+/// the pinned block with a wall-clock timestamp during simulation.
+#[tokio::test]
+async fn pinned_builder_captures_timestamp_from_fetched_header() -> Result<()> {
+    let asserter = Asserter::new();
+    let expected = header(12_345, Some(42));
+    let block: alloy_rpc_types_eth::Block =
+        alloy_rpc_types_eth::Block::empty(alloy_rpc_types_eth::Header::new(expected.clone()));
+    asserter.push_success(&Some(block));
+    let provider = Arc::new(RootProvider::<AnyNetwork>::new(RpcClient::mocked(asserter)));
+
+    let cache = EvmCacheBuilder::new(provider)
+        .block(BlockId::number(expected.number))
+        .chain_id(1)
+        .build()
+        .await;
+
+    assert_eq!(cache.block_number(), Some(expected.number));
+    assert_eq!(cache.timestamp(), Some(expected.timestamp));
+    Ok(())
 }
 
 /// WS-2: a strict `try_build` over a provider that yields no header must fail

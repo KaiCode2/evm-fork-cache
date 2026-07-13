@@ -13,7 +13,7 @@ mod common;
 
 use std::sync::Arc;
 
-use alloy_primitives::{Address, U256, keccak256};
+use alloy_primitives::{Address, Bytes, U256, keccak256};
 use alloy_sol_types::{SolCall, SolValue};
 use anyhow::{Result, anyhow};
 use revm::context::result::ExecutionResult;
@@ -175,6 +175,53 @@ async fn overlay_reads_reflect_snapshot_state() -> Result<()> {
         "overlay calls are non-committing"
     );
 
+    Ok(())
+}
+
+/// A call-scoped code override must affect nested execution without leaking
+/// into the reusable overlay. V3 quoters need this to neutralize the output
+/// token transfer that precedes their intentional quote-data revert when a
+/// snapshot does not carry arbitrary ERC20 balance mappings.
+#[tokio::test(flavor = "multi_thread")]
+async fn call_scoped_code_override_is_applied_then_restored() -> Result<()> {
+    let mut cache = setup_cache().await?;
+    let token = Address::repeat_byte(0x46);
+    let caller = Address::repeat_byte(0x47);
+    let recipient = Address::repeat_byte(0x48);
+
+    install_default_account(&mut cache, caller);
+    install_mock_erc20(&mut cache, token);
+    let snapshot = cache.snapshot();
+    let mut overlay = EvmOverlay::new(snapshot, None);
+    let calldata: Bytes = MockERC20::transferCall {
+        to: recipient,
+        amount: U256::from(1u64),
+    }
+    .abi_encode()
+    .into();
+
+    let before = overlay.call_raw(caller, token, calldata.clone())?;
+    assert!(
+        !before.is_success(),
+        "the real token must reject an unfunded transfer"
+    );
+
+    // Runtime: return ABI `true` for any call without touching storage.
+    let transfer_success =
+        Bytes::from_static(&[0x60, 0x01, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3]);
+    let during = overlay.call_raw_with_code_overrides(
+        caller,
+        token,
+        calldata.clone(),
+        &[(token, transfer_success)],
+    )?;
+    assert!(during.is_success(), "the scoped override must execute");
+
+    let after = overlay.call_raw(caller, token, calldata)?;
+    assert!(
+        !after.is_success(),
+        "the real token code must be restored after the scoped call"
+    );
     Ok(())
 }
 

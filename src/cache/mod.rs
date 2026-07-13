@@ -46,7 +46,9 @@ use alloy_primitives::{Address, B256, Bytes, I256, Log, TxKind, U256, keccak256}
 use alloy_provider::{Provider, network::AnyNetwork};
 use alloy_rpc_types_eth::TransactionRequest;
 use alloy_sol_types::{SolCall, SolValue, sol};
-use foundry_fork_db::{BlockchainDb, SharedBackend, cache::BlockchainDbMeta};
+use foundry_fork_db::{
+    BlockchainDb, SharedBackend, backend::BlockingMode, cache::BlockchainDbMeta,
+};
 use revm::{
     Context, ExecuteCommitEvm, ExecuteEvm, InspectEvm, MainBuilder, MainContext,
     context::{BlockEnv, CfgEnv, Journal, LocalContext, TxEnv, result::ExecutionResult},
@@ -120,7 +122,7 @@ pub type StorageBatchFetchFn = Arc<
 /// Account header + optional storage-proof slots from `eth_getProof`.
 /// `slots` is populated only for requested storage keys; an empty key list is a
 /// root-only probe (account fields + `storage_hash`, no slot payload).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AccountProof {
     /// Merkle root of the account's storage trie (`storageHash`).
     pub storage_hash: B256,
@@ -770,6 +772,117 @@ where
     )
 }
 
+/// Build the same provider-backed storage fetcher selected by an
+/// [`EvmCacheBuilder`] without constructing an [`EvmCache`].
+///
+/// Background cold-start workers use this to perform exact-hash provider work
+/// independently of the cache-owner actor. The returned callback remains
+/// protocol-neutral and accepts the block pin at invocation time.
+pub fn provider_storage_fetcher<P>(
+    provider: Arc<P>,
+    batch_config: StorageBatchConfig,
+    strategy: StorageFetchStrategy,
+) -> StorageBatchFetchFn
+where
+    P: Provider<AnyNetwork> + 'static,
+{
+    let point_reads = point_read_storage_fetcher(provider.clone(), batch_config);
+    match strategy {
+        StorageFetchStrategy::BulkCall(config) => {
+            crate::bulk_storage::bulk_call_storage_fetcher_with_fallback(
+                provider,
+                config,
+                point_reads,
+            )
+        }
+        StorageFetchStrategy::PointRead => point_reads,
+    }
+}
+
+/// Build the cache's bounded provider-backed `eth_getProof` callback without
+/// constructing an [`EvmCache`].
+///
+/// The callback accepts its [`BlockId`] per invocation, allowing a background
+/// worker to pass an EIP-1898 exact canonical hash. `max_concurrent_proofs` is
+/// normalized to at least one and preserves input ordering while overlapping
+/// independent single-account proof requests.
+pub fn account_proof_fetcher<P>(
+    provider: Arc<P>,
+    max_concurrent_proofs: usize,
+) -> AccountProofFetchFn
+where
+    P: Provider<AnyNetwork> + 'static,
+{
+    let max_concurrent_proofs = max_concurrent_proofs.max(1);
+    Arc::new(
+        move |requests: Vec<(Address, Vec<U256>)>, current_block: BlockId| {
+            let handle = match block_in_place_handle() {
+                Ok(handle) => handle,
+                Err(e) => {
+                    return requests
+                        .into_iter()
+                        .map(|(addr, _keys)| {
+                            (
+                                addr,
+                                Err(StorageFetchError::Runtime(RuntimeError::MissingRuntime {
+                                    details: e.to_string(),
+                                })),
+                            )
+                        })
+                        .collect();
+                }
+            };
+            let provider = provider.clone();
+            tokio::task::block_in_place(|| {
+                handle.block_on(async {
+                    use futures::StreamExt;
+                    futures::stream::iter(requests.into_iter().map(|(addr, keys)| {
+                        let provider = provider.clone();
+                        async move {
+                            let proof_keys: Vec<B256> =
+                                keys.iter().map(|slot| B256::from(*slot)).collect();
+                            let outcome = provider
+                                .get_proof(addr, proof_keys)
+                                .block_id(current_block)
+                                .await;
+                            match outcome {
+                                Ok(response) => {
+                                    let slots = response
+                                        .storage_proof
+                                        .iter()
+                                        .map(|proof| {
+                                            (
+                                                U256::from_be_bytes(proof.key.as_b256().0),
+                                                proof.value,
+                                            )
+                                        })
+                                        .collect();
+                                    (
+                                        addr,
+                                        Ok(AccountProof {
+                                            storage_hash: response.storage_hash,
+                                            balance: response.balance,
+                                            nonce: response.nonce,
+                                            code_hash: response.code_hash,
+                                            slots,
+                                        }),
+                                    )
+                                }
+                                Err(e) => {
+                                    (addr, Err(StorageFetchError::provider("eth_getProof", e)))
+                                }
+                            }
+                        }
+                    }))
+                    .buffered(max_concurrent_proofs)
+                    .collect::<Vec<_>>()
+                    .await
+                })
+            })
+        },
+    )
+}
+
 /// Outcome of [`EvmCache::prewarm_slots`].
 #[derive(Debug, Default)]
 pub struct PrewarmReport {
@@ -1264,17 +1377,11 @@ fn apply_storage_fetch_strategy<P>(
     match strategy {
         StorageFetchStrategy::BulkCall(config)
             if config == crate::bulk_storage::BulkCallConfig::default() => {}
-        StorageFetchStrategy::BulkCall(config) => {
-            let fallback = point_read_storage_fetcher(provider.clone(), batch_config);
-            cache.set_storage_batch_fetcher(
-                crate::bulk_storage::bulk_call_storage_fetcher_with_fallback(
-                    provider, config, fallback,
-                ),
-            );
-        }
-        StorageFetchStrategy::PointRead => {
-            cache.set_storage_batch_fetcher(point_read_storage_fetcher(provider, batch_config));
-        }
+        strategy => cache.set_storage_batch_fetcher(provider_storage_fetcher(
+            provider,
+            batch_config,
+            strategy,
+        )),
     }
 }
 
@@ -1547,6 +1654,25 @@ pub fn parse_evm_spec(spec: &str) -> SpecId {
 }
 
 impl EvmCache {
+    /// Select how synchronous provider-backed cache misses block the caller.
+    ///
+    /// `true` blocks the current thread directly, which is required when the
+    /// cache is temporarily used from a Tokio `LocalSet` where
+    /// `tokio::task::block_in_place` is unavailable. `false` restores the
+    /// normal multi-thread-runtime behavior. Callers should keep direct
+    /// blocking scopes short and restore the default before handing the cache
+    /// to a long-lived actor.
+    pub fn set_blocking_provider_reads(&mut self, block_current_thread: bool) {
+        let mode = if block_current_thread {
+            BlockingMode::Block
+        } else {
+            BlockingMode::BlockInPlace
+        };
+        let backend = self.backend.with_blocking_mode(mode);
+        self.backend = backend.clone();
+        self.db.db = backend;
+    }
+
     /// Start a fluent [`EvmCacheBuilder`] over the given provider.
     ///
     /// Preferred over the positional [`with_cache`](Self::with_cache) /
@@ -1668,12 +1794,12 @@ impl EvmCache {
         let max_concurrent_proofs = max_concurrent_proofs.max(1);
 
         // Fetch the pinned block header for accurate block context (NUMBER,
-        // BASEFEE, COINBASE, PREVRANDAO, GASLIMIT opcodes). Without this, revm
-        // defaults to 0/default values, causing contracts that read block
-        // context to execute different code paths. Use the concrete BlockId the
-        // cache is pinned to so hash pins do not accidentally inherit latest
-        // header context.
-        let (block_number, basefee, coinbase, prevrandao, block_gas_limit) =
+        // BASEFEE, COINBASE, PREVRANDAO, GASLIMIT, TIMESTAMP opcodes). Without
+        // this, revm defaults to 0/default values, causing contracts that read
+        // block context to execute different code paths. Use the concrete
+        // BlockId the cache is pinned to so hash pins do not accidentally
+        // inherit latest header context.
+        let (block_number, basefee, coinbase, prevrandao, block_gas_limit, timestamp) =
             match provider.get_block(block_id).await {
                 Ok(Some(blk)) => {
                     let h = blk.header();
@@ -1683,15 +1809,16 @@ impl EvmCache {
                         Some(h.beneficiary()),
                         h.mix_hash(),
                         Some(h.gas_limit()),
+                        Some(h.timestamp()),
                     )
                 }
                 Ok(None) => {
                     debug!("Block header not found for block context initialization");
-                    (None, None, None, None, None)
+                    (None, None, None, None, None, None)
                 }
                 Err(e) => {
                     debug!(error = %e, "Failed to fetch block header for block context");
-                    (None, None, None, None, None)
+                    (None, None, None, None, None, None)
                 }
             };
 
@@ -1856,12 +1983,11 @@ impl EvmCache {
         // docs/bulk-storage-extraction.md). `StorageBatchConfig` tunes the
         // point-read path; `EvmCacheBuilder::storage_fetch_strategy` swaps or
         // tunes the bulk path.
-        let storage_batch_fetcher: StorageBatchFetchFn =
-            crate::bulk_storage::bulk_call_storage_fetcher_with_fallback(
-                provider.clone(),
-                crate::bulk_storage::BulkCallConfig::default(),
-                point_read_storage_fetcher(provider.clone(), storage_batch_config),
-            );
+        let storage_batch_fetcher = provider_storage_fetcher(
+            provider.clone(),
+            storage_batch_config,
+            StorageFetchStrategy::default(),
+        );
 
         // Create an account/root fetcher that bypasses SharedBackend, firing
         // `eth_getProof` calls directly for authoritative account fields plus the
@@ -1870,81 +1996,7 @@ impl EvmCache {
         // resyncs, cold-start probe_roots) fans out with bounded, order-
         // preserving concurrency (`buffered`): wall clock drops from N × RTT to
         // ~ceil(N / max_concurrent_proofs) × RTT.
-        let provider_for_proof = provider.clone();
-        let account_proof_fetcher: AccountProofFetchFn = Arc::new(
-            move |requests: Vec<(Address, Vec<U256>)>, current_block: BlockId| {
-                // Guard against panicking inside `block_in_place` on a
-                // current-thread runtime (or when no runtime is present): return
-                // an `Err` result for every requested address instead.
-                let handle = match block_in_place_handle() {
-                    Ok(handle) => handle,
-                    Err(e) => {
-                        return requests
-                            .into_iter()
-                            .map(|(addr, _keys)| {
-                                (
-                                    addr,
-                                    Err(StorageFetchError::Runtime(RuntimeError::MissingRuntime {
-                                        details: e.to_string(),
-                                    })),
-                                )
-                            })
-                            .collect();
-                    }
-                };
-                let provider = provider_for_proof.clone();
-                // The caller supplies the exact block this proof fetch must observe.
-                tokio::task::block_in_place(|| {
-                    handle.block_on(async {
-                        use futures::StreamExt;
-                        futures::stream::iter(requests.into_iter().map(|(addr, keys)| {
-                            let provider = provider.clone();
-                            async move {
-                                // `eth_getProof` takes slot keys as 32-byte B256.
-                                let proof_keys: Vec<B256> =
-                                    keys.iter().map(|slot| B256::from(*slot)).collect();
-                                let outcome = provider
-                                    .get_proof(addr, proof_keys)
-                                    .block_id(current_block)
-                                    .await;
-                                match outcome {
-                                    Ok(response) => {
-                                        // Map proven storage-proof entries back to
-                                        // the requested `(slot, value)` pairs.
-                                        let slots = response
-                                            .storage_proof
-                                            .iter()
-                                            .map(|proof| {
-                                                (
-                                                    U256::from_be_bytes(proof.key.as_b256().0),
-                                                    proof.value,
-                                                )
-                                            })
-                                            .collect();
-                                        (
-                                            addr,
-                                            Ok(AccountProof {
-                                                storage_hash: response.storage_hash,
-                                                balance: response.balance,
-                                                nonce: response.nonce,
-                                                code_hash: response.code_hash,
-                                                slots,
-                                            }),
-                                        )
-                                    }
-                                    Err(e) => {
-                                        (addr, Err(StorageFetchError::provider("eth_getProof", e)))
-                                    }
-                                }
-                            }
-                        }))
-                        .buffered(max_concurrent_proofs)
-                        .collect::<Vec<_>>()
-                        .await
-                    })
-                })
-            },
-        );
+        let account_proof_fetcher = account_proof_fetcher(provider.clone(), max_concurrent_proofs);
 
         // Create a bulk account-fields fetcher: balance + EXTCODEHASH for many
         // addresses in ONE eth_call via the account-fields extractor program.
@@ -2034,7 +2086,7 @@ impl EvmCache {
             block,
             cache_config,
             immutable_cache,
-            timestamp_override: None,
+            timestamp_override: timestamp,
             chain_id,
             block_number,
             basefee,
@@ -4817,7 +4869,7 @@ impl EvmCache {
                 for (address, account) in evm.journaled_state.state.iter() {
                     if account.is_touched() {
                         access_list.accounts.insert(*address);
-                        for (slot_key, _) in account.storage.iter() {
+                        for slot_key in account.storage.keys() {
                             access_list.slots.insert((*address, *slot_key));
                         }
                     }
@@ -5864,6 +5916,134 @@ impl EvmCache {
             }
         }
         Ok(report)
+    }
+
+    /// Validate exact-hash account fields and verified runtime code without
+    /// mutating either cache layer or the code-seed marks.
+    ///
+    /// The complete patch is validated before the first write: the cache hash
+    /// must still match, account identities must be unique, proofs must be
+    /// root-only, and each runtime byte string must hash to its proof's
+    /// `codeHash`. Existing deliberate etches and conflicting seed generations
+    /// are rejected. The same internal preparation routine is reused by
+    /// [`apply_prepared_account_patch`](Self::apply_prepared_account_patch).
+    #[cfg(feature = "reactive")]
+    pub fn validate_prepared_account_patch(
+        &self,
+        patch: &crate::cold_start::PreparedAccountPatch,
+    ) -> std::result::Result<(), crate::cold_start::PreparedAccountPatchError> {
+        self.prepare_prepared_account_patch(patch).map(|_| ())
+    }
+
+    /// Atomically install a patch previously accepted by
+    /// [`validate_prepared_account_patch`](Self::validate_prepared_account_patch).
+    ///
+    /// This repeats the same pure validation at the final exclusive-owner
+    /// boundary, then performs only infallible in-memory writes. With no
+    /// intervening account/seed or baseline mutation, validation followed by
+    /// apply cannot diverge. Account info/code is written through both cache
+    /// layers and [`CodeSeedState::Verified`] is recorded directly, so canonical
+    /// state is never published with an intermediate `Pending` mark.
+    #[cfg(feature = "reactive")]
+    pub fn apply_prepared_account_patch(
+        &mut self,
+        patch: &crate::cold_start::PreparedAccountPatch,
+    ) -> std::result::Result<usize, crate::cold_start::PreparedAccountPatchError> {
+        let prepared = self.prepare_prepared_account_patch(patch)?;
+
+        for (address, info, _) in &prepared {
+            self.db.insert_account_info(*address, info.clone());
+        }
+        {
+            let mut accounts = self.blockchain_db.accounts().write();
+            for (address, info, _) in &prepared {
+                accounts.insert(*address, info.clone());
+            }
+        }
+        for (address, _, code_hash) in &prepared {
+            self.code_seeds.insert(
+                *address,
+                CodeSeedState::Verified {
+                    code_hash: *code_hash,
+                    verified_at_block: patch.verified_at_block(),
+                },
+            );
+            self.mark_base_dirty(*address);
+        }
+        if !prepared.is_empty() {
+            self.bump_snapshot_generation();
+        }
+        Ok(prepared.len())
+    }
+
+    #[cfg(feature = "reactive")]
+    fn prepare_prepared_account_patch(
+        &self,
+        patch: &crate::cold_start::PreparedAccountPatch,
+    ) -> std::result::Result<
+        Vec<(Address, AccountInfo, B256)>,
+        crate::cold_start::PreparedAccountPatchError,
+    > {
+        use crate::cold_start::PreparedAccountPatchError;
+
+        let cache_hash = match self.block() {
+            BlockId::Hash(hash) => Some(hash.block_hash),
+            BlockId::Number(_) => None,
+        };
+        if cache_hash != Some(patch.block_hash()) {
+            return Err(PreparedAccountPatchError::BaselineMismatch {
+                prepared: patch.block_hash(),
+                cache: cache_hash,
+            });
+        }
+
+        let mut identities = HashSet::with_capacity(patch.values().len());
+        let mut prepared = Vec::with_capacity(patch.values().len());
+        for value in patch.values() {
+            let address = value.address();
+            let proof = value.proof();
+            let code = value.code();
+            if !identities.insert(address) {
+                return Err(PreparedAccountPatchError::DuplicateAccount { address });
+            }
+            if code.is_empty() {
+                return Err(PreparedAccountPatchError::EmptyCode { address });
+            }
+            if !proof.slots.is_empty() {
+                return Err(PreparedAccountPatchError::UnexpectedProofSlots {
+                    address,
+                    slots: proof.slots.len(),
+                });
+            }
+            let actual = keccak256(code);
+            if actual != proof.code_hash {
+                return Err(PreparedAccountPatchError::CodeHashMismatch {
+                    address,
+                    expected: proof.code_hash,
+                    actual,
+                });
+            }
+            if let Some(existing) = self.code_seeds.get(&address) {
+                if matches!(existing, CodeSeedState::Etched { .. }) {
+                    return Err(PreparedAccountPatchError::EtchedAccount { address });
+                }
+                if existing.code_hash() != actual {
+                    return Err(PreparedAccountPatchError::SeedConflict {
+                        address,
+                        existing: existing.code_hash(),
+                        prepared: actual,
+                    });
+                }
+            }
+
+            let mut info = self.local_account_info(address).unwrap_or_default();
+            info.balance = proof.balance;
+            info.nonce = proof.nonce;
+            info.code_hash = actual;
+            info.code = Some(Bytecode::new_raw(code.clone()));
+            prepared.push((address, info, actual));
+        }
+        Ok(prepared)
     }
 
     /// Patch a just-verified seed's balance to the on-chain value from the

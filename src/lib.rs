@@ -178,13 +178,19 @@ pub use cache::{
     BlockStateAccountDiff, BlockStateDiff, BlockStateDiffFetchFn, BlockStateStorageDiff,
     CacheSpeedMode, CallSimulationResult, CodeMismatch, CodeSeedState, CodeVerifyReport, EvmCache,
     EvmCacheBuilder, EvmOverlay, EvmSnapshot, PrewarmReport, StorageBatchConfig,
-    StorageFetchStrategy, TxConfig, point_read_storage_fetcher,
+    StorageFetchStrategy, TxConfig, account_proof_fetcher, point_read_storage_fetcher,
+    provider_storage_fetcher,
 };
 #[cfg(feature = "reactive")]
 pub use cold_start::{
-    ColdStartCall, ColdStartCallResult, ColdStartConfig, ColdStartError, ColdStartPin,
-    ColdStartPlan, ColdStartPlanner, ColdStartResults, ColdStartRoundSummary, ColdStartRunReport,
-    ColdStartStep, RootBaseline, RootBaselinePlanner, RootProbeOutcome, RoundOutcome,
+    AccountCodeClaim, AccountProofOutcome, AccountProofRoundFetch, AccountProofRoundFetchError,
+    AccountProofRoundFetcher, AccountProofRoundRequest, ColdStartCall, ColdStartCallResult,
+    ColdStartConfig, ColdStartError, ColdStartPin, ColdStartPlan, ColdStartPlanner,
+    ColdStartResults, ColdStartRoundSummary, ColdStartRunReport, ColdStartStep,
+    PreparedAccountPatch, PreparedAccountPatchError, PreparedAccountValue, PreparedStoragePatch,
+    PreparedStoragePatchError, PreparedStorageValue, RootBaseline, RootBaselinePlanner,
+    RootProbeOutcome, RoundOutcome, StorageRoundFetch, StorageRoundFetchError, StorageRoundFetcher,
+    StorageRoundRequest, StorageSlotRequest,
 };
 pub use errors::{
     AccessListError, AccessListResult, BlockContextError, CacheError, CacheResult, DeployError,

@@ -15,11 +15,9 @@ prefer this.
 
 ## 0. Ground rules (non-negotiable)
 
-- **Branch:** create `phase-2-freshness` off the current `phase-1-engine-seam`
-  HEAD. Commit there in logical steps. Do **not** push, do **not** tag. Commits
-  must be unsigned: `git -c commit.gpgsign=false commit …` (the 1Password signing
-  agent is unavailable here). End every commit message with exactly:
-  `Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>`
+- **Historical workflow:** the pre-release branch and commit instructions used
+  during this phase are no longer applicable; current work follows the
+  repository's normal contribution and signing policy.
 - **The whole freshness surface is generic core** — it must compile and lint with
   `--no-default-features` (it must NOT depend on the `protocols` feature).
 - **Historical green bar at every commit:**

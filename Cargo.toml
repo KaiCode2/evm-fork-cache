@@ -1,6 +1,6 @@
 [package]
 name = "evm-fork-cache"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT OR Apache-2.0"
@@ -112,6 +112,11 @@ harness = false
 [[bench]]
 name = "event_pipeline"
 harness = false
+
+[[bench]]
+name = "reactive_routing"
+harness = false
+required-features = ["reactive"]
 
 [[bench]]
 name = "mapping_probe"

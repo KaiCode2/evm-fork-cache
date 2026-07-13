@@ -6,7 +6,10 @@
 //! routing remains exact.
 #![cfg(feature = "reactive")]
 
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 
 use alloy_network::Ethereum;
 use alloy_primitives::{Address, B256, Bytes, Log as PrimitiveLog, keccak256};
@@ -15,9 +18,9 @@ use anyhow::Result;
 
 use evm_fork_cache::events::StateView;
 use evm_fork_cache::reactive::{
-    HandlerError, HandlerId, HandlerOutcome, LogInterest, LogMatcher, ReactiveContext,
-    ReactiveEffect, ReactiveHandler, ReactiveInput, ReactiveInterest, ReactiveRegistry, RouteKey,
-    RouteKeySpec, StateEffectQuality,
+    HandlerError, HandlerId, HandlerOutcome, LogInterest, LogMatcher, LogRouteIndex, LogRouteKey,
+    ReactiveContext, ReactiveEffect, ReactiveHandler, ReactiveInput, ReactiveInterest,
+    ReactiveRegistry, RouteKey, RouteKeySpec, StateEffectQuality,
 };
 
 fn rpc_log(address: Address, topics: Vec<B256>) -> Log {
@@ -79,6 +82,117 @@ impl ReactiveHandler<Ethereum> for NoopHandler {
 struct TopicMatcher {
     index: usize,
     value: B256,
+}
+
+struct CountingTopicHandler {
+    id: HandlerId,
+    vault: Address,
+    signature: B256,
+    pool: B256,
+    calls: Arc<AtomicUsize>,
+}
+
+struct CountingTopicMatcher {
+    pool: B256,
+    calls: Arc<AtomicUsize>,
+}
+
+impl LogMatcher for CountingTopicMatcher {
+    fn matches(&self, log: &Log) -> bool {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        log.topics().get(1) == Some(&self.pool)
+    }
+}
+
+impl ReactiveHandler<Ethereum> for CountingTopicHandler {
+    fn id(&self) -> HandlerId {
+        self.id.clone()
+    }
+
+    fn interests(&self) -> Vec<ReactiveInterest> {
+        vec![ReactiveInterest::Logs(LogInterest {
+            provider_filter: Filter::new()
+                .address(self.vault)
+                .event_signature(self.signature),
+            local_matcher: Some(Arc::new(CountingTopicMatcher {
+                pool: self.pool,
+                calls: self.calls.clone(),
+            })),
+            route_key: Some(RouteKeySpec::Topic { index: 1 }),
+        })]
+    }
+
+    fn log_route_index(&self) -> Option<LogRouteIndex> {
+        Some(LogRouteIndex::single(LogRouteKey::Topic {
+            index: 1,
+            value: self.pool,
+        }))
+    }
+
+    fn handle(
+        &self,
+        _ctx: &ReactiveContext,
+        _input: &ReactiveInput<Ethereum>,
+        _state: &dyn StateView,
+    ) -> Result<HandlerOutcome, HandlerError> {
+        Ok(HandlerOutcome::empty(StateEffectQuality::NoStateEffect))
+    }
+}
+
+#[test]
+fn reactive_router_unions_topic_index_and_fallback_in_registration_order() -> Result<()> {
+    let vault = Address::repeat_byte(0xcc);
+    let swap_sig = keccak256(b"Swap(bytes32,address,int256)");
+    let pool_a = B256::repeat_byte(0xa0);
+    let pool_b = B256::repeat_byte(0xb0);
+    let calls_a = Arc::new(AtomicUsize::new(0));
+    let calls_b = Arc::new(AtomicUsize::new(0));
+    let mut registry = ReactiveRegistry::<Ethereum>::new();
+    registry.register_handler(Arc::new(NoopHandler::new(
+        "all-swaps",
+        LogInterest {
+            provider_filter: Filter::new().address(vault).event_signature(swap_sig),
+            local_matcher: None,
+            route_key: Some(RouteKeySpec::EmitterAddress),
+        },
+    )))?;
+    registry.register_handler(Arc::new(CountingTopicHandler {
+        id: HandlerId::new("pool-a"),
+        vault,
+        signature: swap_sig,
+        pool: pool_a,
+        calls: calls_a.clone(),
+    }))?;
+    registry.register_handler(Arc::new(CountingTopicHandler {
+        id: HandlerId::new("pool-b"),
+        vault,
+        signature: swap_sig,
+        pool: pool_b,
+        calls: calls_b.clone(),
+    }))?;
+    registry.register_handler(Arc::new(NoopHandler::new(
+        "audit",
+        LogInterest {
+            provider_filter: Filter::new().address(vault).event_signature(swap_sig),
+            local_matcher: None,
+            route_key: None,
+        },
+    )))?;
+
+    let routes = registry.route_log(&rpc_log(vault, vec![swap_sig, pool_b]));
+    let ids: Vec<_> = routes.into_iter().map(|route| route.handler_id).collect();
+
+    assert_eq!(
+        ids,
+        vec![
+            HandlerId::new("all-swaps"),
+            HandlerId::new("pool-b"),
+            HandlerId::new("audit")
+        ]
+    );
+    assert_eq!(calls_a.load(Ordering::Relaxed), 0);
+    assert_eq!(calls_b.load(Ordering::Relaxed), 1);
+    Ok(())
 }
 
 impl LogMatcher for TopicMatcher {

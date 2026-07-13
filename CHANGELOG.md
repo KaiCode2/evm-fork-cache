@@ -12,10 +12,105 @@ surface freezes at 1.0.
 
 ## [Unreleased]
 
-Remaining from the 0.2.0 plan, tracked as fast-follow: the docs/examples
-polish remainder (a toy constant-product AMM example and the end-to-end
-reactive integration tests enumerated in
-[`docs/KNOWN_ISSUES.md`](docs/KNOWN_ISSUES.md)).
+Remaining from the 0.2.0 plan and tracked as fast-follow: the toy
+constant-product AMM walkthrough and the dedicated reactive integration cases
+enumerated in [`docs/KNOWN_ISSUES.md`](docs/KNOWN_ISSUES.md).
+
+## [0.3.0] - 2026-07-14
+
+This minor release contains source-breaking configuration additions to the
+pre-1.0 public API. `BulkCallConfig` and `SubscriberConfig` struct literals must
+set the new fields or use `..Default::default()`.
+
+### Added
+
+- Added protocol-neutral exact-hash cold-start storage/account-proof rounds and
+  atomic prepared patch application, allowing provider work to run off the
+  cache-owner thread while rejecting stale, malformed, or duplicate artifacts
+  before healing both cache layers. Verified runtime-code proofs now commit
+  directly as `Verified`, never publishing an intermediate `Pending` seed.
+- Provider-backed cache construction now retains the pinned header timestamp
+  alongside NUMBER, BASEFEE, COINBASE, PREVRANDAO, and GASLIMIT. Missing or
+  failed header fetches remain unset so strict downstream validation fails
+  closed instead of pairing pinned state with wall-clock time.
+- `EvmOverlay::call_raw_with_code_overrides` applies runtime bytecode only for
+  one non-committing simulation and restores the prior dirty layer on success or
+  error. Snapshot consumers can neutralize state-independent nested side effects
+  without mutating the shared snapshot or subsequent overlay calls.
+
+### Added
+
+- `SubscriberConfig::max_log_addresses_per_subscription` and provider-side log
+  filter fan-in merge compatible owner filters into bounded address/topic
+  supersets while retaining exact owner matching locally.
+- `BulkCallConfig::max_request_bytes` applies a conservative request-body
+  planning budget to both per-call and `eth_callMany` slot planning; the
+  default is 2.4 MB. It deliberately leaves provider-limit margin rather than
+  claiming a byte-exact transport cap.
+- `AlloySubscriber` now exposes transaction-aware, monotonically epoch-scoped
+  owner staging, activation, abort, and reversible removal APIs. Post-block
+  staging begins catch-up at `N + 1`, and exact-epoch abort cannot affect a
+  replacement generation.
+- `AlloySubscriber::next_scoped_batch` retains enqueue-time owner provenance,
+  separating canonical input from owner-only catch-up. Canonical and per-owner
+  deduplication are isolated so a new owner's replay cannot suppress delivery
+  to existing handlers.
+- `AlloySubscriber::reconcile_interest_owner` installs live streams before
+  bounded owner catch-up, drains live input while RPC fetches are in flight,
+  verifies the exact target block before and after fetching, and publishes
+  recoverable progress even for empty ranges. Stream-revision fencing prevents
+  stale progress from activating after source churn.
+- `AlloySubscriber::reconcile_interest_owners` applies the same contract to a
+  bulk epoch set with one stream reconcile and one double header certification.
+  Retained positions are additionally hash-certified when the target header
+  cannot prove their immediate ancestry. Compatible owner filters are merged
+  into bounded 256-filter RPC chunks, then globally ordered and locally routed
+  back to exact owner epochs. Malformed or conflicting canonical log positions
+  reject the whole attempt; progress and owner records commit atomically, while
+  cancellation-safe hidden live copies preserve continuity without exposing a
+  failed adoption. Empty owner topologies wait for certification without
+  treating the intentional absence of a stream as termination.
+- `AlloySubscriber::next_scoped_batch_or` polls a borrowed driver control future
+  first and preserves both the control future and subscriber delivery across
+  the losing branch. Reconnect intent is now durable across poll cancellation.
+
+### Changed
+
+- Bulk storage extraction now honors configurable multi-call concurrency across
+  dispatch paths and clamps slot ceilings using the request-body planning
+  budget before dispatch.
+
+The following reactive lifecycle and routing improvements were previously
+prepared under 0.2.2 but are included in 0.3.0 so the complete runtime surface
+ships under one honest compatibility boundary.
+
+### Added
+
+- `ReactiveHandler::log_route_index`, `LogRouteIndex`, and `LogRouteKey` let a
+  handler declare an exhaustive set of exact emitter/topic/data-slice routes.
+  Indexed log dispatch selects only matching and compatibility-fallback
+  handlers, then still enforces the original provider filter and local matcher.
+- `ReactiveRuntime::cancel_pending_resync` removes queued work by exact
+  `ResyncId`, allowing generation-scoped owners to tear down their requests
+  without cancelling unrelated work against a shared contract.
+  `cancel_pending_resyncs_by_id` performs multi-ID teardown in one pending-queue
+  pass while preserving queue order.
+- `ReactiveRuntime::{has_journaled_handler_effects, journaled_handler_ids}` let
+  explicit cache eviction stay fenced only while retained reorg history can
+  restore a handler generation's effects; the set-returning form ages large
+  fence populations with one bounded journal scan.
+- An offline `reactive_routing` benchmark compares indexed hit/miss routing with
+  the compatibility fallback scan and measures repeated fallback, distinct-key,
+  and shared-key handler churn at 16, 64, 320, and 4,096 handlers.
+
+### Changed
+
+- `ReactiveRegistry::route_log` and live `ReactiveRuntime` ingestion now share
+  the same indexed candidate selector while preserving registration order,
+  first-matching-interest behavior, and unindexed handler compatibility.
+- Teardown documentation now reserves address-wide resync cancellation and
+  account untracking for exclusively owned accounts; shared-address owners use
+  exact request IDs.
 
 ## [0.2.1] - 2026-07-06
 
@@ -787,6 +882,8 @@ pre-release development phases (see [`docs/ROADMAP.md`](docs/ROADMAP.md)).
 - `EvmCache` requires a multi-thread tokio runtime for any RPC-touching path.
 - See [`docs/KNOWN_ISSUES.md`](docs/KNOWN_ISSUES.md) for current limitations.
 
-[Unreleased]: https://github.com/KaiCode2/evm-fork-cache/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/KaiCode2/evm-fork-cache/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/KaiCode2/evm-fork-cache/compare/v0.2.1...v0.3.0
+[0.2.1]: https://github.com/KaiCode2/evm-fork-cache/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/KaiCode2/evm-fork-cache/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/KaiCode2/evm-fork-cache/releases/tag/v0.1.0

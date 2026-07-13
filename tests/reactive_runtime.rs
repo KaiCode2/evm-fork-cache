@@ -8,7 +8,10 @@
 
 mod common;
 
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicUsize, Ordering},
+};
 
 use alloy_network::Ethereum;
 use alloy_primitives::{Address, B256, Bytes, Log as PrimitiveLog, U256, keccak256};
@@ -20,11 +23,11 @@ use evm_fork_cache::events::StateView;
 use evm_fork_cache::reactive::{
     AppliedReport, BlockRef, ChainStatus, HandlerError, HandlerId, HandlerOutcome, HookSignal,
     InputRef, InputSource, InvalidationReason, InvalidationRequest, LogInterest, LogMatcher,
-    PendingTxInterest, ReactiveConfig, ReactiveContext, ReactiveEffect, ReactiveError,
-    ReactiveHandler, ReactiveHook, ReactiveInput, ReactiveInputBatch, ReactiveInputRecord,
-    ReactiveInterest, ReactiveReport, ReactiveRuntime, ReportTag, ResyncBlock, ResyncId,
-    ResyncPriority, ResyncReason, ResyncRequest, ResyncTarget, RouteKeySpec, SpeculativeId,
-    SpeculativeRequest, StateEffectQuality,
+    LogRouteIndex, LogRouteKey, PendingTxInterest, ReactiveConfig, ReactiveContext, ReactiveEffect,
+    ReactiveError, ReactiveHandler, ReactiveHook, ReactiveInput, ReactiveInputBatch,
+    ReactiveInputRecord, ReactiveInterest, ReactiveReport, ReactiveRuntime, ReportTag, ResyncBlock,
+    ResyncId, ResyncPriority, ResyncReason, ResyncRequest, ResyncTarget, RouteKeySpec,
+    SpeculativeId, SpeculativeRequest, StateEffectQuality,
 };
 use evm_fork_cache::{PurgeScope, StateUpdate};
 
@@ -140,6 +143,109 @@ impl ReactiveHandler<Ethereum> for SlotWriter {
             tags: vec![ReportTag::new("slot", self.slot.to_string())],
         })
     }
+}
+
+struct CountingAddressMatcher {
+    address: Address,
+    calls: Arc<AtomicUsize>,
+}
+
+impl LogMatcher for CountingAddressMatcher {
+    fn matches(&self, log: &Log) -> bool {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        log.address() == self.address
+    }
+}
+
+struct CountingIndexedHandler {
+    id: HandlerId,
+    address: Address,
+    matcher_calls: Arc<AtomicUsize>,
+    handle_calls: Arc<AtomicUsize>,
+}
+
+impl ReactiveHandler<Ethereum> for CountingIndexedHandler {
+    fn id(&self) -> HandlerId {
+        self.id.clone()
+    }
+
+    fn interests(&self) -> Vec<ReactiveInterest> {
+        vec![ReactiveInterest::Logs(LogInterest {
+            provider_filter: Filter::new(),
+            local_matcher: Some(Arc::new(CountingAddressMatcher {
+                address: self.address,
+                calls: self.matcher_calls.clone(),
+            })),
+            route_key: Some(RouteKeySpec::EmitterAddress),
+        })]
+    }
+
+    fn log_route_index(&self) -> Option<LogRouteIndex> {
+        Some(LogRouteIndex::single(LogRouteKey::Emitter(self.address)))
+    }
+
+    fn handle(
+        &self,
+        _ctx: &ReactiveContext,
+        _input: &ReactiveInput<Ethereum>,
+        _state: &dyn StateView,
+    ) -> Result<HandlerOutcome, HandlerError> {
+        self.handle_calls.fetch_add(1, Ordering::Relaxed);
+        Ok(HandlerOutcome::empty(StateEffectQuality::NoStateEffect))
+    }
+}
+
+#[tokio::test]
+async fn reactive_runtime_executes_the_same_indexed_candidates_as_the_registry() -> Result<()> {
+    let pool_a = Address::repeat_byte(0xa1);
+    let pool_b = Address::repeat_byte(0xb2);
+    let matcher_a = Arc::new(AtomicUsize::new(0));
+    let matcher_b = Arc::new(AtomicUsize::new(0));
+    let handle_a = Arc::new(AtomicUsize::new(0));
+    let handle_b = Arc::new(AtomicUsize::new(0));
+    let mut cache = setup_cache().await?;
+    let mut runtime = ReactiveRuntime::<Ethereum>::new(ReactiveConfig::default());
+    runtime.register_handler(Arc::new(CountingIndexedHandler {
+        id: HandlerId::new("pool-a"),
+        address: pool_a,
+        matcher_calls: matcher_a.clone(),
+        handle_calls: handle_a.clone(),
+    }))?;
+    runtime.register_handler(Arc::new(CountingIndexedHandler {
+        id: HandlerId::new("pool-b"),
+        address: pool_b,
+        matcher_calls: matcher_b.clone(),
+        handle_calls: handle_b.clone(),
+    }))?;
+
+    let report = runtime.ingest_batch(
+        &mut cache,
+        batch(vec![(
+            ReactiveInput::Log(rpc_log(pool_b, vec![], 10, 0, 0)),
+            included_context(10, 0),
+        )]),
+    )?;
+
+    assert_eq!(report.applied.len(), 1);
+    assert_eq!(report.applied[0].handler_id, HandlerId::new("pool-b"));
+    assert_eq!(matcher_a.load(Ordering::Relaxed), 0);
+    assert_eq!(matcher_b.load(Ordering::Relaxed), 1);
+    assert_eq!(handle_a.load(Ordering::Relaxed), 0);
+    assert_eq!(handle_b.load(Ordering::Relaxed), 1);
+
+    let miss = runtime.ingest_batch(
+        &mut cache,
+        batch(vec![(
+            ReactiveInput::Log(rpc_log(Address::repeat_byte(0xff), vec![], 11, 0, 0)),
+            included_context(11, 0),
+        )]),
+    )?;
+    assert!(miss.applied.is_empty());
+    assert_eq!(matcher_a.load(Ordering::Relaxed), 0);
+    assert_eq!(matcher_b.load(Ordering::Relaxed), 1);
+    assert_eq!(handle_a.load(Ordering::Relaxed), 0);
+    assert_eq!(handle_b.load(Ordering::Relaxed), 1);
+    Ok(())
 }
 
 struct LogIndexWriter {
@@ -719,6 +825,133 @@ async fn reactive_runtime_cancel_pending_resyncs_preserves_other_targets() -> Re
     assert_eq!(cancelled[0].targets.len(), 1);
     assert_eq!(runtime.pending_resyncs().len(), 1);
     assert_eq!(runtime.pending_resyncs()[0].targets.len(), 1);
+    Ok(())
+}
+
+struct SameAddressResyncHandler {
+    emitter: Address,
+    target: Address,
+}
+
+impl ReactiveHandler<Ethereum> for SameAddressResyncHandler {
+    fn id(&self) -> HandlerId {
+        HandlerId::new("same-address-resyncs")
+    }
+
+    fn interests(&self) -> Vec<ReactiveInterest> {
+        vec![ReactiveInterest::Logs(LogInterest {
+            provider_filter: Filter::new().address(self.emitter),
+            local_matcher: None,
+            route_key: Some(RouteKeySpec::EmitterAddress),
+        })]
+    }
+
+    fn handle(
+        &self,
+        _ctx: &ReactiveContext,
+        _input: &ReactiveInput<Ethereum>,
+        _state: &dyn StateView,
+    ) -> Result<HandlerOutcome, HandlerError> {
+        let request = |id: &str, slot: u64| {
+            ReactiveEffect::Resync(ResyncRequest {
+                id: ResyncId::new(id),
+                reason: ResyncReason::HandlerRequested,
+                block: ResyncBlock::Latest,
+                targets: vec![ResyncTarget::StorageSlot {
+                    address: self.target,
+                    slot: U256::from(slot),
+                }],
+                priority: ResyncPriority::Normal,
+            })
+        };
+        Ok(HandlerOutcome {
+            effects: vec![request("pool-a", 1), request("pool-b", 2)],
+            quality: StateEffectQuality::AppliedWithPendingResync,
+            tags: vec![],
+        })
+    }
+}
+
+#[tokio::test]
+async fn reactive_runtime_cancels_exact_resync_id_and_preserves_same_address_work() -> Result<()> {
+    let emitter = Address::repeat_byte(0x81);
+    let shared_vault = Address::repeat_byte(0x82);
+    let mut cache = setup_cache().await?;
+    let mut runtime = ReactiveRuntime::<Ethereum>::new(ReactiveConfig::default());
+    runtime.register_handler(Arc::new(SameAddressResyncHandler {
+        emitter,
+        target: shared_vault,
+    }))?;
+    runtime.ingest_batch(
+        &mut cache,
+        batch(vec![(
+            ReactiveInput::Log(rpc_log(emitter, vec![], 70, 0, 0)),
+            included_context(70, 0),
+        )]),
+    )?;
+    assert_eq!(runtime.pending_resyncs().len(), 2);
+
+    let cancelled = runtime.cancel_pending_resync(&ResyncId::new("pool-a"));
+
+    assert_eq!(cancelled.len(), 1);
+    assert_eq!(cancelled[0].id, ResyncId::new("pool-a"));
+    assert_eq!(runtime.pending_resyncs().len(), 1);
+    assert_eq!(runtime.pending_resyncs()[0].id, ResyncId::new("pool-b"));
+    assert_eq!(
+        runtime.pending_resyncs()[0].targets,
+        vec![ResyncTarget::StorageSlot {
+            address: shared_vault,
+            slot: U256::from(2),
+        }]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn reactive_runtime_batches_exact_resync_cancellation_in_queue_order() -> Result<()> {
+    let emitter = Address::repeat_byte(0x83);
+    let shared_vault = Address::repeat_byte(0x84);
+    let mut cache = setup_cache().await?;
+    let mut runtime = ReactiveRuntime::<Ethereum>::new(ReactiveConfig::default());
+    runtime.register_handler(Arc::new(SameAddressResyncHandler {
+        emitter,
+        target: shared_vault,
+    }))?;
+    const BACKLOG_EVENTS: u64 = 256;
+    runtime.ingest_batch(
+        &mut cache,
+        batch(
+            (0..BACKLOG_EVENTS)
+                .map(|index| {
+                    (
+                        ReactiveInput::Log(rpc_log(emitter, vec![], 71, 0, index)),
+                        included_context(71, index),
+                    )
+                })
+                .collect(),
+        ),
+    )?;
+    assert_eq!(runtime.pending_resyncs().len(), 2 * BACKLOG_EVENTS as usize);
+    assert!(runtime.has_journaled_handler_effects(&HandlerId::new("same-address-resyncs")));
+    let journaled_handlers = runtime.journaled_handler_ids();
+    assert_eq!(journaled_handlers.len(), 1);
+    assert!(journaled_handlers.contains(&HandlerId::new("same-address-resyncs")));
+
+    let cancelled = runtime.cancel_pending_resyncs_by_id(&[
+        ResyncId::new("pool-b"),
+        ResyncId::new("pool-a"),
+        ResyncId::new("pool-a"),
+        ResyncId::new("missing"),
+    ]);
+
+    assert_eq!(cancelled.len(), 2 * BACKLOG_EVENTS as usize);
+    assert!(
+        cancelled.chunks_exact(2).all(|requests| {
+            requests[0].id == ResyncId::new("pool-a") && requests[1].id == ResyncId::new("pool-b")
+        }),
+        "cancelled requests retain pending-queue order, not caller ID order"
+    );
+    assert!(runtime.pending_resyncs().is_empty());
     Ok(())
 }
 

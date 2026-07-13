@@ -89,7 +89,18 @@ around three capabilities that target exactly this workload:
   targeted purges for irreversible effects, and cancel stale hash-pinned
   resyncs. The
   `ReactiveRegistry` exposes consolidated Alloy log filters for provider
-  subscription setup and exact local log routing with optional route keys. The
+  subscription setup and exact local log routing with optional route keys.
+  The Alloy subscriber additionally merges compatible logical filters into
+  provider-side address/topic supersets and splits them only at
+  `SubscriberConfig::max_log_addresses_per_subscription` (default `1,024`).
+  Every delivered log is still matched against its original owner filter
+  locally, so fan-in reduces WebSocket round trips without broadening logical
+  delivery.
+  Handlers with a complete static route set can return a `LogRouteIndex` of
+  exact emitter, topic, or data-slice keys; registry inspection and live
+  ingestion then select only matching indexed handlers plus legacy fallback
+  handlers before rechecking the original filters and local matchers. Existing
+  handlers default to the compatibility fallback and require no changes. The
   registry and runtime support incremental handler lifecycle:
   `register_handler` remains append-only and duplicate-checked, while
   `unregister_handler(&HandlerId)` removes only that handler's future decode
@@ -119,10 +130,13 @@ around three capabilities that target exactly this workload:
   set is continuity-safe too: the changed subscription inherits the old delivery
   anchor and self-heals the gap. Use stable per-pool or per-adapter `HandlerId`
   values. Dropping an adapter is `engine.unregister_handler(&id)` for
-  routing/transport, plus — for a pool that will not return —
-  `runtime.untrack_account` (stop root-gate `eth_getProof` probes) and
-  `runtime.cancel_pending_resyncs` (drop its queued repairs); cache eviction
-  stays an explicit caller action. Full block bodies and full pending
+  routing/transport, followed by
+  `runtime.cancel_pending_resyncs_by_id(&request_ids)` once for all requests
+  owned by that exact handler generation (or `cancel_pending_resync` for a
+  single ID). Address-wide `cancel_pending_resyncs` and
+  `untrack_account` are only safe when the account is exclusively owned; shared
+  vaults require caller-side ownership tracking. Cache eviction stays an
+  explicit caller action. Full block bodies and full pending
   transaction hydration remain explicit follow-up transport work.
 - **Cold-start** — declaratively warm a working set of accounts and storage slots
   into the cache in one batched pass via `EvmCache::run_cold_start` and a
@@ -328,6 +342,7 @@ and inject all state directly:
 | `state_update_apply` | Advanced | Apply a mixed `StateUpdate` batch (`Slot`/`Account`/`Purge`) and inspect the returned `StateDiff`. |
 | `reactive_cache` | Advanced | Decode ERC-20 `Transfer` logs into `StateUpdate`s, ingest a block, reconcile drift, and purge on a reorg. |
 | `reactive_runtime` | Advanced | Drive the `ReactiveRuntime`: a handler turns a log into a `StateUpdate` (0 RPC), then a reorg triggers automatic journaled rollback. |
+| `reactive_engine_lifecycle` | Advanced | Bind runtime handlers and subscriber interests through one lifecycle surface, including owner-scoped backfill and teardown. |
 | `cold_start` | Advanced | Warm a working set with `run_cold_start`: discover the slots a view-call touches, then authoritatively verify + inject them. |
 | `bundle_simulation` | Advanced | `simulate_bundle`: ordered txs over cumulative state, `Atomic` vs `AllowReverts`, and coinbase-payment accounting. |
 | `call_tracer` | Advanced | `CallTracer` reconstructs a nested call-frame tree; `InspectorStack` composes it with transfer capture in one pass. |
@@ -579,6 +594,7 @@ provider) so they are reproducible:
 | `revert_decoding` | Built-in (`Error`/`Panic`) and custom-error revert decoding, and decoder dispatch over a registered custom error. |
 | `create3` | CREATE3 address derivation. |
 | `mapping_probe` | **Trace-based slot discovery.** `discover_erc20_balance_slot` across Solidity/Vyper/Solady (near-identical — the sim dominates, layout detection is a few hash checks); end-to-end balance forging **cold vs. descriptor-cached**; overlay `mock_balance`; and typed `call_sol` vs. `call_raw` + manual decode (within noise). |
+| `reactive_routing` | Indexed log hit/miss routing versus compatibility scans, plus fallback/distinct/shared-key handler churn at 16–4,096 handlers. |
 
 ```sh
 cargo bench                      # all offline benches
