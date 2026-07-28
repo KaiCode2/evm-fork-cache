@@ -16,6 +16,7 @@
 mod binary_state;
 mod bytecode;
 mod code_seeds;
+mod durable_checkpoint;
 mod journal_access_list;
 mod metadata;
 pub mod overlay;
@@ -24,6 +25,13 @@ pub mod snapshot;
 pub(crate) mod versioned;
 
 pub use binary_state::{load_binary_state, save_binary_state};
+#[cfg(feature = "reactive")]
+pub(crate) use durable_checkpoint::EvmCacheStateSnapshot;
+pub use durable_checkpoint::{
+    DEFAULT_MAX_DURABLE_CHECKPOINT_BYTES, DurableCheckpointBlock, DurableCheckpointError,
+    DurableCheckpointIdentity, DurableCheckpointMetadata, DurableCheckpointStore,
+    LoadedDurableCheckpoint,
+};
 pub use metadata::{CacheConfig, ImmutableDataCache};
 pub use overlay::EvmOverlay;
 pub use slot_observations::SlotObservationTracker;
@@ -1475,8 +1483,8 @@ pub struct EvmCache {
     cache_config: Option<CacheConfig>,
     /// Cache for immutable on-chain data (token decimals).
     immutable_cache: ImmutableDataCache,
-    /// Optional timestamp override for simulating future blocks.
-    /// When set, EVM simulations use this timestamp instead of the current system time.
+    /// Timestamp installed from a full/compact block identity or overridden for
+    /// future-block simulation. `None` falls back to the current system time.
     timestamp_override: Option<u64>,
     /// Chain ID for EVM simulation (e.g. 42161 for Arbitrum, 1 for Ethereum).
     chain_id: u64,
@@ -1500,6 +1508,10 @@ pub struct EvmCache {
     /// builder path sets it before returning. Enforced by
     /// [`advance_block`](Self::advance_block).
     block_context_requirements: BlockContextRequirements,
+    /// Provenance for the currently installed full block environment. A header
+    /// number becomes exact only when the reactive runtime pairs it with the
+    /// independently validated canonical hash carried by the input context.
+    block_env_source: Option<BlockEnvSource>,
     /// Cache-side batch-fetch configuration for this instance.
     storage_batch_config: StorageBatchConfig,
     /// Shared memory buffer reused across EVM simulations.
@@ -1570,6 +1582,12 @@ pub struct EvmCache {
     /// pre-allocate the same amount. See
     /// [`shared_memory_capacity`](Self::shared_memory_capacity).
     shared_memory_capacity: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+enum BlockEnvSource {
+    HeaderNumber(u64),
+    VerifiedHash { number: u64, hash: B256 },
 }
 
 /// Outcome of a balance-delta-tracking simulation.
@@ -1821,6 +1839,13 @@ impl EvmCache {
                     (None, None, None, None, None, None)
                 }
             };
+        let block_env_source = block_number.map(|number| match block_id {
+            BlockId::Hash(hash) => BlockEnvSource::VerifiedHash {
+                number,
+                hash: hash.block_hash,
+            },
+            BlockId::Number(_) => BlockEnvSource::HeaderNumber(number),
+        });
 
         // Ensure cache directory exists
         if let Some(cfg) = &cache_config {
@@ -2094,6 +2119,7 @@ impl EvmCache {
             prevrandao,
             block_gas_limit,
             block_context_requirements: BlockContextRequirements::lenient(),
+            block_env_source,
             storage_batch_config,
             shared_memory_buffer: Rc::new(RefCell::new(Vec::with_capacity(shared_memory_capacity))),
             snapshot_generation: 0,
@@ -2182,6 +2208,7 @@ impl EvmCache {
             prevrandao: None,
             block_gas_limit: None,
             block_context_requirements: BlockContextRequirements::lenient(),
+            block_env_source: None,
             storage_batch_config: StorageBatchConfig::default(),
             snapshot_generation: 0,
             shared_memory_buffer: Rc::new(RefCell::new(Vec::with_capacity(
@@ -2280,6 +2307,7 @@ impl EvmCache {
     pub fn with_blockchain_db_mut<R>(&mut self, f: impl FnOnce(&BlockchainDb) -> R) -> R {
         let result = f(&self.blockchain_db);
         self.invalidate_base();
+        self.bump_snapshot_generation();
         result
     }
 
@@ -2345,6 +2373,9 @@ impl EvmCache {
     /// into the BlockchainDb backend, so parallel tasks sharing the backend
     /// will not see them. Prefer the higher-level mutators; use with care.
     pub fn db_mut(&mut self) -> &mut ForkCacheDB {
+        // Mutable access may change checkpointed overlay state. Bump on access
+        // because changes through the returned reference cannot be observed.
+        self.bump_snapshot_generation();
         &mut self.db
     }
 
@@ -3469,7 +3500,10 @@ impl EvmCache {
     /// [`snapshot`](Self::snapshot) / `build_evm`; existing
     /// snapshots and overlays keep the chain ID captured when they were created.
     pub fn set_chain_id(&mut self, chain_id: u64) {
-        self.chain_id = chain_id;
+        if self.chain_id != chain_id {
+            self.chain_id = chain_id;
+            self.bump_snapshot_generation();
+        }
     }
 
     /// Take a low-level, same-thread checkpoint of the CacheDB overlay for
@@ -3931,15 +3965,24 @@ impl EvmCache {
     /// ids (`latest`, `pending`, hashes, etc.), the height is not
     /// statically known, so `block_number` is cleared.
     ///
-    /// `basefee` (the `BASEFEE` opcode) is **cleared on every block change** and
-    /// on every non-concrete tag/hash pin call because deriving it requires
-    /// fetching the block header, which this synchronous method cannot do. Callers
-    /// that change blocks should refresh it via
-    /// [`set_block_context`](Self::set_block_context) after fetching the new
-    /// header. Prefer [`repin_to_block`](Self::repin_to_block) when re-pinning to
-    /// a concrete height, since it keeps `block_number` and the pinned block in
-    /// lockstep.
+    /// Every header-derived execution-context field (`basefee`, beneficiary,
+    /// `prevrandao`, gas limit, and timestamp) is **cleared on every block
+    /// change** and on every non-concrete tag/hash pin call. Deriving those
+    /// values requires fetching the block header, which this synchronous method
+    /// cannot do. This also clears values installed through the manual context
+    /// setters; callers that intentionally override them must reapply the
+    /// overrides after the repin. Prefer [`advance_block`](Self::advance_block)
+    /// when a complete header is available, or refresh the individual fields
+    /// after [`repin_to_block`](Self::repin_to_block).
     pub fn set_block(&mut self, block: BlockId) {
+        let previous_block_number = self.block_number;
+        let previous_context = (
+            self.basefee,
+            self.coinbase,
+            self.prevrandao,
+            self.block_gas_limit,
+            self.timestamp_override,
+        );
         let changed = self.block != block;
         let concrete_number = match block {
             BlockId::Number(BlockNumberOrTag::Number(n)) => Some(n),
@@ -3955,12 +3998,31 @@ impl EvmCache {
         }
         if changed || concrete_number.is_none() {
             self.basefee = None;
+            self.coinbase = None;
+            self.prevrandao = None;
+            self.block_gas_limit = None;
+            self.timestamp_override = None;
         }
 
         // Keep the EVM `NUMBER` opcode aligned with the pin. Only a concrete
         // height is meaningful; tags and hashes clear it so a stale number from
         // an earlier concrete block cannot leak into simulation.
         self.block_number = concrete_number;
+        let context_changed = self.block_number != previous_block_number
+            || previous_context
+                != (
+                    self.basefee,
+                    self.coinbase,
+                    self.prevrandao,
+                    self.block_gas_limit,
+                    self.timestamp_override,
+                );
+        if !changed && context_changed {
+            self.bump_snapshot_generation();
+        }
+        if changed || context_changed {
+            self.block_env_source = None;
+        }
     }
 
     /// Get the block that RPC fetches are currently pinned to.
@@ -3973,8 +4035,13 @@ impl EvmCache {
     /// Increments on every targeted state write ([`apply_update`](Self::apply_update),
     /// [`apply_updates`](Self::apply_updates), [`modify_slot`](Self::modify_slot)
     /// — and therefore everything built on them: reactive ingestion, freshness
-    /// corrections, fresh injections) and on block re-pins
-    /// ([`set_block`](Self::set_block), [`advance_block`](Self::advance_block)).
+    /// corrections, fresh injections), block re-pins, and persisted execution
+    /// context changes. Mutable access through [`db_mut`](Self::db_mut) and
+    /// [`with_blockchain_db_mut`](Self::with_blockchain_db_mut) advances it
+    /// conservatively. Interior mutation through
+    /// [`unchecked_blockchain_db`](Self::unchecked_blockchain_db) or
+    /// [`unchecked_backend`](Self::unchecked_backend) remains explicitly
+    /// outside this contract.
     /// Cold prefetch ([`inject_storage_batch`](Self::inject_storage_batch)) and
     /// lazy backend fetches do **not** increment it: they materialize the pinned
     /// block's existing state rather than changing it.
@@ -4018,8 +4085,14 @@ impl EvmCache {
     /// time-dependent opportunities (like yield farming rewards) become profitable.
     ///
     /// Pass `None` to use the current system time (default behavior).
+    /// Re-pinning through [`set_block`](Self::set_block) clears the override;
+    /// apply it after the repin when a custom timestamp should remain in force.
     pub fn set_timestamp(&mut self, timestamp: Option<u64>) {
-        self.timestamp_override = timestamp;
+        if self.timestamp_override != timestamp {
+            self.timestamp_override = timestamp;
+            self.block_env_source = None;
+            self.bump_snapshot_generation();
+        }
     }
 
     /// Get the current timestamp override, if any.
@@ -4045,12 +4118,12 @@ impl EvmCache {
     /// Get the base fee per gas used for EVM simulations (the `BASEFEE` opcode).
     ///
     /// Fetched from the pinned block's header at construction. `None` means
-    /// revm falls back to `0`. This is cleared by [`set_block`](Self::set_block)
-    /// / [`repin_to_block`](Self::repin_to_block) when the pin changes, and by
+    /// revm falls back to `0`. This and every other header-derived environment
+    /// field are cleared by [`set_block`](Self::set_block) /
+    /// [`repin_to_block`](Self::repin_to_block) when the pin changes, and by
     /// non-concrete tag/hash pin calls because those can drift without a
-    /// concrete number in the API. Refresh it with
-    /// [`set_block_context`](Self::set_block_context) after fetching a new header
-    /// if `BASEFEE` accuracy matters.
+    /// concrete number in the API. Prefer [`advance_block`](Self::advance_block)
+    /// to install a complete fetched header.
     pub fn basefee(&self) -> Option<u64> {
         self.basefee
     }
@@ -4060,8 +4133,12 @@ impl EvmCache {
     /// Call this when the simulation block changes (e.g. at the start of each
     /// search cycle) to keep NUMBER and BASEFEE opcodes accurate.
     pub fn set_block_context(&mut self, block_number: Option<u64>, basefee: Option<u64>) {
-        self.block_number = block_number;
-        self.basefee = basefee;
+        if self.block_number != block_number || self.basefee != basefee {
+            self.block_number = block_number;
+            self.basefee = basefee;
+            self.block_env_source = None;
+            self.bump_snapshot_generation();
+        }
     }
 
     /// Set the block base fee (the `BASEFEE` opcode) for subsequent simulations,
@@ -4076,7 +4153,12 @@ impl EvmCache {
     /// The cache stores the base fee as a `u64` (matching the block header and the
     /// `EvmSnapshot` field), so a `U256` larger than `u64::MAX` is saturated.
     pub fn set_basefee(&mut self, basefee: U256) {
-        self.basefee = Some(basefee.saturating_to::<u64>());
+        let basefee = Some(basefee.saturating_to::<u64>());
+        if self.basefee != basefee {
+            self.basefee = basefee;
+            self.block_env_source = None;
+            self.bump_snapshot_generation();
+        }
     }
 
     /// Override the block beneficiary (the `COINBASE` opcode) for subsequent
@@ -4085,7 +4167,11 @@ impl EvmCache {
     /// Set this when simulating logic that reads `block.coinbase` (e.g.
     /// MEV/builder tip accounting). `None` lets revm use its default beneficiary.
     pub fn set_coinbase(&mut self, coinbase: Option<Address>) {
-        self.coinbase = coinbase;
+        if self.coinbase != coinbase {
+            self.coinbase = coinbase;
+            self.block_env_source = None;
+            self.bump_snapshot_generation();
+        }
     }
 
     /// Override `prevrandao` (the `PREVRANDAO` opcode, the post-merge header mix
@@ -4094,7 +4180,11 @@ impl EvmCache {
     /// Set this when reproducing contracts that source on-chain randomness from
     /// `block.prevrandao`. `None` leaves revm's default in place.
     pub fn set_prevrandao(&mut self, prevrandao: Option<B256>) {
-        self.prevrandao = prevrandao;
+        if self.prevrandao != prevrandao {
+            self.prevrandao = prevrandao;
+            self.block_env_source = None;
+            self.bump_snapshot_generation();
+        }
     }
 
     /// Override the block gas limit (the `GASLIMIT` opcode) for subsequent
@@ -4103,7 +4193,11 @@ impl EvmCache {
     /// Set this when simulating logic that reads `block.gaslimit`. `None` lets
     /// revm use its default.
     pub fn set_block_gas_limit(&mut self, gas_limit: Option<u64>) {
-        self.block_gas_limit = gas_limit;
+        if self.block_gas_limit != gas_limit {
+            self.block_gas_limit = gas_limit;
+            self.block_env_source = None;
+            self.bump_snapshot_generation();
+        }
     }
 
     /// Get the block beneficiary used for EVM simulations (the `COINBASE`
@@ -4111,8 +4205,8 @@ impl EvmCache {
     ///
     /// Fetched from the pinned block's header at construction, refreshed by
     /// [`advance_block`](Self::advance_block), or overridden via
-    /// [`set_coinbase`](Self::set_coinbase). `None` means revm uses its default
-    /// beneficiary.
+    /// [`set_coinbase`](Self::set_coinbase). A [`set_block`](Self::set_block)
+    /// repin clears it. `None` means revm uses its default beneficiary.
     pub fn coinbase(&self) -> Option<Address> {
         self.coinbase
     }
@@ -4122,8 +4216,9 @@ impl EvmCache {
     ///
     /// Fetched from the pinned block's header at construction, refreshed by
     /// [`advance_block`](Self::advance_block), or overridden via
-    /// [`set_prevrandao`](Self::set_prevrandao). `None` leaves revm's default in
-    /// place.
+    /// [`set_prevrandao`](Self::set_prevrandao). A
+    /// [`set_block`](Self::set_block) repin clears it. `None` leaves revm's
+    /// default in place.
     pub fn prevrandao(&self) -> Option<B256> {
         self.prevrandao
     }
@@ -4132,8 +4227,9 @@ impl EvmCache {
     ///
     /// Fetched from the pinned block's header at construction, refreshed by
     /// [`advance_block`](Self::advance_block), or overridden via
-    /// [`set_block_gas_limit`](Self::set_block_gas_limit). `None` lets revm use
-    /// its default.
+    /// [`set_block_gas_limit`](Self::set_block_gas_limit). A
+    /// [`set_block`](Self::set_block) repin clears it. `None` lets revm use its
+    /// default.
     pub fn block_gas_limit(&self) -> Option<u64> {
         self.block_gas_limit
     }
@@ -4146,7 +4242,10 @@ impl EvmCache {
     /// [`advance_block`](Self::advance_block) rejects a header missing a required
     /// field rather than silently defaulting it.
     pub fn set_block_context_requirements(&mut self, reqs: BlockContextRequirements) {
-        self.block_context_requirements = reqs;
+        if self.block_context_requirements != reqs {
+            self.block_context_requirements = reqs;
+            self.bump_snapshot_generation();
+        }
     }
 
     /// Engine-driven per-block env refresh from a canonical block header.
@@ -4184,6 +4283,7 @@ impl EvmCache {
         self.prevrandao = header.mix_hash();
         self.block_gas_limit = Some(header.gas_limit());
         self.timestamp_override = Some(header.timestamp());
+        self.block_env_source = Some(BlockEnvSource::HeaderNumber(header.number()));
 
         // Advance every fetch path to the new height in lockstep with the env:
         // the SharedBackend lazy fallback (a miss must not serve state from the
@@ -4200,13 +4300,130 @@ impl EvmCache {
         Ok(())
     }
 
+    /// Advance a reactive cache using compact canonical identity when no full
+    /// header is available.
+    ///
+    /// The exact canonical hash pin keeps every later lazy provider read on the
+    /// event's block. `NUMBER` and an available timestamp are known from the
+    /// compact identity. Header-only fields are cleared unless `preserve_env`
+    /// proves this is another record for a block whose full header was already
+    /// installed. Like [`advance_block`](Self::advance_block), this is a forward
+    /// roll of the event-maintained view and deliberately does not discard the
+    /// cache's accumulated state.
+    #[cfg(feature = "reactive")]
+    pub(crate) fn advance_compact_block(
+        &mut self,
+        number: u64,
+        hash: B256,
+        timestamp: Option<u64>,
+        preserve_env: bool,
+    ) {
+        let block = BlockId::from((hash, Some(true)));
+        let preserve_verified_env = preserve_env
+            && match self.block_env_source {
+                Some(BlockEnvSource::HeaderNumber(env_number)) => env_number == number,
+                Some(BlockEnvSource::VerifiedHash {
+                    number: env_number,
+                    hash: env_hash,
+                }) => env_number == number && env_hash == hash,
+                None => false,
+            };
+        // Timestamp is part of compact block identity, unlike the header-only
+        // fee/beneficiary/randomness/gas fields. Preserve an already-known
+        // timestamp for another partial record at the exact same hash even when
+        // it originated from compact progress rather than a full header.
+        let preserve_known_timestamp =
+            preserve_env && self.block == block && self.block_number == Some(number);
+        let next_timestamp =
+            timestamp.or(self.timestamp_override.filter(|_| preserve_known_timestamp));
+        let mut changed = self.block != block
+            || self.block_number != Some(number)
+            || self.timestamp_override != next_timestamp;
+        if !preserve_verified_env {
+            changed |= self.basefee.is_some()
+                || self.coinbase.is_some()
+                || self.prevrandao.is_some()
+                || self.block_gas_limit.is_some();
+            self.basefee = None;
+            self.coinbase = None;
+            self.prevrandao = None;
+            self.block_gas_limit = None;
+            self.block_env_source = None;
+        } else {
+            self.block_env_source = Some(BlockEnvSource::VerifiedHash { number, hash });
+        }
+        self.block = block;
+        self.block_number = Some(number);
+        self.timestamp_override = next_timestamp;
+        let block_number = U256::from(number);
+        changed |= self
+            .blockchain_db
+            .block_hashes()
+            .write()
+            .insert(block_number, hash)
+            != Some(hash);
+        changed |= self.db.cache.block_hashes.insert(block_number, hash) != Some(hash);
+        let _ = self.backend.set_pinned_block(block);
+        if changed {
+            self.bump_snapshot_generation();
+        }
+    }
+
+    /// Forget every cached `BLOCKHASH` value at or above `from_block`.
+    ///
+    /// Foundry's backend cache is keyed only by block number; re-pinning it does
+    /// not invalidate hashes learned on a displaced branch. Reorg handling must
+    /// therefore clear both backend and revm-layer values before any replacement
+    /// branch handler or simulation can observe them.
+    #[cfg(feature = "reactive")]
+    pub(crate) fn invalidate_cached_block_hashes_from(&mut self, from_block: u64) {
+        let from_block = U256::from(from_block);
+        let mut changed = false;
+        {
+            let mut hashes = self.blockchain_db.block_hashes().write();
+            let before = hashes.len();
+            hashes.retain(|number, _| *number < from_block);
+            changed |= hashes.len() != before;
+        }
+        let before = self.db.cache.block_hashes.len();
+        self.db
+            .cache
+            .block_hashes
+            .retain(|number, _| *number < from_block);
+        changed |= self.db.cache.block_hashes.len() != before;
+        if changed {
+            self.bump_snapshot_generation();
+        }
+    }
+
+    /// Install an exact canonical `BLOCKHASH` value in both cache layers.
+    ///
+    /// Reactive reorg recovery uses this after invalidating an unknown-parent
+    /// branch. The arriving child still proves the identity of `N - 1`, so the
+    /// stale value must be replaced before any handler can execute against the
+    /// replacement block.
+    #[cfg(feature = "reactive")]
+    pub(crate) fn set_cached_block_hash(&mut self, block_number: u64, hash: B256) {
+        let block_number = U256::from(block_number);
+        let mut changed = self
+            .blockchain_db
+            .block_hashes()
+            .write()
+            .insert(block_number, hash)
+            != Some(hash);
+        changed |= self.db.cache.block_hashes.insert(block_number, hash) != Some(hash);
+        if changed {
+            self.bump_snapshot_generation();
+        }
+    }
+
     /// Re-pin the cache to a specific block number.
     ///
-    /// Updates the SharedBackend pinned block, the batch fetcher block, and the
-    /// EVM block context (`NUMBER` opcode) in lockstep. The current `basefee` is
-    /// cleared because it cannot be refreshed synchronously; callers should set it
-    /// via [`set_block_context`](Self::set_block_context) after fetching the new
-    /// block header if `BASEFEE` accuracy matters.
+    /// Updates the SharedBackend pinned block and the EVM `NUMBER` context in
+    /// lockstep. All other block-header fields are cleared because they cannot
+    /// be refreshed synchronously; callers should prefer
+    /// [`advance_block`](Self::advance_block) when a complete new header is
+    /// available, or reinstall deliberate manual overrides after this call.
     pub fn repin_to_block(&mut self, block_number: u64) {
         let old_block = self.block;
         self.set_block(BlockId::Number(block_number.into()));

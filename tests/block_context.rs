@@ -1,4 +1,4 @@
-//! Manager-authored red-green acceptance tests for WS-2 / Phase-8 step 2:
+//! Red-green acceptance tests for WS-2 / Phase-8 step 2:
 //! strict block-context requirements and engine-driven `advance_block` env
 //! refresh.
 //!
@@ -17,9 +17,10 @@
 
 mod common;
 
-use alloy_consensus::Header;
+use alloy_consensus::{BlockHeader as _, Header};
 use alloy_eips::BlockId;
-use alloy_primitives::{Address, B256};
+use alloy_primitives::{Address, B256, Bytes, Log as PrimitiveLog};
+use alloy_rpc_types_eth::Log;
 use anyhow::Result;
 
 use common::setup_cache;
@@ -106,6 +107,28 @@ async fn advance_block_refreshes_all_block_env_fields() -> Result<()> {
     Ok(())
 }
 
+/// A low-level repin has no header from which to refresh the EVM environment.
+/// It must fail closed instead of pairing the new state pin with old header
+/// fields, including values that could have been manually overridden.
+#[tokio::test]
+async fn set_block_clears_every_stale_header_field_on_repin() -> Result<()> {
+    let mut cache = setup_cache().await?;
+    cache
+        .advance_block(&header(100, Some(42)))
+        .expect("install complete old header");
+
+    cache.set_block(BlockId::number(101));
+
+    assert_eq!(cache.block(), BlockId::number(101));
+    assert_eq!(cache.block_number(), Some(101));
+    assert_eq!(cache.basefee(), None);
+    assert_eq!(cache.coinbase(), None);
+    assert_eq!(cache.prevrandao(), None);
+    assert_eq!(cache.block_gas_limit(), None);
+    assert_eq!(cache.timestamp(), None);
+    Ok(())
+}
+
 /// WS-2 / Phase-8 s2: under strict requirements, `advance_block` fails loudly on
 /// a header missing a required field instead of silently defaulting it.
 #[tokio::test]
@@ -130,19 +153,19 @@ async fn advance_block_strict_rejects_incomplete_header() -> Result<()> {
     Ok(())
 }
 
-// --- Additional coverage (implementation agent, Wave 4) --------------------
+// --- Additional Wave 4 coverage --------------------------------------------
 
 use std::sync::Arc;
 
-use alloy_network::Ethereum;
+use alloy_network::{Ethereum, primitives::HeaderResponse as _};
 use alloy_provider::RootProvider;
 use alloy_provider::network::AnyNetwork;
 use alloy_rpc_client::RpcClient;
 use alloy_transport::mock::Asserter;
 use evm_fork_cache::EvmCacheBuilder;
 use evm_fork_cache::reactive::{
-    ChainStatus, InputSource, ReactiveConfig, ReactiveContext, ReactiveInput, ReactiveInputBatch,
-    ReactiveInputRecord, ReactiveReport, ReactiveRuntime,
+    BlockRef, ChainControl, ChainStatus, InputSource, ReactiveConfig, ReactiveContext,
+    ReactiveInput, ReactiveInputBatch, ReactiveInputRecord, ReactiveReport, ReactiveRuntime,
 };
 
 /// Build a mocked provider (no network access) modelled on `common::setup_cache`.
@@ -218,18 +241,18 @@ fn rpc_header(number: u64, basefee: Option<u64>) -> alloy_rpc_types_eth::Header 
 }
 
 /// A canonical (`Included`) context for a block header at `number`.
-fn included_header_context(number: u64) -> ReactiveContext {
+fn included_header_context(header: &alloy_rpc_types_eth::Header) -> ReactiveContext {
     let block = evm_fork_cache::reactive::BlockRef {
-        number,
-        hash: B256::repeat_byte(0x11),
-        parent_hash: Some(B256::repeat_byte(0x10)),
-        timestamp: Some(1_700_000_000 + number),
+        number: header.number(),
+        hash: header.hash(),
+        parent_hash: Some(header.parent_hash()),
+        timestamp: Some(header.timestamp()),
     };
     ReactiveContext {
         chain_id: Some(1),
         source: InputSource::Batch,
         chain_status: ChainStatus::Included {
-            block: block.clone(),
+            block,
             confirmations: 0,
         },
         block: Some(block),
@@ -245,11 +268,10 @@ async fn reactive_ingest_of_canonical_header_refreshes_block_env() -> Result<()>
     let mut cache = setup_cache().await?;
     let mut runtime = ReactiveRuntime::<Ethereum>::new(ReactiveConfig::default());
 
-    let input = ReactiveInput::BlockHeader(rpc_header(7_777, Some(123)));
-    let batch = ReactiveInputBatch::new(vec![ReactiveInputRecord::new(
-        input,
-        included_header_context(7_777),
-    )]);
+    let header = rpc_header(7_777, Some(123));
+    let context = included_header_context(&header);
+    let input = ReactiveInput::BlockHeader(header);
+    let batch = ReactiveInputBatch::new(vec![ReactiveInputRecord::new(input, context)]);
 
     let report = runtime.ingest_batch(&mut cache, batch)?;
 
@@ -265,6 +287,90 @@ async fn reactive_ingest_of_canonical_header_refreshes_block_env() -> Result<()>
             .any(|r| matches!(r.as_ref(), ReactiveReport::Error(_))),
         "a lenient canonical drive must not surface an error report"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn post_record_compact_barrier_preserves_full_header_environment() -> Result<()> {
+    let mut cache = setup_cache().await?;
+    let mut runtime = ReactiveRuntime::<Ethereum>::new(ReactiveConfig::default());
+    let header = rpc_header(7_778, Some(124));
+    let context = included_header_context(&header);
+    let exact_hash = header.hash();
+    let compact = BlockRef {
+        number: header.number(),
+        hash: exact_hash,
+        parent_hash: None,
+        timestamp: None,
+    };
+
+    runtime.ingest_batch(
+        &mut cache,
+        ReactiveInputBatch::new(vec![ReactiveInputRecord::new(
+            ReactiveInput::BlockHeader(header),
+            context,
+        )])
+        .with_chain_controls([ChainControl::Barrier {
+            id: b"header-complete".to_vec(),
+            block: Some(compact),
+        }]),
+    )?;
+
+    assert_eq!(cache.block(), BlockId::from((exact_hash, Some(true))));
+    assert_eq!(cache.block_number(), Some(7_778));
+    assert_eq!(cache.basefee(), Some(124));
+    assert_eq!(cache.coinbase(), Some(Address::repeat_byte(0xcb)));
+    assert_eq!(cache.prevrandao(), Some(B256::repeat_byte(0xab)));
+    assert_eq!(cache.block_gas_limit(), Some(30_000_000));
+    assert_eq!(cache.timestamp(), Some(1_700_000_000 + 7_778));
+    Ok(())
+}
+
+#[tokio::test]
+async fn zero_depth_runtime_preserves_full_header_env_for_same_block_compact_records() -> Result<()>
+{
+    let mut cache = setup_cache().await?;
+    let mut runtime = ReactiveRuntime::<Ethereum>::new(ReactiveConfig {
+        journal_depth: 0,
+        ..ReactiveConfig::default()
+    });
+    let header = rpc_header(7_779, Some(125));
+    let context = included_header_context(&header);
+    let block = context.block.expect("canonical block");
+    let log = Log {
+        inner: PrimitiveLog::new_unchecked(
+            Address::repeat_byte(0xdd),
+            vec![B256::repeat_byte(0xee)],
+            Bytes::new(),
+        ),
+        block_hash: Some(block.hash),
+        block_number: Some(block.number),
+        block_timestamp: block.timestamp,
+        transaction_hash: Some(B256::repeat_byte(0xef)),
+        transaction_index: Some(0),
+        log_index: Some(0),
+        removed: false,
+    };
+    let log_context = ReactiveContext {
+        transaction_index: Some(0),
+        log_index: Some(0),
+        ..context.clone()
+    };
+
+    runtime.ingest_batch(
+        &mut cache,
+        ReactiveInputBatch::new(vec![
+            ReactiveInputRecord::new(ReactiveInput::BlockHeader(header), context),
+            ReactiveInputRecord::new(ReactiveInput::Log(log), log_context),
+        ]),
+    )?;
+
+    assert_eq!(runtime.last_canonical_block(), Some(block));
+    assert_eq!(cache.basefee(), Some(125));
+    assert_eq!(cache.coinbase(), Some(Address::repeat_byte(0xcb)));
+    assert_eq!(cache.prevrandao(), Some(B256::repeat_byte(0xab)));
+    assert_eq!(cache.block_gas_limit(), Some(30_000_000));
+    assert_eq!(cache.timestamp(), Some(1_700_000_000 + 7_779));
     Ok(())
 }
 
@@ -303,11 +409,10 @@ async fn reactive_strict_drive_surfaces_error_report_for_incomplete_header() -> 
     let mut runtime = ReactiveRuntime::<Ethereum>::new(ReactiveConfig::default());
 
     // No base fee -> strict validation fails during the drive.
-    let input = ReactiveInput::BlockHeader(rpc_header(4_242, None));
-    let batch = ReactiveInputBatch::new(vec![ReactiveInputRecord::new(
-        input,
-        included_header_context(4_242),
-    )]);
+    let header = rpc_header(4_242, None);
+    let context = included_header_context(&header);
+    let input = ReactiveInput::BlockHeader(header);
+    let batch = ReactiveInputBatch::new(vec![ReactiveInputRecord::new(input, context)]);
 
     let report = runtime.ingest_batch(&mut cache, batch)?;
 
@@ -323,5 +428,32 @@ async fn reactive_strict_drive_surfaces_error_report_for_incomplete_header() -> 
         error_message.to_lowercase().contains("basefee"),
         "the error report must name the missing base-fee field, got: {error_message}"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn canonical_block_records_are_sorted_before_advancing_runtime_and_cache_heads() -> Result<()>
+{
+    let mut cache = setup_cache().await?;
+    let mut runtime = ReactiveRuntime::<Ethereum>::new(ReactiveConfig::default());
+    let older = rpc_header(50, Some(5));
+    let newer = rpc_header(51, Some(6));
+    let older_context = included_header_context(&older);
+    let newer_context = included_header_context(&newer);
+
+    runtime.ingest_batch(
+        &mut cache,
+        ReactiveInputBatch::new(vec![
+            ReactiveInputRecord::new(ReactiveInput::BlockHeader(newer), newer_context),
+            ReactiveInputRecord::new(ReactiveInput::BlockHeader(older), older_context),
+        ]),
+    )?;
+
+    assert_eq!(
+        runtime.last_canonical_block().map(|block| block.number),
+        Some(51)
+    );
+    assert_eq!(cache.block_number(), Some(51));
+    assert_eq!(cache.basefee(), Some(6));
     Ok(())
 }

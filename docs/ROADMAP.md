@@ -3,7 +3,7 @@
 > Status: living document. Phases 0-8 have landed: through bundle simulation +
 > call tracing, plus Phase 8 — storageHash liveness & state invalidation —
 > which shipped in **0.2.0** (all six steps of
-> [`phase-8-liveness-spec.md`](phase-8-liveness-spec.md), including the
+> [`phase-8-liveness-spec.md`](https://github.com/KaiCode2/evm-fork-cache/blob/main/docs/phase-8-liveness-spec.md), including the
 > cold-start root baseline and the Tier-3 trace-backed resync source).
 
 ## Vision
@@ -92,7 +92,7 @@ RPC node                     Event-driven sync  ← WS logs · new block
 | **5** | COW snapshots (Pillar A): structural sharing; overlay buffer reuse. | **Done** (`phase-5-cow-snapshots`) |
 | **6** | Reactive runtime + live transport: provider-neutral `ReactiveRuntime` / `ReactiveHandler`, journaled depth-bounded reorg recovery, the WebSocket `AlloySubscriber`, and declarative `cold_start` warming. | **Done** (`cold-start-sync`) |
 | **7** | Bundle simulation + call tracing: `EvmOverlay::simulate_bundle` (ordered cumulative-state txs, `RevertPolicy`, coinbase-payment accounting) and a `CallTracer` (call-frame tree) + composable `InspectorStack`. | **Done** (`phase-6-bundle-sim`) |
-| **8** | storageHash liveness & state invalidation (Pillar C): account/root fetcher seam (`eth_getProof`); per-block root gate + complement resync (`ResyncReason::RootMoved`) + coverage alarm; per-contract `TrackingPolicy` (`Slots`/`WholeAccount`/`Scalars`); event-write `Validity` stamping; `advance_block` block-env refresh; cold-start root baseline (`roots.bin`); Tier-3 trace-backed resync. | **Done in 0.2.0** ([spec](phase-8-liveness-spec.md)) |
+| **8** | storageHash liveness & state invalidation (Pillar C): account/root fetcher seam (`eth_getProof`); per-block root gate + complement resync (`ResyncReason::RootMoved`) + coverage alarm; per-contract `TrackingPolicy` (`Slots`/`WholeAccount`/`Scalars`); event-write `Validity` stamping; `advance_block` block-env refresh; cold-start root baseline (`roots.bin`); Tier-3 trace-backed resync. | **Done in 0.2.0** ([spec](https://github.com/KaiCode2/evm-fork-cache/blob/main/docs/phase-8-liveness-spec.md)) |
 
 Cross-cutting remaining work: `Create`-kind / state-override bundles, opcode-level
 tracing, and a full no-provider build split.
@@ -116,8 +116,8 @@ a 1.0.
 - **Files:** `src/errors.rs` (+ `thiserror` dep), call sites in
   `src/cache/mod.rs` / `src/cache/overlay.rs`.
 - **API:** `enum SimError { Revert(Box<SimulationError>), Halt { .. }, Other(SimHostError) }`;
-  `type SimulationResult<T> = Result<T, SimError>`. `SimulationErrorKind`
-  retained as a deprecated alias.
+  `type SimulationResult<T> = Result<T, SimError>`. The pre-release
+  `SimulationErrorKind` alias was removed before the public surface shipped.
 - **Done when:** halts surface typed; `cargo test` + clippy green.
 
 ### 1b — Configurable transaction & block environment
@@ -545,14 +545,16 @@ local trie and no proof verification**. This phase uses it to detect and repair
 the staleness the current footprint-bounded model cannot see.
 
 Full design, type sketches, tests, and the cold-start correctness argument live in
-[`phase-8-liveness-spec.md`](phase-8-liveness-spec.md). The build set (in order):
+[`phase-8-liveness-spec.md`](https://github.com/KaiCode2/evm-fork-cache/blob/main/docs/phase-8-liveness-spec.md). The build set (in order):
 
 1. **Account/root fetcher seam** on `EvmCache` (`AccountProofFetchFn` over
    `eth_getProof`, mirroring `StorageBatchFetchFn`). The linchpin — it also
    resolves the tracked `ResyncTarget::Account` `Unsupported` gap
    (`reactive/mod.rs`) and the account-field freshness gap.
 2. **`advance_block(header)`** — engine-driven block-env refresh from the
-   canonical header stream (the runtime does not refresh scalars per block today).
+   canonical header stream. Runtime `BlockHeader` and `FullBlock` ingestion now
+   use this path; compact `CanonicalProgress` intentionally proves only coverage
+   and clears header fields it cannot authenticate.
 3. **`Validity` stamping** of reactive/event-derived writes — the first (minimal,
    intentional) coupling of the reactive runtime to `FreshnessRegistry`
    (`valid_through_slot(N)` on touched slots, aged by `on_new_block`).
@@ -606,7 +608,16 @@ acceptance contract in the spec (`tests/liveness_*`).
 
 ## Remaining work toward 1.0
 
-1. **Bundle-simulation breadth (Phase 7 — core shipped).** `EvmOverlay::simulate_bundle`
+1. **Preconfirmation read-set retention (production-rollout gate).** Prime
+   representative simulation read sets before subscriber attachment, then
+   replace whole-cache preconfirmation restore with target-scoped rollback or
+   an equivalent persistent canonical warm layer. Speculative account, slot,
+   balance, resync, and purge effects must still be removed exactly, while
+   unrelated lazy fills survive branch replacement. Acceptance requires
+   provider-read-count tests across cumulative/replaced/discarded payloads and a
+   repeat paid-provider benchmark with no recurring RPC-scale quote-latency
+   mode.
+2. **Bundle-simulation breadth (Phase 7 — core shipped).** `EvmOverlay::simulate_bundle`
    now evaluates an ordered tx sequence over cumulative state with a revert policy
    and coinbase-payment accounting, and a `CallTracer` reconstructs the call-frame
    tree (see Phase 7 below). The remaining breadth: `Create`-kind bundle txs, a
@@ -614,17 +625,17 @@ acceptance contract in the spec (`tests/liveness_*`).
    reverted-tx gas accounting under `AllowReverts` (a reverted tx's gas is rolled
    back with its checkpoint, so it is not counted toward the searcher's cost —
    tracked in `docs/KNOWN_ISSUES.md`).
-2. **Transport depth.** The live `AlloySubscriber` ships log/block/pending-hash
+3. **Transport depth.** The live `AlloySubscriber` ships log/block/pending-hash
    subscriptions, exponential-backoff reconnect, `get_logs` backfill, and
    journaled parent-hash reorg recovery. The remaining transport gaps are full
    block bodies, full pending-transaction hydration (today only pending-tx
    hashes), and non-log historical backfill. Log interests can request
    owner-scoped `get_logs` backfill from a block anchor. Remaining gaps are
    tracked in `docs/KNOWN_ISSUES.md`.
-3. **Snapshot consistency point in continuous ingestion.** Closed in 0.2.0:
+4. **Snapshot consistency point in continuous ingestion.** Closed in 0.2.0:
    `EvmCache::snapshot_generation()` is the crate-provided generation guard —
    read it around `snapshot()` and re-snapshot when it moved, so simulations
    never observe a partially applied block (G6).
-4. **Full no-provider build split.** The dependency graph still includes
+5. **Full no-provider build split.** The dependency graph still includes
    provider/RPC crates. A later `rpc` feature can make those optional for pure
    offline users.

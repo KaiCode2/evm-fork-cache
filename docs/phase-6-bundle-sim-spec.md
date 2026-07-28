@@ -266,5 +266,5 @@ impl<A,B,CTX,INTR> Inspector<CTX,INTR> for InspectorStack<A,B> where … { /* fa
 
 `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`,
 `cargo test --all-features`, doctests, `RUSTDOCFLAGS=-D warnings cargo doc --no-deps`.
-Manager-authored acceptance tests: `tests/bundle_simulation.rs` (A+B),
+Acceptance tests: `tests/bundle_simulation.rs` (A+B),
 `tests/call_tracer.rs` (C). No new production dependencies. Offline only (mocked provider).

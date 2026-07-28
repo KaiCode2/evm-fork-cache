@@ -1,2 +1,35 @@
 /target
 **/*.rs.bk
+.env
+.env.*
+!.env.example
+
+# Local runtime state and durable checkpoints.
+/cache/
+/.cache/
+/.evm-fork-cache/
+/chain_*/
+/*.db
+/*.db-*
+/*.sqlite
+/*.sqlite-*
+/*.sqlite3
+/*.sqlite3-*
+/*.checkpoint
+/*.checkpoint.*
+/checkpoint*.bin
+/.checkpoint*.tmp-*
+/evm_state.bin
+/state.bin
+/bytecodes.bin
+/immutable_data.bin
+/code_seeds.bin
+/roots.bin
+/observations.bin
+/registry.bin
+
+# Local credentials and signing material.
+*.key
+*.pem
+*.p12
+*.pfx

@@ -22,10 +22,12 @@ Confidence legend: **[V]** verified against the source during review;
    "no block pin" state; explicit construction uses
    `EvmCache::at_block(provider, block)`. `set_block` takes a concrete
    `BlockId`, sets `block_number` only for numeric pins, and clears it for
-   tag/hash pins. Every block change clears stale `basefee`; callers refresh
-   `NUMBER`/`BASEFEE` together with `set_block_context` after fetching the new
-   header. Freshness validation captures the cache's concrete snapshot pin and
-   passes it through to storage fetchers.
+   tag/hash pins. Every repin clears `NUMBER`, `BASEFEE`, `COINBASE`,
+   `PREVRANDAO`, `GASLIMIT`, and timestamp provenance so values from the old
+   header cannot leak into the new pin. Callers must reinstall any intentional
+   manual overrides, or use `advance_block` with a complete canonical header.
+   Freshness validation captures the cache's concrete snapshot pin and passes it
+   through to storage fetchers.
 
 3. **[FIXED] Synchronous layer-2 escape hatches have an invalidating wrapper.**
    Raw handles are now visibly named `unchecked_blockchain_db()` /
@@ -106,6 +108,19 @@ surface was moved out of this crate.
 
 ## Limitations by design / roadmap
 
+- **Preconfirmed branch replacement discards lazy reads made after branch
+  capture.** The Flashblocks runtime takes a complete canonical cache snapshot
+  before applying the first preconfirmed payload and restores that snapshot
+  when the speculative branch is replaced or discarded. This is deliberately
+  fail-safe for correctness, but it also removes unrelated account/storage
+  values fetched lazily by simulations while the branch was active. Repeated
+  quotes can therefore pay the same provider round trip again on later
+  Flashblocks even when their read set is unchanged. Cumulative updates within
+  one payload keep the active branch and retain those reads. The alpha accepts
+  this performance limitation; production rollout is gated on canonical
+  read-set priming plus selective speculative rollback (or an equivalent
+  persistent warm layer), provider-read-count regression coverage, and a repeat
+  live latency benchmark.
 - **Storage-only freshness verification; `ConfirmedFull` is defined but not yet
   emitted.** The optimistic verify-and-rerun loop builds its verify set from the
   volatile storage *slots* in each sim's read set, and its success verdict says
@@ -180,8 +195,35 @@ surface was moved out of this crate.
   the freshness/validation loop is the backstop for that span. This is not silent:
   the runtime emits a `tracing::warn!` when a reorg references a block no longer in
   the journal. Set `journal_depth` above the deepest reorg you intend to recover
-  precisely. (The full conservative-purge fallback for aged-out blocks is a tracked
-  follow-up, not a known defect.)
+  precisely. The crash-safe `ReactiveEngine::*_checkpointed` paths are stricter:
+  an explicit reorg, implicit-parent replacement, or removed/reorged record whose
+  required rollback proof falls outside the retained effect journal is rejected
+  before cache mutation, durable save, or source ACK rather than checkpointing
+  partial recovery. Configure the runtime depth at least as large as the
+  subscriber's promised reorg window.
+  Ordinary direct/non-checkpointed ingestion retains the degraded partial-
+  recovery behavior above for compatibility. (The full conservative-purge
+  fallback for aged-out blocks is a tracked follow-up, not a known defect.)
+- **Replacement-branch rollback does not provenance-tag every lazy account or
+  storage read.** In-window reactive handler effects are journaled and rolled
+  back/purged, and displaced `BLOCKHASH` cache entries are now explicitly
+  invalidated. Ordinary account/storage values fetched lazily through
+  `SharedBackend`, however, are cached by address/slot rather than by the
+  canonical block hash that supplied them. Re-pinning to a replacement branch
+  cannot identify which of those values changed on that branch. This is
+  separate from the `journal_depth` limit: it can matter even for a shallow
+  reorg when a lazily read value is not maintained by a handler. Production
+  consumers should event-maintain and root-gate the state they rely on, or
+  explicitly purge/resync affected accounts (or reconstruct the cache) before
+  trusting replacement-branch simulations.
+- **`ChainControl::CanonicalProgress` certifies event coverage, not full-header
+  readiness.** Compact progress and block-bearing barriers exact-hash pin lazy
+  provider reads and install known `NUMBER`/timestamp metadata. They deliberately
+  clear `BASEFEE`, `COINBASE`, `PREVRANDAO`, and `GASLIMIT` unless a full header
+  for that exact number/hash was already verified. This is safe for event-state
+  catch-up, but a consumer whose simulation reads those opcodes must wait for or
+  fetch the full canonical header before treating the cache as EVM-environment
+  ready.
 - **Bundle `coinbase_payment` excludes the gas of `AllowReverts` transactions that
   actually revert.** `simulate_bundle` rolls a reverting whitelisted tx back to its
   inner checkpoint, which also undoes the gas that tx charged to the beneficiary. So
@@ -248,11 +290,18 @@ surface was moved out of this crate.
   remaining transport limits: **full block bodies**, **full pending-transaction
   hydration**, and non-log historical backfill are not implemented (the
   subscriber returns a typed `SubscriberError::Unsupported` for non-hash pending
-  interests). Mid-lifecycle handler registration through `ReactiveEngine`
-  backfills a new handler's logs from the runtime's last canonical block
-  automatically and catches the newly connected stream up from that anchor after
-  it subscribes, so the discovery→subscription window is closed without caller
-  bookkeeping; the bounded `dedupe_window` suppresses the overlap. The residual
+  interests). Alloy log catch-up is intended for bounded live gaps: each
+  filter/window uses one complete-range `eth_getLogs` request. The
+  `max_backfill_log_bytes` limit rejects a response after decoding, but ranges
+  are not adaptively split and provider result caps can fail a dense or deep
+  query first. Keep registration and reconnect windows modest; use HyperSync or
+  another indexing `EventSubscriber` for deep/high-density history.
+  Mid-lifecycle handler registration through `ReactiveEngine` adopts the live
+  desired state first, replays the new owner at the retained canonical block,
+  then catches the complete handler union up globally above that block through
+  activation. This closes the discovery→subscription window without leaving
+  later effects outside the global rollback journal; the bounded `dedupe_window`
+  suppresses overlap. The residual
   limit is a genuinely live-only registration (no anchor and no backfill
   requested): logs between the registration call and the live subscription start
   are not fetched. A reconnect after more than `dedupe_window` matching logs can
@@ -266,9 +315,10 @@ surface was moved out of this crate.
   end-to-end is now covered offline in `tests/reactive_subscriber_ingest.rs` (a
   real subscriber batch, produced via the mockable `get_logs` backfill path,
   drives a real runtime ingest and asserts the cache write). The remaining paths
-  without dedicated integration coverage are the block-header ingest path, the
-  `ReactiveReport::Decoded` shape, the `EventDecoderHandler` adapter, and custom
-  pending-tx matcher/route-key routing; the live WebSocket transport plumbing is
+  without dedicated integration coverage are the `EventDecoderHandler` adapter
+  and custom pending-tx matcher/route-key routing. Block-header ingestion is
+  covered in `tests/block_context.rs`, and decoded-report delivery is asserted
+  in `tests/reactive_engine.rs`. The live WebSocket transport plumbing is
   covered by reconnect/termination unit tests but not by a networked end-to-end
   test. These are tracked follow-ups, not known defects.
 - **Recent toolchain.** MSRV 1.88 and edition 2024 are intentional and

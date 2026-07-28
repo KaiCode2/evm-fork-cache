@@ -1,12 +1,9 @@
-//! Manager-authored red-green acceptance tests for Phase 6 Track A+B:
+//! Acceptance tests for Phase 6 Track A+B:
 //! ordered multi-transaction bundle simulation over cumulative state, revert
 //! policy, and coinbase/payment accounting.
 //!
-//! These describe the public contract before the implementation exists. The
-//! implementation agent must make them pass WITHOUT weakening, skipping, or
-//! rewriting them; if a test encodes a wrong assumption about EVM/mock behavior
-//! (as opposed to the feature contract), surface it to the manager with a
-//! justification rather than silently changing it.
+//! These describe the public contract. Keep their assertions intact unless a
+//! documented correction to an EVM or mock assumption is required.
 //!
 //! Fully offline (mocked provider, injected state).
 #![cfg(feature = "reactive")]
@@ -301,7 +298,7 @@ async fn commit_flag_controls_overlay_persistence() -> Result<()> {
     Ok(())
 }
 
-/// WS-7 (manager-authored red-green): cost-accounting breakdown. After an
+/// WS-7 red-green coverage: cost-accounting breakdown. After an
 /// `AllowReverts` bundle whose whitelisted tx reverts, the reverted tx's gas is
 /// excluded from `coinbase_payment` (the honest miner receipt) but is exposed via
 /// `reverted_tx_gas`, and `successful_tx_gas + reverted_tx_gas == gas_used`. This
@@ -348,7 +345,7 @@ async fn allow_reverts_exposes_reverted_and_successful_gas() -> Result<()> {
     Ok(())
 }
 
-/// WS-7 (manager-authored red-green): a fully successful bundle reports zero
+/// WS-7 red-green coverage: a fully successful bundle reports zero
 /// reverted gas and all gas in the successful bucket.
 #[tokio::test(flavor = "multi_thread")]
 async fn successful_bundle_reports_zero_reverted_gas() -> Result<()> {

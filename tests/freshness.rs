@@ -2031,7 +2031,7 @@ async fn run_unverified_when_fixed_point_round_cap_exceeded() -> Result<()> {
     Ok(())
 }
 
-/// WS-1c (manager-authored red-green): the verdict taxonomy distinguishes a
+/// WS-1c red-green coverage: the verdict taxonomy distinguishes a
 /// storage-only confirmation from a full (storage + account) one, so callers can
 /// no longer mistake "no volatile storage slot changed" for "account state
 /// verified". The storage-only success verdict is renamed `Confirmed ->

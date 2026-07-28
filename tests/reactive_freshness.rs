@@ -1,4 +1,4 @@
-//! Manager-authored red-green acceptance test for Phase-8 step 3: `Validity`
+//! Red-green acceptance test for Phase-8 step 3: `Validity`
 //! stamping of reactive/event-derived writes.
 //!
 //! With freshness stamping enabled, applying a canonical event write stamps the
@@ -23,6 +23,7 @@ use anyhow::Result;
 use common::setup_cache;
 use evm_fork_cache::StateUpdate;
 use evm_fork_cache::events::StateView;
+use evm_fork_cache::freshness::Validity;
 use evm_fork_cache::reactive::{
     BlockRef, ChainStatus, HandlerError, HandlerId, HandlerOutcome, InputSource, LogInterest,
     ReactiveConfig, ReactiveContext, ReactiveEffect, ReactiveHandler, ReactiveInput,
@@ -57,8 +58,21 @@ fn included_context(block: BlockRef, log_index: u64) -> ReactiveContext {
         chain_id: Some(1),
         source: InputSource::Batch,
         chain_status: ChainStatus::Included {
-            block: block.clone(),
+            block,
             confirmations: 0,
+        },
+        block: Some(block),
+        transaction_index: Some(0),
+        log_index: Some(log_index),
+    }
+}
+
+fn reorged_context(block: BlockRef, log_index: u64) -> ReactiveContext {
+    ReactiveContext {
+        chain_id: Some(1),
+        source: InputSource::Batch,
+        chain_status: ChainStatus::Reorged {
+            dropped_from: block,
         },
         block: Some(block),
         transaction_index: Some(0),
@@ -164,7 +178,7 @@ async fn reactive_write_stamps_validity_through_block() -> Result<()> {
         &mut cache,
         batch(
             ReactiveInput::Log(rpc_log(address, &b10, 10)),
-            included_context(b10.clone(), 10),
+            included_context(b10, 10),
         ),
     )?;
 
@@ -180,6 +194,43 @@ async fn reactive_write_stamps_validity_through_block() -> Result<()> {
     assert!(
         freshness.is_volatile(address, slot, 11),
         "the stamp ages to volatile after its block"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn reorg_invalidates_freshness_stamps_from_the_dropped_branch() -> Result<()> {
+    let address = Address::repeat_byte(0xf4);
+    let slot = U256::from(13);
+    let mut cache = setup_cache().await?;
+    let mut runtime = ReactiveRuntime::<Ethereum>::new(ReactiveConfig::default());
+    runtime.enable_freshness_stamping();
+    runtime.register_handler(Arc::new(BlockValueWriter { address, slot }))?;
+    let dropped = block(20, B256::repeat_byte(0x20), B256::repeat_byte(0x19));
+
+    runtime.ingest_batch(
+        &mut cache,
+        batch(
+            ReactiveInput::Log(rpc_log(address, &dropped, 0)),
+            included_context(dropped, 0),
+        ),
+    )?;
+    assert_eq!(
+        runtime.freshness().unwrap().validity(address, slot),
+        Validity::ValidThrough(20)
+    );
+
+    let mut removed = rpc_log(address, &dropped, 0);
+    removed.removed = true;
+    runtime.ingest_batch(
+        &mut cache,
+        batch(ReactiveInput::Log(removed), reorged_context(dropped, 0)),
+    )?;
+
+    assert_eq!(
+        runtime.freshness().unwrap().validity(address, slot),
+        Validity::Volatile,
+        "a dropped-branch stamp cannot certify replacement-branch state"
     );
     Ok(())
 }
@@ -233,7 +284,7 @@ async fn pending_write_does_not_stamp_validity() -> Result<()> {
         &mut cache,
         batch(
             ReactiveInput::Log(rpc_log(address, &b10, 10)),
-            pending_context(b10.clone(), 10),
+            pending_context(b10, 10),
         ),
     );
 
@@ -272,7 +323,7 @@ async fn later_canonical_stamp_wins() -> Result<()> {
         &mut cache,
         batch(
             ReactiveInput::Log(rpc_log(address, &b10, 10)),
-            included_context(b10.clone(), 10),
+            included_context(b10, 10),
         ),
     )?;
     assert!(
@@ -292,7 +343,7 @@ async fn later_canonical_stamp_wins() -> Result<()> {
         &mut cache,
         batch(
             ReactiveInput::Log(rpc_log(address, &b11, 11)),
-            included_context(b11.clone(), 11),
+            included_context(b11, 11),
         ),
     )?;
 

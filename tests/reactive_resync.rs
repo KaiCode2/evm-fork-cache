@@ -1,4 +1,4 @@
-//! Manager-authored acceptance tests for reactive resync execution.
+//! Acceptance tests for reactive resync execution.
 //!
 //! These tests pin the next runtime slice after routing: handlers can already
 //! emit `ResyncRequest`s, but the runtime must also be able to execute storage
@@ -58,7 +58,7 @@ fn included_context(block_number: u64) -> ReactiveContext {
         chain_id: Some(1),
         source: InputSource::Batch,
         chain_status: ChainStatus::Included {
-            block: block.clone(),
+            block,
             confirmations: 0,
         },
         block: Some(block),
@@ -435,7 +435,7 @@ impl ReactiveHandler<Ethereum> for AccountOnlyResync {
     }
 }
 
-/// WS-1a / Phase-8 s1 (manager-authored red-green): with an `AccountProofFetchFn`
+/// WS-1a / Phase-8 s1 red-green coverage: with an `AccountProofFetchFn`
 /// installed, an `Account`-target resync now SUCCEEDS via the `eth_getProof` seam
 /// — it no longer fails as `UnsupportedAccountTarget`. The fetched account fields
 /// are applied through the cache (materialized, so a cold account is not silently

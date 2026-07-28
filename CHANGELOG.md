@@ -12,9 +12,187 @@ surface freezes at 1.0.
 
 ## [Unreleased]
 
-Remaining from the 0.2.0 plan and tracked as fast-follow: the toy
-constant-product AMM walkthrough and the dedicated reactive integration cases
-enumerated in [`docs/KNOWN_ISSUES.md`](docs/KNOWN_ISSUES.md).
+## [0.4.0-alpha.1] - 2026-07-28
+
+### Migration checklist
+
+- Await reactive engine registration, owner synchronization, and unregistration
+  calls. `EventSubscriber::register_interests` and mutating
+  `InterestOwnerSubscriber` methods now return `SubscriberOperation`; custom
+  implementations must preserve the previous committed desired state on error
+  or cancellation, or block delivery until reconciliation.
+- Handle the now-fallible `ReactiveEngine::into_parts`: `Ok((runtime,
+  subscriber))` is returned only with no pending delivery commit;
+  `Err(Box<engine>)` preserves an acknowledgement/checkpoint retry that must be
+  completed first.
+- `register_handler_with_backfill` now accepts only one hash-certified block
+  still present in the rollback journal. Use ordinary global canonical catch-up
+  for deeper history; owner-only historical effects cannot safely outlive their
+  journal attachment.
+- Add the new `SubscriberConfig` pending-record, pending-backfill,
+  historical-response-byte, and reconcile-concurrency fields, or use
+  `..SubscriberConfig::default()` in struct literals.
+- Provider-backed and composite subscribers should implement `chain_id()`,
+  resolve and reject mixed networks before delivery, stamp every record, and
+  bind control-only batches with `ReactiveInputBatch::with_chain_id`.
+- Advertise `DurableReplay` only when the complete committed position can be
+  restored without a gap. A composite may reconcile a rebuilt ephemeral live
+  child from durable history, but must close the cutover before delivery. ACK
+  must be idempotent, a replayed token must map to one immutable delivery, and a
+  failed `restore_position` must preserve the old position or retain only that
+  exact restore as delivery-blocking pending intent. Checkpointed ingest/restore
+  now rejects ephemeral subscribers, and `SubscriberResumePosition::new`
+  requires the chain id.
+- Attach a stable `SubscriberPayloadCommitment` with
+  `ReactiveInputBatch::with_payload_commitment` whenever a tokened delivery
+  contains `BlockHeader`, `FullBlock`, or hydrated `PendingTx` payloads. The
+  commitment must be derived from a deterministic canonical encoding; without
+  it, durable checkpoint ingestion rejects payloads that the core cannot
+  witness completely.
+- Replace empty handler identities. `HandlerId::new("")` now panics and
+  deserialization rejects the reserved empty value; use a stable non-empty id,
+  or `HandlerId::try_new` for untrusted input.
+- Reinstall manual block-environment overrides after `EvmCache::set_block` or
+  `repin_to_block`. Repinning clears `NUMBER`, `BASEFEE`, `COINBASE`,
+  `PREVRANDAO`, `GASLIMIT`, and timestamp provenance; use `advance_block` when
+  a complete canonical header is available.
+
+### Added
+
+- Added provider-provenanced preconfirmation batches and a disposable cache
+  branch that exposes speculative state without advancing canonical coverage,
+  durability, finality, or health.
+- Added Base-native `newFlashblocks` plus filtered `pendingLogs` correlation,
+  including cumulative payload sequencing, bounded unmatched-log retention,
+  reconnect reset, and pending-state gap recovery.
+- Added an OP Flashblocks adapter over the standard pending block/log surface,
+  with preferred fallback and required-mode validation.
+- Added provider IDs and generations to reactive input reports so downstream
+  reads can prefer the endpoint that announced not-yet-universal state.
+
+- `ReactiveInputBatch` can carry an opaque `SubscriberDeliveryToken`, and
+  `EventSubscriber::acknowledge_delivery` provides an idempotent post-ingest
+  commit hook. `ReactiveEngine::next_ingest*` acknowledges only after runtime
+  ingestion succeeds and reports acknowledgement failures distinctly, enabling
+  durable remote subscribers to replay an uncommitted batch safely.
+- Added `DurableCheckpointStore` and versioned checkpoint metadata binding one
+  atomic cache snapshot to chain, subscriber, handler-schema, canonical block,
+  and delivery-token identity. The checkpointed `ReactiveEngine` loops enforce
+  ingest -> synced checkpoint -> ACK ordering, retry failed commits before
+  polling, and suppress a restored token's cross-process replay. Checkpoints
+  also retain provider-opaque resume bytes, safe/finalized heads, pending
+  repair work, handler provenance, freshness/root-gate state, metrics, and the
+  bounded rollback journal; barrier-certified empty ranges advance the durable
+  coverage anchor. Files have an integrity checksum and configurable size bound;
+  same-path stores share cancellation-safe in-process writer ordering. Encoding
+  and filesystem durability work run on Tokio's blocking pool.
+- Durable delivery tokens now persist a core witness over validated identities,
+  exact log payloads, context, routing, controls, chain id, and provider cursor.
+  A same-token replay must reproduce it before skip-and-ACK; a manually supplied
+  token without a witness cannot use the replay shortcut. Network-generic full
+  block and hydrated-transaction bodies remain subject to the subscriber's
+  immutable-token contract. Tokenless barriers retain the prior token's witness
+  while advancing the overall provider cursor.
+- Durable snapshots now acquire all backend map read locks as one coherent
+  capture window and normalize their exact pin, EVM block number, and timestamp
+  to checkpoint metadata. Header fields not proven by compact progress are
+  cleared. Checkpoint format version 6 records the replay witness and exact
+  full-header environment provenance.
+- Added record-preserving `DeliveryAudience`, ordered in-band `ChainControl`
+  values for reorg/finality/barrier delivery, and fail-closed
+  `SubscriberCapabilities`. Alloy owner catch-up now preserves its exact
+  handler audience and non-canonical delivery scope through the generic
+  `EventSubscriber` path.
+- Added the provider-neutral `CanonicalSequenceState`,
+  `CanonicalSequenceValidation`, and `CanonicalSequenceMutation` surface plus
+  `validate_canonical_sequence` / `normalize_and_validate_canonical_sequence`.
+  Composite sources can now validate a whole envelope, stage replayable
+  rewind/canonical/finality mutations, and normalize exact historical/live
+  overlap without depending on runtime or cache internals. The state's serde
+  representation is caller convenience, not a stable wire/checkpoint schema;
+  durable consumers must wrap it in their own versioned envelope. Diagnostic
+  counterparts return structured `CanonicalSequenceError` /
+  `CanonicalRollbackKind` values so history exhaustion never requires prose
+  matching; `retain_recent_history` gives external checkpoint owners an
+  explicit bounded rollback horizon.
+- Added provider-neutral chain identity reporting and durable resume identity;
+  Alloy resolves `eth_chainId` once and stamps every emitted record. Added an
+  atomic cache/runtime/subscriber restore helper and bounded Alloy queues,
+  historical-response bytes, lazy backfills, and reconcile concurrency.
+  Control-only batches now require an explicit authoritative chain id.
+- Added `ReactiveEngine::preview_durable_resume_position` for durable
+  subscribers that must asynchronously prepare a source before the synchronous
+  restore hook. Preview and restore use one validated runtime plan, so retained
+  canonical history, delivery identity, and provider cursor cannot drift.
+
+### Changed
+
+- Canonical validation now enforces exact parent-height/hash uniqueness across
+  sparse history, records, aliases, and controls; preserves resolved metadata
+  in rewind/finality mutations; rejects removed/canonical contradictions at any
+  height; and anchors exact removals at their authenticated N-1 parent without
+  discarding compatible safe/finalized state. Non-checkpointed deep recovery
+  clears unauthenticated history and emits a typed reorg report even when no
+  journal entry remains, while checkpointed validation continues to reject an
+  incomplete rollback.
+- Chain controls now use explicit execution phases: reorgs run before
+  replacement records, while progress/barrier/finality controls commit after
+  the records they certify. Compact progress exact-hash pins the cache, retains
+  compatible same-block metadata, preserves only a verified exact full-header
+  environment, and keeps certified zero-event tails as durable journal anchors.
+- `HandlerId` is now non-empty by construction and deserialization; the empty
+  identity remains reserved for canonical/global protocol scope.
+- `EvmCache::set_block` and `repin_to_block` now clear every stale block-header
+  environment field, not only base fee. Manual overrides must be reinstalled
+  after a repin; `advance_block` remains the complete-header path.
+- Durable checkpoint writes preflight encoded size before allocating the
+  payload, retry collision-resistant temporary names, preserve destination
+  symlink-entry replacement semantics, and fail with a typed unsupported error
+  on platforms where the crate cannot provide atomic replacement. Unix
+  temporary and final checkpoint files are owner-only (`0600`).
+- `EventSubscriber::register_interests` and every mutating
+  `InterestOwnerSubscriber` operation now return a boxed, sendable
+  `SubscriberOperation` future. `ReactiveEngine` registration, bootstrap sync,
+  and unregistration consequently require `.await`, allowing remote subscribers
+  to wait for authoritative service-side acknowledgement. Handler registration
+  commits subscriber state before runtime routing, so failure or cancellation
+  cannot leave a runtime handler active without committed interests; failed
+  subscriber removal likewise preserves runtime routing.
+- Explicit chain controls now reject mismatched old tips, regressing or
+  conflicting finality, backward/conflicting barriers, and reorgs that cross
+  the finalized head before mutating cache or runtime state.
+- Canonical transition validation now requires exact adjacent parent anchors,
+  emits the complete dropped suffix before an implicit replacement, rejects
+  safe/finalized heads beyond coverage and broken adjacent snapshot links, and
+  retains equal-height metadata enrichment during overlap normalization. Older
+  compatible enrichment remains non-forwarding so extension and runtime state
+  converge. Durable checkpoint preflight now uses this same validator and maps
+  incomplete rollback proof to `CheckpointReorgOutsideJournal`; direct runtime
+  ingestion continues to surface/degrade on observable deep reorgs.
+- Runtime batches now roll back cache state and canonical bookkeeping together
+  on failure while retaining monotonic rejected-attempt metrics. Delivery
+  acknowledgements remain pending across errors or task cancellation and are
+  retried before later polling; checkpointed hooks are dispatched only after
+  staging succeeds.
+- Alloy stream reconciliation installs every successful source immediately and
+  retains unfinished subscribe-then-backfill intent across later connection
+  errors or task cancellation, so retries neither discard nor duplicate an
+  already-live source.
+- Pending checkpoint retries now fail closed if the cache generation changed
+  after ingestion, preventing unrelated state from being persisted under an
+  older delivery/runtime checkpoint. Checkpointed explicit controls, implicit
+  parent mismatches, and removed/reorged records also fail before
+  mutation/save/ACK when complete recovery is not proven by the retained effect
+  journal; `journal_depth` must cover the subscriber's recovery horizon.
+- Runtime input validation now rejects payload/context and cache-chain
+  disagreements, preserves distinct canonical/reorg and header/full-block
+  representations, and merges duplicate audiences only inside one batch.
+  Cross-batch replay suppression remains an explicit subscriber responsibility.
+- Checkpointed ingest and restore now require an advertised `DurableReplay`
+  capability and reject ephemeral subscribers before polling or state mutation;
+  the in-crate Alloy subscriber intentionally remains an ordinary live source.
+- Alloy dependencies are capped below 1.7 so fresh resolution cannot silently
+  select a release requiring a newer compiler than the declared Rust 1.88 MSRV.
 
 ## [0.3.0] - 2026-07-14
 
@@ -254,8 +432,9 @@ hedged picture):
   later). `register_handler` updates runtime routing and subscriber interests
   together and, once ingestion has journaled a canonical block, backfills the
   new handler from that block automatically — closing the discovery→subscription
-  gap with no caller bookkeeping (`register_handler_with_backfill` for deeper
-  history, `register_handler_live_only` to opt out; `sync_handler_interests`
+  gap with no caller bookkeeping (`register_handler_with_backfill` for one
+  explicit retained-block replay, `register_handler_live_only` to opt out;
+  `sync_handler_interests`
   bootstraps a pre-populated runtime). `unregister_handler` removes routing and
   transport for that handler only; the runtime adds `last_canonical_block()`,
   `pending_resyncs()`, `cancel_pending_resyncs(address)`, `handler_ids()`,
@@ -882,7 +1061,8 @@ pre-release development phases (see [`docs/ROADMAP.md`](docs/ROADMAP.md)).
 - `EvmCache` requires a multi-thread tokio runtime for any RPC-touching path.
 - See [`docs/KNOWN_ISSUES.md`](docs/KNOWN_ISSUES.md) for current limitations.
 
-[Unreleased]: https://github.com/KaiCode2/evm-fork-cache/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/KaiCode2/evm-fork-cache/compare/v0.4.0-alpha.1...HEAD
+[0.4.0-alpha.1]: https://github.com/KaiCode2/evm-fork-cache/compare/v0.3.0...v0.4.0-alpha.1
 [0.3.0]: https://github.com/KaiCode2/evm-fork-cache/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/KaiCode2/evm-fork-cache/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/KaiCode2/evm-fork-cache/compare/v0.1.0...v0.2.0

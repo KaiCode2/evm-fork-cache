@@ -1,4 +1,4 @@
-//! Manager-authored acceptance tests for the out-of-the-box Alloy subscriber.
+//! Acceptance tests for the out-of-the-box Alloy subscriber.
 //!
 //! These tests pin the default WebSocket/pubsub subscriber surface and the
 //! opt-in HTTP polling fallback.
@@ -7,7 +7,7 @@
 use std::time::Duration;
 
 use alloy_network::Ethereum;
-#[cfg(feature = "reactive-polling")]
+#[cfg(any(feature = "reactive-polling", feature = "reactive-ws"))]
 use alloy_primitives::U256;
 #[cfg(any(feature = "reactive-polling", feature = "reactive-ws"))]
 use alloy_primitives::{Address, keccak256};
@@ -18,7 +18,7 @@ use alloy_provider::ProviderBuilder;
 use alloy_rpc_types_eth::Filter;
 #[cfg(any(feature = "reactive-polling", feature = "reactive-ws"))]
 use alloy_rpc_types_eth::Log;
-#[cfg(feature = "reactive-polling")]
+#[cfg(any(feature = "reactive-polling", feature = "reactive-ws"))]
 use alloy_rpc_types_eth::{Block, Header};
 use alloy_transport::mock::Asserter;
 use anyhow::Result;
@@ -27,13 +27,16 @@ use anyhow::bail;
 
 #[cfg(feature = "reactive-ws")]
 use evm_fork_cache::reactive::BlockInterestMode;
-#[cfg(feature = "reactive-ws")]
+#[cfg(any(feature = "reactive-polling", feature = "reactive-ws"))]
 use evm_fork_cache::reactive::SubscriberBackfill;
+#[cfg(feature = "reactive-ws")]
+use evm_fork_cache::reactive::SubscriberCapability;
 #[cfg(any(feature = "reactive-polling", feature = "reactive-ws"))]
 use evm_fork_cache::reactive::SubscriberOwnerError;
 use evm_fork_cache::reactive::{
-    AlloySubscriber, EventSubscriber, PendingTxInterest, ReactiveInterest, SubscriberConfig,
-    SubscriberError, SubscriberMode, SubscriberReconnectConfig,
+    AlloySubscriber, DeliveryAudience, DeliveryScope, EventSubscriber, InterestOwnerSubscriber,
+    PendingTxInterest, ReactiveInterest, SubscriberConfig, SubscriberError, SubscriberMode,
+    SubscriberReconnectConfig,
 };
 #[cfg(any(feature = "reactive-polling", feature = "reactive-ws"))]
 use evm_fork_cache::reactive::{BlockInterest, LogInterest};
@@ -66,7 +69,7 @@ fn removed_rpc_log(address: Address, topic0: B256, block_number: u64, log_index:
     log
 }
 
-#[cfg(feature = "reactive-polling")]
+#[cfg(any(feature = "reactive-polling", feature = "reactive-ws"))]
 fn rpc_block(point: &BlockRef) -> Block {
     Block::empty(Header {
         hash: point.hash,
@@ -105,10 +108,65 @@ fn polling_subscriber(
     )
 }
 
+#[cfg(any(feature = "reactive-polling", feature = "reactive-ws"))]
+fn asserter_with_chain_id() -> Asserter {
+    let asserter = Asserter::new();
+    asserter.push_success(&U256::from(1));
+    asserter
+}
+
+#[test]
+#[cfg(feature = "reactive-ws")]
+fn alloy_subscriber_advertises_only_implemented_guarantees() {
+    let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
+    let subscriber = AlloySubscriber::<_, Ethereum>::new(
+        provider,
+        SubscriberMode::PubSub,
+        SubscriberConfig::default(),
+    );
+    let capabilities = subscriber.capabilities();
+    for capability in [
+        SubscriberCapability::Logs,
+        SubscriberCapability::BlockHeaders,
+        SubscriberCapability::PendingTransactionHashes,
+        SubscriberCapability::HistoricalBackfill,
+        SubscriberCapability::Live,
+        SubscriberCapability::OwnerScopedDelivery,
+        SubscriberCapability::DynamicInterests,
+    ] {
+        assert!(capabilities.supports(capability), "missing {capability:?}");
+    }
+    assert!(!capabilities.supports(SubscriberCapability::DurableReplay));
+    assert!(!capabilities.supports(SubscriberCapability::ExplicitReorgs));
+    assert!(!capabilities.supports(SubscriberCapability::FinalityUpdates));
+    assert!(!capabilities.supports(SubscriberCapability::Barriers));
+}
+
+#[test]
+#[cfg(not(any(feature = "reactive-ws", feature = "reactive-polling")))]
+fn alloy_subscriber_does_not_advertise_uncompiled_transports() {
+    let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
+    for mode in [
+        SubscriberMode::Auto,
+        SubscriberMode::PubSub,
+        SubscriberMode::Polling,
+    ] {
+        let subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider.clone(),
+            mode,
+            SubscriberConfig::default(),
+        );
+        assert!(
+            subscriber.capabilities().iter().next().is_none(),
+            "{mode:?} cannot promise behavior whose transport is absent"
+        );
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[cfg(feature = "reactive-polling")]
 async fn staged_reconcile_subscribes_before_fetching_owner_backfill() -> Result<()> {
-    let asserter = Asserter::new();
+    let asserter = asserter_with_chain_id();
     let pool = Address::repeat_byte(0xa4);
     let topic = keccak256(b"Swap()");
     let through = BlockRef {
@@ -144,26 +202,20 @@ async fn staged_reconcile_subscribes_before_fetching_owner_backfill() -> Result<
         "post-block owner cannot activate before certified reconcile"
     );
 
-    let progress = subscriber
-        .reconcile_interest_owner(&epoch, through.clone())
-        .await?;
+    let progress = subscriber.reconcile_interest_owner(&epoch, through).await?;
     assert_eq!(progress.owner(), &epoch);
     assert_eq!(progress.through(), &through);
     assert!(subscriber.activate_interest_owner(&epoch));
 
     let batch = subscriber
-        .next_scoped_batch()
+        .next_batch()
         .await?
         .expect("owner-only catch-up record");
     assert_eq!(batch.records().len(), 1);
-    assert!(
-        matches!(&batch.records()[0].record().input, ReactiveInput::Log(actual) if actual == &log)
-    );
+    assert!(matches!(&batch.records()[0].input, ReactiveInput::Log(actual) if actual == &log));
     assert_eq!(
-        batch.records()[0].scope(),
-        &SubscriberInputScope::OwnerOnly {
-            owners: vec![epoch]
-        }
+        batch.record_audience(0),
+        Some(&DeliveryAudience::Owners(vec![HandlerId::new("pool-a")]))
     );
 
     Ok(())
@@ -171,8 +223,153 @@ async fn staged_reconcile_subscribes_before_fetching_owner_backfill() -> Result<
 
 #[tokio::test(flavor = "multi_thread")]
 #[cfg(feature = "reactive-polling")]
+async fn coordinated_registration_subscribes_then_delivers_c_owner_and_post_c_global() -> Result<()>
+{
+    let asserter = asserter_with_chain_id();
+    let existing_pool = Address::repeat_byte(0xa1);
+    let new_pool = Address::repeat_byte(0xb2);
+    let topic = keccak256(b"Swap()");
+    let retained = BlockRef {
+        number: 100,
+        hash: B256::repeat_byte(100),
+        parent_hash: Some(B256::repeat_byte(99)),
+        timestamp: Some(1_700_000_100),
+    };
+    let activation = BlockRef {
+        number: 102,
+        hash: B256::repeat_byte(102),
+        parent_hash: Some(B256::repeat_byte(101)),
+        timestamp: Some(1_700_000_102),
+    };
+    let owner_at_c = rpc_log(new_pool, topic, 100, 0);
+    let existing_after_c = rpc_log(existing_pool, topic, 101, 0);
+    let new_after_c = rpc_log(new_pool, topic, 102, 1);
+
+    // Strict order proves subscribe-first adoption. The owner-only C window is
+    // certified first; the following poll resolves one global C+1..H window.
+    asserter.push_success(&U256::from(1)); // eth_newFilter
+    asserter.push_success(&Some(rpc_block(&retained)));
+    asserter.push_success(&vec![owner_at_c.clone()]);
+    asserter.push_success(&Some(rpc_block(&retained)));
+    asserter.push_success(&102u64);
+    asserter.push_success(&Some(rpc_block(&activation)));
+    asserter.push_success(&Some(rpc_block(&retained)));
+    asserter.push_success(&vec![existing_after_c.clone(), new_after_c.clone()]);
+    asserter.push_success(&Some(rpc_block(&activation)));
+
+    let mut subscriber = polling_subscriber(asserter.clone(), 16);
+    subscriber.add_interest_owner(
+        HandlerId::new("existing"),
+        &[ReactiveInterest::Logs(LogInterest {
+            provider_filter: Filter::new().address(existing_pool).event_signature(topic),
+            local_matcher: None,
+            route_key: None,
+        })],
+    )?;
+    InterestOwnerSubscriber::add_interest_owner_with_canonical_catchup(
+        &mut subscriber,
+        HandlerId::new("new"),
+        &[ReactiveInterest::Logs(LogInterest {
+            provider_filter: Filter::new().address(new_pool).event_signature(topic),
+            local_matcher: None,
+            route_key: None,
+        })],
+        retained,
+    )
+    .await?;
+
+    let owner_batch = subscriber
+        .next_batch()
+        .await?
+        .expect("owner-only retained-block catch-up");
+    assert_eq!(owner_batch.records().len(), 1);
+    assert_eq!(
+        owner_batch.record_audience(0),
+        Some(&DeliveryAudience::Owners(vec![HandlerId::new("new")]))
+    );
+    assert_eq!(
+        owner_batch.record_delivery_scope(0),
+        Some(DeliveryScope::OwnerCatchup)
+    );
+    assert!(
+        matches!(&owner_batch.records()[0].input, ReactiveInput::Log(log) if log == &owner_at_c)
+    );
+
+    let global_batch = subscriber
+        .next_batch()
+        .await?
+        .expect("globally ordered post-C catch-up");
+    assert_eq!(global_batch.records().len(), 2);
+    assert!(
+        matches!(&global_batch.records()[0].input, ReactiveInput::Log(log) if log == &existing_after_c)
+    );
+    assert!(
+        matches!(&global_batch.records()[1].input, ReactiveInput::Log(log) if log == &new_after_c)
+    );
+    assert!((0..2).all(|index| {
+        global_batch.record_delivery_scope(index) == Some(DeliveryScope::CanonicalProgress)
+    }));
+    assert!(matches!(
+        global_batch.chain_controls(),
+        [evm_fork_cache::reactive::ChainControl::Barrier {
+            block: Some(block),
+            ..
+        }] if block == &activation
+    ));
+    assert!(asserter.read_q().is_empty(), "unexpected coordinated RPCs");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg(feature = "reactive-polling")]
+async fn exact_global_zero_log_window_emits_certified_progress_barrier() -> Result<()> {
+    let asserter = asserter_with_chain_id();
+    let pool = Address::repeat_byte(0xc3);
+    let baseline = BlockRef {
+        number: 100,
+        hash: B256::repeat_byte(100),
+        parent_hash: Some(B256::repeat_byte(99)),
+        timestamp: Some(1_700_000_100),
+    };
+    asserter.push_success(&U256::from(1)); // eth_newFilter before history
+    asserter.push_success(&100u64); // open range resolves to empty C+1..C
+    asserter.push_success(&Some(rpc_block(&baseline)));
+    let mut subscriber = polling_subscriber(asserter.clone(), 16);
+    InterestOwnerSubscriber::replace_interest_owners_with_global_backfill(
+        &mut subscriber,
+        vec![(
+            HandlerId::new("pool"),
+            vec![ReactiveInterest::Logs(LogInterest {
+                provider_filter: Filter::new().address(pool),
+                local_matcher: None,
+                route_key: None,
+            })],
+        )],
+        evm_fork_cache::reactive::SubscriberBackfill::after_canonical_block(baseline)?,
+    )
+    .await?;
+
+    let batch = subscriber
+        .next_batch()
+        .await?
+        .expect("control-only certified progress");
+    assert!(batch.records().is_empty());
+    assert_eq!(batch.chain_id(), Some(1));
+    assert!(matches!(
+        batch.chain_controls(),
+        [evm_fork_cache::reactive::ChainControl::Barrier {
+            block: Some(block),
+            ..
+        }] if block == &baseline
+    ));
+    assert!(asserter.read_q().is_empty(), "unexpected zero-log RPCs");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg(feature = "reactive-polling")]
 async fn bulk_reconcile_routes_merged_backfill_to_exact_owner_epochs() -> Result<()> {
-    let asserter = Asserter::new();
+    let asserter = asserter_with_chain_id();
     let pool_a = Address::repeat_byte(0xb1);
     let pool_b = Address::repeat_byte(0xb2);
     let topic = keccak256(b"Swap()");
@@ -205,7 +402,7 @@ async fn bulk_reconcile_routes_merged_backfill_to_exact_owner_epochs() -> Result
             local_matcher: None,
             route_key: None,
         })],
-        SubscriberOwnerStart::PostBlock(baseline.clone()),
+        SubscriberOwnerStart::PostBlock(baseline),
     )?;
     let epoch_b = subscriber.stage_interest_owner(
         HandlerId::new("bulk-pool-b"),
@@ -218,7 +415,7 @@ async fn bulk_reconcile_routes_merged_backfill_to_exact_owner_epochs() -> Result
     )?;
 
     let progress = subscriber
-        .reconcile_interest_owners(&[epoch_a.clone(), epoch_b.clone()], through.clone())
+        .reconcile_interest_owners(&[epoch_a.clone(), epoch_b.clone()], through)
         .await?;
     assert_eq!(progress.len(), 2);
     assert_eq!(progress[0].owner(), &epoch_a);
@@ -255,7 +452,7 @@ async fn bulk_reconcile_routes_merged_backfill_to_exact_owner_epochs() -> Result
 #[tokio::test(flavor = "multi_thread")]
 #[cfg(feature = "reactive-polling")]
 async fn bulk_reconcile_preserves_exact_windows_for_mixed_owner_baselines() -> Result<()> {
-    let asserter = Asserter::new();
+    let asserter = asserter_with_chain_id();
     let pool_a = Address::repeat_byte(0xb5);
     let pool_b = Address::repeat_byte(0xb6);
     let baseline_a = BlockRef {
@@ -342,7 +539,7 @@ async fn bulk_reconcile_one_thousand_owners_uses_one_certification_and_bounded_l
     const OWNER_COUNT: usize = 1_024;
     const FILTERS_PER_CHUNK: usize = 256;
 
-    let asserter = Asserter::new();
+    let asserter = asserter_with_chain_id();
     let baseline = BlockRef {
         number: 200,
         hash: B256::repeat_byte(0xc8),
@@ -376,12 +573,12 @@ async fn bulk_reconcile_one_thousand_owners_uses_one_certification_and_bounded_l
                 local_matcher: None,
                 route_key: None,
             })],
-            SubscriberOwnerStart::PostBlock(baseline.clone()),
+            SubscriberOwnerStart::PostBlock(baseline),
         )?);
     }
 
     let progress = subscriber
-        .reconcile_interest_owners(&epochs, through.clone())
+        .reconcile_interest_owners(&epochs, through)
         .await?;
     assert_eq!(progress.len(), OWNER_COUNT);
     assert!(
@@ -401,7 +598,7 @@ async fn bulk_reconcile_one_thousand_owners_uses_one_certification_and_bounded_l
     asserter.push_success(&Some(rpc_block(&through)));
     asserter.push_success(&Some(rpc_block(&through)));
     let current_point = subscriber
-        .reconcile_interest_owners(&epochs, through.clone())
+        .reconcile_interest_owners(&epochs, through)
         .await?;
     assert_eq!(current_point.len(), OWNER_COUNT);
     assert!(current_point.iter().all(|item| item.through() == &through));
@@ -413,7 +610,7 @@ async fn bulk_reconcile_one_thousand_owners_uses_one_certification_and_bounded_l
 #[tokio::test(flavor = "multi_thread")]
 #[cfg(feature = "reactive-polling")]
 async fn bulk_reconcile_failure_commits_no_owner_records_or_progress() -> Result<()> {
-    let asserter = Asserter::new();
+    let asserter = asserter_with_chain_id();
     let pool_a = Address::repeat_byte(0xb3);
     let pool_b = Address::repeat_byte(0xb4);
     let baseline = BlockRef {
@@ -428,7 +625,7 @@ async fn bulk_reconcile_failure_commits_no_owner_records_or_progress() -> Result
         parent_hash: Some(B256::repeat_byte(0x2c)),
         timestamp: Some(1_700_000_301),
     };
-    let mut reorged = through.clone();
+    let mut reorged = through;
     reorged.hash = B256::repeat_byte(0xee);
 
     asserter.push_success(&U256::from(1));
@@ -445,7 +642,7 @@ async fn bulk_reconcile_failure_commits_no_owner_records_or_progress() -> Result
                 local_matcher: None,
                 route_key: None,
             })],
-            SubscriberOwnerStart::PostBlock(baseline.clone()),
+            SubscriberOwnerStart::PostBlock(baseline),
         )?);
     }
 
@@ -480,7 +677,7 @@ async fn bulk_reconcile_failure_commits_no_owner_records_or_progress() -> Result
 #[cfg(feature = "reactive-polling")]
 async fn bulk_reconcile_rejects_conflicting_global_log_positions_across_chunks() -> Result<()> {
     const OWNER_COUNT: usize = 257;
-    let asserter = Asserter::new();
+    let asserter = asserter_with_chain_id();
     let baseline = BlockRef {
         number: 400,
         hash: B256::repeat_byte(0x90),
@@ -517,7 +714,7 @@ async fn bulk_reconcile_rejects_conflicting_global_log_positions_across_chunks()
                 local_matcher: None,
                 route_key: None,
             })],
-            SubscriberOwnerStart::PostBlock(baseline.clone()),
+            SubscriberOwnerStart::PostBlock(baseline),
         )?);
     }
 
@@ -545,7 +742,7 @@ async fn bulk_reconcile_rejects_conflicting_global_log_positions_across_chunks()
 async fn bulk_reconcile_globally_orders_canonical_logs_returned_by_different_chunks() -> Result<()>
 {
     const OWNER_COUNT: usize = 257;
-    let asserter = Asserter::new();
+    let asserter = asserter_with_chain_id();
     let baseline = BlockRef {
         number: 500,
         hash: B256::repeat_byte(0xa0),
@@ -583,7 +780,7 @@ async fn bulk_reconcile_globally_orders_canonical_logs_returned_by_different_chu
                 local_matcher: None,
                 route_key: None,
             })],
-            SubscriberOwnerStart::PostBlock(baseline.clone()),
+            SubscriberOwnerStart::PostBlock(baseline),
         )?);
     }
 
@@ -606,7 +803,7 @@ async fn bulk_reconcile_globally_orders_canonical_logs_returned_by_different_chu
 #[tokio::test(flavor = "multi_thread")]
 #[cfg(feature = "reactive-polling")]
 async fn empty_owner_reconcile_still_publishes_exact_hash_certified_progress() -> Result<()> {
-    let asserter = Asserter::new();
+    let asserter = asserter_with_chain_id();
     let pool = Address::repeat_byte(0xa5);
     let through = BlockRef {
         number: 105,
@@ -657,14 +854,10 @@ async fn empty_owner_reconcile_still_publishes_exact_hash_certified_progress() -
         }),
     )?;
 
-    let progress = subscriber
-        .reconcile_interest_owner(&epoch, through.clone())
-        .await?;
+    let progress = subscriber.reconcile_interest_owner(&epoch, through).await?;
     assert_eq!(progress.through(), &through);
     assert_eq!(subscriber.interest_owner_progress(&epoch), Some(&progress));
-    let next_progress = subscriber
-        .reconcile_interest_owner(&epoch, next.clone())
-        .await?;
+    let next_progress = subscriber.reconcile_interest_owner(&epoch, next).await?;
     assert_eq!(next_progress.through(), &next);
     let batch = subscriber
         .next_scoped_batch()
@@ -713,7 +906,7 @@ async fn empty_owner_reconcile_still_publishes_exact_hash_certified_progress() -
 #[tokio::test(flavor = "multi_thread")]
 #[cfg(feature = "reactive-polling")]
 async fn reconcile_at_baseline_certifies_progress_without_log_request() -> Result<()> {
-    let asserter = Asserter::new();
+    let asserter = asserter_with_chain_id();
     let point = BlockRef {
         number: 100,
         hash: B256::repeat_byte(0x64),
@@ -733,12 +926,10 @@ async fn reconcile_at_baseline_certifies_progress_without_log_request() -> Resul
             local_matcher: None,
             route_key: None,
         })],
-        SubscriberOwnerStart::PostBlock(point.clone()),
+        SubscriberOwnerStart::PostBlock(point),
     )?;
 
-    let progress = subscriber
-        .reconcile_interest_owner(&epoch, point.clone())
-        .await?;
+    let progress = subscriber.reconcile_interest_owner(&epoch, point).await?;
     assert_eq!(progress.through(), &point);
     assert!(subscriber.activate_interest_owner(&epoch));
 
@@ -748,7 +939,7 @@ async fn reconcile_at_baseline_certifies_progress_without_log_request() -> Resul
 #[tokio::test(flavor = "multi_thread")]
 #[cfg(feature = "reactive-polling")]
 async fn reconcile_rejects_same_height_hash_replacement_before_provider_io() -> Result<()> {
-    let asserter = Asserter::new();
+    let asserter = asserter_with_chain_id();
     let baseline = BlockRef {
         number: 100,
         hash: B256::repeat_byte(0x64),
@@ -763,7 +954,7 @@ async fn reconcile_rejects_same_height_hash_replacement_before_provider_io() -> 
             local_matcher: None,
             route_key: None,
         })],
-        SubscriberOwnerStart::PostBlock(baseline.clone()),
+        SubscriberOwnerStart::PostBlock(baseline),
     )?;
     let replacement = BlockRef {
         hash: B256::repeat_byte(0xee),
@@ -790,7 +981,7 @@ async fn reconcile_rejects_same_height_hash_replacement_before_provider_io() -> 
 #[tokio::test(flavor = "multi_thread")]
 #[cfg(feature = "reactive-polling")]
 async fn empty_interest_owner_reconciles_without_a_live_stream_topology() -> Result<()> {
-    let asserter = Asserter::new();
+    let asserter = asserter_with_chain_id();
     let baseline = BlockRef {
         number: 100,
         hash: B256::repeat_byte(0x64),
@@ -812,9 +1003,7 @@ async fn empty_interest_owner_reconciles_without_a_live_stream_topology() -> Res
         SubscriberOwnerStart::PostBlock(baseline),
     )?;
 
-    let progress = subscriber
-        .reconcile_interest_owner(&epoch, through.clone())
-        .await?;
+    let progress = subscriber.reconcile_interest_owner(&epoch, through).await?;
     assert_eq!(progress.through(), &through);
     assert!(subscriber.activate_interest_owner(&epoch));
     assert!(subscriber.next_scoped_batch().await?.is_none());
@@ -826,7 +1015,7 @@ async fn empty_interest_owner_reconciles_without_a_live_stream_topology() -> Res
 #[tokio::test(flavor = "multi_thread")]
 #[cfg(feature = "reactive-polling")]
 async fn multi_block_reconcile_rejects_a_replaced_retained_baseline() -> Result<()> {
-    let asserter = Asserter::new();
+    let asserter = asserter_with_chain_id();
     let pool = Address::repeat_byte(0xa9);
     let baseline = BlockRef {
         number: 100,
@@ -840,7 +1029,7 @@ async fn multi_block_reconcile_rejects_a_replaced_retained_baseline() -> Result<
         parent_hash: Some(B256::repeat_byte(0x68)),
         timestamp: Some(1_700_000_105),
     };
-    let mut replaced_baseline = baseline.clone();
+    let mut replaced_baseline = baseline;
     replaced_baseline.hash = B256::repeat_byte(0xee);
 
     // Subscribe, certify the requested target, then prove that the retained
@@ -877,7 +1066,7 @@ async fn multi_block_reconcile_rejects_a_replaced_retained_baseline() -> Result<
 #[tokio::test(flavor = "multi_thread")]
 #[cfg(feature = "reactive-polling")]
 async fn reconcile_hash_mismatch_publishes_nothing_and_remains_abortable() -> Result<()> {
-    let asserter = Asserter::new();
+    let asserter = asserter_with_chain_id();
     let pool = Address::repeat_byte(0xa6);
     let topic = keccak256(b"Swap()");
     let expected = BlockRef {
@@ -886,7 +1075,7 @@ async fn reconcile_hash_mismatch_publishes_nothing_and_remains_abortable() -> Re
         parent_hash: Some(B256::repeat_byte(0x64)),
         timestamp: Some(1_700_000_101),
     };
-    let mut actual = expected.clone();
+    let mut actual = expected;
     actual.hash = B256::repeat_byte(0xee);
     asserter.push_success(&U256::from(1));
     asserter.push_success(&Some(rpc_block(&expected)));
@@ -927,7 +1116,7 @@ async fn reconcile_hash_mismatch_publishes_nothing_and_remains_abortable() -> Re
 #[tokio::test(flavor = "multi_thread")]
 #[cfg(feature = "reactive-polling")]
 async fn reconcile_rejects_logs_without_canonical_transaction_position() -> Result<()> {
-    let asserter = Asserter::new();
+    let asserter = asserter_with_chain_id();
     let pool = Address::repeat_byte(0xaa);
     let topic = keccak256(b"Swap()");
     let baseline = BlockRef {
@@ -976,7 +1165,7 @@ async fn reconcile_rejects_logs_without_canonical_transaction_position() -> Resu
 #[tokio::test(flavor = "multi_thread")]
 #[cfg(feature = "reactive-polling")]
 async fn reconcile_rejects_conflicting_transaction_identity_at_one_position() -> Result<()> {
-    let asserter = Asserter::new();
+    let asserter = asserter_with_chain_id();
     let pool = Address::repeat_byte(0xad);
     let baseline = BlockRef {
         number: 100,
@@ -1026,7 +1215,7 @@ async fn reconcile_rejects_conflicting_transaction_identity_at_one_position() ->
 #[tokio::test(flavor = "multi_thread")]
 #[cfg(feature = "reactive-polling")]
 async fn control_priority_preserves_already_ready_scoped_batch() -> Result<()> {
-    let asserter = Asserter::new();
+    let asserter = asserter_with_chain_id();
     let pool = Address::repeat_byte(0xa7);
     let through = BlockRef {
         number: 101,
@@ -1083,7 +1272,7 @@ async fn control_priority_preserves_already_ready_scoped_batch() -> Result<()> {
 fn mock_subscriber(
     mode: SubscriberMode,
 ) -> AlloySubscriber<impl alloy_provider::Provider<Ethereum>, Ethereum> {
-    let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
+    let provider = ProviderBuilder::new().connect_mocked_client(asserter_with_chain_id());
     AlloySubscriber::new(provider, mode, SubscriberConfig::default())
 }
 
@@ -1094,11 +1283,13 @@ async fn alloy_subscriber_auto_mode_uses_pubsub_by_default() -> Result<()> {
     let topic0 = keccak256(b"AutoMode(uint256)");
 
     let mut subscriber = mock_subscriber(SubscriberMode::Auto);
-    subscriber.register_interests(&[ReactiveInterest::Logs(LogInterest {
-        provider_filter: Filter::new().address(address).event_signature(topic0),
-        local_matcher: None,
-        route_key: None,
-    })])?;
+    subscriber
+        .register_interests(&[ReactiveInterest::Logs(LogInterest {
+            provider_filter: Filter::new().address(address).event_signature(topic0),
+            local_matcher: None,
+            route_key: None,
+        })])
+        .await?;
 
     assert_eq!(SubscriberMode::default(), SubscriberMode::Auto);
     assert_eq!(subscriber.registered_interests().len(), 1);
@@ -1112,22 +1303,24 @@ async fn alloy_subscriber_auto_mode_uses_pubsub_by_default() -> Result<()> {
     Ok(())
 }
 
-#[test]
+#[tokio::test]
 #[cfg(feature = "reactive-ws")]
-fn alloy_subscriber_pubsub_accepts_logs_pending_hashes_and_block_headers() -> Result<()> {
+async fn alloy_subscriber_pubsub_accepts_logs_pending_hashes_and_block_headers() -> Result<()> {
     let address = Address::repeat_byte(0xab);
     let topic0 = keccak256(b"SubscriberLog(uint256)");
 
     let mut subscriber = mock_subscriber(SubscriberMode::PubSub);
-    subscriber.register_interests(&[
-        ReactiveInterest::Logs(LogInterest {
-            provider_filter: Filter::new().address(address).event_signature(topic0),
-            local_matcher: None,
-            route_key: None,
-        }),
-        ReactiveInterest::PendingTransactions(PendingTxInterest::default()),
-        ReactiveInterest::Blocks(BlockInterest::default()),
-    ])?;
+    subscriber
+        .register_interests(&[
+            ReactiveInterest::Logs(LogInterest {
+                provider_filter: Filter::new().address(address).event_signature(topic0),
+                local_matcher: None,
+                route_key: None,
+            }),
+            ReactiveInterest::PendingTransactions(PendingTxInterest::default()),
+            ReactiveInterest::Blocks(BlockInterest::default()),
+        ])
+        .await?;
 
     assert_eq!(subscriber.registered_interests().len(), 3);
 
@@ -1300,7 +1493,7 @@ fn alloy_subscriber_prepares_cancels_and_finalizes_exact_owner_removal() -> Resu
 #[tokio::test(flavor = "multi_thread")]
 #[cfg(feature = "reactive-polling")]
 async fn staged_owner_abort_cleans_reconcile_state_after_provider_error() -> Result<()> {
-    let asserter = Asserter::new();
+    let asserter = asserter_with_chain_id();
     let through = BlockRef {
         number: 51,
         hash: B256::repeat_byte(51),
@@ -1390,24 +1583,26 @@ fn staging_rejects_non_log_post_block_interests() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[cfg(feature = "reactive-ws")]
-async fn alloy_subscriber_owner_backfill_yields_before_live_streams() -> Result<()> {
-    let asserter = Asserter::new();
+#[cfg(feature = "reactive-polling")]
+async fn alloy_subscriber_installs_live_stream_before_owner_backfill() -> Result<()> {
+    let asserter = asserter_with_chain_id();
     let pool = Address::repeat_byte(0xcd);
     let topic = keccak256(b"DiscoveredPool(uint256)");
     let log = rpc_log(pool, topic, 42, 3);
+    let through = BlockRef {
+        number: 42,
+        hash: B256::repeat_byte(42),
+        parent_hash: Some(B256::repeat_byte(41)),
+        timestamp: Some(1_700_000_042),
+    };
+    // Response ordering is part of the assertion: the live source is installed
+    // before the bounded historical window is fetched.
+    asserter.push_success(&U256::from(1));
+    asserter.push_success(&Some(rpc_block(&through)));
     asserter.push_success(&vec![log.clone()]);
+    asserter.push_success(&Some(rpc_block(&through)));
 
-    let provider = ProviderBuilder::new().connect_mocked_client(asserter);
-    let mut subscriber = AlloySubscriber::new(
-        provider,
-        SubscriberMode::PubSub,
-        SubscriberConfig {
-            hydrate_pending_transactions: false,
-            max_batch_size: 16,
-            ..SubscriberConfig::default()
-        },
-    );
+    let mut subscriber = polling_subscriber(asserter.clone(), 16);
     subscriber.add_interest_owner_with_backfill(
         HandlerId::new("pool-cd"),
         &[ReactiveInterest::Logs(LogInterest {
@@ -1419,21 +1614,82 @@ async fn alloy_subscriber_owner_backfill_yields_before_live_streams() -> Result<
     )?;
 
     let Some(batch) = subscriber.next_batch().await? else {
-        bail!("expected owner-scoped backfill batch before live subscription");
+        bail!("expected owner-scoped backfill batch after live source installation");
     };
     let records = batch.records();
     assert_eq!(records.len(), 1);
+    assert_eq!(subscriber.chain_id(), Some(1));
+    assert_eq!(records[0].context.chain_id, Some(1));
     assert_eq!(records[0].context.source, InputSource::Backfill);
     assert!(
         matches!(records[0].context.chain_status, ChainStatus::Included { ref block, confirmations: 0 } if block.number == 42)
     );
     assert!(matches!(&records[0].input, ReactiveInput::Log(actual) if actual == &log));
+    assert_eq!(
+        batch.record_audience(0),
+        Some(&DeliveryAudience::Owners(vec![HandlerId::new("pool-cd")]))
+    );
+    assert_eq!(
+        batch.record_delivery_scope(0),
+        Some(DeliveryScope::OwnerCatchup)
+    );
+    assert!(
+        asserter.read_q().is_empty(),
+        "unexpected owner-backfill RPCs"
+    );
 
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[cfg(feature = "reactive-ws")]
+#[cfg(feature = "reactive-polling")]
+async fn lazy_owner_backfill_rejects_incomplete_canonical_log_identity() -> Result<()> {
+    let asserter = asserter_with_chain_id();
+    let pool = Address::repeat_byte(0xce);
+    let topic = keccak256(b"Malformed(uint256)");
+    let mut malformed = rpc_log(pool, topic, 42, 3);
+    malformed.transaction_hash = None;
+    let through = BlockRef {
+        number: 42,
+        hash: B256::repeat_byte(42),
+        parent_hash: Some(B256::repeat_byte(41)),
+        timestamp: Some(1_700_000_042),
+    };
+    asserter.push_success(&U256::from(1));
+    asserter.push_success(&Some(rpc_block(&through)));
+    asserter.push_success(&vec![malformed]);
+    asserter.push_success(&Some(rpc_block(&through)));
+    let mut subscriber = polling_subscriber(asserter.clone(), 16);
+    subscriber.add_interest_owner_with_backfill(
+        HandlerId::new("malformed-owner"),
+        &[ReactiveInterest::Logs(LogInterest {
+            provider_filter: Filter::new().address(pool).event_signature(topic),
+            local_matcher: None,
+            route_key: None,
+        })],
+        SubscriberBackfill::range(40, 42),
+    )?;
+
+    let error = subscriber
+        .next_batch()
+        .await
+        .expect_err("malformed canonical provider data must fail before delivery");
+    match error {
+        SubscriberError::InvalidBackfill(message) => {
+            assert!(message.contains("transaction hash"), "{message}");
+        }
+        other => bail!("expected invalid-backfill identity error, got {other}"),
+    }
+    assert_eq!(
+        asserter.read_q().len(),
+        1,
+        "identity validation should fail before post-fetch canonical verification"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg(feature = "reactive-polling")]
 async fn alloy_subscriber_owner_growth_backfills_continuity_gap_end_to_end() -> Result<()> {
     // An established owner (pool A) has delivered up to block 100. Growing it to
     // also watch pool B changes the merged filter shape; the subscriber must
@@ -1442,28 +1698,36 @@ async fn alloy_subscriber_owner_growth_backfills_continuity_gap_end_to_end() -> 
     let pool_a = Address::repeat_byte(0xaa);
     let pool_b = Address::repeat_byte(0xbb);
 
-    let asserter = Asserter::new();
-    // (1) Establish pool A's anchor at 100 via an explicit range backfill that
-    //     returns a log — the returned record makes next_batch yield before it
-    //     ever reaches live-stream init.
+    let asserter = asserter_with_chain_id();
+    // (1) Install pool A's live filter, then establish its anchor at 100 via an
+    //     explicit range backfill.
     let anchor_log = rpc_log(pool_a, keccak256(b"Swap()"), 100, 0);
+    let block_100 = BlockRef {
+        number: 100,
+        hash: B256::repeat_byte(100),
+        parent_hash: Some(B256::repeat_byte(99)),
+        timestamp: Some(1_700_000_100),
+    };
+    asserter.push_success(&U256::from(1));
+    asserter.push_success(&Some(rpc_block(&block_100)));
     asserter.push_success(&vec![anchor_log.clone()]);
-    // (2) Continuity backfill for the grown {A,B} shape is open-ended from the
-    //     prior anchor: get_block_number, then get_logs over [100, 105].
+    asserter.push_success(&Some(rpc_block(&block_100)));
+    // (2) Install the grown {A,B} live filter, then run its open-ended
+    //     continuity backfill from the prior anchor over [100, 105].
+    asserter.push_success(&U256::from(2));
     asserter.push_success(&105u64);
     let gap_log = rpc_log(pool_b, keccak256(b"Swap()"), 103, 0);
+    let block_105 = BlockRef {
+        number: 105,
+        hash: B256::repeat_byte(105),
+        parent_hash: Some(B256::repeat_byte(104)),
+        timestamp: Some(1_700_000_105),
+    };
+    asserter.push_success(&Some(rpc_block(&block_105)));
     asserter.push_success(&vec![gap_log.clone()]);
+    asserter.push_success(&Some(rpc_block(&block_105)));
 
-    let provider = ProviderBuilder::new().connect_mocked_client(asserter);
-    let mut subscriber = AlloySubscriber::new(
-        provider,
-        SubscriberMode::PubSub,
-        SubscriberConfig {
-            hydrate_pending_transactions: false,
-            max_batch_size: 16,
-            ..SubscriberConfig::default()
-        },
-    );
+    let mut subscriber = polling_subscriber(asserter.clone(), 16);
 
     // Establish pool A with an explicit backfill through block 100.
     subscriber.add_interest_owner_with_backfill(
@@ -1506,50 +1770,60 @@ async fn alloy_subscriber_owner_growth_backfills_continuity_gap_end_to_end() -> 
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].context.source, InputSource::Backfill);
     assert!(matches!(&records[0].input, ReactiveInput::Log(actual) if actual == &gap_log));
+    assert!(
+        asserter.read_q().is_empty(),
+        "unexpected owner-growth continuity RPCs"
+    );
 
     Ok(())
 }
 
-#[test]
+#[tokio::test]
 #[cfg(feature = "reactive-ws")]
-fn alloy_subscriber_pubsub_rejects_full_body_modes() -> Result<()> {
+async fn alloy_subscriber_pubsub_rejects_full_body_modes() -> Result<()> {
     let mut subscriber = mock_subscriber(SubscriberMode::PubSub);
-    let full_pending = subscriber.register_interests(&[ReactiveInterest::PendingTransactions(
-        PendingTxInterest {
+    let full_pending = subscriber
+        .register_interests(&[ReactiveInterest::PendingTransactions(PendingTxInterest {
             full_transactions: true,
             ..PendingTxInterest::default()
-        },
-    )]);
+        })])
+        .await;
     assert!(matches!(full_pending, Err(SubscriberError::Unsupported(_))));
 
     let mut subscriber = mock_subscriber(SubscriberMode::PubSub);
-    let full_block = subscriber.register_interests(&[ReactiveInterest::Blocks(BlockInterest {
-        mode: BlockInterestMode::FullBlock,
-    })]);
+    let full_block = subscriber
+        .register_interests(&[ReactiveInterest::Blocks(BlockInterest {
+            mode: BlockInterestMode::FullBlock,
+        })])
+        .await;
     assert!(matches!(full_block, Err(SubscriberError::Unsupported(_))));
 
     Ok(())
 }
 
-#[test]
+#[tokio::test]
 #[cfg(not(feature = "reactive-ws"))]
-fn alloy_subscriber_pubsub_requires_ws_feature() -> Result<()> {
+async fn alloy_subscriber_pubsub_requires_ws_feature() -> Result<()> {
     let mut subscriber = mock_subscriber(SubscriberMode::PubSub);
-    let result = subscriber.register_interests(&[ReactiveInterest::PendingTransactions(
-        PendingTxInterest::default(),
-    )]);
+    let result = subscriber
+        .register_interests(&[ReactiveInterest::PendingTransactions(
+            PendingTxInterest::default(),
+        )])
+        .await;
     assert!(matches!(result, Err(SubscriberError::Unsupported(_))));
 
     Ok(())
 }
 
-#[test]
+#[tokio::test]
 #[cfg(not(feature = "reactive-polling"))]
-fn alloy_subscriber_polling_requires_polling_feature() -> Result<()> {
+async fn alloy_subscriber_polling_requires_polling_feature() -> Result<()> {
     let mut subscriber = mock_subscriber(SubscriberMode::Polling);
-    let result = subscriber.register_interests(&[ReactiveInterest::PendingTransactions(
-        PendingTxInterest::default(),
-    )]);
+    let result = subscriber
+        .register_interests(&[ReactiveInterest::PendingTransactions(
+            PendingTxInterest::default(),
+        )])
+        .await;
     assert!(matches!(result, Err(SubscriberError::Unsupported(_))));
 
     Ok(())
@@ -1558,7 +1832,7 @@ fn alloy_subscriber_polling_requires_polling_feature() -> Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 #[cfg(feature = "reactive-polling")]
 async fn alloy_subscriber_polling_logs_yield_reactive_records() -> Result<()> {
-    let asserter = Asserter::new();
+    let asserter = asserter_with_chain_id();
     let address = Address::repeat_byte(0xab);
     let topic0 = keccak256(b"SubscriberLog(uint256)");
     let log = rpc_log(address, topic0, 42, 7);
@@ -1567,11 +1841,13 @@ async fn alloy_subscriber_polling_logs_yield_reactive_records() -> Result<()> {
     asserter.push_success(&vec![log.clone()]);
 
     let mut subscriber = polling_subscriber(asserter, 16);
-    subscriber.register_interests(&[ReactiveInterest::Logs(LogInterest {
-        provider_filter: Filter::new().address(address).event_signature(topic0),
-        local_matcher: None,
-        route_key: None,
-    })])?;
+    subscriber
+        .register_interests(&[ReactiveInterest::Logs(LogInterest {
+            provider_filter: Filter::new().address(address).event_signature(topic0),
+            local_matcher: None,
+            route_key: None,
+        })])
+        .await?;
 
     let Some(batch) = subscriber.next_batch().await? else {
         bail!("expected one batch from the polling log stream");
@@ -1592,7 +1868,7 @@ async fn alloy_subscriber_polling_logs_yield_reactive_records() -> Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 #[cfg(all(feature = "reactive-polling", not(feature = "reactive-ws")))]
 async fn alloy_subscriber_auto_mode_uses_polling_when_ws_is_not_compiled() -> Result<()> {
-    let asserter = Asserter::new();
+    let asserter = asserter_with_chain_id();
     let address = Address::repeat_byte(0xef);
     let topic0 = keccak256(b"AutoMode(uint256)");
     let log = rpc_log(address, topic0, 50, 0);
@@ -1610,11 +1886,13 @@ async fn alloy_subscriber_auto_mode_uses_polling_when_ws_is_not_compiled() -> Re
             ..SubscriberConfig::default()
         },
     );
-    subscriber.register_interests(&[ReactiveInterest::Logs(LogInterest {
-        provider_filter: Filter::new().address(address).event_signature(topic0),
-        local_matcher: None,
-        route_key: None,
-    })])?;
+    subscriber
+        .register_interests(&[ReactiveInterest::Logs(LogInterest {
+            provider_filter: Filter::new().address(address).event_signature(topic0),
+            local_matcher: None,
+            route_key: None,
+        })])
+        .await?;
 
     let Some(batch) = subscriber.next_batch().await? else {
         bail!("expected auto mode to use polling and produce one batch");
@@ -1630,16 +1908,18 @@ async fn alloy_subscriber_auto_mode_uses_polling_when_ws_is_not_compiled() -> Re
 #[tokio::test(flavor = "multi_thread")]
 #[cfg(feature = "reactive-polling")]
 async fn alloy_subscriber_polling_pending_hashes_yield_pending_records() -> Result<()> {
-    let asserter = Asserter::new();
+    let asserter = asserter_with_chain_id();
     let hash = B256::repeat_byte(0x55);
 
     asserter.push_success(&U256::from(2));
     asserter.push_success(&vec![hash]);
 
     let mut subscriber = polling_subscriber(asserter, 16);
-    subscriber.register_interests(&[ReactiveInterest::PendingTransactions(
-        PendingTxInterest::default(),
-    )])?;
+    subscriber
+        .register_interests(&[ReactiveInterest::PendingTransactions(
+            PendingTxInterest::default(),
+        )])
+        .await?;
 
     let Some(batch) = subscriber.next_batch().await? else {
         bail!("expected one batch from the polling pending transaction stream");
@@ -1659,7 +1939,7 @@ async fn alloy_subscriber_polling_pending_hashes_yield_pending_records() -> Resu
 #[tokio::test(flavor = "multi_thread")]
 #[cfg(feature = "reactive-polling")]
 async fn alloy_subscriber_removed_logs_yield_reorged_context() -> Result<()> {
-    let asserter = Asserter::new();
+    let asserter = asserter_with_chain_id();
     let address = Address::repeat_byte(0x12);
     let topic0 = keccak256(b"Removed(uint256)");
     let log = removed_rpc_log(address, topic0, 75, 2);
@@ -1668,11 +1948,13 @@ async fn alloy_subscriber_removed_logs_yield_reorged_context() -> Result<()> {
     asserter.push_success(&vec![log.clone()]);
 
     let mut subscriber = polling_subscriber(asserter, 16);
-    subscriber.register_interests(&[ReactiveInterest::Logs(LogInterest {
-        provider_filter: Filter::new().address(address).event_signature(topic0),
-        local_matcher: None,
-        route_key: None,
-    })])?;
+    subscriber
+        .register_interests(&[ReactiveInterest::Logs(LogInterest {
+            provider_filter: Filter::new().address(address).event_signature(topic0),
+            local_matcher: None,
+            route_key: None,
+        })])
+        .await?;
 
     let Some(batch) = subscriber.next_batch().await? else {
         bail!("expected removed log batch");
@@ -1690,7 +1972,7 @@ async fn alloy_subscriber_removed_logs_yield_reorged_context() -> Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 #[cfg(feature = "reactive-polling")]
 async fn alloy_subscriber_respects_max_batch_size_for_polled_logs() -> Result<()> {
-    let asserter = Asserter::new();
+    let asserter = asserter_with_chain_id();
     let address = Address::repeat_byte(0xcd);
     let topic0 = keccak256(b"Chunked(uint256)");
     let first = rpc_log(address, topic0, 100, 0);
@@ -1700,11 +1982,13 @@ async fn alloy_subscriber_respects_max_batch_size_for_polled_logs() -> Result<()
     asserter.push_success(&vec![first.clone(), second.clone()]);
 
     let mut subscriber = polling_subscriber(asserter, 1);
-    subscriber.register_interests(&[ReactiveInterest::Logs(LogInterest {
-        provider_filter: Filter::new().address(address).event_signature(topic0),
-        local_matcher: None,
-        route_key: None,
-    })])?;
+    subscriber
+        .register_interests(&[ReactiveInterest::Logs(LogInterest {
+            provider_filter: Filter::new().address(address).event_signature(topic0),
+            local_matcher: None,
+            route_key: None,
+        })])
+        .await?;
 
     let Some(first_batch) = subscriber.next_batch().await? else {
         bail!("expected first chunk");
@@ -1725,12 +2009,13 @@ async fn alloy_subscriber_respects_max_batch_size_for_polled_logs() -> Result<()
     Ok(())
 }
 
-#[test]
+#[tokio::test]
 #[cfg(feature = "reactive-polling")]
-fn alloy_subscriber_polling_block_streams_are_explicitly_unsupported() -> Result<()> {
+async fn alloy_subscriber_polling_block_streams_are_explicitly_unsupported() -> Result<()> {
     let mut polling = mock_subscriber(SubscriberMode::Polling);
-    let block_result =
-        polling.register_interests(&[ReactiveInterest::Blocks(BlockInterest::default())]);
+    let block_result = polling
+        .register_interests(&[ReactiveInterest::Blocks(BlockInterest::default())])
+        .await;
     assert!(matches!(block_result, Err(SubscriberError::Unsupported(_))));
 
     Ok(())
@@ -1739,16 +2024,18 @@ fn alloy_subscriber_polling_block_streams_are_explicitly_unsupported() -> Result
 #[tokio::test(flavor = "multi_thread")]
 #[cfg(feature = "reactive-polling")]
 async fn alloy_subscriber_provider_errors_are_reported() -> Result<()> {
-    let asserter = Asserter::new();
+    let asserter = asserter_with_chain_id();
     let address = Address::repeat_byte(0x34);
     let topic0 = keccak256(b"ProviderError(uint256)");
 
     let mut subscriber = polling_subscriber(asserter, 16);
-    subscriber.register_interests(&[ReactiveInterest::Logs(LogInterest {
-        provider_filter: Filter::new().address(address).event_signature(topic0),
-        local_matcher: None,
-        route_key: None,
-    })])?;
+    subscriber
+        .register_interests(&[ReactiveInterest::Logs(LogInterest {
+            provider_filter: Filter::new().address(address).event_signature(topic0),
+            local_matcher: None,
+            route_key: None,
+        })])
+        .await?;
 
     let result = subscriber.next_batch().await;
     assert!(matches!(result, Err(SubscriberError::Provider(_))));
@@ -1759,7 +2046,7 @@ async fn alloy_subscriber_provider_errors_are_reported() -> Result<()> {
 #[tokio::test(flavor = "multi_thread")]
 #[cfg(feature = "reactive-polling")]
 async fn alloy_subscriber_reports_dropped_polling_filters() -> Result<()> {
-    let asserter = Asserter::new();
+    let asserter = asserter_with_chain_id();
     let address = Address::repeat_byte(0x56);
     let topic0 = keccak256(b"DroppedFilter(uint256)");
 
@@ -1767,11 +2054,13 @@ async fn alloy_subscriber_reports_dropped_polling_filters() -> Result<()> {
     asserter.push_failure_msg("filter not found");
 
     let mut subscriber = polling_subscriber(asserter, 16);
-    subscriber.register_interests(&[ReactiveInterest::Logs(LogInterest {
-        provider_filter: Filter::new().address(address).event_signature(topic0),
-        local_matcher: None,
-        route_key: None,
-    })])?;
+    subscriber
+        .register_interests(&[ReactiveInterest::Logs(LogInterest {
+            provider_filter: Filter::new().address(address).event_signature(topic0),
+            local_matcher: None,
+            route_key: None,
+        })])
+        .await?;
 
     let result = subscriber.next_batch().await;
     assert!(
@@ -1795,9 +2084,11 @@ async fn alloy_subscriber_zero_max_batch_size_is_rejected() -> Result<()> {
         },
     );
 
-    let result = subscriber.register_interests(&[ReactiveInterest::PendingTransactions(
-        PendingTxInterest::default(),
-    )]);
+    let result = subscriber
+        .register_interests(&[ReactiveInterest::PendingTransactions(
+            PendingTxInterest::default(),
+        )])
+        .await;
 
     assert!(
         result.is_err(),
@@ -1828,9 +2119,11 @@ async fn alloy_subscriber_rejects_invalid_reconnect_config() -> Result<()> {
         },
     );
 
-    let result = subscriber.register_interests(&[ReactiveInterest::PendingTransactions(
-        PendingTxInterest::default(),
-    )]);
+    let result = subscriber
+        .register_interests(&[ReactiveInterest::PendingTransactions(
+            PendingTxInterest::default(),
+        )])
+        .await;
     assert!(matches!(result, Err(SubscriberError::InvalidConfig(_))));
 
     let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
@@ -1846,9 +2139,11 @@ async fn alloy_subscriber_rejects_invalid_reconnect_config() -> Result<()> {
         },
     );
 
-    let result = subscriber.register_interests(&[ReactiveInterest::PendingTransactions(
-        PendingTxInterest::default(),
-    )]);
+    let result = subscriber
+        .register_interests(&[ReactiveInterest::PendingTransactions(
+            PendingTxInterest::default(),
+        )])
+        .await;
     assert!(matches!(result, Err(SubscriberError::InvalidConfig(_))));
 
     Ok(())

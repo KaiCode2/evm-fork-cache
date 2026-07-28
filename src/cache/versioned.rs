@@ -1,3 +1,4 @@
+use bincode::Options;
 use serde::{Serialize, de::DeserializeOwned};
 use tracing::warn;
 
@@ -60,7 +61,45 @@ pub(crate) fn decode<T: DeserializeOwned>(
         return None;
     }
 
-    bincode::deserialize(&data[header_len..])
+    let payload = &data[header_len..];
+    let mut cursor = std::io::Cursor::new(payload);
+    let value = bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .with_limit(payload.len() as u64)
+        .deserialize_from(&mut cursor)
         .inspect_err(|e| warn!(cache = label, error = %e, "Failed to parse cache payload"))
-        .ok()
+        .ok()?;
+    if cursor.position() != payload.len() as u64 {
+        warn!(
+            cache = label,
+            consumed = cursor.position(),
+            bytes = payload.len(),
+            "Cache payload has trailing bytes; treating as cache miss"
+        );
+        return None;
+    }
+    Some(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MAGIC: &[u8; 8] = b"VERSION\0";
+
+    #[test]
+    fn exact_payload_round_trips() {
+        let encoded = encode(MAGIC, 1, &vec![1_u64, 2, 3], "test").expect("encode");
+        assert_eq!(
+            decode::<Vec<u64>>(&encoded, MAGIC, 1, "test"),
+            Some(vec![1, 2, 3])
+        );
+    }
+
+    #[test]
+    fn trailing_payload_bytes_are_rejected() {
+        let mut encoded = encode(MAGIC, 1, &42_u64, "test").expect("encode");
+        encoded.push(0xff);
+        assert_eq!(decode::<u64>(&encoded, MAGIC, 1, "test"), None);
+    }
 }

@@ -1,4 +1,4 @@
-//! Manager-authored red-green acceptance tests for Phase-8 step 5: the
+//! Red-green acceptance tests for Phase-8 step 5: the
 //! cold-start root baseline (`roots.bin`).
 //!
 //! A process restarting after downtime should not blindly re-read its whole
@@ -217,7 +217,7 @@ async fn missing_baseline_entry_rereads_and_adopts() -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// Implementation-agent tests (Wave 8): guard, probe-failure no-clobber, mixed run
+// Wave 8 coverage: guard, probe-failure no-clobber, mixed run
 // ---------------------------------------------------------------------------
 
 /// Phase-8 s5: a probe_roots-bearing round over a cache with no account-proof

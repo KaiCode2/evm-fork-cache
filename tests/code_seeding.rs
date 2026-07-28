@@ -624,11 +624,13 @@ async fn verify_transport_failure_keeps_seeds_pending() -> Result<()> {
         ),
         "a failed read proves nothing: the seed must stay Pending"
     );
+    assert_eq!(cache.snapshot_generation(), generation_before);
     assert!(
         cache.db_mut().cache.accounts.contains_key(&pool),
         "nothing may be purged on a transport failure"
     );
-    assert_eq!(cache.snapshot_generation(), generation_before);
+    // `db_mut` advances the generation conservatively on mutable access; the
+    // equality above isolates the behavior of `verify_code_seeds` itself.
     assert_eq!(cache.pending_code_seeds(), vec![pool]);
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     Ok(())

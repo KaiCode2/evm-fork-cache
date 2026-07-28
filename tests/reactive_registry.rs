@@ -7,8 +7,9 @@ use std::sync::{
 };
 
 use alloy_network::Ethereum;
-use alloy_primitives::Address;
+use alloy_primitives::{Address, B256};
 use alloy_rpc_types_eth::Filter;
+use proptest::prelude::*;
 
 use evm_fork_cache::events::StateView;
 use evm_fork_cache::reactive::{
@@ -20,6 +21,40 @@ use evm_fork_cache::reactive::{
 struct NoopHandler {
     id: HandlerId,
     address: Address,
+}
+
+struct FilterSetHandler {
+    id: HandlerId,
+    filters: Vec<Filter>,
+}
+
+impl ReactiveHandler<Ethereum> for FilterSetHandler {
+    fn id(&self) -> HandlerId {
+        self.id.clone()
+    }
+
+    fn interests(&self) -> Vec<ReactiveInterest> {
+        self.filters
+            .iter()
+            .cloned()
+            .map(|provider_filter| {
+                ReactiveInterest::Logs(LogInterest {
+                    provider_filter,
+                    local_matcher: None,
+                    route_key: None,
+                })
+            })
+            .collect()
+    }
+
+    fn handle(
+        &self,
+        _ctx: &ReactiveContext,
+        _input: &ReactiveInput<Ethereum>,
+        _state: &dyn StateView,
+    ) -> Result<HandlerOutcome, HandlerError> {
+        Ok(HandlerOutcome::empty(StateEffectQuality::NoStateEffect))
+    }
 }
 
 impl NoopHandler {
@@ -341,6 +376,21 @@ fn reactive_registry_rejects_duplicate_handler_ids() {
 }
 
 #[test]
+fn handler_ids_reject_the_protocol_reserved_empty_identity() {
+    assert!(HandlerId::try_new("").is_err());
+    assert!(
+        serde_json::from_str::<HandlerId>(r#"""#).is_err(),
+        "deserialization must not bypass the public constructor invariant"
+    );
+    assert_eq!(
+        serde_json::from_str::<HandlerId>(r#""pool-a""#)
+            .expect("non-empty handler id")
+            .as_str(),
+        "pool-a"
+    );
+}
+
+#[test]
 fn reactive_registry_unregisters_one_handler_without_rebuilding_others() {
     let pool_a = Address::repeat_byte(0xa1);
     let pool_b = Address::repeat_byte(0xb2);
@@ -454,4 +504,241 @@ fn reactive_registry_handler_ids_preserve_registration_order() {
         registry.handler_ids(),
         vec![HandlerId::new("first"), HandlerId::new("third")]
     );
+}
+
+fn planned_filters(filters: Vec<Filter>) -> Vec<Filter> {
+    let mut registry = ReactiveRegistry::<Ethereum>::new();
+    registry
+        .register_handler(Arc::new(FilterSetHandler {
+            id: HandlerId::new("filter-planner-regression"),
+            filters,
+        }))
+        .expect("register filter planner fixture");
+    registry.log_subscription_filters()
+}
+
+fn shaped_log(
+    address: Address,
+    topics: impl IntoIterator<Item = B256>,
+) -> alloy_rpc_types_eth::Log {
+    alloy_rpc_types_eth::Log {
+        inner: alloy_primitives::Log::new_unchecked(
+            address,
+            topics.into_iter().collect(),
+            alloy_primitives::Bytes::new(),
+        ),
+        block_hash: Some(B256::repeat_byte(0x10)),
+        block_number: Some(10),
+        block_timestamp: Some(1_700_000_010),
+        transaction_hash: Some(B256::repeat_byte(0x20)),
+        transaction_index: Some(0),
+        log_index: Some(0),
+        removed: false,
+    }
+}
+
+#[test]
+fn yearn_filter_shapes_never_plan_a_global_transfer_subscription() {
+    let transfer = B256::repeat_byte(0x01);
+    let factory_registered = B256::repeat_byte(0x02);
+    let auction_kicked = B256::repeat_byte(0x03);
+    let auction = Address::repeat_byte(0xa1);
+    let want = Address::repeat_byte(0xb2);
+    let receiver = Address::repeat_byte(0xc3);
+    let unrelated_token = Address::repeat_byte(0xd4);
+    let unrelated_sender = B256::repeat_byte(0xe5);
+    let unrelated_receiver = B256::repeat_byte(0xf6);
+    let auction_topic = B256::left_padding_from(auction.as_slice());
+    let receiver_topic = B256::left_padding_from(receiver.as_slice());
+
+    let logical = vec![
+        Filter::new().event_signature(vec![factory_registered, auction_kicked]),
+        Filter::new()
+            .event_signature(transfer)
+            .topic1(auction_topic),
+        Filter::new()
+            .address(want)
+            .event_signature(transfer)
+            .topic2(receiver_topic),
+    ];
+    let planned = planned_filters(logical.clone());
+    let unrelated_transfer = shaped_log(
+        unrelated_token,
+        [transfer, unrelated_sender, unrelated_receiver],
+    );
+    let representative_logs = [
+        shaped_log(Address::repeat_byte(0x99), [factory_registered]),
+        shaped_log(
+            unrelated_token,
+            [transfer, auction_topic, unrelated_receiver],
+        ),
+        shaped_log(want, [transfer, unrelated_sender, receiver_topic]),
+    ];
+
+    assert_eq!(
+        planned.len(),
+        3,
+        "two-dimensional differences must stay separate"
+    );
+    for representative in representative_logs {
+        assert!(
+            logical
+                .iter()
+                .any(|filter| filter.rpc_matches(&representative))
+        );
+        assert!(
+            planned
+                .iter()
+                .any(|filter| filter.rpc_matches(&representative))
+        );
+    }
+    assert!(
+        !logical
+            .iter()
+            .any(|filter| filter.rpc_matches(&unrelated_transfer))
+    );
+    assert!(
+        !planned
+            .iter()
+            .any(|filter| filter.rpc_matches(&unrelated_transfer))
+    );
+}
+
+#[test]
+fn filters_that_differ_in_address_and_topic_do_not_gain_cross_product_matches() {
+    let address_a = Address::repeat_byte(0xa1);
+    let address_b = Address::repeat_byte(0xb2);
+    let topic_a = B256::repeat_byte(0x11);
+    let topic_b = B256::repeat_byte(0x22);
+    let logical = vec![
+        Filter::new().address(address_a).event_signature(topic_a),
+        Filter::new().address(address_b).event_signature(topic_b),
+    ];
+    let planned = planned_filters(logical);
+
+    assert_eq!(planned.len(), 2);
+    assert!(
+        !planned
+            .iter()
+            .any(|filter| filter.rpc_matches(&shaped_log(address_a, [topic_b])))
+    );
+    assert!(
+        !planned
+            .iter()
+            .any(|filter| filter.rpc_matches(&shaped_log(address_b, [topic_a])))
+    );
+}
+
+#[test]
+fn wildcard_and_constrained_dimensions_merge_only_by_subsumption() {
+    let address = Address::repeat_byte(0xa1);
+    let other = Address::repeat_byte(0xb2);
+    let topic = B256::repeat_byte(0x11);
+    let other_topic = B256::repeat_byte(0x22);
+
+    let address_wildcard = planned_filters(vec![
+        Filter::new().event_signature(topic),
+        Filter::new().address(address).event_signature(topic),
+    ]);
+    assert_eq!(address_wildcard.len(), 1);
+    assert!(address_wildcard[0].rpc_matches(&shaped_log(other, [topic])));
+    assert!(!address_wildcard[0].rpc_matches(&shaped_log(other, [other_topic])));
+
+    let topic_wildcard = planned_filters(vec![
+        Filter::new().address(address),
+        Filter::new().address(address).event_signature(topic),
+    ]);
+    assert_eq!(topic_wildcard.len(), 1);
+    assert!(topic_wildcard[0].rpc_matches(&shaped_log(address, [other_topic])));
+    assert!(!topic_wildcard[0].rpc_matches(&shaped_log(other, [other_topic])));
+}
+
+fn filter_dimension() -> impl Strategy<Value = Option<Vec<u8>>> {
+    prop_oneof![
+        Just(None),
+        prop::collection::vec(0_u8..4, 1..4).prop_map(Some),
+    ]
+}
+
+type FilterShape = (
+    Option<Vec<u8>>,
+    Option<Vec<u8>>,
+    Option<Vec<u8>>,
+    Option<Vec<u8>>,
+    Option<Vec<u8>>,
+);
+
+fn filter_shape() -> impl Strategy<Value = FilterShape> {
+    (
+        filter_dimension(),
+        filter_dimension(),
+        filter_dimension(),
+        filter_dimension(),
+        filter_dimension(),
+    )
+}
+
+fn filter_from_shape((addresses, topic0, topic1, topic2, topic3): FilterShape) -> Filter {
+    let mut filter = Filter::new();
+    if let Some(values) = addresses {
+        filter = filter.address(
+            values
+                .into_iter()
+                .map(Address::repeat_byte)
+                .collect::<Vec<_>>(),
+        );
+    }
+    if let Some(values) = topic0 {
+        filter = filter.event_signature(
+            values
+                .into_iter()
+                .map(B256::repeat_byte)
+                .collect::<Vec<_>>(),
+        );
+    }
+    if let Some(values) = topic1 {
+        filter = filter.topic1(
+            values
+                .into_iter()
+                .map(B256::repeat_byte)
+                .collect::<Vec<_>>(),
+        );
+    }
+    if let Some(values) = topic2 {
+        filter = filter.topic2(
+            values
+                .into_iter()
+                .map(B256::repeat_byte)
+                .collect::<Vec<_>>(),
+        );
+    }
+    if let Some(values) = topic3 {
+        filter = filter.topic3(
+            values
+                .into_iter()
+                .map(B256::repeat_byte)
+                .collect::<Vec<_>>(),
+        );
+    }
+    filter
+}
+
+proptest! {
+    #[test]
+    fn planned_filter_union_has_no_false_positives_or_false_negatives(
+        shapes in prop::collection::vec(filter_shape(), 1..12),
+        logs in prop::collection::vec((0_u8..4, 0_u8..4, 0_u8..4, 0_u8..4, 0_u8..4), 1..64),
+    ) {
+        let logical = shapes.into_iter().map(filter_from_shape).collect::<Vec<_>>();
+        let planned = planned_filters(logical.clone());
+        for (address, topic0, topic1, topic2, topic3) in logs {
+            let log = shaped_log(
+                Address::repeat_byte(address),
+                [topic0, topic1, topic2, topic3].map(B256::repeat_byte),
+            );
+            let expected = logical.iter().any(|filter| filter.rpc_matches(&log));
+            let actual = planned.iter().any(|filter| filter.rpc_matches(&log));
+            prop_assert_eq!(actual, expected);
+        }
+    }
 }

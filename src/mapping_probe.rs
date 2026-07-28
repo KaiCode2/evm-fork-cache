@@ -57,7 +57,7 @@ const MAX_PREIMAGE_LEN: usize = 4096;
 // ===========================================================================
 
 /// The storage layout a [`HashSlotAccess`] was factored into.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SlotLayout {
     /// `keccak256(key ‖ slot)` — Solidity's `mapping` layout.
     SolidityMapping,
@@ -165,7 +165,7 @@ impl HashSlotAccess {
 /// [`EvmCache::discover_erc20_balance_slot`](crate::cache::EvmCache::discover_erc20_balance_slot)),
 /// then call [`slot_for`](Self::slot_for) for each key you want to track — no
 /// re-simulation required.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TrackedMapping {
     /// The contract whose storage holds the mapping.
     pub contract: Address,

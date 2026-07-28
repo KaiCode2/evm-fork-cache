@@ -196,7 +196,7 @@ where
             })
         })
         .collect::<Vec<_>>();
-    subscriber.register_interests(&interests)?;
+    subscriber.register_interests(&interests).await?;
 
     let started = Instant::now();
     let run_for = Duration::from_secs(run_seconds);

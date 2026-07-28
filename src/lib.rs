@@ -176,10 +176,12 @@ pub use bundle::{BundleOptions, BundleResult, BundleTx, RevertPolicy, TxOutcome}
 pub use cache::{
     AccountFieldsFetchFn, AccountProof, AccountProofFetchFn, BlockContextRequirements,
     BlockStateAccountDiff, BlockStateDiff, BlockStateDiffFetchFn, BlockStateStorageDiff,
-    CacheSpeedMode, CallSimulationResult, CodeMismatch, CodeSeedState, CodeVerifyReport, EvmCache,
-    EvmCacheBuilder, EvmOverlay, EvmSnapshot, PrewarmReport, StorageBatchConfig,
-    StorageFetchStrategy, TxConfig, account_proof_fetcher, point_read_storage_fetcher,
-    provider_storage_fetcher,
+    CacheSpeedMode, CallSimulationResult, CodeMismatch, CodeSeedState, CodeVerifyReport,
+    DEFAULT_MAX_DURABLE_CHECKPOINT_BYTES, DurableCheckpointBlock, DurableCheckpointError,
+    DurableCheckpointIdentity, DurableCheckpointMetadata, DurableCheckpointStore, EvmCache,
+    EvmCacheBuilder, EvmOverlay, EvmSnapshot, LoadedDurableCheckpoint, PrewarmReport,
+    StorageBatchConfig, StorageFetchStrategy, TxConfig, account_proof_fetcher,
+    point_read_storage_fetcher, provider_storage_fetcher,
 };
 #[cfg(feature = "reactive")]
 pub use cold_start::{
@@ -214,8 +216,9 @@ pub use mapping_probe::{
 };
 #[cfg(feature = "reactive")]
 pub use reactive::{
-    InterestOwnerSubscriber, ReactiveConfig, ReactiveEngine, ReactiveEngineError,
-    ReactiveEngineRegisterError, ReactiveHandler, ReactiveRuntime,
+    CheckpointedIngest, InterestOwnerSubscriber, ReactiveBaselineError, ReactiveCanonicalBaseline,
+    ReactiveCheckpointRestoreError, ReactiveConfig, ReactiveEngine, ReactiveEngineError,
+    ReactiveEngineRegisterError, ReactiveHandler, ReactiveRuntime, SubscriberPayloadCommitment,
 };
 pub use state_update::{
     AccountChange, AccountPatch, PurgeRecord, PurgeScope, SkippedAccountPatch, SkippedBalanceDelta,

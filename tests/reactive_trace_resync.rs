@@ -1,4 +1,4 @@
-//! Manager-authored acceptance tests for trace-backed reactive resync execution.
+//! Acceptance tests for trace-backed reactive resync execution.
 //!
 //! These tests pin the Tier-3 liveness/resync path: when handlers request sync
 //! for a block, the runtime should be able to satisfy matching targets from one
@@ -53,7 +53,7 @@ fn included_context(block_number: u64) -> ReactiveContext {
         chain_id: Some(1),
         source: InputSource::Batch,
         chain_status: ChainStatus::Included {
-            block: block.clone(),
+            block,
             confirmations: 0,
         },
         block: Some(block),

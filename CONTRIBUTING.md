@@ -19,8 +19,7 @@ behind an `RPC_URL` environment variable and are skipped when it is unset.
 
 ## The green bar
 
-CI runs the checks below, and every commit on a feature branch is expected to
-pass **all** of them. Run them locally before pushing:
+For ordinary development, run this fast default-feature loop before pushing:
 
 ```sh
 cargo fmt --all --check
@@ -29,7 +28,7 @@ cargo test
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
 ```
 
-A convenience one-liner:
+A convenience one-liner for the same smoke loop:
 
 ```sh
 cargo fmt --all --check && \
@@ -37,6 +36,14 @@ cargo clippy --all-targets --no-deps -- -D warnings && \
 cargo test && \
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
 ```
+
+This is not the complete release matrix. Changes to reactive delivery,
+feature-gated code, persistence, or public APIs must also pass the locked
+all-feature tests, doctests, clippy and rustdoc gates; the polling-only,
+reactive-only, and no-reactive feature checks; the Rust 1.88 library check;
+benchmark compilation; security-scope validation; and package verification in
+[`RELEASING.md`](RELEASING.md). The CI workflow and release checklist must stay
+synchronized, including the polling-only test run.
 
 ### MSRV
 
