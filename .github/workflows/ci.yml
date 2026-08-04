@@ -7,7 +7,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  TRANSPORT_REF: b84a24823286313cf6ab19e2da4b38724e925dba
+  TRANSPORT_REF: 7868bea593dec5748ad7475d1909fc3a2de0d4ad
 
 permissions:
   contents: read

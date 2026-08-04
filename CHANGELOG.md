@@ -12,7 +12,7 @@ surface freezes at 1.0.
 
 ## [Unreleased]
 
-## [0.4.0-alpha.2] - 2026-08-04
+## [0.4.0-alpha.2] - 2026-08-05
 
 ### Migration checklist
 
