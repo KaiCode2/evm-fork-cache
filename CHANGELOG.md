@@ -12,7 +12,20 @@ surface freezes at 1.0.
 
 ## [Unreleased]
 
-## [0.4.0-alpha.2] - 2026-07-29
+## [0.4.0-alpha.2] - 2026-08-04
+
+### Migration checklist
+
+- Replace `FlashblockRef::block_hash` reads with
+  `FlashblockRef::content_hash` when identifying, comparing, or deduplicating
+  one exact cumulative speculative view. The content hash is scoped to the
+  provider generation and must never be treated as a canonical block hash.
+  Use the new optional `FlashblockRef::partial_block_hash` only when the
+  provider's non-placeholder partial hash is needed, and keep it speculative.
+- `ChainStatus::Preconfirmed::flashblock` is now an `Arc<FlashblockRef>` so all
+  logs from one cumulative preview share the same identity cheaply. Wrap
+  constructed values with `Arc::new`, borrow through the `Arc` for reads, and
+  use `Arc::clone` when retaining the reference.
 
 ### Added
 

@@ -21,6 +21,41 @@ fn manifest_no_longer_defines_protocols_feature_or_protocol_benchmarks() {
 }
 
 #[test]
+fn published_package_excludes_source_tree_release_audits() {
+    let manifest = read("Cargo.toml");
+
+    assert!(
+        manifest.contains("tests/public_release_surface.rs"),
+        "the source-tree release audit depends on files intentionally omitted from the published crate"
+    );
+}
+
+#[test]
+fn alpha2_changelog_explains_flashblock_identity_migration() {
+    let changelog = read("CHANGELOG.md");
+    let alpha2 = changelog
+        .split("## [0.4.0-alpha.2]")
+        .nth(1)
+        .expect("alpha.2 changelog section")
+        .split("## [0.4.0-alpha.1]")
+        .next()
+        .expect("alpha.2 changelog boundary");
+
+    for required in [
+        "### Migration checklist",
+        "`FlashblockRef::block_hash`",
+        "`FlashblockRef::content_hash`",
+        "`FlashblockRef::partial_block_hash`",
+        "`Arc<FlashblockRef>`",
+    ] {
+        assert!(
+            alpha2.contains(required),
+            "alpha.2 migration guidance should mention {required}"
+        );
+    }
+}
+
+#[test]
 fn protocol_modules_are_not_part_of_the_core_crate_surface() {
     for path in [
         "src/events/uniswap_v3.rs",

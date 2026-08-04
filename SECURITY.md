@@ -108,6 +108,6 @@ the new upstream ref and full commit before changing the pin.
 
 Sibling development dependencies are also immutable in CI. The alpha.2 cache
 workflow checks out `alloy-transport-balancer` at exact commit
-`5d012b8b848cd061c9aa909a17597cd4c303f4b7`, matching the first candidate in
+`b84a24823286313cf6ab19e2da4b38724e925dba`, matching the first candidate in
 the documented publish order. Changing that revision requires rerunning the
 cache's complete locked release matrix.

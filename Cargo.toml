@@ -13,9 +13,15 @@ documentation = "https://docs.rs/evm-fork-cache"
 
 # Keep the published crate lean: development specs and release plans (per-phase
 # build orders with internal line references) are planning artifacts, and the CI
-# workflow has no consumer value. The consumer-facing ROADMAP.md, KNOWN_ISSUES.md,
-# INTERNALS.md, and benchmark notes under docs/ are still shipped.
-exclude = ["docs/*-spec.md", "docs/*-plan.md", ".github/"]
+# workflow and source-tree release audit have no consumer value. The
+# consumer-facing ROADMAP.md, KNOWN_ISSUES.md, INTERNALS.md, and benchmark notes
+# under docs/ are still shipped.
+exclude = [
+    "docs/*-spec.md",
+    "docs/*-plan.md",
+    ".github/",
+    "tests/public_release_surface.rs",
+]
 
 # Build the docs.rs page with every feature enabled so the full surface — the
 # reactive runtime, the default WebSocket subscriber, the opt-in polling

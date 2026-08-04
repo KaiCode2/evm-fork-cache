@@ -51,8 +51,10 @@ substitute.
 Inspect `cargo package --list --locked` and confirm that secrets, local databases,
 planning/spec documents, and build output are excluded while consumer
 documentation, tests, examples, and benchmarks needed to understand the public
-surface are present. Run authenticated examples or probes only before this
-clean-tree preflight, never as part of packaging.
+surface are present. The source-only `tests/public_release_surface.rs` audit must
+remain excluded because it reads CI and archival planning files that are
+intentionally absent from the consumer package. Run authenticated examples or
+probes only before this clean-tree preflight, never as part of packaging.
 
 Before publishing a durable subscriber extension, exercise a real multi-block
 checkpoint restart through
