@@ -36,8 +36,9 @@ pub use durable_checkpoint::{
 pub use metadata::{CacheConfig, ImmutableDataCache};
 pub use overlay::{EvmOverlay, MissingState};
 pub use read_set::{
-    AccessListFetchFn, ReadSetHydrationReport, ReadSetWarmupBatch, ReadSetWarmupCall,
-    ReadSetWarmupConfig, ReadSetWarmupReport, ReadSetWarmupStrategy,
+    AccessListFetchFn, ReadSetHydrationFailure, ReadSetHydrationReport, ReadSetWarmupBatch,
+    ReadSetWarmupCall, ReadSetWarmupConfig, ReadSetWarmupError, ReadSetWarmupReport,
+    ReadSetWarmupStrategy,
 };
 pub use slot_observations::SlotObservationTracker;
 pub use snapshot::EvmSnapshot;
@@ -163,9 +164,10 @@ pub struct AccountProof {
 ///
 /// **Contract:** an implementation returns at most one result per requested
 /// address. An address present with `Ok(..)` succeeded; present with `Err(..)`
-/// failed; omitted entirely means the fetcher produced no result for it. Callers
-/// derive their per-address outcome from whether the address appears and, if so,
-/// whether it is `Ok`/`Err`.
+/// failed; omitted entirely means the fetcher produced no result for it. A
+/// successful proof contains exactly one `(slot, value)` pair for every
+/// requested key and no unrequested keys. Callers derive their per-address and
+/// per-slot outcomes from that shape and fail closed when it is violated.
 pub type AccountProofFetchFn = Arc<
     dyn Fn(Vec<(Address, Vec<U256>)>, BlockId) -> Vec<(Address, StorageFetchResult<AccountProof>)>
         + Send

@@ -156,19 +156,18 @@ surface was moved out of this crate.
   token emitting such a value would corrupt the reconstructed delta. Real ERC-20
   supplies are far below 2^255, so this is unreachable for honest tokens; a
   malicious token can misreport balances by other means regardless.
-- **[Hardened in 0.2.0] `BLOCKHASH` resolves to ZERO in ext-db-less overlays —
-  and the freshness validator now fails closed on it.** Snapshots do not track
-  block hashes (the live cache does not track them either), so an `EvmOverlay`
-  built without an `ext_db` returns `B256::ZERO` for in-lookback-range
-  `BLOCKHASH` reads. Since 0.2.0 the freshness pipeline records such reads
-  (`EvmOverlay::blockhash_zero_fallback`) and reports the batch
-  `Validation::Unverified` — on the optimistic pass **and** on corrected
-  re-runs — instead of silently confirming a result whose control flow may
-  depend on the real hash. Out-of-range reads return the spec-mandated ZERO
-  without a database call and are deliberately not flagged (they are correct
-  on-chain too). Direct, non-validator simulations over ext-db-less overlays
-  still observe ZERO; supply an `ext_db` or snapshot-provided hashes when
-  `BLOCKHASH` accuracy matters to such a sim.
+- **[Hardened in 0.2.0; canonical residency added in 0.4.0-alpha.2]
+  `BLOCKHASH` fails closed when its canonical value is absent.** The live cache
+  and its snapshots retain block hashes that have been loaded from canonical
+  state, and `hydrate_read_set` reports any required non-resident hash through
+  `missing_after`; it does not issue a separate hash fetch. An `EvmOverlay`
+  without a resident hash or `ext_db` still returns `B256::ZERO` for an
+  in-lookback-range read, but records that fallback. The freshness pipeline
+  therefore reports the batch `Validation::Unverified` on the optimistic pass
+  and on corrected re-runs instead of confirming control flow that may depend
+  on the real hash. Out-of-range reads return the spec-mandated ZERO without a
+  database call and are deliberately not flagged. Warm the canonical hash
+  before publishing an offline snapshot whenever `BLOCKHASH` accuracy matters.
 - **[Closed in 0.2.0] `EventPipeline::derived_slots` is bounded.** The
   event-derived `(address, slot)` set is now a block-horizon ring bounded to
   `ReorgConfig::depth` (mirroring the `touched` ring), so steady-state

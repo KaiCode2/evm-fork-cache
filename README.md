@@ -394,10 +394,20 @@ successful probe alone is not liveness.
 `StorageAccessList` covers accounts, runtime-code identities, storage slots, and
 `BLOCKHASH` dependencies. Provider-backed caches can discover large unknown call
 read sets with exact-block `eth_createAccessList` probes through
-`EvmCache::prewarm_read_sets`; small or known sets continue through the ordinary
-bulk loader. `EvmCache::hydrate_read_set` refreshes account headers and storage
-together with exact-pin `eth_getProof`, reports incomplete proofs, and rejects a
-runtime-code hash change instead of reusing slot identifiers across layouts.
+`EvmCache::prewarm_read_sets`; small or declared sets continue through the
+ordinary bulk loader. Required discovery fails with a typed error when no
+callback is installed or when it violates the one-result-per-call contract;
+individual provider failures remain indexed in the successful batch report.
+
+`EvmCache::hydrate_read_set` refreshes account headers and requested storage
+together with exact-pin `eth_getProof`, reports incomplete or malformed proof
+responses with typed causes, and rejects a runtime-code hash change instead of
+reusing slot identifiers across layouts. Because `eth_getProof` returns a code
+hash rather than bytecode, deployed runtime code must already be resident before
+exact hydration. Historical block hashes must likewise already be retained in
+the canonical cache. Absent bytecode or block hashes remain in `missing_after`,
+so `ReadSetHydrationReport::is_complete` stays false and callers can reject the
+candidate without an implicit hot-path read.
 
 Snapshots expose `resident_read_set` and `missing_read_set`, retain cached block
 hashes, and RPC-disconnected overlays return a precise `MissingState`. Consumers

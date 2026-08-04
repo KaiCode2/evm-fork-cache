@@ -299,3 +299,39 @@ fn library_error_surface_is_typed_not_anyhow() {
         }
     }
 }
+
+#[test]
+fn execution_read_set_surface_is_typed_and_fail_closed() {
+    let read_set = read("src/cache/read_set.rs");
+    let exports = read("src/lib.rs");
+
+    for required in [
+        "pub enum ReadSetWarmupError",
+        "AccessListFetcherUnavailable",
+        "AccessListResultCountMismatch",
+        "pub enum ReadSetHydrationFailure",
+        "ProofResultMissing",
+        "ProofResultDuplicate",
+        "ProofResultUnexpected",
+        "StorageSlotDuplicate",
+        "StorageSlotUnexpected",
+        "RuntimeCodeUnavailable",
+        "pub failures: Vec<ReadSetHydrationFailure>",
+    ] {
+        assert!(
+            read_set.contains(required),
+            "read-set API should retain its typed failure contract: {required}"
+        );
+    }
+    for required in ["ReadSetWarmupError", "ReadSetHydrationFailure"] {
+        assert!(
+            exports.contains(required),
+            "crate root should export the public read-set failure type: {required}"
+        );
+    }
+    assert!(
+        !read_set.contains("account_failures: Vec<(Address, String)>")
+            && !read_set.contains("unwrap_or_else(|| Ok(StorageAccessList::default()))"),
+        "read-set failures must not regress to strings or fabricated callback results"
+    );
+}

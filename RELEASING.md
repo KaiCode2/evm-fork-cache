@@ -25,6 +25,7 @@ cargo clippy --locked --all-targets --no-default-features --features reactive-po
 cargo test --locked --no-default-features --features reactive-polling
 cargo +1.90.0 check --locked --lib
 cargo bench --no-run --all-features --locked
+bash scripts/check-authoring-hygiene.sh
 bash scripts/check-security-exceptions.sh
 cargo audit --ignore RUSTSEC-2025-0055
 cargo package --locked
@@ -43,6 +44,9 @@ Confirm every third-party `uses:` entry remains pinned to the officially
 verified full commit recorded in `SECURITY.md`, not a mutable tag or branch.
 The stable and MSRV jobs must use the same pinned `dtolnay/rust-toolchain`
 action with explicit `toolchain: stable` and `toolchain: 1.90.0` inputs.
+Confirm the workflow's transport checkout still names the reviewed exact
+candidate commit recorded in `SECURITY.md`; a moving branch is not an acceptable
+substitute.
 
 Inspect `cargo package --list --locked` and confirm that secrets, local databases,
 planning/spec documents, and build output are excluded while consumer

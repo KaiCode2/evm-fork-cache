@@ -181,10 +181,10 @@ pub use cache::{
     CodeVerifyReport, DEFAULT_MAX_DURABLE_CHECKPOINT_BYTES, DurableCheckpointBlock,
     DurableCheckpointError, DurableCheckpointIdentity, DurableCheckpointMetadata,
     DurableCheckpointStore, EvmCache, EvmCacheBuilder, EvmOverlay, EvmSnapshot,
-    LoadedDurableCheckpoint, PrewarmReport, ReadSetHydrationReport, ReadSetWarmupBatch,
-    ReadSetWarmupCall, ReadSetWarmupConfig, ReadSetWarmupReport, ReadSetWarmupStrategy,
-    StorageBatchConfig, StorageFetchStrategy, TxConfig, account_proof_fetcher,
-    point_read_storage_fetcher, provider_storage_fetcher,
+    LoadedDurableCheckpoint, PrewarmReport, ReadSetHydrationFailure, ReadSetHydrationReport,
+    ReadSetWarmupBatch, ReadSetWarmupCall, ReadSetWarmupConfig, ReadSetWarmupError,
+    ReadSetWarmupReport, ReadSetWarmupStrategy, StorageBatchConfig, StorageFetchStrategy, TxConfig,
+    account_proof_fetcher, point_read_storage_fetcher, provider_storage_fetcher,
 };
 #[cfg(feature = "reactive")]
 pub use cold_start::{

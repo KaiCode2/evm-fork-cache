@@ -16,9 +16,10 @@ surface freezes at 1.0.
 
 ### Added
 
-- Added cache-owned execution read-set discovery and exact-block hydration for
-  account, code, storage, and block-hash dependencies, including missing-state
-  provenance and provider-read instrumentation.
+- Added cache-owned execution read-set discovery and exact-block proof
+  hydration for account headers and storage, code-identity validation against
+  resident bytecode, and canonical block-hash residency checks, including
+  typed missing-state provenance and provider-read instrumentation.
 - Added `AlloySubscriber::establish_flashblocks_preflight` to verify a pinned
   Base or OP chain and establish its chain-specific Flashblocks surface while
   retaining optional provider capability evidence.
@@ -41,6 +42,13 @@ surface freezes at 1.0.
 
 - Raised the minimum supported Rust version to 1.90 and updated the locked
   `ruint` dependency to the release that resolves `RUSTSEC-2026-0220`.
+- Read-set discovery now rejects a selected-but-unavailable access-list fetcher
+  and any callback result-count mismatch before partially warming the declared
+  slots. Exact hydration exposes structured failure causes, rejects duplicate
+  or unrequested proof slots, and fails closed when runtime bytecode or
+  historical block hashes are not already resident.
+- Alpha.2 CI now checks out the transport candidate by exact commit and applies
+  a release-delta authoring-hygiene gate before the locked release matrix.
 - Preconfirmed identity is now a non-zero, provider-generation-scoped content
   commitment over the cumulative preview, with any real provider-reported
   partial hash retained separately. Pending logs correlate by block number and

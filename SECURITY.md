@@ -105,3 +105,9 @@ comments retain the reviewed human-readable upstream ref:
 The stable and MSRV jobs use the same reviewed toolchain-action commit and pass
 their requested toolchain explicitly. Updating any action requires verifying
 the new upstream ref and full commit before changing the pin.
+
+Sibling development dependencies are also immutable in CI. The alpha.2 cache
+workflow checks out `alloy-transport-balancer` at exact commit
+`5d012b8b848cd061c9aa909a17597cd4c303f4b7`, matching the first candidate in
+the documented publish order. Changing that revision requires rerunning the
+cache's complete locked release matrix.

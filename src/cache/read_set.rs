@@ -9,7 +9,82 @@ use alloy_rpc_types_eth::TransactionRequest;
 
 use super::{EvmCache, PrewarmReport};
 use crate::access_set::StorageAccessList;
-use crate::errors::AccessListError;
+use crate::errors::{AccessListError, StorageFetchError};
+
+/// One exact-hydration failure, with enough structure for callers to decide
+/// whether to retry, re-warm, or reject a candidate.
+#[derive(Clone, Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum ReadSetHydrationFailure {
+    /// The cache has no account-proof callback installed.
+    #[error("no account proof fetcher is installed for {address}")]
+    ProofFetcherUnavailable {
+        /// Account that could not be refreshed.
+        address: Address,
+    },
+    /// The callback returned no result for a requested account.
+    #[error("account proof fetcher omitted requested address {address}")]
+    ProofResultMissing {
+        /// Requested account omitted by the callback.
+        address: Address,
+    },
+    /// The callback returned more than one result for a requested account.
+    #[error("account proof fetcher returned duplicate results for {address}")]
+    ProofResultDuplicate {
+        /// Requested account with ambiguous results.
+        address: Address,
+    },
+    /// The callback returned a result for an account that was not requested.
+    #[error("account proof fetcher returned unexpected address {address}")]
+    ProofResultUnexpected {
+        /// Unrequested account returned by the callback.
+        address: Address,
+    },
+    /// A successful account proof returned one requested storage slot more
+    /// than once, making its value ambiguous.
+    #[error("account proof for {address} returned duplicate storage slot {slot}")]
+    StorageSlotDuplicate {
+        /// Account whose proof contained the duplicate slot.
+        address: Address,
+        /// Requested slot returned more than once.
+        slot: U256,
+    },
+    /// A successful account proof returned a storage slot that was not
+    /// requested.
+    #[error("account proof for {address} returned unexpected storage slot {slot}")]
+    StorageSlotUnexpected {
+        /// Account whose proof contained the unrequested slot.
+        address: Address,
+        /// Unrequested slot returned by the callback.
+        slot: U256,
+    },
+    /// The provider or custom callback failed for one requested account.
+    #[error("account proof fetch failed for {address}: {source}")]
+    ProofFetch {
+        /// Account whose proof failed.
+        address: Address,
+        /// Typed provider/callback failure.
+        #[source]
+        source: StorageFetchError,
+    },
+    /// A deployed account's runtime code is not resident, so its code identity
+    /// cannot be validated from a hash-only proof.
+    #[error("runtime code {code_hash} is not resident for deployed account {address}")]
+    RuntimeCodeUnavailable {
+        /// Deployed account requiring runtime code.
+        address: Address,
+        /// Code hash reported by the exact-block account proof.
+        code_hash: alloy_primitives::B256,
+    },
+    /// A successful account proof omitted one requested storage slot.
+    #[error("account proof for {address} omitted requested storage slot {slot}")]
+    StorageSlotMissing {
+        /// Account whose proof was incomplete.
+        address: Address,
+        /// Requested slot omitted from the proof result.
+        slot: U256,
+    },
+}
 
 /// Exact-block hydration result for one learned execution read set.
 #[derive(Clone, Debug)]
@@ -20,8 +95,8 @@ pub struct ReadSetHydrationReport {
     pub accounts_refreshed: usize,
     /// Storage slots refreshed from proofs.
     pub slots_refreshed: usize,
-    /// Per-account provider or proof-shape failures.
-    pub account_failures: Vec<(Address, String)>,
+    /// Typed provider, callback, code-residency, or proof-shape failures.
+    pub failures: Vec<ReadSetHydrationFailure>,
     /// Runtime-code identity changes that invalidate the learned layout.
     pub code_changes: Vec<(Address, alloy_primitives::B256, alloy_primitives::B256)>,
     /// Required reads still unavailable after hydration.
@@ -32,13 +107,15 @@ impl ReadSetHydrationReport {
     /// Whether every requested dependency is resident and every code identity
     /// still matches the learned layout.
     pub fn is_complete(&self) -> bool {
-        self.account_failures.is_empty()
-            && self.code_changes.is_empty()
-            && self.missing_after.is_empty()
+        self.failures.is_empty() && self.code_changes.is_empty() && self.missing_after.is_empty()
     }
 }
 
 /// Callback for deriving calls' read sets via `eth_createAccessList`.
+///
+/// The returned vector must contain exactly one result for each request, in
+/// request order. [`EvmCache::prewarm_read_sets`] rejects the whole discovery
+/// batch when that cardinality contract is violated.
 pub type AccessListFetchFn = Arc<
     dyn Fn(
             Vec<TransactionRequest>,
@@ -47,6 +124,27 @@ pub type AccessListFetchFn = Arc<
         + Send
         + Sync,
 >;
+
+/// A cache-owned read-set warmup could not honor its selected discovery policy.
+#[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ReadSetWarmupError {
+    /// Access-list discovery was selected, but the cache has no discovery
+    /// callback installed.
+    #[error("access-list discovery was required for {calls} call(s), but no fetcher is installed")]
+    AccessListFetcherUnavailable {
+        /// Number of calls that could not be discovered.
+        calls: usize,
+    },
+    /// The callback violated the one-result-per-request contract.
+    #[error("access-list fetcher returned {actual} result(s) for {expected} request(s)")]
+    AccessListResultCountMismatch {
+        /// Number of access-list requests issued.
+        expected: usize,
+        /// Number of callback results returned.
+        actual: usize,
+    },
+}
 
 /// One call whose storage read set may be remotely discovered.
 #[derive(Clone, Debug, Default)]
@@ -74,7 +172,7 @@ pub enum ReadSetWarmupStrategy {
     /// Use access-list discovery only when the call hints justify its round trip.
     #[default]
     Auto,
-    /// Keep discovery local to the later simulation path.
+    /// Warm declared slots only; leave every call for later local simulation.
     LocalOnly,
     /// Attempt access-list discovery for every declared call.
     AccessList,
@@ -107,7 +205,10 @@ impl ReadSetWarmupConfig {
             ReadSetWarmupStrategy::LocalOnly => false,
             ReadSetWarmupStrategy::AccessList => !calls.is_empty(),
             ReadSetWarmupStrategy::Auto => {
-                let expected: usize = calls.iter().filter_map(|call| call.expected_slots).sum();
+                let expected = calls
+                    .iter()
+                    .filter_map(|call| call.expected_slots)
+                    .fold(0usize, usize::saturating_add);
                 let unhinted = calls
                     .iter()
                     .filter(|call| call.expected_slots.is_none())
@@ -126,7 +227,7 @@ pub struct ReadSetWarmupReport {
     pub known: PrewarmReport,
     /// Whether remote access-list discovery was attempted.
     pub used_access_lists: bool,
-    /// Calls skipped by policy or an unavailable fetcher.
+    /// Calls skipped because the selected policy did not request discovery.
     pub skipped_calls: usize,
     /// Successful access-list probes.
     pub access_list_successes: usize,
@@ -151,11 +252,43 @@ impl EvmCache {
 
     /// Warm known slots and, when selected by policy, discover and bulk-load
     /// unknown call read sets through cache-owned provider plumbing.
+    ///
+    /// An access-list callback is mandatory when [`ReadSetWarmupStrategy::AccessList`]
+    /// is selected, or when [`ReadSetWarmupStrategy::Auto`] crosses its configured
+    /// threshold. A callback result remains a per-call success or failure, but
+    /// the callback itself must return exactly one result per request.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReadSetWarmupError::AccessListFetcherUnavailable`] when remote
+    /// discovery was selected without an installed callback, or
+    /// [`ReadSetWarmupError::AccessListResultCountMismatch`] when the callback
+    /// violates the one-result-per-request contract.
     pub fn prewarm_read_sets(
         &mut self,
         batch: ReadSetWarmupBatch,
         config: ReadSetWarmupConfig,
-    ) -> ReadSetWarmupReport {
+    ) -> Result<ReadSetWarmupReport, ReadSetWarmupError> {
+        let discovery_results =
+            if batch.calls.is_empty() || !config.should_use_access_lists(&batch.calls) {
+                None
+            } else {
+                let Some(fetcher) = self.access_list_fetcher.clone() else {
+                    return Err(ReadSetWarmupError::AccessListFetcherUnavailable {
+                        calls: batch.calls.len(),
+                    });
+                };
+                let requests = batch.calls.iter().map(|call| call.tx.clone()).collect();
+                let results = fetcher(requests, self.block);
+                if results.len() != batch.calls.len() {
+                    return Err(ReadSetWarmupError::AccessListResultCountMismatch {
+                        expected: batch.calls.len(),
+                        actual: results.len(),
+                    });
+                }
+                Some(results)
+            };
+
         let known = if batch.known_slots.is_empty() {
             PrewarmReport::default()
         } else {
@@ -166,28 +299,20 @@ impl EvmCache {
             ..Default::default()
         };
         if batch.calls.is_empty() {
-            return report;
+            return Ok(report);
         }
-        if !config.should_use_access_lists(&batch.calls) {
+        let Some(results) = discovery_results else {
             report.skipped_calls = batch.calls.len();
-            return report;
-        }
-        let Some(fetcher) = self.access_list_fetcher.clone() else {
-            report.skipped_calls = batch.calls.len();
-            return report;
+            return Ok(report);
         };
 
         report.used_access_lists = true;
-        let requests = batch.calls.iter().map(|call| call.tx.clone()).collect();
-        let mut results = fetcher(requests, self.block).into_iter();
+        let mut results = results.into_iter();
         let mut discovered = StorageAccessList::default();
         for (index, call) in batch.calls.iter().enumerate() {
-            let result = results.next().unwrap_or_else(|| {
-                Err(AccessListError::query(
-                    "eth_createAccessList",
-                    "access-list fetcher omitted a result",
-                ))
-            });
+            let result = results
+                .next()
+                .expect("access-list result count was checked above");
             match result {
                 Ok(mut access) => {
                     if let Some(restrict_to) = &call.restrict_to {
@@ -208,7 +333,7 @@ impl EvmCache {
         if !slots.is_empty() {
             report.discovered = self.prewarm_slots(&slots);
         }
-        report
+        Ok(report)
     }
 
     /// Refresh a learned execution read set at this cache's exact block pin.
@@ -219,6 +344,13 @@ impl EvmCache {
     /// proof reports the same code hash; a changed hash is surfaced explicitly
     /// so an AMM manifest can be invalidated instead of simulating against a new
     /// layout with stale slot identifiers.
+    ///
+    /// Hash-only proofs cannot supply runtime bytecode. Code required by the
+    /// read set must therefore already be resident, and its identity must match
+    /// the proof. Historical `BLOCKHASH` values are likewise never fetched by
+    /// this method: they must already be present in the canonical cache. Any
+    /// missing code, slot, account, or block hash keeps the returned report
+    /// incomplete.
     pub fn hydrate_read_set(&mut self, required: &StorageAccessList) -> ReadSetHydrationReport {
         let block = self.block;
         let mut requests: BTreeMap<Address, Vec<U256>> = BTreeMap::new();
@@ -237,7 +369,7 @@ impl EvmCache {
             block,
             accounts_refreshed: 0,
             slots_refreshed: 0,
-            account_failures: Vec::new(),
+            failures: Vec::new(),
             code_changes: Vec::new(),
             missing_after: required.clone(),
         };
@@ -246,11 +378,11 @@ impl EvmCache {
             return report;
         }
         let Some(fetcher) = self.account_proof_fetcher.clone() else {
-            report.account_failures.extend(
+            report.failures.extend(
                 requests
                     .keys()
                     .copied()
-                    .map(|address| (address, "no account proof fetcher installed".to_owned())),
+                    .map(|address| ReadSetHydrationFailure::ProofFetcherUnavailable { address }),
             );
             return report;
         };
@@ -259,21 +391,45 @@ impl EvmCache {
             .iter()
             .map(|(address, slots)| (*address, slots.clone()))
             .collect();
-        let fetched: HashMap<_, _> = fetcher(requested, block).into_iter().collect();
+        let mut fetched = HashMap::new();
+        let mut duplicate_addresses = HashSet::new();
+        for (address, result) in fetcher(requested, block) {
+            if !requests.contains_key(&address) {
+                report
+                    .failures
+                    .push(ReadSetHydrationFailure::ProofResultUnexpected { address });
+                continue;
+            }
+            if duplicate_addresses.contains(&address) || fetched.contains_key(&address) {
+                if duplicate_addresses.insert(address) {
+                    report
+                        .failures
+                        .push(ReadSetHydrationFailure::ProofResultDuplicate { address });
+                }
+                fetched.remove(&address);
+                continue;
+            }
+            fetched.insert(address, result);
+        }
         let mut fresh_slots = Vec::new();
 
         for (address, expected_slots) in requests {
+            if duplicate_addresses.contains(&address) {
+                continue;
+            }
             let Some(result) = fetched.get(&address) else {
-                report.account_failures.push((
-                    address,
-                    "account proof fetcher omitted the requested address".to_owned(),
-                ));
+                report
+                    .failures
+                    .push(ReadSetHydrationFailure::ProofResultMissing { address });
                 continue;
             };
             let proof = match result {
                 Ok(proof) => proof,
                 Err(error) => {
-                    report.account_failures.push((address, error.to_string()));
+                    report.failures.push(ReadSetHydrationFailure::ProofFetch {
+                        address,
+                        source: error.clone(),
+                    });
                     continue;
                 }
             };
@@ -291,10 +447,12 @@ impl EvmCache {
                 && proof.code_hash != alloy_primitives::B256::ZERO
                 && proof.code_hash != revm::primitives::KECCAK_EMPTY
             {
-                report.account_failures.push((
-                    address,
-                    "runtime code was not resident for a deployed account".to_owned(),
-                ));
+                report
+                    .failures
+                    .push(ReadSetHydrationFailure::RuntimeCodeUnavailable {
+                        address,
+                        code_hash: proof.code_hash,
+                    });
                 continue;
             }
 
@@ -305,14 +463,37 @@ impl EvmCache {
             self.write_account_info_through(address, info);
             report.accounts_refreshed += 1;
 
-            let by_slot: HashMap<_, _> = proof.slots.iter().copied().collect();
+            let expected_slot_set: HashSet<_> = expected_slots.iter().copied().collect();
+            let mut by_slot = HashMap::new();
+            let mut duplicate_slots = HashSet::new();
+            for (slot, value) in proof.slots.iter().copied() {
+                if !expected_slot_set.contains(&slot) {
+                    report
+                        .failures
+                        .push(ReadSetHydrationFailure::StorageSlotUnexpected { address, slot });
+                    continue;
+                }
+                if duplicate_slots.contains(&slot) || by_slot.contains_key(&slot) {
+                    if duplicate_slots.insert(slot) {
+                        report
+                            .failures
+                            .push(ReadSetHydrationFailure::StorageSlotDuplicate { address, slot });
+                    }
+                    by_slot.remove(&slot);
+                    continue;
+                }
+                by_slot.insert(slot, value);
+            }
             let mut complete_slots = true;
             for slot in expected_slots {
+                if duplicate_slots.contains(&slot) {
+                    complete_slots = false;
+                    continue;
+                }
                 let Some(value) = by_slot.get(&slot).copied() else {
-                    report.account_failures.push((
-                        address,
-                        format!("account proof omitted requested storage slot {slot}"),
-                    ));
+                    report
+                        .failures
+                        .push(ReadSetHydrationFailure::StorageSlotMissing { address, slot });
                     complete_slots = false;
                     continue;
                 };
