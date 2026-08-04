@@ -1,9 +1,9 @@
 # Releasing
 
-`evm-fork-cache` 0.4.0-alpha.1 is the second prerelease in the Flashblocks
-compatibility set. Publish `alloy-transport-balancer 0.3.0-alpha.1` first, then
+`evm-fork-cache` 0.4.0-alpha.2 is the second prerelease in the Flashblocks
+compatibility set. Publish `alloy-transport-balancer 0.3.0-alpha.2` first, then
 publish this crate before any extension crate that declares
-`evm-fork-cache = "0.4.0-alpha.1"`, including `evm-amm-state 0.3.0-alpha.1` and
+`evm-fork-cache = "0.4.0-alpha.2"`, including `evm-amm-state 0.3.0-alpha.2` and
 the remote/Hybrid subscriber packages.
 No release step is automatic: use clean, reviewed commits and never publish
 from a credential-bearing working tree.
@@ -23,7 +23,7 @@ cargo check --locked --no-default-features --features reactive-polling
 cargo check --locked --no-default-features --features reactive-ws
 cargo clippy --locked --all-targets --no-default-features --features reactive-polling --no-deps -- -D warnings
 cargo test --locked --no-default-features --features reactive-polling
-cargo +1.88.0 check --locked --lib
+cargo +1.90.0 check --locked --lib
 cargo bench --no-run --all-features --locked
 bash scripts/check-security-exceptions.sh
 cargo audit --ignore RUSTSEC-2025-0055
@@ -42,7 +42,7 @@ removed.
 Confirm every third-party `uses:` entry remains pinned to the officially
 verified full commit recorded in `SECURITY.md`, not a mutable tag or branch.
 The stable and MSRV jobs must use the same pinned `dtolnay/rust-toolchain`
-action with explicit `toolchain: stable` and `toolchain: 1.88.0` inputs.
+action with explicit `toolchain: stable` and `toolchain: 1.90.0` inputs.
 
 Inspect `cargo package --list --locked` and confirm that secrets, local databases,
 planning/spec documents, and build output are excluded while consumer
@@ -61,11 +61,11 @@ the core's retained canonical history exactly.
 
 ```bash
 cargo publish --locked
-git tag -s v0.4.0-alpha.1 -m "Release evm-fork-cache v0.4.0-alpha.1"
-git push origin v0.4.0-alpha.1
+git tag -s v0.4.0-alpha.2 -m "Release evm-fork-cache v0.4.0-alpha.2"
+git push origin v0.4.0-alpha.2
 ```
 
-Wait for 0.4.0-alpha.1 to appear in the crates.io index before removing sibling path
+Wait for 0.4.0-alpha.2 to appear in the crates.io index before removing sibling path
 dependencies and verifying downstream extension packages. Publish only after
 explicit authorization; preparing or running this checklist is not permission
 to publish, tag, or push.

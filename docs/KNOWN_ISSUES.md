@@ -108,19 +108,12 @@ surface was moved out of this crate.
 
 ## Limitations by design / roadmap
 
-- **Preconfirmed branch replacement discards lazy reads made after branch
-  capture.** The Flashblocks runtime takes a complete canonical cache snapshot
-  before applying the first preconfirmed payload and restores that snapshot
-  when the speculative branch is replaced or discarded. This is deliberately
-  fail-safe for correctness, but it also removes unrelated account/storage
-  values fetched lazily by simulations while the branch was active. Repeated
-  quotes can therefore pay the same provider round trip again on later
-  Flashblocks even when their read set is unchanged. Cumulative updates within
-  one payload keep the active branch and retain those reads. The alpha accepts
-  this performance limitation; production rollout is gated on canonical
-  read-set priming plus selective speculative rollback (or an equivalent
-  persistent warm layer), provider-read-count regression coverage, and a repeat
-  live latency benchmark.
+- **Unlearned speculative reads remain generation-local.** Same-payload
+  cumulative previews retain them, while replacement, reconnect, canonical
+  advancement, and explicit invalidation discard them. This is intentional:
+  learned read-set identities persist separately and are hydrated only against
+  an exact canonical point, so pending values can never leak into canonical
+  state.
 - **Storage-only freshness verification; `ConfirmedFull` is defined but not yet
   emitted.** The optimistic verify-and-rerun loop builds its verify set from the
   volatile storage *slots* in each sim's read set, and its success verdict says
@@ -321,5 +314,5 @@ surface was moved out of this crate.
   in `tests/reactive_engine.rs`. The live WebSocket transport plumbing is
   covered by reconnect/termination unit tests but not by a networked end-to-end
   test. These are tracked follow-ups, not known defects.
-- **Recent toolchain.** MSRV 1.88 and edition 2024 are intentional and
+- **Recent toolchain.** MSRV 1.90 and edition 2024 are intentional and
   CI-enforced; consumers on older toolchains are not supported.

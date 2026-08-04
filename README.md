@@ -103,8 +103,10 @@ The reactive subscriber contract became asynchronous and explicitly durable in
   when a complete canonical header is available.
 - Choose an explicit `SubscriberConfig::preconfirmations` policy. The default is
   `PreconfirmationMode::Disabled`; `Preferred` falls back on unsupported chains,
-  while `Required` fails closed when the chain, transport, or stable provider
-  identity cannot supply Flashblocks.
+  keeps canonical subscriptions live through Flashblocks rejection,
+  termination, and background reconnect exhaustion, while `Required` fails
+  closed when the chain, transport, or stable provider identity cannot supply
+  Flashblocks.
 - Attach a `ProviderRef` to Flashblocks-enabled `AlloySubscriber` sessions. The
   endpoint ID is propagated into every preconfirmed record so pending reads can
   remain pinned to the announcing provider and later canonical reads can prefer it.
@@ -338,24 +340,71 @@ let subscriber = AlloySubscriber::new(provider, SubscriberMode::PubSub, config)
 # }
 ```
 
-- **Base** (`8453`, `84532`) consumes both native `newFlashblocks` markers and
-  filter-shaped `pendingLogs`. Logs are buffered until their partial-block hash
-  can be correlated with the cumulative Flashblock identity, regardless of
-  arrival order. Reconnect or index gaps recover from the endpoint's cumulative
-  `pending` snapshot.
-- **OP** (`10`, `11155420`) samples the documented standard `pending` state at
-  `flashblock_poll_interval`, deduplicating cumulative logs while canonical
-  block subscriptions continue normally. `Required` verifies that the endpoint
-  actually exposes a pending block ahead of the canonical head.
+- **Base** (`8453`, `84532`) consumes native `newFlashblocks` plus
+  filter-shaped `pendingLogs`. Both subscription lanes and every recovery read
+  share one provider lease and generation.
+- Pending logs are buffered until the cumulative preview for the same block
+  contains their transaction hash. Provider-supplied zero `hash`/`blockHash`
+  placeholders are never used as identities; each exact cumulative view instead
+  receives a non-zero, provider-generation-scoped content commitment.
+- Indexed gaps recover once from the endpoint's cumulative `pending` snapshot.
+  Conflicting duplicate indices, duplicate transaction membership, an
+  unrecoverable gap, or either Base subscription ending invalidates the
+  complete speculative generation before reconnect I/O.
+- On Base Flashblocks endpoints, canonical progress is certified at
+  `canonical_head_poll_interval` through `eth_getBlockByNumber("latest")`.
+  The provider's `newHeads` feed is not trusted because Flashblocks-aware
+  endpoints may expose partial/preconfirmed progress through it.
+- **OP** (`10`, `11155420`) uses one generation-pinned sampler for the standard
+  `pending` block surface, exact hash-addressed parent certification, filtered
+  pending logs, and bounded exact transaction receipts. The sampler runs at
+  `flashblock_poll_interval`, deduplicates cumulative views, rejects
+  non-monotonic transaction membership, and enforces
+  `max_flashblock_rpc_requests_per_second` across actual method calls.
+- A separate state provider may be paired with the event provider through
+  `with_flashblocks_state_provider`; preflight verifies the paired chain before
+  publishing any pending data. This lets applications keep a WebSocket lease
+  for canonical streams while routing OP pending reads through the matching
+  provider's request/response endpoint.
 
 Both adapters emit `ChainStatus::Preconfirmed`, `InputSource::Flashblocks`, and
 `DeliveryScope::Preconfirmed`. `ReactiveRuntime` applies each cumulative
 Flashblock to a disposable overlay: a newer payload/provider generation replaces
 the previous preview, canonical input restores the saved canonical state before
-commit, and `discard_preconfirmation` restores it explicitly. Preconfirmed
-resyncs use the `pending` block tag. The overlay never advances canonical
+commit, and `discard_preconfirmation` restores it explicitly. The cache pins
+preconfirmed reads to `pending` and installs the preview's complete available
+EVM block environment. Preconfirmed resyncs also use the `pending` block tag.
+The overlay never advances canonical
 coverage, finality, health, rollback journals, or durable checkpoints; the
 checkpointed engine rejects speculative batches rather than persisting them.
+
+After registering at least one active log interest, call
+`AlloySubscriber::establish_flashblocks_preflight(expected_chain_id)` with a
+15-second outer timeout. It verifies the pinned Base or OP chain and retains an
+optional opaque `op_supportedCapabilities` response. Base acknowledges both
+native subscription lanes; OP probes its bounded pending block, exact parent,
+filtered log, and receipt methods. The returned filter/subscription counts make
+the covered stream set explicit. Endpoint
+qualification still requires a live acceptance window that observes advancing
+Flashblocks and a correlated active-pool pending log; acknowledgement or a
+successful probe alone is not liveness.
+
+### Execution read-set warming
+
+`StorageAccessList` covers accounts, runtime-code identities, storage slots, and
+`BLOCKHASH` dependencies. Provider-backed caches can discover large unknown call
+read sets with exact-block `eth_createAccessList` probes through
+`EvmCache::prewarm_read_sets`; small or known sets continue through the ordinary
+bulk loader. `EvmCache::hydrate_read_set` refreshes account headers and storage
+together with exact-pin `eth_getProof`, reports incomplete proofs, and rejects a
+runtime-code hash change instead of reusing slot identifiers across layouts.
+
+Snapshots expose `resident_read_set` and `missing_read_set`, retain cached block
+hashes, and RPC-disconnected overlays return a precise `MissingState`. Consumers
+can therefore warm a canonical baseline before attaching subscriptions, prove a
+speculative simulation performed no provider reads, and carry newly discovered
+dependencies into the next canonical hydration cycle without issuing RPCs on a
+Flashblock hot path.
 
 - **Cold-start** — declaratively warm a working set of accounts and storage slots
   into the cache in one batched pass via `EvmCache::run_cold_start` and a
@@ -895,7 +944,7 @@ protocol-specific storage layouts, and DeFi adapters belong in the companion
 releases** — the roadmap deliberately reshapes the API before the surface
 freezes. Each release documents its breaking changes in [`CHANGELOG.md`](CHANGELOG.md).
 
-- **MSRV:** Rust 1.88 (enforced in CI). Edition 2024.
+- **MSRV:** Rust 1.90 (enforced in CI). Edition 2024.
 - **Semver:** pre-1.0 minor versions may break; patch versions will not.
 - **Roadmap:** see [`docs/ROADMAP.md`](docs/ROADMAP.md) for the path to 1.0.
 - **Known issues / limitations:** see [`docs/KNOWN_ISSUES.md`](docs/KNOWN_ISSUES.md).

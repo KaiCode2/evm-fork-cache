@@ -293,6 +293,12 @@ async fn overlay_call_raw_with_access_list_captures_read_set() -> Result<()> {
 
     assert!(result.is_success(), "balanceOf should succeed: {result:?}");
     assert!(access.accounts.contains(&token), "token account touched");
+    assert!(
+        access
+            .code_hashes
+            .contains(&common::mock_erc20_runtime().hash_slow()),
+        "executed runtime code captured in read set"
+    );
     // The hashed balance slot for owner should be in the read set.
     let hashed = {
         use alloy_sol_types::SolValue;

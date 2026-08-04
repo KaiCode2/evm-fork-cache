@@ -26,7 +26,7 @@ use std::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use alloy_consensus::{BlockHeader as _, Transaction as _};
@@ -39,14 +39,15 @@ use alloy_network::{
     },
 };
 use alloy_primitives::{Address, B256, Bytes, FixedBytes, Keccak256, U256};
-use alloy_provider::Provider;
+use alloy_provider::{Provider, RootProvider};
+use alloy_rpc_client::BatchRequest;
 use alloy_rpc_types_eth::{Filter, FilterSet, Log};
 pub use alloy_transport_balancer::EndpointId;
 use bincode::Options;
 use futures::{StreamExt, stream};
 use futures::{
     future::{Either, poll_fn, select},
-    stream::BoxStream,
+    stream::{BoxStream, FuturesUnordered},
 };
 
 use crate::{
@@ -137,34 +138,64 @@ pub struct FlashblockRef {
     pub provider: ProviderRef,
     /// Sequencer payload id shared by every Flashblock in the full block.
     ///
-    /// OP RPCs that expose only the standard pending block surface may not
-    /// expose this Base-native identifier.
+    /// Some provider wire shapes omit this indexed-payload identifier.
     pub payload_id: Option<FixedBytes<8>>,
     /// Zero-based Flashblock index, when exposed by the endpoint.
     pub index: Option<u64>,
     /// Pending block number represented by this cumulative snapshot.
     pub block_number: u64,
-    /// Hash of the cumulative partial block at this snapshot.
-    pub block_hash: B256,
+    /// Provider-generation-scoped commitment to this exact cumulative view.
+    ///
+    /// This is deliberately not a canonical or provider-reported block hash.
+    /// It remains non-zero even when a pending endpoint uses the zero hash
+    /// placeholder permitted by the Flashblocks specification.
+    pub content_hash: B256,
+    /// Non-placeholder partial block hash reported by the provider, when any.
+    pub partial_block_hash: Option<B256>,
     /// Canonical parent of the pending block, when exposed.
     pub parent_hash: Option<B256>,
     /// State root after this cumulative snapshot, when exposed.
     pub state_root: Option<B256>,
+    /// Transaction-trie root committed by a cumulative block-shaped preview.
+    pub transactions_root: Option<B256>,
+    /// Ordered cumulative transaction membership for this preview.
+    pub transaction_hashes: Vec<B256>,
     /// Pending block timestamp, when exposed.
     pub timestamp: Option<u64>,
+    /// Pending EIP-1559 base fee, when exposed.
+    pub base_fee_per_gas: Option<u64>,
+    /// Pending block beneficiary / fee recipient, when exposed.
+    pub beneficiary: Option<Address>,
+    /// Pending block randomness value, when exposed.
+    pub prevrandao: Option<B256>,
+    /// Pending block gas limit, when exposed.
+    pub gas_limit: Option<u64>,
 }
 
 impl FlashblockRef {
     /// Convert the pre-confirmed identity into the block metadata used by
-    /// ordinary log routing. The hash is explicitly a partial/pending hash and
+    /// ordinary log routing. The hash is the provider-generation-scoped
+    /// [`content_hash`](Self::content_hash), never a canonical block hash, and
     /// must not advance canonical coverage.
     pub const fn block_ref(&self) -> BlockRef {
         BlockRef {
             number: self.block_number,
-            hash: self.block_hash,
+            hash: self.content_hash,
             parent_hash: self.parent_hash,
             timestamp: self.timestamp,
         }
+    }
+
+    /// Whether the cumulative preview contains `transaction_hash`.
+    pub fn contains_transaction(&self, transaction_hash: &B256) -> bool {
+        self.transaction_hashes.contains(transaction_hash)
+    }
+
+    fn transaction_index(&self, transaction_hash: &B256) -> Option<u64> {
+        self.transaction_hashes
+            .iter()
+            .position(|candidate| candidate == transaction_hash)
+            .and_then(|index| u64::try_from(index).ok())
     }
 
     fn same_payload(&self, other: &Self) -> bool {
@@ -174,6 +205,18 @@ impl FlashblockRef {
                 _ => {
                     self.block_number == other.block_number && self.parent_hash == other.parent_hash
                 }
+            }
+    }
+
+    fn is_cumulative_successor_of(&self, previous: &Self) -> bool {
+        self.same_payload(previous)
+            && self.transaction_hashes.len() >= previous.transaction_hashes.len()
+            && self
+                .transaction_hashes
+                .starts_with(&previous.transaction_hashes)
+            && match (previous.index, self.index) {
+                (Some(previous), Some(current)) => current >= previous,
+                _ => true,
             }
     }
 }
@@ -191,7 +234,7 @@ pub enum PreconfirmationMode {
     Required,
 }
 
-/// Base-native `newFlashblocks` subscription payload.
+/// Indexed OP Stack `newFlashblocks` subscription payload.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
 pub struct BaseFlashblockPayload {
     /// Block-builder payload id shared by every incremental snapshot.
@@ -218,6 +261,23 @@ pub struct BaseFlashblockBase {
     /// Pending block timestamp.
     #[serde(deserialize_with = "deserialize_rpc_u64")]
     pub timestamp: u64,
+    /// Pending block gas limit.
+    #[serde(default, deserialize_with = "deserialize_optional_rpc_u64")]
+    pub gas_limit: Option<u64>,
+    /// Pending EIP-1559 base fee.
+    #[serde(default, deserialize_with = "deserialize_optional_rpc_u64")]
+    pub base_fee_per_gas: Option<u64>,
+    /// Pending block beneficiary / fee recipient.
+    #[serde(default, alias = "fee_recipient", alias = "feeRecipient")]
+    pub beneficiary: Option<Address>,
+    /// Pending block randomness value.
+    #[serde(
+        default,
+        alias = "prev_randao",
+        alias = "prevRandao",
+        alias = "mixHash"
+    )]
+    pub prevrandao: Option<B256>,
 }
 
 /// Stable commitment subset from Base's Flashblocks wire format.
@@ -227,6 +287,12 @@ pub struct BaseFlashblockDiff {
     pub state_root: B256,
     /// Partial block hash after this cumulative snapshot.
     pub block_hash: B256,
+    /// Transactions added by this indexed Flashblock diff.
+    #[serde(default)]
+    pub transactions: Vec<serde_json::Value>,
+    /// Transaction root when exposed by the provider.
+    #[serde(default)]
+    pub transactions_root: Option<B256>,
 }
 
 /// Stable metadata subset used when index-greater-than-zero payloads omit the
@@ -238,8 +304,8 @@ pub struct BaseFlashblockMetadata {
     pub block_number: u64,
 }
 
-/// Current Base/QuickNode `newFlashblocks` wire shape. The endpoint emits a
-/// cumulative block-shaped snapshot for every partial block update.
+/// Cumulative block-shaped `newFlashblocks` wire shape used by some OP Stack
+/// providers.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct BaseFlashblockBlockPayload {
@@ -248,11 +314,23 @@ struct BaseFlashblockBlockPayload {
     number: u64,
     parent_hash: B256,
     state_root: B256,
+    #[serde(default)]
+    transactions_root: Option<B256>,
+    #[serde(default)]
+    transactions: Vec<serde_json::Value>,
     #[serde(deserialize_with = "deserialize_rpc_u64")]
     timestamp: u64,
+    #[serde(default, deserialize_with = "deserialize_optional_rpc_u64")]
+    base_fee_per_gas: Option<u64>,
+    #[serde(default, alias = "beneficiary", alias = "feeRecipient")]
+    miner: Option<Address>,
+    #[serde(default, alias = "prevRandao")]
+    mix_hash: Option<B256>,
+    #[serde(default, deserialize_with = "deserialize_optional_rpc_u64")]
+    gas_limit: Option<u64>,
 }
 
-/// Base has exposed both an indexed diff envelope and a cumulative
+/// OP Stack providers expose either an indexed diff envelope or a cumulative
 /// block-shaped envelope for `newFlashblocks`. Accept both so provider rollout
 /// differences do not force callers onto separate subscriber paths.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
@@ -279,6 +357,179 @@ where
             let value = value.strip_prefix("0x").unwrap_or(&value);
             u64::from_str_radix(value, 16).map_err(serde::de::Error::custom)
         }
+    }
+}
+
+fn deserialize_optional_rpc_u64<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum RpcU64 {
+        Number(u64),
+        String(String),
+    }
+
+    let Some(value) = <Option<RpcU64> as serde::Deserialize>::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+    match value {
+        RpcU64::Number(number) => Ok(Some(number)),
+        RpcU64::String(value) => {
+            let value = value.strip_prefix("0x").unwrap_or(&value);
+            u64::from_str_radix(value, 16)
+                .map(Some)
+                .map_err(serde::de::Error::custom)
+        }
+    }
+}
+
+fn non_placeholder_hash(hash: B256) -> Option<B256> {
+    (!hash.is_zero()).then_some(hash)
+}
+
+fn flashblock_transaction_hashes(
+    transactions: &[serde_json::Value],
+) -> Result<Vec<B256>, SubscriberError> {
+    let hashes: Vec<B256> = transactions
+        .iter()
+        .map(|transaction| {
+            let value = match transaction {
+                serde_json::Value::String(value) => value.as_str(),
+                serde_json::Value::Object(object) => object
+                    .get("hash")
+                    .or_else(|| object.get("transactionHash"))
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| {
+                        SubscriberError::Provider(
+                            "Flashblock transaction object is missing its hash".into(),
+                        )
+                    })?,
+                _ => {
+                    return Err(SubscriberError::Provider(
+                        "Flashblock transaction must be a hash, raw transaction, or object".into(),
+                    ));
+                }
+            };
+            if value.len() == 66 {
+                return value.parse::<B256>().map_err(|error| {
+                    SubscriberError::Provider(format!(
+                        "Flashblock transaction hash is invalid: {error}"
+                    ))
+                });
+            }
+            let encoded = value.strip_prefix("0x").unwrap_or(value);
+            let raw = alloy_primitives::hex::decode(encoded).map_err(|error| {
+                SubscriberError::Provider(format!(
+                    "Flashblock raw transaction is invalid hex: {error}"
+                ))
+            })?;
+            Ok(alloy_primitives::keccak256(raw))
+        })
+        .collect::<Result<_, _>>()?;
+    let mut unique = HashSet::with_capacity(hashes.len());
+    if hashes.iter().any(|hash| !unique.insert(*hash)) {
+        return Err(SubscriberError::Provider(
+            "Flashblock cumulative transaction membership contains a duplicate hash".into(),
+        ));
+    }
+    Ok(hashes)
+}
+
+struct FlashblockContentCommitment<'a> {
+    provider: &'a ProviderRef,
+    payload_id: Option<FixedBytes<8>>,
+    index: Option<u64>,
+    block_number: u64,
+    partial_block_hash: Option<B256>,
+    parent_hash: Option<B256>,
+    state_root: Option<B256>,
+    transactions_root: Option<B256>,
+    transaction_hashes: &'a [B256],
+    timestamp: Option<u64>,
+    base_fee_per_gas: Option<u64>,
+    beneficiary: Option<Address>,
+    prevrandao: Option<B256>,
+    gas_limit: Option<u64>,
+}
+
+fn flashblock_content_hash(content: FlashblockContentCommitment<'_>) -> B256 {
+    let mut commitment = Keccak256::new();
+    commitment.update(b"evm-fork-cache/flashblock-content/v1");
+    let endpoint = content.provider.endpoint.as_str().as_bytes();
+    commitment.update((endpoint.len() as u64).to_be_bytes());
+    commitment.update(endpoint);
+    commitment.update(content.provider.generation.to_be_bytes());
+    commitment.update(content.block_number.to_be_bytes());
+    commit_optional_bytes(
+        &mut commitment,
+        content.payload_id.as_ref().map(FixedBytes::as_slice),
+    );
+    commit_optional_u64(&mut commitment, content.index);
+    commit_optional_bytes(
+        &mut commitment,
+        content
+            .partial_block_hash
+            .as_ref()
+            .map(FixedBytes::as_slice),
+    );
+    commit_optional_bytes(
+        &mut commitment,
+        content.parent_hash.as_ref().map(FixedBytes::as_slice),
+    );
+    commit_optional_bytes(
+        &mut commitment,
+        content.state_root.as_ref().map(FixedBytes::as_slice),
+    );
+    commit_optional_bytes(
+        &mut commitment,
+        content.transactions_root.as_ref().map(FixedBytes::as_slice),
+    );
+    commitment.update((content.transaction_hashes.len() as u64).to_be_bytes());
+    for transaction_hash in content.transaction_hashes {
+        commitment.update(transaction_hash);
+    }
+    commit_optional_u64(&mut commitment, content.timestamp);
+    commit_optional_u64(&mut commitment, content.base_fee_per_gas);
+    commit_optional_bytes(
+        &mut commitment,
+        content
+            .beneficiary
+            .as_ref()
+            .map(|address| address.as_slice()),
+    );
+    commit_optional_bytes(
+        &mut commitment,
+        content.prevrandao.as_ref().map(FixedBytes::as_slice),
+    );
+    commit_optional_u64(&mut commitment, content.gas_limit);
+    let hash = commitment.finalize();
+    if hash.is_zero() {
+        B256::with_last_byte(1)
+    } else {
+        hash
+    }
+}
+
+fn commit_optional_bytes(commitment: &mut Keccak256, value: Option<&[u8]>) {
+    match value {
+        Some(value) => {
+            commitment.update([1]);
+            commitment.update((value.len() as u64).to_be_bytes());
+            commitment.update(value);
+        }
+        None => commitment.update([0]),
+    }
+}
+
+fn commit_optional_u64(commitment: &mut Keccak256, value: Option<u64>) {
+    match value {
+        Some(value) => {
+            commitment.update([1]);
+            commitment.update(value.to_be_bytes());
+        }
+        None => commitment.update([0]),
     }
 }
 
@@ -512,8 +763,10 @@ pub enum ChainStatus {
     /// Handlers may update the runtime's speculative overlay for this status,
     /// but the update never advances canonical coverage or durable journals.
     Preconfirmed {
-        /// Exact cumulative pre-confirmation snapshot observed by the source.
-        flashblock: FlashblockRef,
+        /// Shared exact cumulative pre-confirmation snapshot observed by the
+        /// source. Sharing keeps ordinary canonical records compact and makes
+        /// multi-log Flashblock delivery cheap to clone.
+        flashblock: Arc<FlashblockRef>,
     },
     /// The input is included in a block with a confirmation count.
     Included {
@@ -995,8 +1248,7 @@ impl<N: Network> ReactiveInputRecord<N> {
         if !self.same_deduplicable_payload(other) || !self.dedupe_context_is_compatible(other) {
             return Err(ReactiveError::InvalidInputRecord {
                 message: format!(
-                    "conflicting payload or semantic context for identity {:?}",
-                    identity
+                    "conflicting payload or semantic context for identity {identity:?}"
                 ),
             });
         }
@@ -4592,15 +4844,17 @@ impl<N: Network> ReactiveRuntime<N> {
                     ),
                 });
             }
-            if active.flashblock.index == incoming.index
-                && active.flashblock.block_hash != incoming.block_hash
+            if active.flashblock.index.is_some()
+                && active.flashblock.index == incoming.index
+                && active.flashblock.content_hash != incoming.content_hash
             {
+                self.discard_preconfirmed_branch(cache);
                 return Err(ReactiveError::InvalidInputRecord {
-                    message:
-                        "same Flashblock payload/index carried conflicting partial block hashes"
-                            .into(),
+                    message: "same Flashblock payload/index carried conflicting cumulative content"
+                        .into(),
                 });
             }
+            install_preconfirmed_cache_context(cache, incoming);
             return Ok(());
         }
 
@@ -4609,6 +4863,7 @@ impl<N: Network> ReactiveRuntime<N> {
             flashblock: incoming.clone(),
             canonical_cache: EvmCacheStateSnapshot::capture(cache),
         });
+        install_preconfirmed_cache_context(cache, incoming);
         Ok(())
     }
 
@@ -6032,6 +6287,15 @@ impl<N: Network> ReactiveRuntime<N> {
         self.pending_resyncs
             .retain(|request| !ids.contains(&request.id));
     }
+}
+
+fn install_preconfirmed_cache_context(cache: &mut EvmCache, flashblock: &FlashblockRef) {
+    cache.set_block(BlockId::pending());
+    cache.set_block_context(Some(flashblock.block_number), flashblock.base_fee_per_gas);
+    cache.set_coinbase(flashblock.beneficiary);
+    cache.set_prevrandao(flashblock.prevrandao);
+    cache.set_block_gas_limit(flashblock.gas_limit);
+    cache.set_timestamp(flashblock.timestamp);
 }
 
 /// Validate one provider-neutral delivery envelope without mutating runtime or
@@ -7855,12 +8119,15 @@ fn batch_preconfirmation<N: Network>(
                         message: "pre-confirmed input requires pre-confirmed delivery scope".into(),
                     });
                 }
-                if flashblock.as_ref().is_some_and(|known| known != current) {
+                if flashblock
+                    .as_ref()
+                    .is_some_and(|known| known != current.as_ref())
+                {
                     return Err(ReactiveError::InvalidInputRecord {
                         message: "one batch cannot mix distinct Flashblock snapshots".into(),
                     });
                 }
-                flashblock.get_or_insert_with(|| current.clone());
+                flashblock.get_or_insert_with(|| current.as_ref().clone());
             }
             _ => has_non_preconfirmed = true,
         }
@@ -9560,14 +9827,14 @@ pub enum SubscriberMode {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FlashblocksAdapter {
-    BaseNative,
-    OpPending,
+    NativeSubscriptions,
+    PendingStatePolling,
 }
 
 fn flashblocks_adapter(chain_id: u64) -> Option<FlashblocksAdapter> {
     match chain_id {
-        8_453 | 84_532 => Some(FlashblocksAdapter::BaseNative),
-        10 | 11_155_420 => Some(FlashblocksAdapter::OpPending),
+        8_453 | 84_532 => Some(FlashblocksAdapter::NativeSubscriptions),
+        10 | 11_155_420 => Some(FlashblocksAdapter::PendingStatePolling),
         _ => None,
     }
 }
@@ -9578,9 +9845,41 @@ pub struct SubscriberConfig {
     /// Flashblocks delivery policy. Provider support itself is configured by
     /// the transport's single `flashblocks` endpoint flag.
     pub preconfirmations: PreconfirmationMode,
-    /// OP pending-state sampling cadence. Base uses native `newFlashblocks`
-    /// plus `pendingLogs` subscriptions instead.
+    /// Cadence for certifying sealed canonical heads while connected to a
+    /// Flashblocks endpoint whose `newHeads` stream may contain partial heads.
+    pub canonical_head_poll_interval: Duration,
+    /// Optimism pending-state sampling cadence.
+    ///
+    /// Base uses native `newFlashblocks` plus `pendingLogs`. Optimism providers
+    /// currently expose the interoperable Flashblocks surface through
+    /// `pending` RPC reads, so one generation-pinned sampler reads the
+    /// cumulative pending block, its exact hash-addressed parent, filtered
+    /// pending-block logs, and bounded exact transaction receipts.
     pub flashblock_poll_interval: Duration,
+    /// Consecutive pending-state request failure allowance.
+    ///
+    /// A successful sampling tick resets this counter. Semantic integrity
+    /// failures, such as non-monotonic transaction membership or malformed
+    /// logs, are never retried through this allowance.
+    pub max_consecutive_flashblock_poll_failures: usize,
+    /// Maximum pending receipts per sampling tick.
+    ///
+    /// Receipts are requested by exact transaction hash in one JSON-RPC batch,
+    /// because separate `eth_getBlockReceipts("pending")` responses can refer
+    /// to a different cumulative Flashblock. The rolling total-method budget
+    /// may impose a lower effective per-tick limit; with the defaults and one
+    /// log filter, at most seven receipts are requested per tick.
+    pub max_pending_transaction_receipts_per_tick: usize,
+    /// Pending-state RPC method budget per rolling one-second window.
+    ///
+    /// The sampler reserves capacity for the pending-block, exact-parent, and
+    /// filtered-log methods implied by its cadence and filter plan, plus the
+    /// exact-parent canonical-head poll when block interests require it. Exact
+    /// receipt hydration uses only an evenly apportioned remainder. Request
+    /// timestamps enforce the ceiling across actual ticks, including delayed
+    /// ticks. The default leaves headroom below common paid-provider limits of
+    /// 50 requests per second.
+    pub max_flashblock_rpc_requests_per_second: usize,
     /// Hydrate pending transaction hashes into full bodies when possible.
     pub hydrate_pending_transactions: bool,
     /// Verify each canonical log's block identity through RPC and enrich its
@@ -9621,7 +9920,11 @@ impl Default for SubscriberConfig {
     fn default() -> Self {
         Self {
             preconfirmations: PreconfirmationMode::Disabled,
-            flashblock_poll_interval: Duration::from_millis(100),
+            canonical_head_poll_interval: Duration::from_millis(500),
+            flashblock_poll_interval: Duration::from_millis(250),
+            max_consecutive_flashblock_poll_failures: 10,
+            max_pending_transaction_receipts_per_tick: 32,
+            max_flashblock_rpc_requests_per_second: 40,
             hydrate_pending_transactions: false,
             verify_log_block_context: false,
             max_batch_size: 1024,
@@ -9632,6 +9935,150 @@ impl Default for SubscriberConfig {
             max_reconcile_requests_in_flight: 8,
             reconnect: SubscriberReconnectConfig::default(),
         }
+    }
+}
+
+/// Provider surface established for one Flashblocks generation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum FlashblocksDelivery {
+    /// Native `newFlashblocks` plus filtered `pendingLogs` WebSocket streams.
+    NativeSubscriptions,
+    /// Generation-pinned `pending` block and log sampling.
+    PendingStatePolling,
+}
+
+/// Request/response traffic issued by one Flashblocks subscriber generation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FlashblocksRpcMetrics {
+    capability_requests: u64,
+    provider_pair_chain_requests: u64,
+    canonical_head_requests: u64,
+    pending_block_requests: u64,
+    pending_log_requests: u64,
+    pending_receipt_requests: u64,
+    pending_receipts_completed: u64,
+    pending_receipts_unavailable: u64,
+    failed_requests: u64,
+    raced_samples: u64,
+}
+
+impl FlashblocksRpcMetrics {
+    /// Opportunistic `op_supportedCapabilities` probes attempted.
+    pub const fn capability_requests(self) -> u64 {
+        self.capability_requests
+    }
+
+    /// Chain-identity requests used to verify an explicitly paired
+    /// pending-state provider against the subscriber's stream provider.
+    pub const fn provider_pair_chain_requests(self) -> u64 {
+        self.provider_pair_chain_requests
+    }
+
+    /// Exact parent-block requests used to fence pending and canonical state.
+    pub const fn canonical_head_requests(self) -> u64 {
+        self.canonical_head_requests
+    }
+
+    /// Cumulative pending-block requests.
+    pub const fn pending_block_requests(self) -> u64 {
+        self.pending_block_requests
+    }
+
+    /// Pending log-filter requests.
+    pub const fn pending_log_requests(self) -> u64 {
+        self.pending_log_requests
+    }
+
+    /// Pending-state `eth_getTransactionReceipt` methods issued by exact hash.
+    /// Several methods may share one JSON-RPC batch transport request.
+    pub const fn pending_receipt_requests(self) -> u64 {
+        self.pending_receipt_requests
+    }
+
+    /// Exact pending transaction receipts returned successfully.
+    pub const fn pending_receipts_completed(self) -> u64 {
+        self.pending_receipts_completed
+    }
+
+    /// Exact pending transaction receipts that were not materialized yet and remain
+    /// eligible for retry on the next cumulative sample.
+    pub const fn pending_receipts_unavailable(self) -> u64 {
+        self.pending_receipts_unavailable
+    }
+
+    /// Provider request failures observed by a pending-state sampler.
+    pub const fn failed_requests(self) -> u64 {
+        self.failed_requests
+    }
+
+    /// Samples discarded because the pending-log response advanced beyond
+    /// the separately fetched cumulative block. The next tick retries from a
+    /// fresh block/log pair; no partial speculative view is published.
+    pub const fn raced_samples(self) -> u64 {
+        self.raced_samples
+    }
+
+    /// Total request/response calls attributable to Flashblocks qualification
+    /// and sampling.
+    pub const fn total_requests(self) -> u64 {
+        self.capability_requests
+            .saturating_add(self.provider_pair_chain_requests)
+            .saturating_add(self.canonical_head_requests)
+            .saturating_add(self.pending_block_requests)
+            .saturating_add(self.pending_log_requests)
+            .saturating_add(self.pending_receipt_requests)
+    }
+}
+
+/// Successful initial Flashblocks endpoint preflight.
+///
+/// This proves chain identity and either subscription acknowledgement for
+/// Base's `newFlashblocks` plus every pool-filtered `pendingLogs` stream, or
+/// method support for OP's bounded pending block/log sampler. Notification
+/// liveness and an active-pool pending log remain acceptance-window checks: a
+/// successful preflight alone must not qualify an endpoint for live trading.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FlashblocksPreflight {
+    chain_id: u64,
+    provider: ProviderRef,
+    delivery: FlashblocksDelivery,
+    pending_log_subscriptions: usize,
+    pending_log_filters: usize,
+    advertised_capabilities: Option<serde_json::Value>,
+}
+
+impl FlashblocksPreflight {
+    /// Chain identity read from the pinned provider lease.
+    pub const fn chain_id(&self) -> u64 {
+        self.chain_id
+    }
+
+    /// Provider generation whose HTTP state and both WebSocket streams were
+    /// preflighted together.
+    pub const fn provider(&self) -> &ProviderRef {
+        &self.provider
+    }
+
+    /// Provider surface selected for this chain.
+    pub const fn delivery(&self) -> FlashblocksDelivery {
+        self.delivery
+    }
+
+    /// Number of acknowledged pool-filtered `pendingLogs` subscriptions.
+    pub const fn pending_log_subscriptions(&self) -> usize {
+        self.pending_log_subscriptions
+    }
+
+    /// Number of provider-facing pending-log filters covered by the native or
+    /// sampled delivery surface.
+    pub const fn pending_log_filters(&self) -> usize {
+        self.pending_log_filters
+    }
+
+    /// Opaque response from `op_supportedCapabilities`, when the provider
+    /// implements that optional RPC method.
+    pub const fn advertised_capabilities(&self) -> Option<&serde_json::Value> {
+        self.advertised_capabilities.as_ref()
     }
 }
 
@@ -9933,6 +10380,7 @@ pub struct SubscriberInputBatch<N: Network = Ethereum> {
     records: Vec<SubscriberInputRecord<N>>,
     chain_id: Option<u64>,
     chain_controls: Vec<ChainControl>,
+    preconfirmation_invalidated: bool,
 }
 
 /// Result of polling a scoped subscriber batch against one driver control
@@ -9960,6 +10408,12 @@ impl<N: Network> SubscriberInputBatch<N> {
     /// Ordered chain controls committed after the preceding records.
     pub fn chain_controls(&self) -> &[ChainControl] {
         &self.chain_controls
+    }
+
+    /// Whether the announcing Flashblocks generation lost continuity before
+    /// this batch was returned.
+    pub const fn preconfirmation_invalidated(&self) -> bool {
+        self.preconfirmation_invalidated
     }
 
     /// Consume the scoped subscriber delivery into a runtime-ready batch.
@@ -11762,6 +12216,17 @@ where
     }
 }
 
+type FlashblockReconnectFuture<N> = Pin<
+    Box<
+        dyn Future<
+                Output = (
+                    SubscriberStreamSource,
+                    Result<BoxStream<'static, SubscriberEvent<N>>, SubscriberError>,
+                ),
+            > + Send,
+    >,
+>;
+
 /// Alloy-backed event subscriber.
 ///
 /// The default transport slice drives Alloy pubsub subscriptions for logs,
@@ -11784,6 +12249,10 @@ where
 /// `Ok(None)`.
 pub struct AlloySubscriber<P, N: Network = Ethereum> {
     provider: P,
+    /// Optional request/response half of the same configured provider lease.
+    /// OP Flashblocks pending reads use this transport when WebSocket JSON-RPC
+    /// does not expose the provider's pending-state surface.
+    flashblocks_state_provider: Option<P>,
     /// Stable identity for the provider session used by Flashblocks and every
     /// follow-up pending-state read.
     provider_ref: Option<ProviderRef>,
@@ -11838,11 +12307,26 @@ pub struct AlloySubscriber<P, N: Network = Ethereum> {
     recent_compat_owner_input_refs: HashMap<HandlerId, VecDeque<InputRef>>,
     recent_compat_owner_input_ref_sets: HashMap<HandlerId, HashSet<InputRef>>,
     base_flashblock_header: Option<(FixedBytes<8>, BaseFlashblockBase)>,
-    flashblocks_by_hash: HashMap<B256, FlashblockRef>,
-    flashblock_hash_order: VecDeque<B256>,
+    base_flashblock_transactions: Option<(FixedBytes<8>, u64, Vec<B256>, Vec<B256>)>,
     unmatched_pending_logs: VecDeque<(usize, Log)>,
     latest_preconfirmation: Option<FlashblockRef>,
     preconfirmed_seen_logs: HashSet<(B256, u64)>,
+    /// OP transaction receipts already proven for the active cumulative
+    /// payload. This avoids re-querying non-matching transactions while still
+    /// retrying receipts that were temporarily unavailable.
+    preconfirmed_receipted_transactions: HashSet<B256>,
+    /// OP receipt hashes that returned `null` at least once for the active
+    /// payload. Never-attempted hashes are scheduled ahead of this retry set so
+    /// a lagging provider cache cannot let a few transactions monopolize the
+    /// bounded request budget.
+    preconfirmed_unavailable_receipts: HashSet<B256>,
+    last_certified_canonical_head: Option<BlockRef>,
+    pending_preconfirmation_invalidation: bool,
+    pending_flashblock_reconnects: FuturesUnordered<FlashblockReconnectFuture<N>>,
+    pending_flashblock_reconnect_sources: Vec<SubscriberStreamSource>,
+    flashblocks_rpc_metrics: FlashblocksRpcMetrics,
+    consecutive_flashblock_poll_failures: usize,
+    flashblock_rpc_request_times: VecDeque<Instant>,
     _network: PhantomData<N>,
 }
 
@@ -11920,6 +12404,7 @@ impl<P, N: Network> AlloySubscriber<P, N> {
         ensure_ring_crypto_provider();
         Self {
             provider,
+            flashblocks_state_provider: None,
             provider_ref: None,
             log_verification_provider: None,
             chain_id: None,
@@ -11950,11 +12435,19 @@ impl<P, N: Network> AlloySubscriber<P, N> {
             recent_compat_owner_input_refs: HashMap::new(),
             recent_compat_owner_input_ref_sets: HashMap::new(),
             base_flashblock_header: None,
-            flashblocks_by_hash: HashMap::new(),
-            flashblock_hash_order: VecDeque::new(),
+            base_flashblock_transactions: None,
             unmatched_pending_logs: VecDeque::new(),
             latest_preconfirmation: None,
             preconfirmed_seen_logs: HashSet::new(),
+            preconfirmed_receipted_transactions: HashSet::new(),
+            preconfirmed_unavailable_receipts: HashSet::new(),
+            last_certified_canonical_head: None,
+            pending_preconfirmation_invalidation: false,
+            pending_flashblock_reconnects: FuturesUnordered::new(),
+            pending_flashblock_reconnect_sources: Vec::new(),
+            flashblocks_rpc_metrics: FlashblocksRpcMetrics::default(),
+            consecutive_flashblock_poll_failures: 0,
+            flashblock_rpc_request_times: VecDeque::new(),
             _network: PhantomData,
         }
     }
@@ -11970,6 +12463,19 @@ impl<P, N: Network> AlloySubscriber<P, N> {
     #[must_use]
     pub fn with_provider_ref(mut self, provider: ProviderRef) -> Self {
         self.provider_ref = Some(provider);
+        self
+    }
+
+    /// Pair the subscriber's event transport with the request/response
+    /// transport for the same configured provider ID and generation.
+    ///
+    /// Optimism pending block/log sampling uses this provider. Preflight reads
+    /// its chain ID and rejects a mismatch before pending data can be emitted.
+    /// Use type-erased Alloy providers when the WebSocket and HTTP transports
+    /// have different concrete Rust types.
+    #[must_use]
+    pub fn with_flashblocks_state_provider(mut self, provider: P) -> Self {
+        self.flashblocks_state_provider = Some(provider);
         self
     }
 
@@ -11993,6 +12499,12 @@ impl<P, N: Network> AlloySubscriber<P, N> {
     /// Subscriber config.
     pub fn config(&self) -> &SubscriberConfig {
         &self.config
+    }
+
+    /// Request/response traffic issued for Flashblocks qualification and
+    /// pending-state sampling since the last full interest reset.
+    pub const fn flashblocks_rpc_metrics(&self) -> FlashblocksRpcMetrics {
+        self.flashblocks_rpc_metrics
     }
 
     /// Registered interests across base and owner-scoped registrations.
@@ -13091,6 +13603,7 @@ impl<P, N: Network> AlloySubscriber<P, N> {
                     }
                     SubscriberStreamSource::BaseFlashblocks
                     | SubscriberStreamSource::OpPendingFlashblocks
+                    | SubscriberStreamSource::CanonicalHeadPolling
                     | SubscriberStreamSource::PubSubPendingHashes
                     | SubscriberStreamSource::PubSubBlockHeaders
                     | SubscriberStreamSource::PollingPendingHashes => {}
@@ -13105,7 +13618,10 @@ impl<P, N: Network> AlloySubscriber<P, N> {
     }
 
     fn drain_next_scoped_batch(&mut self) -> Option<SubscriberInputBatch<N>> {
-        if self.pending_records.is_empty() && self.pending_chain_controls.is_empty() {
+        if self.pending_records.is_empty()
+            && self.pending_chain_controls.is_empty()
+            && !self.pending_preconfirmation_invalidation
+        {
             return None;
         }
 
@@ -13143,6 +13659,9 @@ impl<P, N: Network> AlloySubscriber<P, N> {
             records,
             chain_id: self.chain_id,
             chain_controls,
+            preconfirmation_invalidated: std::mem::take(
+                &mut self.pending_preconfirmation_invalidation,
+            ),
         })
     }
 
@@ -13162,19 +13681,42 @@ impl<P, N: Network> AlloySubscriber<P, N> {
         self.recent_compat_owner_input_ref_sets.clear();
         self.pending_backfills.clear();
         self.pending_source_backfills.clear();
+        self.pending_preconfirmation_invalidation = false;
+        self.pending_flashblock_reconnects.clear();
+        self.pending_flashblock_reconnect_sources.clear();
+        self.flashblocks_rpc_metrics = FlashblocksRpcMetrics::default();
         self.log_source_ids.clear();
         self.next_log_source_id = 0;
         self.sources_dirty = true;
+        self.last_certified_canonical_head = None;
         self.reset_flashblock_tracking();
     }
 
     fn reset_flashblock_tracking(&mut self) {
         self.base_flashblock_header = None;
-        self.flashblocks_by_hash.clear();
-        self.flashblock_hash_order.clear();
+        self.base_flashblock_transactions = None;
         self.unmatched_pending_logs.clear();
         self.latest_preconfirmation = None;
         self.preconfirmed_seen_logs.clear();
+        self.preconfirmed_receipted_transactions.clear();
+        self.preconfirmed_unavailable_receipts.clear();
+        self.consecutive_flashblock_poll_failures = 0;
+    }
+
+    /// Revoke only the active speculative snapshot while keeping the pinned
+    /// provider session and its streams alive. A sampled OP pending view can
+    /// legitimately be replaced, or a provider backend can briefly return an
+    /// older cumulative view. Either observation makes the current signing
+    /// authority unsafe, but does not prove that the transport generation is
+    /// broken and should be reconnected.
+    fn invalidate_preconfirmation_snapshot(&mut self) {
+        self.pending_records
+            .retain(|record| record.scope != SubscriberInputScope::Preconfirmed);
+        self.pending_preconfirmation_invalidation = true;
+        self.latest_preconfirmation = None;
+        self.preconfirmed_seen_logs.clear();
+        self.preconfirmed_receipted_transactions.clear();
+        self.preconfirmed_unavailable_receipts.clear();
     }
 
     fn bump_stream_revision(&mut self) {
@@ -13410,6 +13952,7 @@ enum SubscriberStreamSource {
     BasePendingLog { id: usize, filter: Filter },
     BaseFlashblocks,
     OpPendingFlashblocks,
+    CanonicalHeadPolling,
     PubSubPendingHashes,
     PubSubBlockHeaders,
     PollingLog { filter: Filter },
@@ -13420,9 +13963,10 @@ impl SubscriberStreamSource {
     fn label(&self) -> &'static str {
         match self {
             Self::PubSubLog { .. } => "pubsub log",
-            Self::BasePendingLog { .. } => "Base pendingLogs",
-            Self::BaseFlashblocks => "Base newFlashblocks",
-            Self::OpPendingFlashblocks => "OP pending Flashblocks",
+            Self::BasePendingLog { .. } => "OP Stack pendingLogs",
+            Self::BaseFlashblocks => "OP Stack newFlashblocks",
+            Self::OpPendingFlashblocks => "Optimism pending Flashblocks",
+            Self::CanonicalHeadPolling => "certified canonical head",
             Self::PubSubPendingHashes => "pubsub pending transaction hash",
             Self::PubSubBlockHeaders => "pubsub block header",
             Self::PollingLog { .. } => "polling log",
@@ -13436,6 +13980,7 @@ impl SubscriberStreamSource {
             Self::PubSubLog { .. }
                 | Self::BasePendingLog { .. }
                 | Self::BaseFlashblocks
+                | Self::OpPendingFlashblocks
                 | Self::PubSubPendingHashes
                 | Self::PubSubBlockHeaders
         )
@@ -13460,6 +14005,7 @@ impl SubscriberStreamSource {
             }
             (Self::BaseFlashblocks, Self::BaseFlashblocks)
             | (Self::OpPendingFlashblocks, Self::OpPendingFlashblocks)
+            | (Self::CanonicalHeadPolling, Self::CanonicalHeadPolling)
             | (Self::PubSubPendingHashes, Self::PubSubPendingHashes)
             | (Self::PubSubBlockHeaders, Self::PubSubBlockHeaders)
             | (Self::PollingPendingHashes, Self::PollingPendingHashes) => true,
@@ -13488,12 +14034,146 @@ enum SubscriberEvent<N: Network> {
     },
     BaseFlashblock(BaseFlashblockWirePayload),
     OpFlashblockTick,
+    CanonicalHeadTick,
     PreconfirmedLogs {
         flashblock: FlashblockRef,
         logs: Vec<Log>,
     },
+    FlashblockInvalidated,
     FlashblockObserved,
     StreamTerminated(SubscriberStreamSource),
+}
+
+enum SubscriberReady<N: Network> {
+    Event(Option<SubscriberEvent<N>>),
+    FlashblockReconnect(
+        SubscriberStreamSource,
+        Result<BoxStream<'static, SubscriberEvent<N>>, SubscriberError>,
+    ),
+}
+
+#[derive(Debug)]
+enum PendingFlashblockPollError {
+    Request(SubscriberError),
+    Integrity(SubscriberError),
+}
+
+impl PendingFlashblockPollError {
+    fn into_subscriber(self) -> SubscriberError {
+        match self {
+            Self::Request(error) | Self::Integrity(error) => error,
+        }
+    }
+}
+
+fn pending_flashblock_request_error(error: impl fmt::Display) -> PendingFlashblockPollError {
+    PendingFlashblockPollError::Request(provider_error(error))
+}
+
+fn normalize_op_pending_block<N: Network>(
+    mut value: serde_json::Value,
+) -> Result<N::BlockResponse, SubscriberError> {
+    let object = value.as_object_mut().ok_or_else(|| {
+        SubscriberError::Provider("OP pending block response is not an object".into())
+    })?;
+    let transactions = object
+        .get_mut("transactions")
+        .and_then(serde_json::Value::as_array_mut)
+        .ok_or_else(|| {
+            SubscriberError::Provider(
+                "OP pending block response is missing its transaction array".into(),
+            )
+        })?;
+    for transaction in transactions {
+        if transaction.is_string() {
+            continue;
+        }
+        let hash = transaction
+            .as_object()
+            .and_then(|object| object.get("hash"))
+            .filter(|hash| hash.is_string())
+            .cloned()
+            .ok_or_else(|| {
+                SubscriberError::Provider("OP pending block transaction is missing its hash".into())
+            })?;
+        *transaction = hash;
+    }
+    if object.get("hash").is_none_or(serde_json::Value::is_null) {
+        object.insert(
+            "hash".into(),
+            serde_json::Value::String(B256::ZERO.to_string()),
+        );
+    }
+    if object.get("nonce").is_none_or(serde_json::Value::is_null) {
+        object.insert(
+            "nonce".into(),
+            serde_json::Value::String("0x0000000000000000".into()),
+        );
+    }
+    if object.get("miner").is_none_or(serde_json::Value::is_null)
+        || object
+            .get("beneficiary")
+            .is_none_or(serde_json::Value::is_null)
+    {
+        object.insert(
+            "miner".into(),
+            serde_json::Value::String(Address::ZERO.to_string()),
+        );
+    }
+    serde_json::from_value(value).map_err(|error| {
+        SubscriberError::Provider(format!(
+            "failed to decode normalized OP pending block: {error}"
+        ))
+    })
+}
+
+fn normalize_pending_transaction_receipt(
+    expected_transaction_hash: B256,
+    value: serde_json::Value,
+) -> Result<Option<Vec<Log>>, SubscriberError> {
+    if value.is_null() {
+        return Ok(None);
+    }
+    let receipt = value.as_object().ok_or_else(|| {
+        SubscriberError::Provider("pending transaction receipt response is not an object".into())
+    })?;
+    let transaction_hash: B256 =
+        serde_json::from_value(receipt.get("transactionHash").cloned().ok_or_else(|| {
+            SubscriberError::Provider(
+                "pending transaction receipt is missing its transaction hash".into(),
+            )
+        })?)
+        .map_err(|error| {
+            SubscriberError::Provider(format!(
+                "failed to decode pending transaction receipt hash: {error}"
+            ))
+        })?;
+    if transaction_hash != expected_transaction_hash {
+        return Err(SubscriberError::Provider(
+            "pending transaction receipt hash disagrees with its request".into(),
+        ));
+    }
+    let receipt_logs = receipt
+        .get("logs")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| {
+            SubscriberError::Provider("pending transaction receipt is missing its log array".into())
+        })?;
+    let mut logs = Vec::new();
+    for log in receipt_logs {
+        let log: Log = serde_json::from_value(log.clone()).map_err(|error| {
+            SubscriberError::Provider(format!(
+                "failed to decode pending transaction receipt log: {error}"
+            ))
+        })?;
+        if log.transaction_hash != Some(expected_transaction_hash) {
+            return Err(SubscriberError::Provider(
+                "pending transaction receipt log hash disagrees with its receipt".into(),
+            ));
+        }
+        logs.push(log);
+    }
+    Ok(Some(logs))
 }
 
 impl<P, N> EventSubscriber<N> for AlloySubscriber<P, N>
@@ -13568,6 +14248,269 @@ where
     N: Network + 'static,
     N::HeaderResponse: Send + 'static,
 {
+    /// Validate one pinned OP Stack provider generation and establish its
+    /// chain-specific Flashblocks surface.
+    ///
+    /// The caller must register at least one active log interest first. The
+    /// method requires a matching chain id and stable [`ProviderRef`]. Base
+    /// additionally requires pubsub, `newFlashblocks`, and one `pendingLogs`
+    /// acknowledgement per planned provider filter. Optimism probes the
+    /// bounded pending block/log/receipt surface. `op_supportedCapabilities`
+    /// is queried opportunistically and retained as opaque evidence because
+    /// provider implementations do not expose a uniform capability vocabulary.
+    ///
+    /// A successful return is deliberately not a liveness qualification. The
+    /// acceptance window must still observe a Flashblock whose pending state
+    /// advances and a correlated log for an active pool.
+    pub async fn establish_flashblocks_preflight(
+        &mut self,
+        expected_chain_id: u64,
+    ) -> Result<FlashblocksPreflight, SubscriberError> {
+        validate_subscriber_config(&self.config)?;
+        if self.config.preconfirmations == PreconfirmationMode::Disabled {
+            return Err(SubscriberError::InvalidConfig(
+                "Flashblocks preflight requires preconfirmations",
+            ));
+        }
+        if !self
+            .interests
+            .iter()
+            .any(|interest| matches!(interest, ReactiveInterest::Logs(_)))
+        {
+            return Err(SubscriberError::InvalidConfig(
+                "Flashblocks preflight requires at least one active log interest",
+            ));
+        }
+        let chain_id = self.ensure_chain_id().await?;
+        if chain_id != expected_chain_id {
+            return Err(SubscriberError::ChainMismatch {
+                expected: expected_chain_id,
+                actual: chain_id,
+            });
+        }
+        self.validate_flashblocks_setup()?;
+        let adapter = flashblocks_adapter(chain_id).ok_or(SubscriberError::Unsupported(
+            "Flashblocks are currently implemented for Base and OP chains",
+        ))?;
+        let provider = self
+            .provider_ref
+            .clone()
+            .ok_or(SubscriberError::InvalidConfig(
+                "Flashblocks preflight requires a stable provider ref",
+            ))?;
+        self.flashblocks_rpc_metrics.capability_requests = self
+            .flashblocks_rpc_metrics
+            .capability_requests
+            .saturating_add(1);
+        let capability_provider = if adapter == FlashblocksAdapter::PendingStatePolling {
+            self.flashblocks_state_provider
+                .as_ref()
+                .unwrap_or(&self.provider)
+        } else {
+            &self.provider
+        };
+        let advertised_capabilities = capability_provider
+            .client()
+            .request::<_, serde_json::Value>("op_supportedCapabilities", ())
+            .await
+            .ok();
+
+        self.ensure_streams().await?;
+        let pending_log_filters = self.log_stream_filters();
+        if adapter == FlashblocksAdapter::PendingStatePolling
+            && self.pending_receipt_requests_per_tick_capacity() == 0
+        {
+            return Err(SubscriberError::InvalidConfig(
+                "Flashblocks RPC budget leaves no capacity for OP transaction receipts",
+            ));
+        }
+        let (delivery, pending_log_subscriptions) = match adapter {
+            FlashblocksAdapter::NativeSubscriptions => {
+                if resolve_subscriber_transport(self.mode)? != SubscriberTransport::PubSub {
+                    return Err(SubscriberError::Unsupported(
+                        "Base Flashblocks preflight requires pubsub",
+                    ));
+                }
+                let pending_sources = self
+                    .pubsub_stream_sources()
+                    .into_iter()
+                    .filter(|source| {
+                        matches!(source, SubscriberStreamSource::BasePendingLog { .. })
+                    })
+                    .collect::<Vec<_>>();
+                let AlloySubscriberState::Active(streams) = &self.state else {
+                    return Err(SubscriberError::Provider(
+                        "Flashblocks preflight subscriptions did not become active".to_owned(),
+                    ));
+                };
+                if !streams.contains_source(&SubscriberStreamSource::BaseFlashblocks)
+                    || pending_sources
+                        .iter()
+                        .any(|source| !streams.contains_source(source))
+                {
+                    return Err(SubscriberError::Provider(
+                        "Base Flashblocks preflight did not retain both subscription lanes"
+                            .to_owned(),
+                    ));
+                }
+                (
+                    FlashblocksDelivery::NativeSubscriptions,
+                    pending_sources.len(),
+                )
+            }
+            FlashblocksAdapter::PendingStatePolling => {
+                if let Some(state_provider) = self.flashblocks_state_provider.as_ref() {
+                    self.flashblocks_rpc_metrics.provider_pair_chain_requests = self
+                        .flashblocks_rpc_metrics
+                        .provider_pair_chain_requests
+                        .saturating_add(1);
+                    let actual = state_provider
+                        .get_chain_id()
+                        .await
+                        .map_err(provider_error)?;
+                    if actual != expected_chain_id {
+                        return Err(SubscriberError::ChainMismatch {
+                            expected: expected_chain_id,
+                            actual,
+                        });
+                    }
+                }
+                let AlloySubscriberState::Active(streams) = &self.state else {
+                    return Err(SubscriberError::Provider(
+                        "Flashblocks preflight streams did not become active".to_owned(),
+                    ));
+                };
+                if !streams.contains_source(&SubscriberStreamSource::OpPendingFlashblocks) {
+                    return Err(SubscriberError::Provider(
+                        "Optimism Flashblocks preflight did not retain its pending-state sampler"
+                            .to_owned(),
+                    ));
+                }
+                self.probe_pending_state(&pending_log_filters).await?;
+                (FlashblocksDelivery::PendingStatePolling, 0)
+            }
+        };
+        Ok(FlashblocksPreflight {
+            chain_id,
+            provider,
+            delivery,
+            pending_log_subscriptions,
+            pending_log_filters: pending_log_filters.len(),
+            advertised_capabilities,
+        })
+    }
+
+    async fn probe_pending_state(&mut self, filters: &[Filter]) -> Result<(), SubscriberError> {
+        self.flashblocks_rpc_metrics.pending_block_requests = self
+            .flashblocks_rpc_metrics
+            .pending_block_requests
+            .saturating_add(1);
+        let pending = self
+            .fetch_op_pending_block()
+            .await
+            .map_err(PendingFlashblockPollError::into_subscriber)?
+            .ok_or_else(|| {
+                SubscriberError::Provider(
+                    "provider returned no pending block during Flashblocks preflight".into(),
+                )
+            })?;
+        self.certify_op_pending_parent(&pending)
+            .await
+            .map_err(PendingFlashblockPollError::into_subscriber)?;
+        for filter in filters {
+            self.flashblocks_rpc_metrics.pending_log_requests = self
+                .flashblocks_rpc_metrics
+                .pending_log_requests
+                .saturating_add(1);
+            self.flashblocks_state_provider
+                .as_ref()
+                .unwrap_or(&self.provider)
+                .get_logs(
+                    &filter
+                        .clone()
+                        .from_block(BlockNumberOrTag::Latest)
+                        .to_block(BlockNumberOrTag::Pending),
+                )
+                .await
+                .map_err(provider_error)?;
+        }
+        self.flashblocks_rpc_metrics.pending_receipt_requests = self
+            .flashblocks_rpc_metrics
+            .pending_receipt_requests
+            .saturating_add(1);
+        let _: serde_json::Value = self
+            .flashblocks_state_provider
+            .as_ref()
+            .unwrap_or(&self.provider)
+            .raw_request(Cow::Borrowed("eth_getTransactionReceipt"), (B256::ZERO,))
+            .await
+            .map_err(provider_error)?;
+        Ok(())
+    }
+
+    async fn certify_op_pending_parent(
+        &mut self,
+        pending: &N::BlockResponse,
+    ) -> Result<N::HeaderResponse, PendingFlashblockPollError> {
+        let pending_header = pending.header();
+        let pending_number = pending_header.number();
+        let parent_hash = pending_header.parent_hash();
+        if pending_number == 0 || parent_hash.is_zero() {
+            return Err(PendingFlashblockPollError::Integrity(
+                SubscriberError::Provider(
+                    "OP pending block omitted a certifiable canonical parent".into(),
+                ),
+            ));
+        }
+        self.flashblocks_rpc_metrics.canonical_head_requests = self
+            .flashblocks_rpc_metrics
+            .canonical_head_requests
+            .saturating_add(1);
+        let parent = self
+            .flashblocks_state_provider
+            .as_ref()
+            .unwrap_or(&self.provider)
+            .get_block_by_hash(parent_hash)
+            .await
+            .map_err(pending_flashblock_request_error)?
+            .ok_or_else(|| {
+                PendingFlashblockPollError::Request(SubscriberError::Provider(
+                    "Flashblocks provider returned no exact OP pending parent block".into(),
+                ))
+            })?;
+        let parent_header = parent.header();
+        if parent_header.hash() != parent_hash
+            || parent_header.number().checked_add(1) != Some(pending_number)
+        {
+            return Err(PendingFlashblockPollError::Integrity(
+                SubscriberError::Provider(
+                    "OP pending block does not extend its exact certified parent".into(),
+                ),
+            ));
+        }
+        Ok(parent_header.clone())
+    }
+
+    async fn fetch_op_pending_block(
+        &mut self,
+    ) -> Result<Option<N::BlockResponse>, PendingFlashblockPollError> {
+        let state_provider = self
+            .flashblocks_state_provider
+            .as_ref()
+            .unwrap_or(&self.provider);
+        let value: Option<serde_json::Value> = state_provider
+            .raw_request(
+                Cow::Borrowed("eth_getBlockByNumber"),
+                (BlockNumberOrTag::Pending, true),
+            )
+            .await
+            .map_err(pending_flashblock_request_error)?;
+        value
+            .map(normalize_op_pending_block::<N>)
+            .transpose()
+            .map_err(PendingFlashblockPollError::Integrity)
+    }
+
     /// Resolve the provider's chain identity once. The assignment happens only
     /// after a complete RPC response, so cancelling the future leaves the
     /// subscriber cleanly retryable.
@@ -13593,7 +14536,7 @@ where
             return Ok(());
         };
         match flashblocks_adapter(chain_id) {
-            Some(FlashblocksAdapter::BaseNative)
+            Some(FlashblocksAdapter::NativeSubscriptions)
                 if resolve_subscriber_transport(self.mode)? != SubscriberTransport::PubSub
                     && self.config.preconfirmations == PreconfirmationMode::Required =>
             {
@@ -13601,6 +14544,7 @@ where
                     "Base Flashblocks require pubsub for newFlashblocks and pendingLogs",
                 ));
             }
+            Some(FlashblocksAdapter::NativeSubscriptions) => {}
             Some(_) => {}
             None if self.config.preconfirmations == PreconfirmationMode::Required => {
                 return Err(SubscriberError::Unsupported(
@@ -14001,7 +14945,27 @@ where
         };
 
         for source in missing {
-            let stream = self.connect_source_stream(source.clone()).await?;
+            let stream = match self.connect_source_stream(source.clone()).await {
+                Ok(stream) => stream,
+                Err(error)
+                    if source.is_flashblocks()
+                        && self.config.preconfirmations == PreconfirmationMode::Preferred =>
+                {
+                    tracing::warn!(
+                        stream = source.label(),
+                        error = %error,
+                        "Flashblocks source unavailable; canonical delivery remains active"
+                    );
+                    if self.config.reconnect.enabled {
+                        self.schedule_flashblock_reconnect(
+                            source,
+                            self.config.reconnect.retry_delay,
+                        );
+                    }
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             // Publish each successful connection before any later await. If a
             // second connection or anchored catch-up fails/cancels, this stream
             // remains live and the next reconcile skips reconnecting it.
@@ -14068,6 +15032,38 @@ where
         // A partially completed reconcile is still a topology change. Advance
         // the revision now rather than only at the final clean boundary.
         self.bump_stream_revision();
+    }
+
+    fn schedule_flashblock_reconnect(
+        &mut self,
+        source: SubscriberStreamSource,
+        first_delay: Duration,
+    ) {
+        if self
+            .pending_flashblock_reconnect_sources
+            .iter()
+            .any(|pending| pending.same_key(&source))
+        {
+            return;
+        }
+        self.pending_flashblock_reconnect_sources
+            .push(source.clone());
+        self.pending_flashblock_reconnects
+            .push(flashblock_reconnect_future(
+                self.provider.root().clone(),
+                source,
+                self.config.max_batch_size,
+                self.config.reconnect.clone(),
+                first_delay,
+                self.config.flashblock_poll_interval,
+            ));
+    }
+
+    fn reschedule_preferred_flashblock(&mut self, source: SubscriberStreamSource) {
+        if !self.config.reconnect.enabled {
+            return;
+        }
+        self.schedule_flashblock_reconnect(source, self.config.reconnect.max_delay);
     }
 
     fn source_requires_backfill(&self, source: &SubscriberStreamSource) -> bool {
@@ -14250,19 +15246,25 @@ where
         }
 
         if needs_header_block_stream(&self.interests) {
-            sources.push(SubscriberStreamSource::PubSubBlockHeaders);
+            if self.config.preconfirmations != PreconfirmationMode::Disabled
+                && self.chain_id.and_then(flashblocks_adapter).is_some()
+            {
+                sources.push(SubscriberStreamSource::CanonicalHeadPolling);
+            } else {
+                sources.push(SubscriberStreamSource::PubSubBlockHeaders);
+            }
         }
 
         if self.config.preconfirmations != PreconfirmationMode::Disabled {
             match self.chain_id.and_then(flashblocks_adapter) {
-                Some(FlashblocksAdapter::BaseNative) => {
+                Some(FlashblocksAdapter::NativeSubscriptions) => {
                     sources.push(SubscriberStreamSource::BaseFlashblocks);
                     for filter in self.log_stream_filters() {
                         let id = self.log_source_id(&filter);
                         sources.push(SubscriberStreamSource::BasePendingLog { id, filter });
                     }
                 }
-                Some(FlashblocksAdapter::OpPending) => {
+                Some(FlashblocksAdapter::PendingStatePolling) => {
                     sources.push(SubscriberStreamSource::OpPendingFlashblocks);
                 }
                 None => {}
@@ -14284,7 +15286,8 @@ where
         }
 
         if self.config.preconfirmations != PreconfirmationMode::Disabled
-            && self.chain_id.and_then(flashblocks_adapter) == Some(FlashblocksAdapter::OpPending)
+            && self.chain_id.and_then(flashblocks_adapter)
+                == Some(FlashblocksAdapter::PendingStatePolling)
         {
             sources.push(SubscriberStreamSource::OpPendingFlashblocks);
         }
@@ -14317,6 +15320,9 @@ where
             SubscriberStreamSource::BaseFlashblocks => self.connect_base_flashblock_stream().await,
             SubscriberStreamSource::OpPendingFlashblocks => {
                 self.connect_op_flashblock_tick_stream()
+            }
+            SubscriberStreamSource::CanonicalHeadPolling => {
+                self.connect_canonical_head_tick_stream()
             }
             SubscriberStreamSource::PubSubPendingHashes => {
                 self.connect_pubsub_pending_hash_stream().await
@@ -14423,10 +15429,28 @@ where
         }
     }
 
+    fn connect_canonical_head_tick_stream(
+        &self,
+    ) -> Result<BoxStream<'static, SubscriberEvent<N>>, SubscriberError> {
+        let mut interval = tokio::time::interval(self.config.canonical_head_poll_interval);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let stream = stream::unfold(interval, |mut interval| async move {
+            interval.tick().await;
+            Some((SubscriberEvent::CanonicalHeadTick, interval))
+        });
+        Ok(stream_with_termination(
+            stream,
+            SubscriberStreamSource::CanonicalHeadPolling,
+        ))
+    }
+
     fn connect_op_flashblock_tick_stream(
         &self,
     ) -> Result<BoxStream<'static, SubscriberEvent<N>>, SubscriberError> {
-        let interval = tokio::time::interval(self.config.flashblock_poll_interval);
+        let first_tick = tokio::time::Instant::now() + self.config.flashblock_poll_interval;
+        let mut interval =
+            tokio::time::interval_at(first_tick, self.config.flashblock_poll_interval);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let stream = stream::unfold(interval, |mut interval| async move {
             interval.tick().await;
             Some((SubscriberEvent::OpFlashblockTick, interval))
@@ -14549,10 +15573,65 @@ where
 
     async fn next_event(&mut self) -> Result<Option<SubscriberEvent<N>>, SubscriberError> {
         loop {
-            let event = match &mut self.state {
-                AlloySubscriberState::Active(streams) => streams.next().await,
+            let ready = match &mut self.state {
+                AlloySubscriberState::Active(streams)
+                    if !self.pending_flashblock_reconnects.is_empty() =>
+                {
+                    let stream_event = Box::pin(streams.next());
+                    let reconnect = Box::pin(self.pending_flashblock_reconnects.next());
+                    match select(reconnect, stream_event).await {
+                        Either::Left((reconnect, pending_event)) => {
+                            drop(pending_event);
+                            let Some((source, result)) = reconnect else {
+                                continue;
+                            };
+                            SubscriberReady::FlashblockReconnect(source, result)
+                        }
+                        Either::Right((event, pending_reconnect)) => {
+                            drop(pending_reconnect);
+                            SubscriberReady::Event(event)
+                        }
+                    }
+                }
+                AlloySubscriberState::Active(streams) => {
+                    SubscriberReady::Event(streams.next().await)
+                }
+                AlloySubscriberState::Uninitialized | AlloySubscriberState::Empty
+                    if !self.pending_flashblock_reconnects.is_empty() =>
+                {
+                    let Some((source, result)) = self.pending_flashblock_reconnects.next().await
+                    else {
+                        continue;
+                    };
+                    SubscriberReady::FlashblockReconnect(source, result)
+                }
                 AlloySubscriberState::Uninitialized | AlloySubscriberState::Empty => {
                     return Ok(None);
+                }
+            };
+
+            let event = match ready {
+                SubscriberReady::Event(event) => event,
+                SubscriberReady::FlashblockReconnect(source, result) => {
+                    self.pending_flashblock_reconnect_sources
+                        .retain(|pending| !pending.same_key(&source));
+                    match result {
+                        Ok(stream) => {
+                            self.install_source_stream(source, stream);
+                        }
+                        Err(error)
+                            if self.config.preconfirmations == PreconfirmationMode::Preferred =>
+                        {
+                            tracing::warn!(
+                                stream = source.label(),
+                                error = %error,
+                                "Flashblocks reconnect window exhausted; canonical delivery remains active"
+                            );
+                            self.reschedule_preferred_flashblock(source);
+                        }
+                        Err(error) => return Err(error),
+                    }
+                    continue;
                 }
             };
 
@@ -14568,11 +15647,12 @@ where
                     // Persist the missing-source intent before the first await.
                     // If a control command cancels this poll during reconnect,
                     // the next poll will reconcile the desired/live diff.
+                    if source.is_flashblocks() {
+                        self.invalidate_flashblock_generation();
+                        return Ok(Some(SubscriberEvent::FlashblockInvalidated));
+                    }
                     self.sources_dirty = true;
                     self.bump_stream_revision();
-                    if source.is_flashblocks() {
-                        self.reset_flashblock_tracking();
-                    }
                     if let Some(backfill_event) = self.reconnect_source_stream(source).await? {
                         self.sources_dirty = false;
                         if let Some(backfill_event) =
@@ -14595,21 +15675,70 @@ where
         }
     }
 
+    fn invalidate_flashblock_generation(&mut self) {
+        self.pending_records
+            .retain(|record| record.scope != SubscriberInputScope::Preconfirmed);
+        self.pending_preconfirmation_invalidation = true;
+        self.reset_flashblock_tracking();
+        if let Some(provider) = self.provider_ref.as_mut() {
+            provider.generation = provider.generation.saturating_add(1);
+        }
+        if let AlloySubscriberState::Active(streams) = &mut self.state {
+            streams
+                .entries
+                .retain(|entry| !entry.source.is_flashblocks());
+            streams.normalize_next_index();
+        }
+        let reconnect_sources = self
+            .stream_sources()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(SubscriberStreamSource::is_flashblocks)
+            .collect::<Vec<_>>();
+        self.pending_flashblock_reconnects.clear();
+        self.pending_flashblock_reconnect_sources.clear();
+        if self.config.preconfirmations == PreconfirmationMode::Required
+            || self.config.reconnect.enabled
+        {
+            for source in reconnect_sources {
+                self.schedule_flashblock_reconnect(source, self.config.reconnect.initial_delay);
+            }
+        }
+        self.sources_dirty = false;
+        self.bump_stream_revision();
+    }
+
     async fn normalize_flashblock_event(
         &mut self,
         event: SubscriberEvent<N>,
     ) -> Result<Option<SubscriberEvent<N>>, SubscriberError> {
         match event {
             SubscriberEvent::BasePendingLog { source_id, log } => {
-                let hash = log.block_hash.ok_or_else(|| {
+                let block_number = log.block_number.ok_or_else(|| {
                     SubscriberError::Provider(
-                        "Base pendingLogs item is missing its partial block hash".into(),
+                        "pendingLogs item is missing its pending block number".into(),
                     )
                 })?;
-                let Some(flashblock) = self.flashblocks_by_hash.get(&hash).cloned() else {
+                let transaction_hash = log.transaction_hash.ok_or_else(|| {
+                    SubscriberError::Provider(
+                        "pendingLogs item is missing its transaction hash".into(),
+                    )
+                })?;
+                let matching = self.latest_preconfirmation.as_ref().filter(|flashblock| {
+                    flashblock.block_number == block_number
+                        && flashblock.contains_transaction(&transaction_hash)
+                });
+                let Some(flashblock) = matching.cloned() else {
+                    if self
+                        .latest_preconfirmation
+                        .as_ref()
+                        .is_some_and(|latest| block_number < latest.block_number)
+                    {
+                        return Ok(None);
+                    }
                     if self.unmatched_pending_logs.len() >= self.config.max_pending_records {
                         return Err(SubscriberError::ResourceExhausted(
-                            "unmatched Base pendingLogs exceeded max_pending_records".into(),
+                            "unmatched pendingLogs exceeded max_pending_records".into(),
                         ));
                     }
                     self.unmatched_pending_logs.push_back((source_id, log));
@@ -14628,19 +15757,51 @@ where
                 let mut logs = Vec::new();
                 let mut retained = VecDeque::new();
                 while let Some((source_id, log)) = self.unmatched_pending_logs.pop_front() {
-                    if log.block_hash == Some(flashblock.block_hash) {
+                    let transaction_hash = log.transaction_hash;
+                    if log.block_number == Some(flashblock.block_number)
+                        && transaction_hash
+                            .as_ref()
+                            .is_some_and(|hash| flashblock.contains_transaction(hash))
+                    {
                         let _ = source_id;
                         logs.push(log);
-                    } else {
+                    } else if log
+                        .block_number
+                        .is_some_and(|number| number >= flashblock.block_number)
+                    {
                         retained.push_back((source_id, log));
+                    } else {
+                        // A late log for an older speculative block can no
+                        // longer be applied to the active cumulative branch.
                     }
                 }
                 self.unmatched_pending_logs = retained;
 
-                if recover_pending_snapshot
-                    && let Some(event) = self.fetch_pending_flashblock().await?
-                {
-                    return Ok(Some(event));
+                let indexed_recovery = recover_pending_snapshot.then(|| {
+                    let payload_id = flashblock
+                        .payload_id
+                        .expect("indexed recovery carries a payload id");
+                    let index = flashblock.index.expect("indexed recovery carries an index");
+                    let last_diff = self
+                        .base_flashblock_transactions
+                        .as_ref()
+                        .filter(|(known_payload, known_index, _, _)| {
+                            *known_payload == payload_id && *known_index == index
+                        })
+                        .map(|(_, _, _, last_diff)| last_diff.clone())
+                        .unwrap_or_default();
+                    (payload_id, index, last_diff)
+                });
+                if recover_pending_snapshot {
+                    if let Some(event) = self
+                        .fetch_pending_flashblock(indexed_recovery)
+                        .await
+                        .map_err(PendingFlashblockPollError::into_subscriber)?
+                    {
+                        return Ok(Some(event));
+                    }
+                    self.invalidate_flashblock_generation();
+                    return Ok(Some(SubscriberEvent::FlashblockInvalidated));
                 }
                 let logs = self.filter_preconfirmed_logs(&flashblock, logs)?;
                 Ok(Some(if logs.is_empty() {
@@ -14649,7 +15810,8 @@ where
                     SubscriberEvent::PreconfirmedLogs { flashblock, logs }
                 }))
             }
-            SubscriberEvent::OpFlashblockTick => self.fetch_pending_flashblock().await,
+            SubscriberEvent::OpFlashblockTick => self.poll_op_pending_flashblock().await,
+            SubscriberEvent::CanonicalHeadTick => self.fetch_certified_canonical_head().await,
             SubscriberEvent::PreconfirmedLogs { flashblock, logs } => {
                 let logs = self.filter_preconfirmed_logs(&flashblock, logs)?;
                 Ok(Some(if logs.is_empty() {
@@ -14661,6 +15823,77 @@ where
             SubscriberEvent::FlashblockObserved => Ok(None),
             event => Ok(Some(event)),
         }
+    }
+
+    async fn fetch_certified_canonical_head(
+        &mut self,
+    ) -> Result<Option<SubscriberEvent<N>>, SubscriberError> {
+        if self.chain_id.and_then(flashblocks_adapter)
+            == Some(FlashblocksAdapter::PendingStatePolling)
+        {
+            if !self.reserve_flashblock_rpc_methods(2) {
+                return Ok(None);
+            }
+            self.flashblocks_rpc_metrics.pending_block_requests = self
+                .flashblocks_rpc_metrics
+                .pending_block_requests
+                .saturating_add(1);
+            let pending = self
+                .fetch_op_pending_block()
+                .await
+                .map_err(PendingFlashblockPollError::into_subscriber)?
+                .ok_or_else(|| {
+                    SubscriberError::Provider(
+                        "provider returned no OP pending block while certifying its parent".into(),
+                    )
+                })?;
+            let header = self
+                .certify_op_pending_parent(&pending)
+                .await
+                .map_err(PendingFlashblockPollError::into_subscriber)?;
+            let certified = BlockRef {
+                number: header.number(),
+                hash: header.hash(),
+                parent_hash: Some(header.parent_hash()),
+                timestamp: Some(header.timestamp()),
+            };
+            if self.last_certified_canonical_head.as_ref() == Some(&certified) {
+                return Ok(None);
+            }
+            self.last_certified_canonical_head = Some(certified);
+            return Ok(Some(SubscriberEvent::BlockHeader(header)));
+        }
+        self.flashblocks_rpc_metrics.canonical_head_requests = self
+            .flashblocks_rpc_metrics
+            .canonical_head_requests
+            .saturating_add(1);
+        let block = self
+            .provider
+            .get_block_by_number(BlockNumberOrTag::Latest)
+            .await
+            .map_err(provider_error)?
+            .ok_or_else(|| {
+                SubscriberError::Provider(
+                    "provider returned no latest block while certifying canonical head".into(),
+                )
+            })?;
+        let header = block.header();
+        if header.hash().is_zero() {
+            return Err(SubscriberError::Provider(
+                "provider returned a placeholder hash for the latest canonical head".into(),
+            ));
+        }
+        let certified = BlockRef {
+            number: header.number(),
+            hash: header.hash(),
+            parent_hash: Some(header.parent_hash()),
+            timestamp: Some(header.timestamp()),
+        };
+        if self.last_certified_canonical_head.as_ref() == Some(&certified) {
+            return Ok(None);
+        }
+        self.last_certified_canonical_head = Some(certified);
+        Ok(Some(SubscriberEvent::BlockHeader(header.clone())))
     }
 
     fn accept_base_flashblock(
@@ -14678,7 +15911,7 @@ where
                 if payload.index == 0 {
                     let base = payload.base.clone().ok_or_else(|| {
                         SubscriberError::Provider(
-                            "Base newFlashblocks index zero omitted its base header".into(),
+                            "indexed newFlashblocks item zero omitted its base header".into(),
                         )
                     })?;
                     self.base_flashblock_header = Some((payload.payload_id, base));
@@ -14697,20 +15930,115 @@ where
                 });
                 let block_number = block_number.ok_or_else(|| {
                     SubscriberError::Provider(
-                        "Base newFlashblocks payload omitted both base and metadata block number"
+                        "indexed newFlashblocks payload omitted both base and metadata block number"
                             .into(),
                     )
                 })?;
+                let diff_transactions = flashblock_transaction_hashes(&payload.diff.transactions)?;
+                let transaction_hashes = match self.base_flashblock_transactions.as_mut() {
+                    Some((known_payload, known_index, transactions, last_diff))
+                        if *known_payload == payload.payload_id =>
+                    {
+                        if payload.index < *known_index {
+                            return self
+                                .latest_preconfirmation
+                                .clone()
+                                .map(|flashblock| (flashblock, false))
+                                .ok_or_else(|| {
+                                    SubscriberError::Provider(
+                                        "regressive indexed Flashblock arrived without an active snapshot"
+                                            .into(),
+                                    )
+                                });
+                        }
+                        if payload.index == *known_index {
+                            if *last_diff != diff_transactions {
+                                return Err(SubscriberError::Provider(
+                                    "conflicting duplicate indexed Flashblock payload".into(),
+                                ));
+                            }
+                        } else {
+                            if diff_transactions
+                                .iter()
+                                .any(|hash| transactions.contains(hash))
+                            {
+                                return Err(SubscriberError::Provider(
+                                    "indexed Flashblock repeated a transaction from an earlier diff"
+                                        .into(),
+                                ));
+                            }
+                            transactions.extend(diff_transactions.iter().copied());
+                            *known_index = payload.index;
+                            *last_diff = diff_transactions;
+                        }
+                        transactions.clone()
+                    }
+                    _ => {
+                        self.base_flashblock_transactions = Some((
+                            payload.payload_id,
+                            payload.index,
+                            diff_transactions.clone(),
+                            diff_transactions.clone(),
+                        ));
+                        diff_transactions
+                    }
+                };
+                let partial_block_hash = non_placeholder_hash(payload.diff.block_hash);
+                let transactions_root = payload
+                    .diff
+                    .transactions_root
+                    .and_then(non_placeholder_hash);
+                let parent_hash = base.and_then(|base| non_placeholder_hash(base.parent_hash));
+                let state_root = non_placeholder_hash(payload.diff.state_root);
+                let timestamp = base.map(|base| base.timestamp);
+                let base_fee_per_gas = base.and_then(|base| base.base_fee_per_gas);
+                let beneficiary = base.and_then(|base| base.beneficiary);
+                let prevrandao = base
+                    .and_then(|base| base.prevrandao)
+                    .and_then(non_placeholder_hash);
+                let gas_limit = base.and_then(|base| base.gas_limit);
+                let content_hash = flashblock_content_hash(FlashblockContentCommitment {
+                    provider: &provider,
+                    payload_id: Some(payload.payload_id),
+                    index: Some(payload.index),
+                    block_number,
+                    partial_block_hash,
+                    parent_hash,
+                    state_root,
+                    transactions_root,
+                    transaction_hashes: &transaction_hashes,
+                    timestamp,
+                    base_fee_per_gas,
+                    beneficiary,
+                    prevrandao,
+                    gas_limit,
+                });
                 let flashblock = FlashblockRef {
                     provider,
                     payload_id: Some(payload.payload_id),
                     index: Some(payload.index),
                     block_number,
-                    block_hash: payload.diff.block_hash,
-                    parent_hash: base.map(|base| base.parent_hash),
-                    state_root: Some(payload.diff.state_root),
-                    timestamp: base.map(|base| base.timestamp),
+                    content_hash,
+                    partial_block_hash,
+                    parent_hash,
+                    state_root,
+                    transactions_root,
+                    transaction_hashes,
+                    timestamp,
+                    base_fee_per_gas,
+                    beneficiary,
+                    prevrandao,
+                    gas_limit,
                 };
+                if let Some(previous) = self.latest_preconfirmation.as_ref()
+                    && previous.same_payload(&flashblock)
+                    && previous.index == flashblock.index
+                    && previous.content_hash != flashblock.content_hash
+                {
+                    return Err(SubscriberError::Provider(
+                        "conflicting duplicate indexed Flashblock content".into(),
+                    ));
+                }
                 let recover = match self.latest_preconfirmation.as_ref() {
                     Some(previous) if previous.same_payload(&flashblock) => {
                         if let (Some(previous), Some(current)) = (previous.index, flashblock.index)
@@ -14729,107 +16057,296 @@ where
                 (flashblock, recover)
             }
             BaseFlashblockWirePayload::Block(payload) => {
-                let index = self
-                    .latest_preconfirmation
-                    .as_ref()
-                    .filter(|previous| {
-                        previous.block_number == payload.number
-                            && previous.parent_hash == Some(payload.parent_hash)
-                    })
-                    .and_then(|previous| previous.index)
-                    .map_or(0, |index| index.saturating_add(1));
-                (
-                    FlashblockRef {
-                        provider,
-                        payload_id: None,
-                        index: Some(index),
-                        block_number: payload.number,
-                        block_hash: payload.hash,
-                        parent_hash: Some(payload.parent_hash),
-                        state_root: Some(payload.state_root),
-                        timestamp: Some(payload.timestamp),
-                    },
-                    false,
-                )
+                let transaction_hashes = flashblock_transaction_hashes(&payload.transactions)?;
+                let parent_hash = non_placeholder_hash(payload.parent_hash);
+                let state_root = non_placeholder_hash(payload.state_root);
+                let transactions_root = payload.transactions_root.and_then(non_placeholder_hash);
+                let partial_block_hash = non_placeholder_hash(payload.hash);
+                let prevrandao = payload.mix_hash.and_then(non_placeholder_hash);
+                let content_hash = flashblock_content_hash(FlashblockContentCommitment {
+                    provider: &provider,
+                    payload_id: None,
+                    index: None,
+                    block_number: payload.number,
+                    partial_block_hash,
+                    parent_hash,
+                    state_root,
+                    transactions_root,
+                    transaction_hashes: &transaction_hashes,
+                    timestamp: Some(payload.timestamp),
+                    base_fee_per_gas: payload.base_fee_per_gas,
+                    beneficiary: payload.miner,
+                    prevrandao,
+                    gas_limit: payload.gas_limit,
+                });
+                let flashblock = FlashblockRef {
+                    provider,
+                    payload_id: None,
+                    index: None,
+                    block_number: payload.number,
+                    content_hash,
+                    partial_block_hash,
+                    parent_hash,
+                    state_root,
+                    transactions_root,
+                    transaction_hashes,
+                    timestamp: Some(payload.timestamp),
+                    base_fee_per_gas: payload.base_fee_per_gas,
+                    beneficiary: payload.miner,
+                    prevrandao,
+                    gas_limit: payload.gas_limit,
+                };
+                if let Some(previous) = self.latest_preconfirmation.as_ref()
+                    && flashblock.same_payload(previous)
+                    && flashblock.content_hash != previous.content_hash
+                    && !flashblock.is_cumulative_successor_of(previous)
+                {
+                    return Err(SubscriberError::Provider(
+                        "cumulative Flashblock transaction membership is non-monotonic".into(),
+                    ));
+                }
+                (flashblock, false)
             }
         };
-
-        self.flashblocks_by_hash
-            .insert(flashblock.block_hash, flashblock.clone());
-        self.flashblock_hash_order.push_back(flashblock.block_hash);
-        while self.flashblock_hash_order.len() > 64 {
-            if let Some(hash) = self.flashblock_hash_order.pop_front() {
-                self.flashblocks_by_hash.remove(&hash);
-            }
-        }
         Ok((flashblock, recover_pending_snapshot))
+    }
+
+    async fn poll_op_pending_flashblock(
+        &mut self,
+    ) -> Result<Option<SubscriberEvent<N>>, SubscriberError> {
+        match self.fetch_pending_flashblock(None).await {
+            Ok(event) => {
+                self.consecutive_flashblock_poll_failures = 0;
+                Ok(event)
+            }
+            Err(PendingFlashblockPollError::Request(error)) => {
+                self.flashblocks_rpc_metrics.failed_requests = self
+                    .flashblocks_rpc_metrics
+                    .failed_requests
+                    .saturating_add(1);
+                self.consecutive_flashblock_poll_failures =
+                    self.consecutive_flashblock_poll_failures.saturating_add(1);
+                if self.consecutive_flashblock_poll_failures
+                    >= self.config.max_consecutive_flashblock_poll_failures
+                {
+                    return Err(error);
+                }
+                tracing::warn!(
+                    consecutive_failures = self.consecutive_flashblock_poll_failures,
+                    failure_limit = self.config.max_consecutive_flashblock_poll_failures,
+                    error = %error,
+                    "Optimism pending-state Flashblocks request failed; retrying on the next tick"
+                );
+                Ok(None)
+            }
+            Err(PendingFlashblockPollError::Integrity(error)) => Err(error),
+        }
     }
 
     async fn fetch_pending_flashblock(
         &mut self,
-    ) -> Result<Option<SubscriberEvent<N>>, SubscriberError> {
-        let latest = self
-            .provider
-            .get_block_number()
-            .await
-            .map_err(provider_error)?;
-        let Some(block) = self
-            .provider
-            .get_block_by_number(BlockNumberOrTag::Pending)
-            .await
-            .map_err(provider_error)?
-        else {
+        indexed_recovery: Option<(FixedBytes<8>, u64, Vec<B256>)>,
+    ) -> Result<Option<SubscriberEvent<N>>, PendingFlashblockPollError> {
+        let samples_pending_range = self.chain_id.and_then(flashblocks_adapter)
+            == Some(FlashblocksAdapter::PendingStatePolling);
+        if samples_pending_range {
+            let fixed_methods = 2_usize.saturating_add(self.log_stream_filters().len());
+            if !self.reserve_flashblock_rpc_methods(fixed_methods) {
+                return Ok(None);
+            }
+        }
+        let state_provider = if samples_pending_range {
+            self.flashblocks_state_provider
+                .as_ref()
+                .unwrap_or(&self.provider)
+        } else {
+            &self.provider
+        };
+        let latest = if samples_pending_range {
+            None
+        } else {
+            self.flashblocks_rpc_metrics.canonical_head_requests = self
+                .flashblocks_rpc_metrics
+                .canonical_head_requests
+                .saturating_add(1);
+            Some(
+                state_provider
+                    .get_block_number()
+                    .await
+                    .map_err(pending_flashblock_request_error)?,
+            )
+        };
+        self.flashblocks_rpc_metrics.pending_block_requests = self
+            .flashblocks_rpc_metrics
+            .pending_block_requests
+            .saturating_add(1);
+        let pending_block = if samples_pending_range {
+            self.fetch_op_pending_block().await?
+        } else {
+            self.provider
+                .get_block_by_number(BlockNumberOrTag::Pending)
+                .await
+                .map_err(pending_flashblock_request_error)?
+        };
+        let Some(block) = pending_block else {
             if self.config.preconfirmations == PreconfirmationMode::Required {
-                return Err(SubscriberError::Provider(
-                    "Flashblocks provider returned no pending block".into(),
+                return Err(PendingFlashblockPollError::Request(
+                    SubscriberError::Provider(
+                        "Flashblocks provider returned no pending block".into(),
+                    ),
                 ));
             }
             return Ok(None);
         };
+        let latest = if samples_pending_range {
+            self.certify_op_pending_parent(&block).await?.number()
+        } else {
+            latest.expect("non-OP pending recovery fetched a canonical height")
+        };
         let header = block.header();
         if header.number() <= latest {
-            if self.config.preconfirmations == PreconfirmationMode::Required {
-                return Err(SubscriberError::Provider(
-                    "Flashblocks provider pending state did not advance beyond the canonical head"
-                        .into(),
-                ));
-            }
             return Ok(None);
         }
 
         let provider = self.provider_ref.clone().ok_or({
-            SubscriberError::InvalidConfig(
+            PendingFlashblockPollError::Integrity(SubscriberError::InvalidConfig(
                 "Flashblocks require a stable provider ref from a pinned provider lease",
-            )
+            ))
         })?;
         let parent_hash = Some(header.parent_hash());
-        let index = self.latest_preconfirmation.as_ref().and_then(|previous| {
-            (previous.block_number == header.number() && previous.parent_hash == parent_hash)
-                .then(|| previous.index.unwrap_or(0).saturating_add(1))
+        let transaction_hashes = if let Some(hashes) = block.transactions().as_hashes() {
+            hashes.to_vec()
+        } else if let Some(transactions) = block.transactions().as_transactions() {
+            transactions
+                .iter()
+                .map(|transaction| transaction.tx_hash())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let state_root = non_placeholder_hash(header.state_root());
+        let transactions_root = non_placeholder_hash(header.transactions_root());
+        let partial_block_hash = non_placeholder_hash(header.hash());
+        let prevrandao = header.mix_hash().and_then(non_placeholder_hash);
+        let content_hash = flashblock_content_hash(FlashblockContentCommitment {
+            provider: &provider,
+            payload_id: None,
+            index: None,
+            block_number: header.number(),
+            partial_block_hash,
+            parent_hash,
+            state_root,
+            transactions_root,
+            transaction_hashes: &transaction_hashes,
+            timestamp: Some(header.timestamp()),
+            base_fee_per_gas: header.base_fee_per_gas(),
+            beneficiary: Some(header.beneficiary()),
+            prevrandao,
+            gas_limit: Some(header.gas_limit()),
         });
         let flashblock = FlashblockRef {
             provider,
             payload_id: None,
-            index: Some(index.unwrap_or(0)),
+            index: None,
             block_number: header.number(),
-            block_hash: header.hash(),
+            content_hash,
+            partial_block_hash,
             parent_hash,
-            state_root: Some(header.state_root()),
+            state_root,
+            transactions_root,
+            transaction_hashes,
             timestamp: Some(header.timestamp()),
+            base_fee_per_gas: header.base_fee_per_gas(),
+            beneficiary: Some(header.beneficiary()),
+            prevrandao,
+            gas_limit: Some(header.gas_limit()),
         };
-        if self
+        if samples_pending_range
+            && self
+                .latest_preconfirmation
+                .as_ref()
+                .is_some_and(|previous| !previous.same_payload(&flashblock))
+        {
+            // Revoke as soon as the sampled payload changes, before any
+            // follow-up receipt await can fail or be cancelled.
+            self.invalidate_preconfirmation_snapshot();
+        }
+        if let Some((payload_id, index, last_diff)) = indexed_recovery {
+            self.base_flashblock_transactions = Some((
+                payload_id,
+                index,
+                flashblock.transaction_hashes.clone(),
+                last_diff,
+            ));
+        }
+        let repeats_pending_snapshot = self
             .latest_preconfirmation
             .as_ref()
-            .is_some_and(|previous| {
-                previous.block_hash == flashblock.block_hash
-                    && previous.block_number == flashblock.block_number
-            })
-        {
+            .is_some_and(|previous| previous == &flashblock);
+        if repeats_pending_snapshot && !samples_pending_range {
             return Ok(None);
         }
 
-        let logs = self.fetch_pending_logs().await?;
-        let logs = self.filter_preconfirmed_logs(&flashblock, logs)?;
+        if let Some(previous) = self.latest_preconfirmation.as_ref()
+            && flashblock.same_payload(previous)
+            && !flashblock.is_cumulative_successor_of(previous)
+        {
+            if samples_pending_range {
+                // OP pending-state reads are not atomic and paid endpoints can
+                // briefly expose a shorter backend view. Never publish the
+                // regression. Revoke the active overlay and require a fresh,
+                // internally coherent sample on a later tick instead.
+                self.invalidate_preconfirmation_snapshot();
+                return Ok(Some(SubscriberEvent::FlashblockInvalidated));
+            }
+            return Err(PendingFlashblockPollError::Integrity(
+                SubscriberError::Provider(
+                    "sampled cumulative Flashblock transaction membership is non-monotonic".into(),
+                ),
+            ));
+        }
+
+        let mut logs = self.fetch_pending_logs(flashblock.block_number).await?;
+        if samples_pending_range {
+            let (mut receipt_logs, completed_receipts, unavailable_receipts) =
+                self.fetch_pending_transaction_receipts(&flashblock).await?;
+            logs.append(&mut receipt_logs);
+            logs.retain(|log| log.block_number == Some(flashblock.block_number));
+            for log in &logs {
+                let transaction_hash = log.transaction_hash.ok_or_else(|| {
+                    PendingFlashblockPollError::Integrity(SubscriberError::Provider(
+                        "pre-confirmed log is missing its transaction hash".into(),
+                    ))
+                })?;
+                if !flashblock.contains_transaction(&transaction_hash) {
+                    self.flashblocks_rpc_metrics.raced_samples =
+                        self.flashblocks_rpc_metrics.raced_samples.saturating_add(1);
+                    return Ok(None);
+                }
+            }
+            let logs = self
+                .filter_preconfirmed_logs(&flashblock, logs)
+                .map_err(PendingFlashblockPollError::Integrity)?;
+            self.preconfirmed_unavailable_receipts
+                .extend(unavailable_receipts);
+            for transaction_hash in &completed_receipts {
+                self.preconfirmed_unavailable_receipts
+                    .remove(transaction_hash);
+            }
+            self.preconfirmed_receipted_transactions
+                .extend(completed_receipts);
+            if repeats_pending_snapshot && logs.is_empty() {
+                return Ok(None);
+            }
+            return Ok(Some(if logs.is_empty() {
+                SubscriberEvent::FlashblockObserved
+            } else {
+                SubscriberEvent::PreconfirmedLogs { flashblock, logs }
+            }));
+        }
+        let logs = self
+            .filter_preconfirmed_logs(&flashblock, logs)
+            .map_err(PendingFlashblockPollError::Integrity)?;
         Ok(Some(if logs.is_empty() {
             SubscriberEvent::FlashblockObserved
         } else {
@@ -14837,20 +16354,206 @@ where
         }))
     }
 
-    async fn fetch_pending_logs(&mut self) -> Result<Vec<Log>, SubscriberError> {
+    async fn fetch_pending_logs(
+        &mut self,
+        pending_block_number: u64,
+    ) -> Result<Vec<Log>, PendingFlashblockPollError> {
         let mut logs = Vec::new();
+        let samples_pending_range = self.chain_id.and_then(flashblocks_adapter)
+            == Some(FlashblocksAdapter::PendingStatePolling);
+        let state_provider = if samples_pending_range {
+            self.flashblocks_state_provider
+                .as_ref()
+                .unwrap_or(&self.provider)
+        } else {
+            &self.provider
+        };
         for filter in self.log_stream_filters() {
-            let filter = filter
-                .from_block(BlockNumberOrTag::Pending)
-                .to_block(BlockNumberOrTag::Pending);
+            self.flashblocks_rpc_metrics.pending_log_requests = self
+                .flashblocks_rpc_metrics
+                .pending_log_requests
+                .saturating_add(1);
+            let filter = if samples_pending_range {
+                filter
+                    .from_block(pending_block_number)
+                    .to_block(BlockNumberOrTag::Pending)
+            } else {
+                filter
+                    .from_block(BlockNumberOrTag::Pending)
+                    .to_block(BlockNumberOrTag::Pending)
+            };
             logs.extend(
-                self.provider
+                state_provider
                     .get_logs(&filter)
                     .await
-                    .map_err(provider_error)?,
+                    .map_err(pending_flashblock_request_error)?,
             );
         }
+        if samples_pending_range {
+            logs.retain(|log| log.block_number == Some(pending_block_number));
+        }
         Ok(logs)
+    }
+
+    async fn fetch_pending_transaction_receipts(
+        &mut self,
+        flashblock: &FlashblockRef,
+    ) -> Result<(Vec<Log>, Vec<B256>, Vec<B256>), PendingFlashblockPollError> {
+        let receipt_allowance = self.pending_receipt_request_allowance();
+        let receipt_limit = self
+            .config
+            .max_pending_transaction_receipts_per_tick
+            .min(receipt_allowance);
+        if receipt_limit == 0 {
+            return Ok((Vec::new(), Vec::new(), Vec::new()));
+        }
+        let mut transaction_hashes = Vec::with_capacity(receipt_limit);
+        for transaction_hash in &flashblock.transaction_hashes {
+            if !self
+                .preconfirmed_receipted_transactions
+                .contains(transaction_hash)
+                && !self
+                    .preconfirmed_unavailable_receipts
+                    .contains(transaction_hash)
+            {
+                transaction_hashes.push(*transaction_hash);
+                if transaction_hashes.len() == receipt_limit {
+                    break;
+                }
+            }
+        }
+        if transaction_hashes.len() < receipt_limit {
+            for transaction_hash in &flashblock.transaction_hashes {
+                if self
+                    .preconfirmed_unavailable_receipts
+                    .contains(transaction_hash)
+                {
+                    transaction_hashes.push(*transaction_hash);
+                    if transaction_hashes.len() == receipt_limit {
+                        break;
+                    }
+                }
+            }
+        }
+        if transaction_hashes.is_empty() {
+            return Ok((Vec::new(), Vec::new(), Vec::new()));
+        }
+        let reserved = self.reserve_flashblock_rpc_methods(transaction_hashes.len());
+        debug_assert!(reserved, "receipt allowance must remain reserved until use");
+        if !reserved {
+            return Ok((Vec::new(), Vec::new(), Vec::new()));
+        }
+        self.flashblocks_rpc_metrics.pending_receipt_requests = self
+            .flashblocks_rpc_metrics
+            .pending_receipt_requests
+            .saturating_add(transaction_hashes.len() as u64);
+        let state_provider = self
+            .flashblocks_state_provider
+            .as_ref()
+            .unwrap_or(&self.provider);
+        let client = state_provider.client();
+        let mut batch = BatchRequest::new(client);
+        let mut waiters = Vec::with_capacity(transaction_hashes.len());
+        for transaction_hash in transaction_hashes {
+            let waiter = batch
+                .add_call::<_, serde_json::Value>("eth_getTransactionReceipt", &(transaction_hash,))
+                .map_err(pending_flashblock_request_error)?;
+            waiters.push((transaction_hash, waiter));
+        }
+        batch
+            .send()
+            .await
+            .map_err(pending_flashblock_request_error)?;
+        let mut logs = Vec::new();
+        let mut completed = Vec::new();
+        let mut unavailable = Vec::new();
+        for (transaction_hash, waiter) in waiters {
+            let value = waiter.await.map_err(pending_flashblock_request_error)?;
+            if let Some(mut receipt_logs) =
+                normalize_pending_transaction_receipt(transaction_hash, value)
+                    .map_err(PendingFlashblockPollError::Integrity)?
+            {
+                self.flashblocks_rpc_metrics.pending_receipts_completed = self
+                    .flashblocks_rpc_metrics
+                    .pending_receipts_completed
+                    .saturating_add(1);
+                logs.append(&mut receipt_logs);
+                completed.push(transaction_hash);
+            } else {
+                self.flashblocks_rpc_metrics.pending_receipts_unavailable = self
+                    .flashblocks_rpc_metrics
+                    .pending_receipts_unavailable
+                    .saturating_add(1);
+                unavailable.push(transaction_hash);
+            }
+        }
+        Ok((logs, completed, unavailable))
+    }
+
+    fn pending_receipt_request_allowance(&mut self) -> usize {
+        self.prune_flashblock_rpc_request_times();
+        let rolling_capacity = self
+            .config
+            .max_flashblock_rpc_requests_per_second
+            .saturating_sub(self.flashblock_rpc_request_times.len());
+        rolling_capacity.min(self.pending_receipt_requests_per_tick_capacity())
+    }
+
+    fn pending_receipt_requests_per_tick_capacity(&self) -> usize {
+        let interval_nanos = self.config.flashblock_poll_interval.as_nanos().max(1);
+        let ticks_per_second = Duration::from_secs(1).as_nanos().div_ceil(interval_nanos);
+        let ticks_per_second = usize::try_from(ticks_per_second).unwrap_or(usize::MAX);
+        self.pending_receipt_requests_per_second_capacity()
+            .checked_div(ticks_per_second)
+            .unwrap_or(0)
+    }
+
+    fn pending_receipt_requests_per_second_capacity(&self) -> usize {
+        let interval_nanos = self.config.flashblock_poll_interval.as_nanos().max(1);
+        let ticks_per_second = Duration::from_secs(1).as_nanos().div_ceil(interval_nanos);
+        let ticks_per_second = usize::try_from(ticks_per_second).unwrap_or(usize::MAX);
+        let fixed_methods_per_tick = 2_usize.saturating_add(self.log_stream_filters().len());
+        let mut reserved_methods = ticks_per_second.saturating_mul(fixed_methods_per_tick);
+        if needs_header_block_stream(&self.interests) {
+            let canonical_interval_nanos =
+                self.config.canonical_head_poll_interval.as_nanos().max(1);
+            let canonical_ticks = Duration::from_secs(1)
+                .as_nanos()
+                .div_ceil(canonical_interval_nanos);
+            let canonical_ticks = usize::try_from(canonical_ticks).unwrap_or(usize::MAX);
+            reserved_methods = reserved_methods.saturating_add(canonical_ticks.saturating_mul(2));
+        }
+        self.config
+            .max_flashblock_rpc_requests_per_second
+            .saturating_sub(reserved_methods)
+    }
+
+    fn reserve_flashblock_rpc_methods(&mut self, methods: usize) -> bool {
+        self.prune_flashblock_rpc_request_times();
+        if self
+            .flashblock_rpc_request_times
+            .len()
+            .saturating_add(methods)
+            > self.config.max_flashblock_rpc_requests_per_second
+        {
+            return false;
+        }
+        let now = Instant::now();
+        for _ in 0..methods {
+            self.flashblock_rpc_request_times.push_back(now);
+        }
+        true
+    }
+
+    fn prune_flashblock_rpc_request_times(&mut self) {
+        let now = Instant::now();
+        while self
+            .flashblock_rpc_request_times
+            .front()
+            .is_some_and(|requested| now.duration_since(*requested) >= Duration::from_secs(1))
+        {
+            self.flashblock_rpc_request_times.pop_front();
+        }
     }
 
     fn filter_preconfirmed_logs(
@@ -14858,6 +16561,19 @@ where
         flashblock: &FlashblockRef,
         mut logs: Vec<Log>,
     ) -> Result<Vec<Log>, SubscriberError> {
+        let samples_pending_range = self.chain_id.and_then(flashblocks_adapter)
+            == Some(FlashblocksAdapter::PendingStatePolling);
+        if self
+            .latest_preconfirmation
+            .as_ref()
+            .is_some_and(|previous| !previous.same_payload(flashblock))
+        {
+            // A new payload revokes the previous overlay even when none of the
+            // caller's log filters matched in the replacement. Otherwise a
+            // quiet block could leave stale speculative signing authority
+            // active until an unrelated canonical pool event arrived.
+            self.invalidate_preconfirmation_snapshot();
+        }
         if self
             .latest_preconfirmation
             .as_ref()
@@ -14876,11 +16592,8 @@ where
 
         logs.sort_by_key(|log| (log.transaction_index.unwrap_or(u64::MAX), log.log_index));
         let mut filtered = Vec::new();
-        for log in logs {
-            if log.removed
-                || log.block_number != Some(flashblock.block_number)
-                || log.block_hash != Some(flashblock.block_hash)
-            {
+        for mut log in logs {
+            if log.removed || log.block_number != Some(flashblock.block_number) {
                 return Err(SubscriberError::Provider(
                     "pre-confirmed log disagrees with its Flashblock snapshot".into(),
                 ));
@@ -14893,6 +16606,38 @@ where
             let log_index = log.log_index.ok_or_else(|| {
                 SubscriberError::Provider("pre-confirmed log is missing its log index".into())
             })?;
+            let transaction_index =
+                flashblock
+                    .transaction_index(&transaction_hash)
+                    .ok_or_else(|| {
+                        SubscriberError::Provider(
+                        "pre-confirmed log transaction is absent from the cumulative Flashblock"
+                            .into(),
+                    )
+                    })?;
+            if log
+                .transaction_index
+                .is_some_and(|reported| reported != transaction_index)
+            {
+                return Err(SubscriberError::Provider(
+                    "pre-confirmed log transaction index disagrees with cumulative membership"
+                        .into(),
+                ));
+            }
+            let reported_hash = log.block_hash.and_then(non_placeholder_hash);
+            if !samples_pending_range
+                && let (Some(reported), Some(expected)) =
+                    (reported_hash, flashblock.partial_block_hash)
+                && reported != expected
+            {
+                return Err(SubscriberError::Provider(
+                    "pre-confirmed log partial block hash disagrees with its Flashblock snapshot"
+                        .into(),
+                ));
+            }
+            log.block_hash = Some(flashblock.content_hash);
+            log.block_timestamp = flashblock.timestamp.or(log.block_timestamp);
+            log.transaction_index = Some(transaction_index);
             if self
                 .preconfirmed_seen_logs
                 .insert((transaction_hash, log_index))
@@ -14925,7 +16670,9 @@ where
             | SubscriberEvent::BasePendingLog { .. }
             | SubscriberEvent::BaseFlashblock(_)
             | SubscriberEvent::OpFlashblockTick
+            | SubscriberEvent::CanonicalHeadTick
             | SubscriberEvent::PreconfirmedLogs { .. }
+            | SubscriberEvent::FlashblockInvalidated
             | SubscriberEvent::FlashblockObserved
             | SubscriberEvent::StreamTerminated(_) => Ok(()),
         }
@@ -15019,7 +16766,9 @@ where
             | SubscriberEvent::BasePendingLog { .. }
             | SubscriberEvent::BaseFlashblock(_)
             | SubscriberEvent::OpFlashblockTick
+            | SubscriberEvent::CanonicalHeadTick
             | SubscriberEvent::PreconfirmedLogs { .. }
+            | SubscriberEvent::FlashblockInvalidated
             | SubscriberEvent::FlashblockObserved
             | SubscriberEvent::StreamTerminated(_) => {}
         }
@@ -15155,9 +16904,13 @@ where
                     });
                 }
             }
+            SubscriberEvent::FlashblockInvalidated => {
+                self.pending_preconfirmation_invalidation = true;
+            }
             SubscriberEvent::BasePendingLog { .. }
             | SubscriberEvent::BaseFlashblock(_)
             | SubscriberEvent::OpFlashblockTick
+            | SubscriberEvent::CanonicalHeadTick
             | SubscriberEvent::FlashblockObserved => {}
             SubscriberEvent::StreamTerminated(_) => {}
         }
@@ -15327,7 +17080,7 @@ where
         source: &SubscriberStreamSource,
     ) -> Result<Option<SubscriberEvent<N>>, SubscriberError> {
         if source.is_flashblocks() {
-            return self.fetch_pending_flashblock().await;
+            return Ok(None);
         }
         let SubscriberStreamSource::PubSubLog { id, filter } = source else {
             return Ok(None);
@@ -15719,6 +17472,157 @@ where
         .boxed()
 }
 
+fn flashblock_reconnect_future<N>(
+    provider: RootProvider<N>,
+    source: SubscriberStreamSource,
+    channel_size: usize,
+    reconnect: SubscriberReconnectConfig,
+    first_delay: Duration,
+    flashblock_poll_interval: Duration,
+) -> FlashblockReconnectFuture<N>
+where
+    N: Network + 'static,
+{
+    Box::pin(async move {
+        if !reconnect.enabled {
+            let error = SubscriberError::Provider(format!(
+                "Alloy subscriber {} stream terminated and reconnect is disabled",
+                source.label()
+            ));
+            return (source, Err(error));
+        }
+
+        let mut attempts = 0_usize;
+        let mut delay = first_delay;
+        let mut retry_delay = reconnect.retry_delay;
+        loop {
+            attempts = attempts.saturating_add(1);
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
+            match connect_flashblock_source_once(
+                &provider,
+                source.clone(),
+                channel_size,
+                flashblock_poll_interval,
+            )
+            .await
+            {
+                Ok(stream) => return (source, Ok(stream)),
+                Err(error) if reconnect_attempts_exhausted(attempts, &reconnect) => {
+                    return (
+                        source.clone(),
+                        Err(SubscriberError::Provider(format!(
+                            "Alloy subscriber {} stream reconnect failed after {attempts} attempt(s): {error}",
+                            source.label()
+                        ))),
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        stream = source.label(),
+                        attempts,
+                        error = %error,
+                        "Flashblocks reconnect attempt failed"
+                    );
+                    delay = retry_delay;
+                    retry_delay = next_reconnect_delay(retry_delay, reconnect.max_delay);
+                }
+            }
+        }
+    })
+}
+
+async fn connect_flashblock_source_once<N>(
+    provider: &RootProvider<N>,
+    source: SubscriberStreamSource,
+    channel_size: usize,
+    flashblock_poll_interval: Duration,
+) -> Result<BoxStream<'static, SubscriberEvent<N>>, SubscriberError>
+where
+    N: Network + 'static,
+{
+    #[cfg(not(feature = "reactive-ws"))]
+    let _ = provider;
+
+    match source {
+        SubscriberStreamSource::BasePendingLog { id, filter } => {
+            #[cfg(feature = "reactive-ws")]
+            {
+                let source = SubscriberStreamSource::BasePendingLog {
+                    id,
+                    filter: filter.clone(),
+                };
+                let params = base_pending_log_filter(&filter)?;
+                let stream = provider
+                    .subscribe::<_, Log>(("pendingLogs", params))
+                    .channel_size(channel_size.max(1))
+                    .await
+                    .map_err(provider_error)?
+                    .into_stream()
+                    .map(move |log| SubscriberEvent::BasePendingLog { source_id: id, log });
+                Ok(stream_with_termination(stream, source))
+            }
+            #[cfg(not(feature = "reactive-ws"))]
+            {
+                let _ = (id, filter, channel_size);
+                Err(SubscriberError::Unsupported(
+                    "Base Flashblocks require the reactive-ws feature",
+                ))
+            }
+        }
+        SubscriberStreamSource::BaseFlashblocks => {
+            #[cfg(feature = "reactive-ws")]
+            {
+                let stream = provider
+                    .subscribe::<_, BaseFlashblockWirePayload>(("newFlashblocks",))
+                    .channel_size(channel_size.max(1))
+                    .await
+                    .map_err(provider_error)?
+                    .into_stream()
+                    .map(SubscriberEvent::BaseFlashblock);
+                Ok(stream_with_termination(
+                    stream,
+                    SubscriberStreamSource::BaseFlashblocks,
+                ))
+            }
+            #[cfg(not(feature = "reactive-ws"))]
+            {
+                let _ = channel_size;
+                Err(SubscriberError::Unsupported(
+                    "Base Flashblocks require the reactive-ws feature",
+                ))
+            }
+        }
+        SubscriberStreamSource::OpPendingFlashblocks => {
+            let first_tick = tokio::time::Instant::now();
+            let mut interval = tokio::time::interval_at(first_tick, flashblock_poll_interval);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let stream = stream::unfold(interval, |mut interval| async move {
+                interval.tick().await;
+                Some((SubscriberEvent::OpFlashblockTick, interval))
+            });
+            Ok(stream_with_termination(
+                stream,
+                SubscriberStreamSource::OpPendingFlashblocks,
+            ))
+        }
+        source => Err(SubscriberError::InvalidConfig(match source {
+            SubscriberStreamSource::PubSubLog { .. }
+            | SubscriberStreamSource::CanonicalHeadPolling
+            | SubscriberStreamSource::PubSubPendingHashes
+            | SubscriberStreamSource::PubSubBlockHeaders
+            | SubscriberStreamSource::PollingLog { .. }
+            | SubscriberStreamSource::PollingPendingHashes => {
+                "Flashblocks reconnect received a canonical source"
+            }
+            SubscriberStreamSource::BasePendingLog { .. }
+            | SubscriberStreamSource::BaseFlashblocks
+            | SubscriberStreamSource::OpPendingFlashblocks => unreachable!(),
+        })),
+    }
+}
+
 fn aggregate_interests<N: Network>(
     base: &[ReactiveInterest<N>],
     owned: &[OwnedSubscriberInterests<N>],
@@ -15769,6 +17673,215 @@ mod subscriber_helper_tests {
     use alloy_provider::ProviderBuilder;
     use alloy_transport::mock::Asserter;
 
+    fn indexed_flashblock(transaction_hash: B256, state_root: B256) -> BaseFlashblockWirePayload {
+        BaseFlashblockWirePayload::Indexed(BaseFlashblockPayload {
+            payload_id: FixedBytes::repeat_byte(0x11),
+            index: 0,
+            base: Some(BaseFlashblockBase {
+                parent_hash: B256::repeat_byte(100),
+                block_number: 101,
+                timestamp: 1_700_000_101,
+                gas_limit: Some(30_000_000),
+                base_fee_per_gas: Some(7),
+                beneficiary: Some(Address::repeat_byte(0xcb)),
+                prevrandao: Some(B256::repeat_byte(0x77)),
+            }),
+            diff: BaseFlashblockDiff {
+                state_root,
+                block_hash: B256::ZERO,
+                transactions: vec![serde_json::Value::String(format!("{transaction_hash:#x}"))],
+                transactions_root: None,
+            },
+            metadata: None,
+        })
+    }
+
+    #[test]
+    fn duplicate_flashblock_transaction_membership_is_rejected() {
+        let transaction = format!("{:#x}", B256::repeat_byte(0x41));
+        let transactions = vec![
+            serde_json::Value::String(transaction.clone()),
+            serde_json::Value::String(transaction),
+        ];
+        assert!(matches!(
+            flashblock_transaction_hashes(&transactions),
+            Err(SubscriberError::Provider(ref message)) if message.contains("duplicate")
+        ));
+    }
+
+    #[test]
+    fn conflicting_duplicate_indexed_flashblock_is_rejected() {
+        let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig::default(),
+        )
+        .with_provider_ref(ProviderRef::new("base-paid", 7));
+        subscriber.chain_id = Some(8_453);
+
+        subscriber
+            .accept_base_flashblock(indexed_flashblock(
+                B256::repeat_byte(0x41),
+                B256::repeat_byte(0xa1),
+            ))
+            .expect("first indexed preview");
+        assert!(matches!(
+            subscriber.accept_base_flashblock(indexed_flashblock(
+                B256::repeat_byte(0x42),
+                B256::repeat_byte(0xa2),
+            )),
+            Err(SubscriberError::Provider(ref message))
+                if message.contains("conflicting duplicate")
+        ));
+    }
+
+    #[tokio::test]
+    async fn duplicate_index_with_changed_commitment_is_rejected() {
+        let transaction = B256::repeat_byte(0x41);
+        let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig::default(),
+        )
+        .with_provider_ref(ProviderRef::new("base-paid", 7));
+        subscriber.chain_id = Some(8_453);
+
+        subscriber
+            .normalize_flashblock_event(SubscriberEvent::BaseFlashblock(indexed_flashblock(
+                transaction,
+                B256::repeat_byte(0xa1),
+            )))
+            .await
+            .expect("first indexed preview");
+
+        let BaseFlashblockWirePayload::Indexed(mut conflicting) =
+            indexed_flashblock(transaction, B256::repeat_byte(0xa1))
+        else {
+            unreachable!()
+        };
+        conflicting.diff.state_root = B256::repeat_byte(0xbb);
+        assert!(matches!(
+            subscriber
+                .normalize_flashblock_event(SubscriberEvent::BaseFlashblock(
+                    BaseFlashblockWirePayload::Indexed(conflicting),
+                ))
+                .await,
+            Err(SubscriberError::Provider(ref message))
+                if message.contains("conflicting duplicate indexed Flashblock content")
+        ));
+    }
+
+    #[tokio::test]
+    async fn indexed_gap_recovery_seeds_later_cumulative_membership() {
+        let transaction_a = B256::repeat_byte(0x41);
+        let transaction_b = B256::repeat_byte(0x42);
+        let transaction_c = B256::repeat_byte(0x43);
+        let transaction_d = B256::repeat_byte(0x44);
+        let asserter = Asserter::new();
+        asserter.push_success(&100_u64);
+        let pending = rpc_block(101, B256::ZERO).with_transactions(
+            alloy_network::primitives::BlockTransactions::Hashes(vec![
+                transaction_a,
+                transaction_b,
+                transaction_c,
+            ]),
+        );
+        asserter.push_success(&Some(pending));
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig::default(),
+        )
+        .with_provider_ref(ProviderRef::new("base-paid", 7));
+        subscriber.chain_id = Some(8_453);
+
+        subscriber
+            .normalize_flashblock_event(SubscriberEvent::BaseFlashblock(indexed_flashblock(
+                transaction_a,
+                B256::repeat_byte(0xa1),
+            )))
+            .await
+            .expect("index zero preview");
+        let BaseFlashblockWirePayload::Indexed(mut gap) =
+            indexed_flashblock(transaction_c, B256::repeat_byte(0xa3))
+        else {
+            unreachable!()
+        };
+        gap.index = 2;
+        gap.base = None;
+        gap.metadata = Some(BaseFlashblockMetadata { block_number: 101 });
+        subscriber
+            .normalize_flashblock_event(SubscriberEvent::BaseFlashblock(
+                BaseFlashblockWirePayload::Indexed(gap),
+            ))
+            .await
+            .expect("the missing index is recovered from pending state");
+
+        let BaseFlashblockWirePayload::Indexed(mut next) =
+            indexed_flashblock(transaction_d, B256::repeat_byte(0xa4))
+        else {
+            unreachable!()
+        };
+        next.index = 3;
+        next.base = None;
+        next.metadata = Some(BaseFlashblockMetadata { block_number: 101 });
+        let (next, recover) = subscriber
+            .accept_base_flashblock(BaseFlashblockWirePayload::Indexed(next))
+            .expect("the next diff extends the recovered cumulative set");
+        assert!(!recover);
+        assert_eq!(
+            next.transaction_hashes,
+            vec![transaction_a, transaction_b, transaction_c, transaction_d]
+        );
+    }
+
+    #[tokio::test]
+    async fn unrecoverable_indexed_gap_revokes_the_generation() {
+        let asserter = Asserter::new();
+        asserter.push_success(&100_u64);
+        asserter.push_success(&Some(rpc_block(100, B256::repeat_byte(0x64))));
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig {
+                preconfirmations: PreconfirmationMode::Preferred,
+                ..SubscriberConfig::default()
+            },
+        )
+        .with_provider_ref(ProviderRef::new("base-paid", 7));
+        subscriber.chain_id = Some(8_453);
+
+        subscriber
+            .normalize_flashblock_event(SubscriberEvent::BaseFlashblock(indexed_flashblock(
+                B256::repeat_byte(0x41),
+                B256::repeat_byte(0xa1),
+            )))
+            .await
+            .expect("index zero preview");
+        let BaseFlashblockWirePayload::Indexed(mut gap) =
+            indexed_flashblock(B256::repeat_byte(0x43), B256::repeat_byte(0xa3))
+        else {
+            unreachable!()
+        };
+        gap.index = 2;
+        gap.base = None;
+        gap.metadata = Some(BaseFlashblockMetadata { block_number: 101 });
+        let event = subscriber
+            .normalize_flashblock_event(SubscriberEvent::BaseFlashblock(
+                BaseFlashblockWirePayload::Indexed(gap),
+            ))
+            .await
+            .expect("preferred mode fails closed without pending recovery")
+            .expect("generation invalidation is observable");
+        assert!(matches!(event, SubscriberEvent::FlashblockInvalidated));
+        assert!(subscriber.latest_preconfirmation.is_none());
+        assert_eq!(subscriber.provider_ref.as_ref().unwrap().generation, 8);
+    }
+
     #[test]
     fn base_flashblock_wire_decodes_cumulative_block_shape() {
         let payload: BaseFlashblockWirePayload = serde_json::from_str(
@@ -15790,6 +17903,1308 @@ mod subscriber_helper_tests {
         assert_eq!(payload.hash, B256::repeat_byte(0xaa));
         assert_eq!(payload.parent_hash, B256::repeat_byte(0xbb));
         assert_eq!(payload.state_root, B256::repeat_byte(0xcc));
+    }
+
+    #[tokio::test]
+    async fn zero_hash_pending_log_waits_for_the_preview_containing_its_transaction() {
+        let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig::default(),
+        )
+        .with_provider_ref(ProviderRef::new("base-paid", 7));
+        subscriber.base_interests = vec![ReactiveInterest::Logs(LogInterest {
+            provider_filter: Filter::new().address(Address::repeat_byte(0x42)),
+            local_matcher: None,
+            route_key: None,
+        })];
+        subscriber.interests = subscriber.base_interests.clone();
+
+        let first: BaseFlashblockWirePayload = serde_json::from_str(
+            r#"{
+                "hash":"0x0000000000000000000000000000000000000000000000000000000000000000",
+                "number":"0x65",
+                "parentHash":"0x6464646464646464646464646464646464646464646464646464646464646464",
+                "stateRoot":"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "transactionsRoot":"0x1111111111111111111111111111111111111111111111111111111111111111",
+                "timestamp":"0x6553f165",
+                "transactions":["0x4141414141414141414141414141414141414141414141414141414141414141"]
+            }"#,
+        )
+        .expect("decode first cumulative preview");
+        subscriber
+            .normalize_flashblock_event(SubscriberEvent::BaseFlashblock(first))
+            .await
+            .expect("first preview is accepted");
+
+        let mut second_log = rpc_log(false);
+        second_log.block_hash = Some(B256::ZERO);
+        second_log.block_number = Some(102);
+        second_log.block_timestamp = Some(1_700_000_102);
+        second_log.transaction_hash = Some(B256::repeat_byte(0x42));
+        second_log.transaction_index = Some(0);
+        second_log.log_index = Some(0);
+
+        let before_preview = subscriber
+            .normalize_flashblock_event(SubscriberEvent::BasePendingLog {
+                source_id: 0,
+                log: second_log,
+            })
+            .await
+            .expect("a zero-hash log for the next block must be buffered");
+        assert!(before_preview.is_none());
+
+        let second: BaseFlashblockWirePayload = serde_json::from_str(
+            r#"{
+                "hash":"0x0000000000000000000000000000000000000000000000000000000000000000",
+                "number":"0x66",
+                "parentHash":"0x6565656565656565656565656565656565656565656565656565656565656565",
+                "stateRoot":"0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "transactionsRoot":"0x2222222222222222222222222222222222222222222222222222222222222222",
+                "timestamp":"0x6553f166",
+                "transactions":["0x4242424242424242424242424242424242424242424242424242424242424242"]
+            }"#,
+        )
+        .expect("decode second cumulative preview");
+        let event = subscriber
+            .normalize_flashblock_event(SubscriberEvent::BaseFlashblock(second))
+            .await
+            .expect("second preview is accepted")
+            .expect("the matching buffered log is released");
+        let SubscriberEvent::PreconfirmedLogs { flashblock, logs } = event else {
+            panic!("expected a preconfirmed log batch")
+        };
+        assert_eq!(flashblock.block_number, 102);
+        assert_ne!(flashblock.content_hash, B256::ZERO);
+        assert_eq!(flashblock.partial_block_hash, None);
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].transaction_hash, Some(B256::repeat_byte(0x42)));
+        assert_eq!(logs[0].block_hash, Some(flashblock.content_hash));
+    }
+
+    #[test]
+    fn flashblock_endpoints_certify_canonical_heads_instead_of_trusting_newheads() {
+        let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig {
+                preconfirmations: PreconfirmationMode::Required,
+                ..SubscriberConfig::default()
+            },
+        )
+        .with_provider_ref(ProviderRef::new("base-paid", 7));
+        subscriber.chain_id = Some(8_453);
+        subscriber.interests = vec![ReactiveInterest::Blocks(BlockInterest::default())];
+
+        let sources = subscriber.pubsub_stream_sources();
+        assert!(
+            sources
+                .iter()
+                .any(|source| matches!(source, SubscriberStreamSource::CanonicalHeadPolling))
+        );
+        assert!(
+            !sources
+                .iter()
+                .any(|source| matches!(source, SubscriberStreamSource::PubSubBlockHeaders))
+        );
+    }
+
+    #[tokio::test]
+    async fn certified_canonical_heads_are_deduplicated_and_reject_placeholder_hashes() {
+        let asserter = Asserter::new();
+        let certified = rpc_block(101, B256::repeat_byte(0x65));
+        asserter.push_success(&Some(certified.clone()));
+        asserter.push_success(&Some(certified));
+        asserter.push_success(&Some(rpc_block(102, B256::ZERO)));
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig::default(),
+        );
+
+        assert!(matches!(
+            subscriber
+                .fetch_certified_canonical_head()
+                .await
+                .expect("first certified head"),
+            Some(SubscriberEvent::BlockHeader(_))
+        ));
+        assert!(
+            subscriber
+                .fetch_certified_canonical_head()
+                .await
+                .expect("duplicate certified head")
+                .is_none()
+        );
+        assert!(matches!(
+            subscriber.fetch_certified_canonical_head().await,
+            Err(SubscriberError::Provider(ref message))
+                if message.contains("placeholder hash")
+        ));
+    }
+
+    #[tokio::test]
+    async fn optimism_canonical_head_is_the_exact_parent_of_pending() {
+        let asserter = Asserter::new();
+        queue_op_pending(&asserter, rpc_block(101, B256::ZERO));
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig {
+                preconfirmations: PreconfirmationMode::Required,
+                ..SubscriberConfig::default()
+            },
+        );
+        subscriber.chain_id = Some(10);
+        subscriber.interests = vec![ReactiveInterest::Blocks(BlockInterest::default())];
+
+        let event = subscriber
+            .fetch_certified_canonical_head()
+            .await
+            .expect("OP pending parent can be certified")
+            .expect("the first certified parent is emitted");
+        let SubscriberEvent::BlockHeader(header) = event else {
+            panic!("expected a certified canonical block header")
+        };
+        assert_eq!(header.number(), 100);
+        assert_eq!(header.hash, B256::repeat_byte(0x64));
+        assert_eq!(
+            subscriber
+                .flashblocks_rpc_metrics()
+                .pending_block_requests(),
+            1
+        );
+        assert_eq!(
+            subscriber
+                .flashblocks_rpc_metrics()
+                .canonical_head_requests(),
+            1
+        );
+        assert!(asserter.read_q().is_empty());
+    }
+
+    #[test]
+    fn optimism_uses_one_bounded_pending_state_stream() {
+        let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig {
+                preconfirmations: PreconfirmationMode::Required,
+                ..SubscriberConfig::default()
+            },
+        )
+        .with_provider_ref(ProviderRef::new("op-paid", 11));
+        subscriber.chain_id = Some(10);
+        subscriber.base_interests = vec![ReactiveInterest::Logs(LogInterest {
+            provider_filter: Filter::new().address(Address::repeat_byte(0x42)),
+            local_matcher: None,
+            route_key: None,
+        })];
+        subscriber.interests = subscriber.base_interests.clone();
+
+        let sources = subscriber.pubsub_stream_sources();
+        assert_eq!(
+            sources
+                .iter()
+                .filter(|source| matches!(source, SubscriberStreamSource::OpPendingFlashblocks))
+                .count(),
+            1
+        );
+        assert!(sources.iter().all(|source| !matches!(
+            source,
+            SubscriberStreamSource::BaseFlashblocks | SubscriberStreamSource::BasePendingLog { .. }
+        )));
+    }
+
+    #[test]
+    fn optimism_default_receipt_budget_reserves_every_fixed_sampler_method() {
+        let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig {
+                preconfirmations: PreconfirmationMode::Required,
+                ..SubscriberConfig::default()
+            },
+        );
+        subscriber.chain_id = Some(10);
+        subscriber.base_interests = vec![log_interest_matching_rpc_log()];
+        subscriber.interests = subscriber.base_interests.clone();
+
+        // At 250 ms, the sampler reserves 4 * (exact parent + pending block +
+        // one filtered log request) = 12 methods. The remaining 28 exact
+        // receipt methods stay below the configured 40-method ceiling.
+        assert_eq!(
+            subscriber.pending_receipt_requests_per_second_capacity(),
+            28
+        );
+        assert_eq!(subscriber.pending_receipt_requests_per_tick_capacity(), 7);
+
+        subscriber
+            .interests
+            .push(ReactiveInterest::Blocks(BlockInterest::default()));
+        assert_eq!(
+            subscriber.pending_receipt_requests_per_second_capacity(),
+            24
+        );
+        assert_eq!(subscriber.pending_receipt_requests_per_tick_capacity(), 6);
+        subscriber.interests.pop();
+
+        for _ in 0..4 {
+            assert!(subscriber.reserve_flashblock_rpc_methods(3));
+            assert_eq!(subscriber.pending_receipt_request_allowance(), 7);
+            assert!(subscriber.reserve_flashblock_rpc_methods(7));
+        }
+        assert!(!subscriber.reserve_flashblock_rpc_methods(1));
+        subscriber.reset_flashblock_tracking();
+        assert!(
+            !subscriber.reserve_flashblock_rpc_methods(1),
+            "a reconnect must not reset an endpoint's rolling quota window"
+        );
+    }
+
+    #[test]
+    fn flashblocks_config_rejects_a_zero_rpc_budget() {
+        let config = SubscriberConfig {
+            preconfirmations: PreconfirmationMode::Required,
+            max_flashblock_rpc_requests_per_second: 0,
+            ..SubscriberConfig::default()
+        };
+
+        assert!(matches!(
+            validate_subscriber_config(&config),
+            Err(SubscriberError::InvalidConfig(
+                "SubscriberConfig::max_flashblock_rpc_requests_per_second must be greater than zero"
+            ))
+        ));
+    }
+
+    #[tokio::test]
+    async fn optimism_preflight_rejects_a_budget_without_receipt_capacity() {
+        let asserter = Asserter::new();
+        asserter.push_success(&serde_json::json!(["flashblocksv1"]));
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig {
+                preconfirmations: PreconfirmationMode::Required,
+                // Four ticks reserve three fixed methods each. Three remaining
+                // methods cannot fund even one receipt on every tick.
+                max_flashblock_rpc_requests_per_second: 15,
+                ..SubscriberConfig::default()
+            },
+        )
+        .with_provider_ref(ProviderRef::new("op-paid", 12));
+        subscriber.chain_id = Some(10);
+        subscriber.base_interests = vec![log_interest_matching_rpc_log()];
+        subscriber.interests = subscriber.base_interests.clone();
+        let desired = subscriber.pubsub_stream_sources();
+        let mut streams = SubscriberStreams::new();
+        for source in desired {
+            streams.push(source, stream::pending().boxed());
+        }
+        subscriber.state = AlloySubscriberState::Active(streams);
+        subscriber.sources_dirty = false;
+        assert!(matches!(
+            subscriber.establish_flashblocks_preflight(10).await,
+            Err(SubscriberError::InvalidConfig(message))
+                if message.contains("leaves no capacity for OP transaction receipts")
+        ));
+        assert!(asserter.read_q().is_empty());
+    }
+
+    #[cfg(feature = "reactive-ws")]
+    #[tokio::test]
+    async fn flashblocks_preflight_proves_chain_and_both_subscription_lanes() {
+        let asserter = Asserter::new();
+        asserter.push_success(&serde_json::json!({"flashblocks": true}));
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig {
+                preconfirmations: PreconfirmationMode::Required,
+                ..SubscriberConfig::default()
+            },
+        )
+        .with_provider_ref(ProviderRef::new("base-paid", 7));
+        subscriber.chain_id = Some(8_453);
+        subscriber.base_interests = vec![log_interest_matching_rpc_log()];
+        subscriber.interests = subscriber.base_interests.clone();
+        let desired = subscriber.pubsub_stream_sources();
+        let mut streams = SubscriberStreams::new();
+        for source in desired {
+            streams.push(source, stream::pending().boxed());
+        }
+        subscriber.state = AlloySubscriberState::Active(streams);
+        subscriber.sources_dirty = false;
+
+        let preflight = subscriber
+            .establish_flashblocks_preflight(8_453)
+            .await
+            .expect("preflight succeeds");
+
+        assert_eq!(preflight.chain_id(), 8_453);
+        assert_eq!(preflight.provider(), &ProviderRef::new("base-paid", 7));
+        assert_eq!(
+            preflight.delivery(),
+            FlashblocksDelivery::NativeSubscriptions
+        );
+        assert_eq!(preflight.pending_log_subscriptions(), 1);
+        assert_eq!(preflight.pending_log_filters(), 1);
+        assert_eq!(
+            preflight.advertised_capabilities(),
+            Some(&serde_json::json!({"flashblocks": true}))
+        );
+    }
+
+    #[tokio::test]
+    async fn optimism_preflight_probes_pending_state_without_native_subscriptions() {
+        let asserter = Asserter::new();
+        asserter.push_success(&serde_json::json!(["flashblocksv1"]));
+        queue_op_pending(&asserter, rpc_block(101, B256::ZERO));
+        asserter.push_success(&Vec::<Log>::new());
+        asserter.push_success(&serde_json::json!([]));
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig {
+                preconfirmations: PreconfirmationMode::Required,
+                ..SubscriberConfig::default()
+            },
+        )
+        .with_provider_ref(ProviderRef::new("op-paid", 12));
+        subscriber.chain_id = Some(10);
+        subscriber.base_interests = vec![log_interest_matching_rpc_log()];
+        subscriber.interests = subscriber.base_interests.clone();
+        let desired = subscriber.pubsub_stream_sources();
+        let mut streams = SubscriberStreams::new();
+        for source in desired {
+            streams.push(source, stream::pending().boxed());
+        }
+        subscriber.state = AlloySubscriberState::Active(streams);
+        subscriber.sources_dirty = false;
+
+        let preflight = subscriber
+            .establish_flashblocks_preflight(10)
+            .await
+            .expect("Optimism pending-state preflight succeeds");
+
+        assert_eq!(preflight.chain_id(), 10);
+        assert_eq!(preflight.provider(), &ProviderRef::new("op-paid", 12));
+        assert_eq!(
+            preflight.delivery(),
+            FlashblocksDelivery::PendingStatePolling
+        );
+        assert_eq!(preflight.pending_log_subscriptions(), 0);
+        assert_eq!(preflight.pending_log_filters(), 1);
+        assert_eq!(
+            preflight.advertised_capabilities(),
+            Some(&serde_json::json!(["flashblocksv1"]))
+        );
+        assert!(asserter.read_q().is_empty());
+    }
+
+    #[test]
+    fn optimism_full_pending_block_normalizes_op_transaction_types_to_hashes() {
+        let transaction_hash = B256::repeat_byte(0x7e);
+        let mut value = serde_json::to_value(rpc_block(101, B256::ZERO))
+            .expect("serialize pending block fixture");
+        value["transactions"] = serde_json::json!([{
+            "type": "0x7e",
+            "hash": transaction_hash,
+            "sourceHash": B256::repeat_byte(0x11),
+            "from": Address::repeat_byte(0x22),
+            "to": Address::repeat_byte(0x33)
+        }]);
+
+        let block = normalize_op_pending_block::<Ethereum>(value)
+            .expect("OP-specific transaction bodies are reduced to hashes");
+
+        assert_eq!(
+            block.transactions().as_hashes(),
+            Some(&[transaction_hash][..])
+        );
+    }
+
+    #[tokio::test]
+    async fn optimism_sampler_does_not_retry_malformed_pending_content() {
+        let asserter = Asserter::new();
+        let mut pending = serde_json::to_value(rpc_block(101, B256::ZERO))
+            .expect("serialize pending block fixture");
+        pending["transactions"] = serde_json::json!([{"type": "0x7e"}]);
+        asserter.push_success(&Some(pending));
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig {
+                preconfirmations: PreconfirmationMode::Required,
+                ..SubscriberConfig::default()
+            },
+        )
+        .with_provider_ref(ProviderRef::new("op-paid", 12));
+        subscriber.chain_id = Some(10);
+
+        let error = match subscriber
+            .normalize_flashblock_event(SubscriberEvent::OpFlashblockTick)
+            .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("malformed provider content must fail immediately"),
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("transaction is missing its hash")
+        );
+        assert_eq!(subscriber.flashblocks_rpc_metrics().failed_requests(), 0);
+        assert!(asserter.read_q().is_empty());
+    }
+
+    #[tokio::test]
+    async fn optimism_sampler_certifies_the_pending_block_by_exact_parent_hash() {
+        let asserter = Asserter::new();
+        queue_op_pending(&asserter, rpc_block(101, B256::ZERO));
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig {
+                preconfirmations: PreconfirmationMode::Required,
+                ..SubscriberConfig::default()
+            },
+        )
+        .with_provider_ref(ProviderRef::new("op-paid", 12));
+        subscriber.chain_id = Some(10);
+
+        assert!(
+            subscriber
+                .fetch_pending_flashblock(None)
+                .await
+                .expect("the exact parent certifies the pending payload")
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn optimism_sampler_rejects_a_nonconsecutive_pending_parent() {
+        let asserter = Asserter::new();
+        asserter.push_success(&Some(rpc_block(101, B256::ZERO)));
+        asserter.push_success(&Some(rpc_block(99, B256::repeat_byte(0x64))));
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig {
+                preconfirmations: PreconfirmationMode::Required,
+                ..SubscriberConfig::default()
+            },
+        )
+        .with_provider_ref(ProviderRef::new("op-paid", 12));
+        subscriber.chain_id = Some(10);
+
+        assert!(matches!(
+            subscriber.fetch_pending_flashblock(None).await,
+            Err(PendingFlashblockPollError::Integrity(SubscriberError::Provider(
+                ref message
+            ))) if message.contains("does not extend its exact certified parent")
+        ));
+        assert!(asserter.read_q().is_empty());
+    }
+
+    #[tokio::test]
+    async fn optimism_sampler_rechecks_unchanged_content_without_republishing_logs() {
+        let asserter = Asserter::new();
+        let pending = rpc_block(101, B256::ZERO);
+        queue_op_pending(&asserter, pending.clone());
+        asserter.push_success(&Vec::<Log>::new());
+        queue_op_pending(&asserter, pending);
+        asserter.push_success(&Vec::<Log>::new());
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig {
+                preconfirmations: PreconfirmationMode::Required,
+                ..SubscriberConfig::default()
+            },
+        )
+        .with_provider_ref(ProviderRef::new("op-paid", 12));
+        subscriber.chain_id = Some(10);
+        subscriber.base_interests = vec![log_interest_matching_rpc_log()];
+        subscriber.interests = subscriber.base_interests.clone();
+
+        assert!(
+            subscriber
+                .fetch_pending_flashblock(None)
+                .await
+                .expect("first cumulative pending view")
+                .is_some()
+        );
+        assert!(
+            subscriber
+                .fetch_pending_flashblock(None)
+                .await
+                .expect("duplicate cumulative pending view")
+                .is_none()
+        );
+
+        assert_eq!(
+            subscriber.flashblocks_rpc_metrics(),
+            FlashblocksRpcMetrics {
+                capability_requests: 0,
+                provider_pair_chain_requests: 0,
+                canonical_head_requests: 2,
+                pending_block_requests: 2,
+                pending_log_requests: 2,
+                pending_receipt_requests: 0,
+                pending_receipts_completed: 0,
+                pending_receipts_unavailable: 0,
+                failed_requests: 0,
+                raced_samples: 0,
+            }
+        );
+        assert!(asserter.read_q().is_empty());
+    }
+
+    #[tokio::test]
+    async fn optimism_sampler_rechecks_logs_for_an_unchanged_pending_view() {
+        let asserter = Asserter::new();
+        let transaction = B256::repeat_byte(0x42);
+        let pending = rpc_block(101, B256::repeat_byte(0xa1)).with_transactions(
+            alloy_network::primitives::BlockTransactions::Hashes(vec![transaction]),
+        );
+        let mut log = rpc_log(false);
+        log.block_number = Some(101);
+        log.block_hash = Some(B256::repeat_byte(0xa2));
+        log.transaction_hash = Some(transaction);
+        log.transaction_index = Some(0);
+        log.log_index = Some(0);
+        queue_op_pending(&asserter, pending.clone());
+        asserter.push_success(&Vec::<Log>::new());
+        asserter.push_success(&serde_json::Value::Null);
+        queue_op_pending(&asserter, pending);
+        asserter.push_success(&vec![log]);
+        asserter.push_success(&serde_json::Value::Null);
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig {
+                preconfirmations: PreconfirmationMode::Required,
+                ..SubscriberConfig::default()
+            },
+        )
+        .with_provider_ref(ProviderRef::new("op-paid", 12));
+        subscriber.chain_id = Some(10);
+        subscriber.base_interests = vec![log_interest_matching_rpc_log()];
+        subscriber.interests = subscriber.base_interests.clone();
+
+        assert!(matches!(
+            subscriber
+                .normalize_flashblock_event(SubscriberEvent::OpFlashblockTick)
+                .await
+                .expect("first pending view is coherent"),
+            Some(SubscriberEvent::FlashblockObserved)
+        ));
+        assert!(matches!(
+            subscriber
+                .normalize_flashblock_event(SubscriberEvent::OpFlashblockTick)
+                .await
+                .expect("the unchanged view is checked again for lagging logs"),
+            Some(SubscriberEvent::PreconfirmedLogs { ref logs, .. }) if logs.len() == 1
+        ));
+        assert!(asserter.read_q().is_empty());
+    }
+
+    #[tokio::test]
+    async fn optimism_sampler_hydrates_exact_receipts_when_filtered_logs_are_empty() {
+        let asserter = Asserter::new();
+        let transaction = B256::repeat_byte(0x42);
+        let pending = rpc_block(101, B256::repeat_byte(0xa1)).with_transactions(
+            alloy_network::primitives::BlockTransactions::Hashes(vec![transaction]),
+        );
+        let mut log = rpc_log(false);
+        log.block_number = Some(101);
+        log.block_hash = Some(B256::repeat_byte(0xa2));
+        log.transaction_hash = Some(transaction);
+        log.transaction_index = Some(0);
+        log.log_index = Some(0);
+        queue_op_pending(&asserter, pending);
+        asserter.push_success(&Vec::<Log>::new());
+        asserter.push_success(&serde_json::json!({
+            "transactionHash": transaction,
+            "logs": [log]
+        }));
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig {
+                preconfirmations: PreconfirmationMode::Required,
+                ..SubscriberConfig::default()
+            },
+        )
+        .with_provider_ref(ProviderRef::new("op-paid", 12));
+        subscriber.chain_id = Some(10);
+        subscriber.base_interests = vec![log_interest_matching_rpc_log()];
+        subscriber.interests = subscriber.base_interests.clone();
+
+        let event = subscriber
+            .normalize_flashblock_event(SubscriberEvent::OpFlashblockTick)
+            .await
+            .expect("pending receipt fallback succeeds");
+        assert!(matches!(
+            event,
+            Some(SubscriberEvent::PreconfirmedLogs { ref logs, .. }) if logs.len() == 1
+        ));
+        assert_eq!(
+            subscriber
+                .flashblocks_rpc_metrics()
+                .pending_receipt_requests(),
+            1
+        );
+        assert!(asserter.read_q().is_empty());
+    }
+
+    #[tokio::test]
+    async fn optimism_receipt_hydration_is_bounded_and_resumes_on_the_next_tick() {
+        let asserter = Asserter::new();
+        let transaction_a = B256::repeat_byte(0x41);
+        let transaction_b = B256::repeat_byte(0x42);
+        let pending = rpc_block(101, B256::repeat_byte(0xa1)).with_transactions(
+            alloy_network::primitives::BlockTransactions::Hashes(vec![
+                transaction_a,
+                transaction_b,
+            ]),
+        );
+        let mut log = rpc_log(false);
+        log.block_number = Some(101);
+        log.transaction_hash = Some(transaction_b);
+        log.transaction_index = Some(1);
+        queue_op_pending(&asserter, pending.clone());
+        asserter.push_success(&Vec::<Log>::new());
+        asserter.push_success(&serde_json::json!({
+            "transactionHash": transaction_a,
+            "logs": []
+        }));
+        queue_op_pending(&asserter, pending);
+        asserter.push_success(&Vec::<Log>::new());
+        asserter.push_success(&serde_json::json!({
+            "transactionHash": transaction_b,
+            "logs": [log]
+        }));
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig {
+                preconfirmations: PreconfirmationMode::Required,
+                max_pending_transaction_receipts_per_tick: 1,
+                ..SubscriberConfig::default()
+            },
+        )
+        .with_provider_ref(ProviderRef::new("op-paid", 12));
+        subscriber.chain_id = Some(10);
+        subscriber.base_interests = vec![log_interest_matching_rpc_log()];
+        subscriber.interests = subscriber.base_interests.clone();
+
+        assert!(matches!(
+            subscriber
+                .normalize_flashblock_event(SubscriberEvent::OpFlashblockTick)
+                .await
+                .expect("the first bounded receipt is hydrated"),
+            Some(SubscriberEvent::FlashblockObserved)
+        ));
+        assert!(matches!(
+            subscriber
+                .normalize_flashblock_event(SubscriberEvent::OpFlashblockTick)
+                .await
+                .expect("the remaining receipt is hydrated on the next tick"),
+            Some(SubscriberEvent::PreconfirmedLogs { ref logs, .. }) if logs.len() == 1
+        ));
+        assert_eq!(
+            subscriber
+                .flashblocks_rpc_metrics()
+                .pending_receipt_requests(),
+            2
+        );
+        assert_eq!(subscriber.preconfirmed_receipted_transactions.len(), 2);
+        assert!(asserter.read_q().is_empty());
+    }
+
+    #[tokio::test]
+    async fn optimism_receipt_hydration_prioritizes_unattempted_hashes_over_null_retries() {
+        let asserter = Asserter::new();
+        let transaction_a = B256::repeat_byte(0x41);
+        let transaction_b = B256::repeat_byte(0x42);
+        let pending = rpc_block(101, B256::repeat_byte(0xa1)).with_transactions(
+            alloy_network::primitives::BlockTransactions::Hashes(vec![
+                transaction_a,
+                transaction_b,
+            ]),
+        );
+        let mut log = rpc_log(false);
+        log.block_number = Some(101);
+        log.transaction_hash = Some(transaction_b);
+        log.transaction_index = Some(1);
+        queue_op_pending(&asserter, pending.clone());
+        asserter.push_success(&Vec::<Log>::new());
+        asserter.push_success(&serde_json::Value::Null);
+        queue_op_pending(&asserter, pending);
+        asserter.push_success(&Vec::<Log>::new());
+        asserter.push_success(&serde_json::json!({
+            "transactionHash": transaction_b,
+            "logs": [log]
+        }));
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig {
+                preconfirmations: PreconfirmationMode::Required,
+                max_pending_transaction_receipts_per_tick: 1,
+                ..SubscriberConfig::default()
+            },
+        )
+        .with_provider_ref(ProviderRef::new("op-paid", 12));
+        subscriber.chain_id = Some(10);
+        subscriber.base_interests = vec![log_interest_matching_rpc_log()];
+        subscriber.interests = subscriber.base_interests.clone();
+
+        assert!(matches!(
+            subscriber
+                .normalize_flashblock_event(SubscriberEvent::OpFlashblockTick)
+                .await
+                .expect("the first null receipt remains retryable"),
+            Some(SubscriberEvent::FlashblockObserved)
+        ));
+        assert!(matches!(
+            subscriber
+                .normalize_flashblock_event(SubscriberEvent::OpFlashblockTick)
+                .await
+                .expect("the next unattempted receipt is not starved"),
+            Some(SubscriberEvent::PreconfirmedLogs { ref logs, .. }) if logs.len() == 1
+        ));
+        assert!(
+            subscriber
+                .preconfirmed_unavailable_receipts
+                .contains(&transaction_a)
+        );
+        assert!(
+            subscriber
+                .preconfirmed_receipted_transactions
+                .contains(&transaction_b)
+        );
+        assert!(asserter.read_q().is_empty());
+    }
+
+    #[tokio::test]
+    async fn optimism_receipt_batch_commits_dedupe_only_after_every_response_succeeds() {
+        let asserter = Asserter::new();
+        let transaction_a = B256::repeat_byte(0x41);
+        let transaction_b = B256::repeat_byte(0x42);
+        let pending = rpc_block(101, B256::repeat_byte(0xa1)).with_transactions(
+            alloy_network::primitives::BlockTransactions::Hashes(vec![
+                transaction_a,
+                transaction_b,
+            ]),
+        );
+        let mut log = rpc_log(false);
+        log.block_number = Some(101);
+        log.transaction_hash = Some(transaction_b);
+        log.transaction_index = Some(1);
+        queue_op_pending(&asserter, pending.clone());
+        asserter.push_success(&Vec::<Log>::new());
+        asserter.push_success(&serde_json::json!({
+            "transactionHash": transaction_a,
+            "logs": []
+        }));
+        asserter.push_failure_msg("receipt temporarily unavailable");
+        queue_op_pending(&asserter, pending);
+        asserter.push_success(&Vec::<Log>::new());
+        asserter.push_success(&serde_json::json!({
+            "transactionHash": transaction_a,
+            "logs": []
+        }));
+        asserter.push_success(&serde_json::json!({
+            "transactionHash": transaction_b,
+            "logs": [log]
+        }));
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig {
+                preconfirmations: PreconfirmationMode::Required,
+                max_pending_transaction_receipts_per_tick: 2,
+                max_consecutive_flashblock_poll_failures: 2,
+                ..SubscriberConfig::default()
+            },
+        )
+        .with_provider_ref(ProviderRef::new("op-paid", 12));
+        subscriber.chain_id = Some(10);
+        subscriber.base_interests = vec![log_interest_matching_rpc_log()];
+        subscriber.interests = subscriber.base_interests.clone();
+
+        assert!(
+            subscriber
+                .normalize_flashblock_event(SubscriberEvent::OpFlashblockTick)
+                .await
+                .expect("one failed receipt response remains retryable")
+                .is_none()
+        );
+        assert!(subscriber.preconfirmed_receipted_transactions.is_empty());
+        assert!(matches!(
+            subscriber
+                .normalize_flashblock_event(SubscriberEvent::OpFlashblockTick)
+                .await
+                .expect("the complete batch is retried transactionally"),
+            Some(SubscriberEvent::PreconfirmedLogs { ref logs, .. }) if logs.len() == 1
+        ));
+        assert_eq!(subscriber.preconfirmed_receipted_transactions.len(), 2);
+        assert_eq!(subscriber.flashblocks_rpc_metrics().failed_requests(), 1);
+        assert_eq!(
+            subscriber
+                .flashblocks_rpc_metrics()
+                .pending_receipt_requests(),
+            4
+        );
+        assert!(asserter.read_q().is_empty());
+    }
+
+    #[tokio::test]
+    async fn optimism_sampler_rejects_a_receipt_for_a_different_transaction() {
+        let asserter = Asserter::new();
+        let sampled_transaction = B256::repeat_byte(0x41);
+        let advanced_transaction = B256::repeat_byte(0x42);
+        let pending = rpc_block(101, B256::repeat_byte(0xa1)).with_transactions(
+            alloy_network::primitives::BlockTransactions::Hashes(vec![sampled_transaction]),
+        );
+        let mut log = rpc_log(false);
+        log.block_number = Some(101);
+        log.transaction_hash = Some(advanced_transaction);
+        queue_op_pending(&asserter, pending);
+        asserter.push_success(&Vec::<Log>::new());
+        asserter.push_success(&serde_json::json!({
+            "transactionHash": advanced_transaction,
+            "logs": [log]
+        }));
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig {
+                preconfirmations: PreconfirmationMode::Required,
+                ..SubscriberConfig::default()
+            },
+        )
+        .with_provider_ref(ProviderRef::new("op-paid", 12));
+        subscriber.chain_id = Some(10);
+        subscriber.base_interests = vec![log_interest_matching_rpc_log()];
+        subscriber.interests = subscriber.base_interests.clone();
+
+        let error = match subscriber
+            .normalize_flashblock_event(SubscriberEvent::OpFlashblockTick)
+            .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("a receipt for another transaction must fail closed"),
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("hash disagrees with its request")
+        );
+        assert!(asserter.read_q().is_empty());
+    }
+
+    #[tokio::test]
+    async fn optimism_sampler_revokes_then_recovers_from_a_regressive_pending_view() {
+        let asserter = Asserter::new();
+        let transaction_a = B256::repeat_byte(0x41);
+        let transaction_b = B256::repeat_byte(0x42);
+        let first = rpc_block(101, B256::repeat_byte(0xa1)).with_transactions(
+            alloy_network::primitives::BlockTransactions::Hashes(vec![
+                transaction_a,
+                transaction_b,
+            ]),
+        );
+        let regressive = rpc_block(101, B256::repeat_byte(0xa2)).with_transactions(
+            alloy_network::primitives::BlockTransactions::Hashes(vec![transaction_a]),
+        );
+        queue_op_pending(&asserter, first);
+        asserter.push_success(&Vec::<Log>::new());
+        asserter.push_success(&serde_json::Value::Null);
+        asserter.push_success(&serde_json::Value::Null);
+        queue_op_pending(&asserter, regressive.clone());
+        queue_op_pending(&asserter, regressive);
+        asserter.push_success(&Vec::<Log>::new());
+        asserter.push_success(&serde_json::Value::Null);
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig {
+                preconfirmations: PreconfirmationMode::Required,
+                ..SubscriberConfig::default()
+            },
+        )
+        .with_provider_ref(ProviderRef::new("op-paid", 12));
+        subscriber.chain_id = Some(10);
+        subscriber.base_interests = vec![log_interest_matching_rpc_log()];
+        subscriber.interests = subscriber.base_interests.clone();
+
+        assert!(
+            subscriber
+                .normalize_flashblock_event(SubscriberEvent::OpFlashblockTick)
+                .await
+                .expect("first pending view is coherent")
+                .is_some()
+        );
+        assert!(matches!(
+            subscriber
+                .normalize_flashblock_event(SubscriberEvent::OpFlashblockTick)
+                .await
+                .expect("regression revokes instead of terminating the stream"),
+            Some(SubscriberEvent::FlashblockInvalidated)
+        ));
+        assert!(subscriber.latest_preconfirmation.is_none());
+        assert!(subscriber.pending_preconfirmation_invalidation);
+        assert!(
+            subscriber
+                .normalize_flashblock_event(SubscriberEvent::OpFlashblockTick)
+                .await
+                .expect("a later coherent view establishes a fresh snapshot")
+                .is_some()
+        );
+        assert!(subscriber.latest_preconfirmation.is_some());
+        assert_eq!(subscriber.provider_ref.as_ref().unwrap().generation, 12);
+        assert!(asserter.read_q().is_empty());
+    }
+
+    #[tokio::test]
+    async fn optimism_new_quiet_payload_revokes_the_previous_snapshot() {
+        let asserter = Asserter::new();
+        let first = rpc_block(101, B256::repeat_byte(0xa1));
+        let second = rpc_block(102, B256::repeat_byte(0xa2));
+        queue_op_pending(&asserter, first);
+        asserter.push_success(&Vec::<Log>::new());
+        queue_op_pending(&asserter, second);
+        asserter.push_success(&Vec::<Log>::new());
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig {
+                preconfirmations: PreconfirmationMode::Required,
+                ..SubscriberConfig::default()
+            },
+        )
+        .with_provider_ref(ProviderRef::new("op-paid", 12));
+        subscriber.chain_id = Some(10);
+        subscriber.base_interests = vec![log_interest_matching_rpc_log()];
+        subscriber.interests = subscriber.base_interests.clone();
+
+        subscriber
+            .normalize_flashblock_event(SubscriberEvent::OpFlashblockTick)
+            .await
+            .expect("first quiet payload is observed");
+        assert!(!subscriber.pending_preconfirmation_invalidation);
+        subscriber
+            .normalize_flashblock_event(SubscriberEvent::OpFlashblockTick)
+            .await
+            .expect("replacement quiet payload is observed");
+        assert!(subscriber.pending_preconfirmation_invalidation);
+        assert_eq!(
+            subscriber
+                .latest_preconfirmation
+                .as_ref()
+                .map(|flashblock| flashblock.block_number),
+            Some(102)
+        );
+        assert!(asserter.read_q().is_empty());
+    }
+
+    #[tokio::test]
+    async fn optimism_sampler_rejects_malformed_pending_receipts() {
+        let asserter = Asserter::new();
+        let transaction = B256::repeat_byte(0x42);
+        let pending = rpc_block(101, B256::ZERO).with_transactions(
+            alloy_network::primitives::BlockTransactions::Hashes(vec![transaction]),
+        );
+        queue_op_pending(&asserter, pending);
+        asserter.push_success(&Vec::<Log>::new());
+        asserter.push_success(&serde_json::json!({"transactionHash": transaction}));
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig {
+                preconfirmations: PreconfirmationMode::Required,
+                ..SubscriberConfig::default()
+            },
+        )
+        .with_provider_ref(ProviderRef::new("op-paid", 12));
+        subscriber.chain_id = Some(10);
+        subscriber.base_interests = vec![log_interest_matching_rpc_log()];
+        subscriber.interests = subscriber.base_interests.clone();
+
+        let error = match subscriber
+            .normalize_flashblock_event(SubscriberEvent::OpFlashblockTick)
+            .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("malformed receipt content must fail closed"),
+        };
+        assert!(error.to_string().contains("missing its log array"));
+        assert_eq!(subscriber.flashblocks_rpc_metrics().failed_requests(), 0);
+        assert!(asserter.read_q().is_empty());
+    }
+
+    #[tokio::test]
+    async fn optimism_sampler_retries_when_logs_advance_past_the_sampled_block() {
+        let asserter = Asserter::new();
+        let transaction_a = B256::repeat_byte(0x41);
+        let transaction_b = B256::repeat_byte(0x42);
+        let first = rpc_block(101, B256::repeat_byte(0xa1)).with_transactions(
+            alloy_network::primitives::BlockTransactions::Hashes(vec![transaction_a]),
+        );
+        let second = rpc_block(101, B256::repeat_byte(0xa2)).with_transactions(
+            alloy_network::primitives::BlockTransactions::Hashes(vec![
+                transaction_a,
+                transaction_b,
+            ]),
+        );
+        let mut log = rpc_log(false);
+        log.block_number = Some(101);
+        log.block_hash = Some(B256::repeat_byte(0xa2));
+        log.transaction_hash = Some(transaction_b);
+        log.transaction_index = Some(1);
+        log.log_index = Some(0);
+        queue_op_pending(&asserter, first);
+        asserter.push_success(&vec![log.clone()]);
+        asserter.push_success(&serde_json::Value::Null);
+        queue_op_pending(&asserter, second);
+        asserter.push_success(&vec![log.clone()]);
+        asserter.push_success(&serde_json::Value::Null);
+        asserter.push_success(&serde_json::json!({
+            "transactionHash": transaction_b,
+            "logs": [log]
+        }));
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig {
+                preconfirmations: PreconfirmationMode::Required,
+                ..SubscriberConfig::default()
+            },
+        )
+        .with_provider_ref(ProviderRef::new("op-paid", 12));
+        subscriber.chain_id = Some(10);
+        subscriber.base_interests = vec![log_interest_matching_rpc_log()];
+        subscriber.interests = subscriber.base_interests.clone();
+
+        assert!(
+            subscriber
+                .normalize_flashblock_event(SubscriberEvent::OpFlashblockTick)
+                .await
+                .expect("a cross-request race remains retryable")
+                .is_none()
+        );
+        assert!(
+            subscriber
+                .normalize_flashblock_event(SubscriberEvent::OpFlashblockTick)
+                .await
+                .expect("the next coherent cumulative view is delivered")
+                .is_some()
+        );
+        assert_eq!(subscriber.flashblocks_rpc_metrics().raced_samples(), 1);
+        assert_eq!(subscriber.flashblocks_rpc_metrics().failed_requests(), 0);
+        assert!(asserter.read_q().is_empty());
+    }
+
+    #[tokio::test]
+    async fn optimism_sampler_uses_the_paired_pending_state_provider() {
+        let stream_asserter = Asserter::new();
+        let stream_provider = ProviderBuilder::new().connect_mocked_client(stream_asserter.clone());
+        let state_asserter = Asserter::new();
+        queue_op_pending(&state_asserter, rpc_block(101, B256::ZERO));
+        state_asserter.push_success(&Vec::<Log>::new());
+        let state_provider = ProviderBuilder::new().connect_mocked_client(state_asserter.clone());
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            stream_provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig {
+                preconfirmations: PreconfirmationMode::Required,
+                ..SubscriberConfig::default()
+            },
+        )
+        .with_provider_ref(ProviderRef::new("op-paid", 12))
+        .with_flashblocks_state_provider(state_provider);
+        subscriber.chain_id = Some(10);
+        subscriber.base_interests = vec![log_interest_matching_rpc_log()];
+        subscriber.interests = subscriber.base_interests.clone();
+
+        assert!(
+            subscriber
+                .normalize_flashblock_event(SubscriberEvent::OpFlashblockTick)
+                .await
+                .expect("paired pending-state reads succeed")
+                .is_some()
+        );
+        assert!(state_asserter.read_q().is_empty());
+        assert!(stream_asserter.read_q().is_empty());
+    }
+
+    #[tokio::test]
+    async fn optimism_sampler_retries_an_isolated_provider_request_failure() {
+        let asserter = Asserter::new();
+        let pending = rpc_block(101, B256::ZERO);
+        queue_op_pending(&asserter, pending.clone());
+        asserter.push_failure_msg("temporarily unavailable");
+        queue_op_pending(&asserter, pending);
+        asserter.push_success(&Vec::<Log>::new());
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig {
+                preconfirmations: PreconfirmationMode::Required,
+                max_consecutive_flashblock_poll_failures: 2,
+                ..SubscriberConfig::default()
+            },
+        )
+        .with_provider_ref(ProviderRef::new("op-paid", 12));
+        subscriber.chain_id = Some(10);
+        subscriber.base_interests = vec![log_interest_matching_rpc_log()];
+        subscriber.interests = subscriber.base_interests.clone();
+
+        assert!(
+            subscriber
+                .normalize_flashblock_event(SubscriberEvent::OpFlashblockTick)
+                .await
+                .expect("one request failure stays retryable")
+                .is_none()
+        );
+        assert!(
+            subscriber
+                .normalize_flashblock_event(SubscriberEvent::OpFlashblockTick)
+                .await
+                .expect("the next cumulative view retries the missing logs")
+                .is_some()
+        );
+        assert_eq!(subscriber.flashblocks_rpc_metrics().failed_requests(), 1);
+        assert!(asserter.read_q().is_empty());
+    }
+
+    #[tokio::test]
+    async fn optimism_sampler_surfaces_sustained_provider_request_failures() {
+        let asserter = Asserter::new();
+        asserter.push_failure_msg("temporarily unavailable");
+        asserter.push_failure_msg("still unavailable");
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig {
+                preconfirmations: PreconfirmationMode::Required,
+                max_consecutive_flashblock_poll_failures: 2,
+                ..SubscriberConfig::default()
+            },
+        )
+        .with_provider_ref(ProviderRef::new("op-paid", 12));
+        subscriber.chain_id = Some(10);
+
+        assert!(
+            subscriber
+                .normalize_flashblock_event(SubscriberEvent::OpFlashblockTick)
+                .await
+                .expect("the first request failure stays retryable")
+                .is_none()
+        );
+        let error = match subscriber
+            .normalize_flashblock_event(SubscriberEvent::OpFlashblockTick)
+            .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("the configured consecutive-failure limit must fail closed"),
+        };
+        assert!(error.to_string().contains("still unavailable"));
+        assert_eq!(subscriber.flashblocks_rpc_metrics().failed_requests(), 2);
+        assert!(asserter.read_q().is_empty());
+    }
+
+    #[tokio::test]
+    async fn flashblocks_preflight_rejects_a_mismatched_chain_before_subscribing() {
+        let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig {
+                preconfirmations: PreconfirmationMode::Required,
+                ..SubscriberConfig::default()
+            },
+        )
+        .with_provider_ref(ProviderRef::new("wrong-chain", 1));
+        subscriber.chain_id = Some(10);
+        subscriber.interests = vec![log_interest_matching_rpc_log()];
+
+        assert!(matches!(
+            subscriber.establish_flashblocks_preflight(8_453).await,
+            Err(SubscriberError::ChainMismatch {
+                expected: 8_453,
+                actual: 10
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn optimism_preflight_rejects_a_mismatched_paired_provider() {
+        let stream_asserter = Asserter::new();
+        let stream_provider = ProviderBuilder::new().connect_mocked_client(stream_asserter.clone());
+        let state_asserter = Asserter::new();
+        state_asserter.push_success(&serde_json::json!(["flashblocksv1"]));
+        state_asserter.push_success(&8_453_u64);
+        let state_provider = ProviderBuilder::new().connect_mocked_client(state_asserter.clone());
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            stream_provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig {
+                preconfirmations: PreconfirmationMode::Required,
+                ..SubscriberConfig::default()
+            },
+        )
+        .with_provider_ref(ProviderRef::new("op-paid", 12))
+        .with_flashblocks_state_provider(state_provider);
+        subscriber.chain_id = Some(10);
+        subscriber.base_interests = vec![log_interest_matching_rpc_log()];
+        subscriber.interests = subscriber.base_interests.clone();
+        let desired = subscriber.pubsub_stream_sources();
+        let mut streams = SubscriberStreams::new();
+        for source in desired {
+            streams.push(source, stream::pending().boxed());
+        }
+        subscriber.state = AlloySubscriberState::Active(streams);
+        subscriber.sources_dirty = false;
+        assert!(matches!(
+            subscriber.establish_flashblocks_preflight(10).await,
+            Err(SubscriberError::ChainMismatch {
+                expected: 10,
+                actual: 8_453
+            })
+        ));
+        assert!(state_asserter.read_q().is_empty());
+        assert!(stream_asserter.read_q().is_empty());
     }
 
     #[test]
@@ -15904,6 +19319,15 @@ mod subscriber_helper_tests {
             total_difficulty: None,
             size: None,
         })
+    }
+
+    fn queue_op_pending(asserter: &Asserter, pending: alloy_rpc_types_eth::Block) {
+        let parent = rpc_block(
+            pending.header().number().saturating_sub(1),
+            pending.header().parent_hash(),
+        );
+        asserter.push_success(&Some(pending));
+        asserter.push_success(&Some(parent));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -17321,6 +20745,334 @@ mod subscriber_helper_tests {
         );
     }
 
+    #[tokio::test]
+    #[cfg(feature = "reactive-ws")]
+    async fn flashblock_stream_termination_invalidates_before_reconnect_io() {
+        let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig {
+                preconfirmations: PreconfirmationMode::Required,
+                ..SubscriberConfig::default()
+            },
+        )
+        .with_provider_ref(ProviderRef::new("base-paid", 7));
+        subscriber.chain_id = Some(8_453);
+        subscriber.base_interests = vec![log_interest_matching_rpc_log()];
+        subscriber.interests = subscriber.base_interests.clone();
+        subscriber.sources_dirty = false;
+
+        let preview: BaseFlashblockWirePayload = serde_json::from_str(
+            r#"{
+                "hash":"0x0000000000000000000000000000000000000000000000000000000000000000",
+                "number":"0x65",
+                "parentHash":"0x6464646464646464646464646464646464646464646464646464646464646464",
+                "stateRoot":"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "transactionsRoot":"0x1111111111111111111111111111111111111111111111111111111111111111",
+                "timestamp":"0x6553f165",
+                "transactions":["0x4141414141414141414141414141414141414141414141414141414141414141"]
+            }"#,
+        )
+        .unwrap();
+        let (preview, _) = subscriber.accept_base_flashblock(preview).unwrap();
+        subscriber.latest_preconfirmation = Some(preview);
+
+        let mut streams = SubscriberStreams::new();
+        streams.push(
+            SubscriberStreamSource::BaseFlashblocks,
+            stream::once(async {
+                SubscriberEvent::<Ethereum>::StreamTerminated(
+                    SubscriberStreamSource::BaseFlashblocks,
+                )
+            })
+            .boxed(),
+        );
+        subscriber.state = AlloySubscriberState::Active(streams);
+
+        let batch = subscriber
+            .next_scoped_batch()
+            .await
+            .expect("termination handling succeeds")
+            .expect("invalidation is delivered");
+        assert!(batch.preconfirmation_invalidated());
+        assert!(subscriber.latest_preconfirmation.is_none());
+        assert_eq!(subscriber.provider_ref.as_ref().unwrap().generation, 8);
+        assert_eq!(subscriber.pending_flashblock_reconnects.len(), 2);
+        assert!(
+            subscriber
+                .pending_flashblock_reconnect_sources
+                .iter()
+                .any(|source| matches!(source, SubscriberStreamSource::BaseFlashblocks))
+        );
+        assert!(
+            subscriber
+                .pending_flashblock_reconnect_sources
+                .iter()
+                .any(|source| matches!(source, SubscriberStreamSource::BasePendingLog { .. }))
+        );
+        let AlloySubscriberState::Active(streams) = &subscriber.state else {
+            panic!("subscriber remains active while reconnect is pending")
+        };
+        assert!(
+            streams
+                .entries
+                .iter()
+                .all(|entry| !entry.source.is_flashblocks())
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "reactive-ws")]
+    async fn preferred_initial_flashblock_rejection_retains_canonical_streams() {
+        let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
+        let filter = Filter::new().address(Address::repeat_byte(0x42));
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig {
+                preconfirmations: PreconfirmationMode::Preferred,
+                reconnect: SubscriberReconnectConfig {
+                    enabled: false,
+                    ..SubscriberReconnectConfig::default()
+                },
+                ..SubscriberConfig::default()
+            },
+        )
+        .with_provider_ref(ProviderRef::new("base-paid", 1));
+        subscriber.chain_id = Some(8_453);
+        subscriber.base_interests = vec![ReactiveInterest::Logs(LogInterest {
+            provider_filter: filter.clone(),
+            local_matcher: None,
+            route_key: None,
+        })];
+        subscriber.interests = subscriber.base_interests.clone();
+        subscriber.log_source_ids.insert(filter.clone(), 0);
+        subscriber.next_log_source_id = 1;
+
+        let canonical_source = SubscriberStreamSource::PubSubLog {
+            id: 0,
+            filter: filter.clone(),
+        };
+        let mut streams = SubscriberStreams::new();
+        streams.push(
+            canonical_source.clone(),
+            stream::pending::<SubscriberEvent<Ethereum>>().boxed(),
+        );
+        subscriber.state = AlloySubscriberState::Active(streams);
+        subscriber.sources_dirty = true;
+
+        subscriber
+            .ensure_streams()
+            .await
+            .expect("preferred Flashblocks setup degrades to canonical-only");
+        let AlloySubscriberState::Active(streams) = &subscriber.state else {
+            panic!("canonical stream remains active")
+        };
+        assert!(streams.contains_source(&canonical_source));
+        assert!(
+            streams
+                .entries
+                .iter()
+                .all(|entry| !entry.source.is_flashblocks())
+        );
+        assert!(subscriber.pending_flashblock_reconnects.is_empty());
+        assert!(!subscriber.sources_dirty);
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "reactive-ws")]
+    async fn required_initial_flashblock_rejection_remains_fail_closed() {
+        let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
+        let filter = Filter::new().address(Address::repeat_byte(0x42));
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig {
+                preconfirmations: PreconfirmationMode::Required,
+                reconnect: SubscriberReconnectConfig {
+                    enabled: false,
+                    ..SubscriberReconnectConfig::default()
+                },
+                ..SubscriberConfig::default()
+            },
+        )
+        .with_provider_ref(ProviderRef::new("base-paid", 1));
+        subscriber.chain_id = Some(8_453);
+        subscriber.base_interests = vec![ReactiveInterest::Logs(LogInterest {
+            provider_filter: filter.clone(),
+            local_matcher: None,
+            route_key: None,
+        })];
+        subscriber.interests = subscriber.base_interests.clone();
+        subscriber.log_source_ids.insert(filter.clone(), 0);
+        subscriber.next_log_source_id = 1;
+
+        let canonical_source = SubscriberStreamSource::PubSubLog {
+            id: 0,
+            filter: filter.clone(),
+        };
+        let mut streams = SubscriberStreams::new();
+        streams.push(
+            canonical_source.clone(),
+            stream::pending::<SubscriberEvent<Ethereum>>().boxed(),
+        );
+        subscriber.state = AlloySubscriberState::Active(streams);
+        subscriber.sources_dirty = true;
+
+        let error = subscriber
+            .ensure_streams()
+            .await
+            .expect_err("required Flashblocks setup must fail closed");
+        assert!(matches!(error, SubscriberError::Provider(_)));
+        let AlloySubscriberState::Active(streams) = &subscriber.state else {
+            panic!("the already-connected canonical stream is retained")
+        };
+        assert!(streams.contains_source(&canonical_source));
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "reactive-ws")]
+    async fn preferred_flashblock_termination_preserves_canonical_delivery() {
+        let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
+        let filter = Filter::new().address(Address::repeat_byte(0x42));
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig {
+                preconfirmations: PreconfirmationMode::Preferred,
+                reconnect: SubscriberReconnectConfig {
+                    enabled: false,
+                    ..SubscriberReconnectConfig::default()
+                },
+                ..SubscriberConfig::default()
+            },
+        )
+        .with_provider_ref(ProviderRef::new("base-paid", 1));
+        subscriber.chain_id = Some(8_453);
+        subscriber.base_interests = vec![ReactiveInterest::Logs(LogInterest {
+            provider_filter: filter.clone(),
+            local_matcher: None,
+            route_key: None,
+        })];
+        subscriber.interests = subscriber.base_interests.clone();
+        subscriber.log_source_ids.insert(filter.clone(), 0);
+        subscriber.next_log_source_id = 1;
+        subscriber.sources_dirty = false;
+
+        let mut streams = SubscriberStreams::new();
+        streams.push(
+            SubscriberStreamSource::BaseFlashblocks,
+            stream::once(async {
+                SubscriberEvent::<Ethereum>::StreamTerminated(
+                    SubscriberStreamSource::BaseFlashblocks,
+                )
+            })
+            .boxed(),
+        );
+        streams.push(
+            SubscriberStreamSource::PubSubLog {
+                id: 0,
+                filter: filter.clone(),
+            },
+            stream::once(async {
+                SubscriberEvent::<Ethereum>::Log {
+                    source_id: 0,
+                    log: rpc_log(false),
+                }
+            })
+            .boxed(),
+        );
+        subscriber.state = AlloySubscriberState::Active(streams);
+
+        let invalidation = subscriber
+            .next_scoped_batch()
+            .await
+            .expect("preferred termination does not fail")
+            .expect("invalidation is delivered");
+        assert!(invalidation.preconfirmation_invalidated());
+
+        let canonical = subscriber
+            .next_scoped_batch()
+            .await
+            .expect("canonical stream remains healthy")
+            .expect("canonical log is delivered");
+        assert!(!canonical.preconfirmation_invalidated());
+        assert_eq!(canonical.records().len(), 1);
+        assert_eq!(
+            canonical.records()[0].record.context.source,
+            InputSource::Subscription
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "reactive-ws")]
+    async fn preferred_flashblock_reconnect_exhaustion_preserves_canonical_delivery() {
+        let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
+        let filter = Filter::new().address(Address::repeat_byte(0x42));
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig {
+                preconfirmations: PreconfirmationMode::Preferred,
+                reconnect: SubscriberReconnectConfig {
+                    enabled: false,
+                    ..SubscriberReconnectConfig::default()
+                },
+                ..SubscriberConfig::default()
+            },
+        )
+        .with_provider_ref(ProviderRef::new("base-paid", 1));
+        subscriber.chain_id = Some(8_453);
+        subscriber.base_interests = vec![ReactiveInterest::Logs(LogInterest {
+            provider_filter: filter.clone(),
+            local_matcher: None,
+            route_key: None,
+        })];
+        subscriber.interests = subscriber.base_interests.clone();
+        subscriber.log_source_ids.insert(filter.clone(), 0);
+        subscriber.next_log_source_id = 1;
+        subscriber.sources_dirty = false;
+
+        let canonical_source = SubscriberStreamSource::PubSubLog { id: 0, filter };
+        let mut streams = SubscriberStreams::new();
+        streams.push(
+            canonical_source,
+            stream::once(async {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+                SubscriberEvent::<Ethereum>::Log {
+                    source_id: 0,
+                    log: rpc_log(false),
+                }
+            })
+            .boxed(),
+        );
+        subscriber.state = AlloySubscriberState::Active(streams);
+
+        let source = SubscriberStreamSource::BaseFlashblocks;
+        subscriber
+            .pending_flashblock_reconnect_sources
+            .push(source.clone());
+        subscriber
+            .pending_flashblock_reconnects
+            .push(Box::pin(async move {
+                (
+                    source,
+                    Err(SubscriberError::Provider(
+                        "test reconnect window exhausted".to_owned(),
+                    )),
+                )
+            }));
+
+        let canonical = subscriber
+            .next_scoped_batch()
+            .await
+            .expect("preferred reconnect exhaustion does not fail")
+            .expect("canonical log is delivered");
+        assert_eq!(canonical.records().len(), 1);
+        assert!(subscriber.pending_flashblock_reconnects.is_empty());
+    }
+
     #[test]
     fn backfilled_logs_skip_recent_subscription_duplicates() {
         let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
@@ -17808,7 +21560,7 @@ mod subscriber_helper_tests {
     }
 
     // A log interest matching `rpc_log` (address 0x42, topic0 0x01).
-    #[cfg(feature = "reactive-ws")]
+    #[cfg(any(feature = "reactive-ws", feature = "reactive-polling"))]
     fn log_interest_matching_rpc_log() -> ReactiveInterest<Ethereum> {
         ReactiveInterest::Logs(LogInterest {
             provider_filter: Filter::new()
@@ -18219,10 +21971,38 @@ fn resolve_auto_subscriber_transport() -> Result<SubscriberTransport, Subscriber
 
 fn validate_subscriber_config(config: &SubscriberConfig) -> Result<(), SubscriberError> {
     if config.preconfirmations != PreconfirmationMode::Disabled
+        && config.canonical_head_poll_interval.is_zero()
+    {
+        return Err(SubscriberError::InvalidConfig(
+            "SubscriberConfig::canonical_head_poll_interval must be greater than zero",
+        ));
+    }
+    if config.preconfirmations != PreconfirmationMode::Disabled
         && config.flashblock_poll_interval.is_zero()
     {
         return Err(SubscriberError::InvalidConfig(
             "SubscriberConfig::flashblock_poll_interval must be greater than zero",
+        ));
+    }
+    if config.preconfirmations != PreconfirmationMode::Disabled
+        && config.max_consecutive_flashblock_poll_failures == 0
+    {
+        return Err(SubscriberError::InvalidConfig(
+            "SubscriberConfig::max_consecutive_flashblock_poll_failures must be greater than zero",
+        ));
+    }
+    if config.preconfirmations != PreconfirmationMode::Disabled
+        && config.max_pending_transaction_receipts_per_tick == 0
+    {
+        return Err(SubscriberError::InvalidConfig(
+            "SubscriberConfig::max_pending_transaction_receipts_per_tick must be greater than zero",
+        ));
+    }
+    if config.preconfirmations != PreconfirmationMode::Disabled
+        && config.max_flashblock_rpc_requests_per_second == 0
+    {
+        return Err(SubscriberError::InvalidConfig(
+            "SubscriberConfig::max_flashblock_rpc_requests_per_second must be greater than zero",
         ));
     }
     if config.max_batch_size == 0 {
@@ -18714,7 +22494,9 @@ fn preconfirmed_log_input_record<N: Network>(
         ReactiveContext {
             chain_id: None,
             source: InputSource::Flashblocks,
-            chain_status: ChainStatus::Preconfirmed { flashblock },
+            chain_status: ChainStatus::Preconfirmed {
+                flashblock: Arc::new(flashblock),
+            },
             block: Some(block),
             transaction_index: log.transaction_index,
             log_index: log.log_index,
@@ -18825,6 +22607,14 @@ pub enum SubscriberError {
     /// Requested subscriber behavior is not implemented.
     #[error("{0}")]
     Unsupported(&'static str),
+    /// The pinned provider lease reports a different chain identity.
+    #[error("subscriber chain mismatch: expected {expected}, got {actual}")]
+    ChainMismatch {
+        /// Required chain id.
+        expected: u64,
+        /// Observed chain id.
+        actual: u64,
+    },
     /// Provider or transport error.
     #[error("provider error: {0}")]
     Provider(String),

@@ -40,16 +40,16 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
 This is not the complete release matrix. Changes to reactive delivery,
 feature-gated code, persistence, or public APIs must also pass the locked
 all-feature tests, doctests, clippy and rustdoc gates; the polling-only,
-reactive-only, and no-reactive feature checks; the Rust 1.88 library check;
+reactive-only, and no-reactive feature checks; the Rust 1.90 library check;
 benchmark compilation; security-scope validation; and package verification in
 [`RELEASING.md`](RELEASING.md). The CI workflow and release checklist must stay
 synchronized, including the polling-only test run.
 
 ### MSRV
 
-The minimum supported Rust version is **1.88** (edition 2024), enforced by a
-dedicated CI job (`cargo check --lib --locked` on 1.88). Do not use std APIs
-newer than 1.88 in the library. Dev-only code (examples, benches, tests) is not
+The minimum supported Rust version is **1.90** (edition 2024), enforced by a
+dedicated CI job (`cargo check --lib --locked` on 1.90). Do not use std APIs
+newer than 1.90 in the library. Dev-only code (examples, benches, tests) is not
 MSRV-constrained.
 
 ### Crate boundary

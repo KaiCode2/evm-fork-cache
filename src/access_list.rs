@@ -20,10 +20,10 @@
 //! so use `into_access_list_always()` to skip the profitability check.
 
 use alloy_eips::{
-    BlockNumberOrTag,
+    BlockId, BlockNumberOrTag,
     eip2930::{AccessList, AccessListItem},
 };
-use alloy_network::Network;
+use alloy_network::{AnyNetwork, Network};
 use alloy_primitives::{Address, B256, Bytes, U256, address};
 use alloy_provider::Provider;
 use alloy_rlp::Encodable;
@@ -32,6 +32,7 @@ use alloy_sol_types::{SolCall, sol};
 use revm::context::result::ExecutionResult;
 use tracing::{debug, info};
 
+use crate::access_set::StorageAccessList;
 use crate::cache::EvmCache;
 use crate::errors::{AccessListError, AccessListResult as Result};
 
@@ -44,6 +45,26 @@ const ARB_GAS_INFO: Address = address!("000000000000000000000000000000000000006C
 /// ([`query_l1_base_fee_for_chain`]) and the full Ecotone L1 data fee
 /// ([`compute_op_l1_fee`]).
 pub const OP_GAS_PRICE_ORACLE: Address = address!("420000000000000000000000000000000000000F");
+
+/// Default gas cap for an `eth_createAccessList` read-set probe.
+pub const DEFAULT_CREATE_ACCESS_LIST_GAS_CAP: u64 = 30_000_000;
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateAccessListProbe {
+    #[serde(default)]
+    access_list: Vec<CreateAccessListProbeItem>,
+    #[serde(default)]
+    error: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateAccessListProbeItem {
+    address: Address,
+    #[serde(default)]
+    storage_keys: Option<Vec<B256>>,
+}
 
 /// Chain fee model used by helpers that only need to identify the chain's L1
 /// base-fee oracle.
@@ -71,6 +92,77 @@ pub enum AccessListPricing {
         /// Serialized unsigned transaction bytes with the candidate access list.
         tx_with_access_list: Bytes,
     },
+}
+
+/// Ask a provider to derive the account/storage touch set for `request` at an
+/// exact block.
+pub async fn create_access_list_read_set<P>(
+    provider: &P,
+    block: BlockId,
+    request: TransactionRequest,
+) -> Result<StorageAccessList>
+where
+    P: Provider<AnyNetwork>,
+{
+    let gas_price = default_access_list_gas_price(provider, block).await;
+    create_access_list_read_set_with_gas_price(provider, block, request, gas_price).await
+}
+
+pub(crate) async fn create_access_list_read_set_with_gas_price<P>(
+    provider: &P,
+    block: BlockId,
+    mut request: TransactionRequest,
+    default_gas_price: u128,
+) -> Result<StorageAccessList>
+where
+    P: Provider<AnyNetwork>,
+{
+    if request.gas.is_none() {
+        request.gas = Some(DEFAULT_CREATE_ACCESS_LIST_GAS_CAP);
+    }
+    if request.gas_price.is_none()
+        && request.max_fee_per_gas.is_none()
+        && request.max_priority_fee_per_gas.is_none()
+    {
+        request.gas_price = Some(default_gas_price);
+    }
+    let result: CreateAccessListProbe = provider
+        .client()
+        .request("eth_createAccessList", (request, block))
+        .await
+        .map_err(|error| AccessListError::query("eth_createAccessList", error))?;
+    if let Some(error) = result.error {
+        return Err(AccessListError::query(
+            "eth_createAccessList execution",
+            error,
+        ));
+    }
+
+    let mut access = StorageAccessList::default();
+    for item in result.access_list {
+        access.accounts.insert(item.address);
+        if let Some(storage_keys) = item.storage_keys {
+            access.slots.extend(
+                storage_keys
+                    .into_iter()
+                    .map(|key| (item.address, U256::from_be_slice(key.as_slice()))),
+            );
+        }
+    }
+    Ok(access)
+}
+
+pub(crate) async fn default_access_list_gas_price<P>(provider: &P, block: BlockId) -> u128
+where
+    P: Provider<AnyNetwork>,
+{
+    let base_fee = provider
+        .get_block(block)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|block| block.header.base_fee_per_gas.map(u128::from));
+    base_fee.unwrap_or(1_000_000_000)
 }
 
 sol! {

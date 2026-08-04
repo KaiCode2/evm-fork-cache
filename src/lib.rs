@@ -131,7 +131,7 @@
 //!
 //! This crate is **pre-1.0** and developed against a phased roadmap (see
 //! `docs/ROADMAP.md`). Until 1.0, breaking changes may land in minor releases;
-//! each is recorded in the crate `CHANGELOG.md`. MSRV is Rust 1.88 (edition 2024).
+//! each is recorded in the crate `CHANGELOG.md`. MSRV is Rust 1.90 (edition 2024).
 //!
 //! The `examples/` directory has runnable, documented walkthroughs of each
 //! module — offline ones that need no network, plus a few that fork real chain
@@ -159,6 +159,7 @@ pub mod reactive;
 pub mod state_update;
 pub mod tracing;
 
+pub use access_list::{DEFAULT_CREATE_ACCESS_LIST_GAS_CAP, create_access_list_read_set};
 pub use access_set::StorageAccessList;
 // Bulk storage extraction over eth_call state overrides — the default batch
 // storage fetcher since 0.2.0 (see docs/bulk-storage-extraction.md).
@@ -174,12 +175,14 @@ pub use bundle::{BundleOptions, BundleResult, BundleTx, RevertPolicy, TxOutcome}
 // fully-qualified module paths (`cache::EvmCache`, `reactive::ReactiveRuntime`,
 // …) remain valid, so this is purely additive.
 pub use cache::{
-    AccountFieldsFetchFn, AccountProof, AccountProofFetchFn, BlockContextRequirements,
-    BlockStateAccountDiff, BlockStateDiff, BlockStateDiffFetchFn, BlockStateStorageDiff,
-    CacheSpeedMode, CallSimulationResult, CodeMismatch, CodeSeedState, CodeVerifyReport,
-    DEFAULT_MAX_DURABLE_CHECKPOINT_BYTES, DurableCheckpointBlock, DurableCheckpointError,
-    DurableCheckpointIdentity, DurableCheckpointMetadata, DurableCheckpointStore, EvmCache,
-    EvmCacheBuilder, EvmOverlay, EvmSnapshot, LoadedDurableCheckpoint, PrewarmReport,
+    AccessListFetchFn, AccountFieldsFetchFn, AccountProof, AccountProofFetchFn,
+    BlockContextRequirements, BlockStateAccountDiff, BlockStateDiff, BlockStateDiffFetchFn,
+    BlockStateStorageDiff, CacheSpeedMode, CallSimulationResult, CodeMismatch, CodeSeedState,
+    CodeVerifyReport, DEFAULT_MAX_DURABLE_CHECKPOINT_BYTES, DurableCheckpointBlock,
+    DurableCheckpointError, DurableCheckpointIdentity, DurableCheckpointMetadata,
+    DurableCheckpointStore, EvmCache, EvmCacheBuilder, EvmOverlay, EvmSnapshot,
+    LoadedDurableCheckpoint, PrewarmReport, ReadSetHydrationReport, ReadSetWarmupBatch,
+    ReadSetWarmupCall, ReadSetWarmupConfig, ReadSetWarmupReport, ReadSetWarmupStrategy,
     StorageBatchConfig, StorageFetchStrategy, TxConfig, account_proof_fetcher,
     point_read_storage_fetcher, provider_storage_fetcher,
 };

@@ -44,6 +44,8 @@ use alloy_primitives::{Address, B256, U256};
 use revm::primitives::hardfork::SpecId;
 use revm::state::{AccountInfo, Bytecode};
 
+use crate::access_set::StorageAccessList;
+
 /// Memoized, immutable flatten of the **cold layer-2** index (Pillar A).
 ///
 /// Holds layer-2 (`BlockchainDb`) account info and storage only; the layer-1
@@ -121,6 +123,114 @@ pub struct EvmSnapshot {
 }
 
 impl EvmSnapshot {
+    /// Chain ID captured by this immutable simulation snapshot.
+    pub const fn chain_id(&self) -> u64 {
+        self.chain_id
+    }
+
+    /// Block number installed in the snapshot's EVM context.
+    pub const fn block_number(&self) -> Option<u64> {
+        self.block_number
+    }
+
+    /// Base fee installed in the snapshot's EVM context.
+    pub const fn basefee(&self) -> Option<u64> {
+        self.basefee
+    }
+
+    /// Block beneficiary installed in the snapshot's EVM context.
+    pub const fn coinbase(&self) -> Option<Address> {
+        self.coinbase
+    }
+
+    /// PREVRANDAO value installed in the snapshot's EVM context.
+    pub const fn prevrandao(&self) -> Option<B256> {
+        self.prevrandao
+    }
+
+    /// Block gas limit installed in the snapshot's EVM context.
+    pub const fn gas_limit(&self) -> Option<u64> {
+        self.gas_limit
+    }
+
+    /// Timestamp installed in the snapshot's EVM context.
+    pub const fn timestamp(&self) -> Option<u64> {
+        self.timestamp
+    }
+
+    /// Enumerate account, code, explicit storage, and block-hash entries held by
+    /// this immutable snapshot.
+    ///
+    /// Accounts already proven absent are included because their `None` result
+    /// is locally authoritative. Storage entries implied to be zero by a
+    /// `StorageCleared` account are not enumerable; use
+    /// [`missing_read_set`](Self::missing_read_set) when checking a concrete
+    /// required set.
+    pub fn resident_read_set(&self) -> StorageAccessList {
+        let mut resident = StorageAccessList::default();
+        resident.accounts.extend(self.base.accounts.keys().copied());
+        resident
+            .accounts
+            .extend(self.overlay_accounts.keys().copied());
+        resident
+            .accounts
+            .extend(self.accounts_not_existing.iter().copied());
+        resident
+            .code_hashes
+            .extend(self.base.code_by_hash.keys().copied());
+        resident
+            .code_hashes
+            .extend(self.overlay_code_by_hash.keys().copied());
+        for (address, slots) in &self.base.storage {
+            resident
+                .slots
+                .extend(slots.keys().copied().map(|slot| (*address, slot)));
+        }
+        for (address, slots) in &self.overlay_storage {
+            resident
+                .slots
+                .extend(slots.keys().copied().map(|slot| (*address, slot)));
+        }
+        resident
+            .block_numbers
+            .extend(self.block_hashes.keys().copied());
+        resident
+    }
+
+    /// Return the concrete subset of `required` this snapshot cannot resolve
+    /// without an external database.
+    pub fn missing_read_set(&self, required: &StorageAccessList) -> StorageAccessList {
+        StorageAccessList {
+            accounts: required
+                .accounts
+                .iter()
+                .copied()
+                .filter(|address| {
+                    !self.accounts_not_existing.contains(address)
+                        && self.account_info(*address).is_none()
+                })
+                .collect(),
+            code_hashes: required
+                .code_hashes
+                .iter()
+                .copied()
+                .filter(|hash| self.code(*hash).is_none())
+                .collect(),
+            slots: required
+                .slots
+                .iter()
+                .copied()
+                .filter(|(address, slot)| self.storage_value(*address, *slot).is_none())
+                .collect(),
+            block_numbers: required
+                .block_numbers
+                .iter()
+                .copied()
+                .filter(|number| !self.block_hashes.contains_key(number))
+                .collect(),
+        }
+    }
+
     /// Account info as the EVM sees it: overlay (layer 1) wins, else the base
     /// (layer 2), else `None`.
     ///

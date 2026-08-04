@@ -608,15 +608,15 @@ acceptance contract in the spec (`tests/liveness_*`).
 
 ## Remaining work toward 1.0
 
-1. **Preconfirmation read-set retention (production-rollout gate).** Prime
-   representative simulation read sets before subscriber attachment, then
-   replace whole-cache preconfirmation restore with target-scoped rollback or
-   an equivalent persistent canonical warm layer. Speculative account, slot,
-   balance, resync, and purge effects must still be removed exactly, while
-   unrelated lazy fills survive branch replacement. Acceptance requires
-   provider-read-count tests across cumulative/replaced/discarded payloads and a
-   repeat paid-provider benchmark with no recurring RPC-scale quote-latency
-   mode.
+1. **Preconfirmation read-set retention (closed in 0.4.0-alpha.2).**
+   Representative execution read sets can be discovered and hydrated at an
+   exact canonical pin before subscriber attachment. Their account, code,
+   storage, and block-hash identities persist outside disposable speculative
+   values; cumulative views retain generation-local fills, while replacement,
+   discard, reconnect, and canonical advancement remove pending effects. Tests
+   cover resident/missing sets, exact hydration, code-identity invalidation,
+   cumulative/replaced/discarded payloads, and zero provider reads on repeated
+   offline execution.
 2. **Bundle-simulation breadth (Phase 7 — core shipped).** `EvmOverlay::simulate_bundle`
    now evaluates an ordered tx sequence over cumulative state with a revert policy
    and coinbase-payment accounting, and a `CallTracer` reconstructs the call-frame

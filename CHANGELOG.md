@@ -12,6 +12,63 @@ surface freezes at 1.0.
 
 ## [Unreleased]
 
+## [0.4.0-alpha.2] - 2026-07-29
+
+### Added
+
+- Added cache-owned execution read-set discovery and exact-block hydration for
+  account, code, storage, and block-hash dependencies, including missing-state
+  provenance and provider-read instrumentation.
+- Added `AlloySubscriber::establish_flashblocks_preflight` to verify a pinned
+  Base or OP chain and establish its chain-specific Flashblocks surface while
+  retaining optional provider capability evidence.
+- Added snapshot-resident/missing read-set inspection and offline block-hash
+  retention.
+- Added native `newFlashblocks` plus filtered `pendingLogs` subscriptions for
+  Base mainnet/testnet and a bounded pending block/log sampler for Optimism
+  mainnet/testnet through the standard subscriber output path.
+- Added per-generation Flashblocks RPC metrics for qualification and recovery
+  traffic.
+- Added exact transaction-receipt hydration for OP pending samples, with
+  per-tick and rolling per-second request budgets.
+- Added complete pending EVM context propagation for available number,
+  timestamp, base fee, beneficiary, randomness, and gas-limit fields.
+- Added generation-wide invalidation delivery so downstream consumers revoke a
+  published speculative snapshot before coupled Flashblock subscriptions are
+  re-established.
+
+### Changed
+
+- Raised the minimum supported Rust version to 1.90 and updated the locked
+  `ruint` dependency to the release that resolves `RUSTSEC-2026-0220`.
+- Preconfirmed identity is now a non-zero, provider-generation-scoped content
+  commitment over the cumulative preview, with any real provider-reported
+  partial hash retained separately. Pending logs correlate by block number and
+  transaction membership rather than a pending block hash.
+- Base Flashblocks endpoints no longer treat `newHeads` as canonical because a
+  provider may expose partial heads there. Canonical progress is certified
+  through `eth_getBlockByNumber("latest")`.
+- Optimism pending-state sampling now pins cumulative blocks, exact canonical
+  parents, filtered logs, and receipts to one provider generation, retries
+  isolated request failures, and fails closed after a configurable consecutive
+  failure threshold.
+- Cumulative updates within one payload retain generation-local lazy fills;
+  replacement, reconnect, explicit discard, and canonical advancement restore
+  the exact canonical cache state.
+
+### Fixed
+
+- Rejected conflicting duplicate indices, duplicate cumulative transaction
+  membership, and unrecoverable indexed gaps before publishing incomplete or
+  ambiguous speculative state.
+- Reconnect now treats `newFlashblocks` and every `pendingLogs` stream as one
+  coupled generation, purges buffered records, increments provider provenance,
+  and performs one cumulative pending-state recovery after resubscription.
+- `PreconfirmationMode::Preferred` now isolates initial Flashblocks rejection,
+  Flashblocks stream termination, and exhausted Flashblocks reconnects from
+  the canonical subscriptions. Retry proceeds in the background while
+  canonical logs and heads remain deliverable; `Required` remains fail-closed.
+
 ## [0.4.0-alpha.1] - 2026-07-28
 
 ### Migration checklist
@@ -192,7 +249,7 @@ surface freezes at 1.0.
   capability and reject ephemeral subscribers before polling or state mutation;
   the in-crate Alloy subscriber intentionally remains an ordinary live source.
 - Alloy dependencies are capped below 1.7 so fresh resolution cannot silently
-  select a release requiring a newer compiler than the declared Rust 1.88 MSRV.
+  select a release requiring a newer compiler than the declared Rust 1.90 MSRV.
 
 ## [0.3.0] - 2026-07-14
 
@@ -1061,7 +1118,8 @@ pre-release development phases (see [`docs/ROADMAP.md`](docs/ROADMAP.md)).
 - `EvmCache` requires a multi-thread tokio runtime for any RPC-touching path.
 - See [`docs/KNOWN_ISSUES.md`](docs/KNOWN_ISSUES.md) for current limitations.
 
-[Unreleased]: https://github.com/KaiCode2/evm-fork-cache/compare/v0.4.0-alpha.1...HEAD
+[Unreleased]: https://github.com/KaiCode2/evm-fork-cache/compare/v0.4.0-alpha.2...HEAD
+[0.4.0-alpha.2]: https://github.com/KaiCode2/evm-fork-cache/compare/v0.4.0-alpha.1...v0.4.0-alpha.2
 [0.4.0-alpha.1]: https://github.com/KaiCode2/evm-fork-cache/compare/v0.3.0...v0.4.0-alpha.1
 [0.3.0]: https://github.com/KaiCode2/evm-fork-cache/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/KaiCode2/evm-fork-cache/compare/v0.2.0...v0.2.1

@@ -20,6 +20,7 @@ mod durable_checkpoint;
 mod journal_access_list;
 mod metadata;
 pub mod overlay;
+mod read_set;
 pub mod slot_observations;
 pub mod snapshot;
 pub(crate) mod versioned;
@@ -33,7 +34,11 @@ pub use durable_checkpoint::{
     LoadedDurableCheckpoint,
 };
 pub use metadata::{CacheConfig, ImmutableDataCache};
-pub use overlay::EvmOverlay;
+pub use overlay::{EvmOverlay, MissingState};
+pub use read_set::{
+    AccessListFetchFn, ReadSetHydrationReport, ReadSetWarmupBatch, ReadSetWarmupCall,
+    ReadSetWarmupConfig, ReadSetWarmupReport, ReadSetWarmupStrategy,
+};
 pub use slot_observations::SlotObservationTracker;
 pub use snapshot::EvmSnapshot;
 
@@ -1530,6 +1535,8 @@ pub struct EvmCache {
     /// (`inject_storage_batch`) does not bump it.
     snapshot_generation: u64,
     storage_batch_fetcher: Option<StorageBatchFetchFn>,
+    /// Optional provider-backed `eth_createAccessList` read-set discovery.
+    access_list_fetcher: Option<AccessListFetchFn>,
     /// Optional account/root fetcher that bypasses SharedBackend.
     /// Captures a provider clone and fires `eth_getProof` calls directly to fetch
     /// authoritative account fields (balance/nonce/code hash) and `storageHash`.
@@ -2014,6 +2021,57 @@ impl EvmCache {
             StorageFetchStrategy::default(),
         );
 
+        // Cache-owned read-set discovery. Calls are issued concurrently and
+        // returned in request order so a batching transport may coalesce them.
+        let provider_for_access_lists = provider.clone();
+        let access_list_fetcher: AccessListFetchFn = Arc::new(
+            move |requests: Vec<TransactionRequest>, block: BlockId| {
+                let handle = match block_in_place_handle() {
+                    Ok(handle) => handle,
+                    Err(error) => {
+                        let message = error.to_string();
+                        return requests
+                            .into_iter()
+                            .map(|_| {
+                                Err(crate::errors::AccessListError::query("runtime", &message))
+                            })
+                            .collect();
+                    }
+                };
+                tokio::task::block_in_place(|| {
+                    handle.block_on(async {
+                        use futures::StreamExt;
+
+                        let gas_price = crate::access_list::default_access_list_gas_price(
+                            provider_for_access_lists.as_ref(),
+                            block,
+                        )
+                        .await;
+                        let mut results: Vec<_> = futures::stream::iter(
+                            requests.into_iter().enumerate().map(|(index, request)| {
+                                let provider = Arc::clone(&provider_for_access_lists);
+                                async move {
+                                    let result = crate::access_list::create_access_list_read_set_with_gas_price(
+                                        provider.as_ref(),
+                                        block,
+                                        request,
+                                        gas_price,
+                                    )
+                                    .await;
+                                    (index, result)
+                                }
+                            }),
+                        )
+                        .buffer_unordered(16)
+                        .collect()
+                        .await;
+                        results.sort_by_key(|(index, _)| *index);
+                        results.into_iter().map(|(_, result)| result).collect()
+                    })
+                })
+            },
+        );
+
         // Create an account/root fetcher that bypasses SharedBackend, firing
         // `eth_getProof` calls directly for authoritative account fields plus the
         // account's `storageHash`. `eth_getProof` is single-address at the RPC
@@ -2125,6 +2183,7 @@ impl EvmCache {
             snapshot_generation: 0,
             rpc_caller: Some(rpc_caller),
             storage_batch_fetcher: Some(storage_batch_fetcher),
+            access_list_fetcher: Some(access_list_fetcher),
             account_proof_fetcher: Some(account_proof_fetcher),
             block_state_diff_fetcher: Some(block_state_diff_fetcher),
             account_fields_fetcher: Some(account_fields_fetcher),
@@ -2216,6 +2275,7 @@ impl EvmCache {
             ))),
             rpc_caller: None,
             storage_batch_fetcher: None,
+            access_list_fetcher: None,
             account_proof_fetcher: None,
             block_state_diff_fetcher: None,
             account_fields_fetcher: None,
@@ -3613,6 +3673,7 @@ impl EvmCache {
             }
         }
 
+        let block_hashes = self.snapshot_block_hashes();
         Arc::new(snapshot::EvmSnapshot {
             base,
             overlay_accounts,
@@ -3620,7 +3681,7 @@ impl EvmCache {
             overlay_code_by_hash,
             storage_cleared,
             accounts_not_existing,
-            block_hashes: HashMap::new(),
+            block_hashes,
             block_number: self.block_number,
             basefee: self.basefee,
             coinbase: self.coinbase,
@@ -3911,6 +3972,7 @@ impl EvmCache {
             code_by_hash,
         };
 
+        let block_hashes = self.snapshot_block_hashes();
         Arc::new(snapshot::EvmSnapshot {
             base: Arc::new(base),
             overlay_accounts: HashMap::new(),
@@ -3918,7 +3980,7 @@ impl EvmCache {
             overlay_code_by_hash: HashMap::new(),
             storage_cleared,
             accounts_not_existing,
-            block_hashes: HashMap::new(),
+            block_hashes,
             block_number: self.block_number,
             basefee: self.basefee,
             coinbase: self.coinbase,
@@ -3929,6 +3991,24 @@ impl EvmCache {
             spec_id: self.spec_id,
             shared_memory_capacity: self.shared_memory_capacity,
         })
+    }
+
+    fn snapshot_block_hashes(&self) -> HashMap<u64, B256> {
+        let mut block_hashes = HashMap::new();
+        {
+            let backend = self.blockchain_db.block_hashes().read();
+            for (number, hash) in backend.iter() {
+                if number.bit_len() <= 64 {
+                    block_hashes.insert(number.to::<u64>(), *hash);
+                }
+            }
+        }
+        for (number, hash) in &self.db.cache.block_hashes {
+            if number.bit_len() <= 64 {
+                block_hashes.insert(number.to::<u64>(), *hash);
+            }
+        }
+        block_hashes
     }
 
     /// Mark a layer-2 address dirty so the next [`refresh_base`](Self::refresh_base)
@@ -5086,6 +5166,10 @@ impl EvmCache {
                 for (address, account) in evm.journaled_state.state.iter() {
                     if account.is_touched() {
                         access_list.accounts.insert(*address);
+                        let code_hash = account.info.code_hash;
+                        if code_hash != B256::ZERO && code_hash != revm::primitives::KECCAK_EMPTY {
+                            access_list.code_hashes.insert(code_hash);
+                        }
                         for slot_key in account.storage.keys() {
                             access_list.slots.insert((*address, *slot_key));
                         }

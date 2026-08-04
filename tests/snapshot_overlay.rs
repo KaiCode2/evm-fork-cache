@@ -13,15 +13,15 @@ mod common;
 
 use std::sync::Arc;
 
-use alloy_primitives::{Address, Bytes, U256, keccak256};
+use alloy_primitives::{Address, B256, Bytes, U256, keccak256};
 use alloy_sol_types::{SolCall, SolValue};
 use anyhow::{Result, anyhow};
 use revm::context::result::ExecutionResult;
 use revm::database_interface::Database;
 
 use common::{
-    MOCK_ERC20_BALANCE_SLOT, MockERC20, install_default_account, install_mock_erc20, setup_cache,
-    transfer,
+    MOCK_ERC20_BALANCE_SLOT, MockERC20, install_default_account, install_mock_erc20,
+    mock_erc20_runtime, setup_cache, transfer,
 };
 use evm_fork_cache::cache::{EvmOverlay, EvmSnapshot};
 
@@ -178,6 +178,68 @@ async fn overlay_reads_reflect_snapshot_state() -> Result<()> {
     Ok(())
 }
 
+/// An offline overlay must make an unresolved storage read observable instead
+/// of silently treating its ZERO fallback as authoritative state. Readiness
+/// gates use this signal to reject an incompletely warmed speculative quote.
+#[tokio::test(flavor = "multi_thread")]
+async fn offline_overlay_reports_missing_storage_and_reset_clears_it() -> Result<()> {
+    let mut cache = setup_cache().await?;
+    let contract = Address::repeat_byte(0x45);
+    let slot = U256::from(9);
+    let snapshot = cache.snapshot();
+    let mut overlay = EvmOverlay::new(snapshot, None);
+
+    assert_eq!(overlay.storage(contract, slot)?, U256::ZERO);
+    assert_eq!(
+        overlay.missing_state().storage,
+        [(contract, slot)].into_iter().collect()
+    );
+    assert!(!overlay.missing_state().is_empty());
+
+    overlay.reset();
+    assert!(overlay.missing_state().is_empty());
+    Ok(())
+}
+
+/// A missing account header is distinct from an account the snapshot already
+/// knows does not exist. Only the unresolved former case makes an offline
+/// simulation incomplete.
+#[tokio::test(flavor = "multi_thread")]
+async fn offline_overlay_reports_unresolved_account_headers() -> Result<()> {
+    let mut cache = setup_cache().await?;
+    let unresolved = Address::repeat_byte(0x49);
+    let snapshot = cache.snapshot();
+    let mut overlay = EvmOverlay::new(snapshot, None);
+
+    assert!(overlay.basic(unresolved)?.is_none());
+    assert_eq!(
+        overlay.missing_state().accounts,
+        [unresolved].into_iter().collect()
+    );
+    let missing = overlay.missing_state().as_read_set();
+    assert!(missing.accounts.contains(&unresolved));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn snapshot_reports_its_complete_resident_read_set() -> Result<()> {
+    let mut cache = setup_cache().await?;
+    let token = Address::repeat_byte(0x4a);
+    install_mock_erc20(&mut cache, token);
+    cache.insert_storage_slot(token, U256::from(7), U256::from(9))?;
+
+    let resident = cache.snapshot().resident_read_set();
+
+    assert!(resident.accounts.contains(&token));
+    assert!(
+        resident
+            .code_hashes
+            .contains(&mock_erc20_runtime().hash_slow())
+    );
+    assert!(resident.slots.contains(&(token, U256::from(7))));
+    Ok(())
+}
+
 /// A call-scoped code override must affect nested execution without leaking
 /// into the reusable overlay. V3 quoters need this to neutralize the output
 /// token transfer that precedes their intentional quote-data revert when a
@@ -303,5 +365,26 @@ async fn snapshot_basic_returns_none_for_notexisting_account() -> Result<()> {
         "snapshot-backed overlay must read a NotExisting account as absent (None), \
          not a phantom Some(info); got {basic:?}"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn snapshots_retain_resident_block_hash_dependencies_offline() -> Result<()> {
+    let mut cache = setup_cache().await?;
+    let number = 42_u64;
+    let hash = B256::repeat_byte(0x42);
+    cache
+        .db_mut()
+        .cache
+        .block_hashes
+        .insert(U256::from(number), hash);
+
+    let snapshot = cache.snapshot();
+    assert!(snapshot.resident_read_set().block_numbers.contains(&number));
+    let mut overlay = EvmOverlay::new(snapshot, None);
+    assert_eq!(overlay.block_hash(number)?, hash);
+
+    let mut deep = EvmOverlay::new(cache.snapshot_deep_clone(), None);
+    assert_eq!(deep.block_hash(number)?, hash);
     Ok(())
 }
