@@ -31,6 +31,53 @@ fn published_package_excludes_source_tree_release_audits() {
 }
 
 #[test]
+fn raw_json_flashblocks_remain_explicit_and_transport_free() {
+    let manifest = read("Cargo.toml");
+    let feature_section = manifest
+        .split("[features]")
+        .nth(1)
+        .expect("features section")
+        .split("[dependencies]")
+        .next()
+        .expect("feature boundary");
+
+    assert!(
+        feature_section.contains("default = [\"reactive\", \"reactive-ws\"]"),
+        "the raw adapter must remain excluded from default features"
+    );
+    assert!(
+        feature_section.contains("raw-flashblocks-json = [\"reactive\", \"tokio/sync\"]"),
+        "the raw adapter should add only the reactive core and its bounded in-process handoff"
+    );
+    let dependencies = manifest
+        .split("[dependencies]")
+        .nth(1)
+        .expect("dependencies section")
+        .split("[dev-dependencies]")
+        .next()
+        .expect("dependency boundary");
+    assert!(
+        !dependencies.contains("tokio-tungstenite =") && !dependencies.contains("tungstenite ="),
+        "the published raw adapter must not add a source-socket dependency"
+    );
+    assert!(
+        manifest.contains("name = \"raw_json_flashblocks_subscriber_acceptance\"")
+            && manifest.contains("required-features = [\"raw-flashblocks-json\", \"reactive-ws\"]"),
+        "the networked acceptance probe must remain explicit and default-excluded"
+    );
+}
+
+#[test]
+fn raw_json_acceptance_rejects_a_canonical_chain_mismatch() {
+    let acceptance = read("examples/raw_json_flashblocks_subscriber_acceptance.rs");
+
+    assert!(
+        acceptance.contains("establish_flashblocks_preflight(chain_id)"),
+        "the live acceptance probe must preflight its reported chain id against the canonical subscriber"
+    );
+}
+
+#[test]
 fn alpha2_changelog_explains_flashblock_identity_migration() {
     let changelog = read("CHANGELOG.md");
     let alpha2 = changelog

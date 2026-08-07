@@ -1,10 +1,11 @@
 # Releasing
 
-`evm-fork-cache` 0.4.0-alpha.2 is the second prerelease in the Flashblocks
-compatibility set. Publish `alloy-transport-balancer 0.3.0-alpha.2` first, then
-publish this crate before any extension crate that declares
-`evm-fork-cache = "0.4.0-alpha.2"`, including `evm-amm-state 0.3.0-alpha.2` and
-the remote/Hybrid subscriber packages.
+`evm-fork-cache` 0.4.0-alpha.3 adds the default-off raw JSON Flashblocks
+normalization layer to the existing Flashblocks compatibility set. Publish
+`alloy-transport-balancer 0.3.0-alpha.2` first, then publish this crate before
+any extension crate that declares `evm-fork-cache = "0.4.0-alpha.3"`,
+including `evm-amm-state 0.3.0-alpha.4` and the remote/Hybrid subscriber
+packages.
 No release step is automatic: use clean, reviewed commits and never publish
 from a credential-bearing working tree.
 
@@ -21,10 +22,17 @@ cargo check --locked --no-default-features
 cargo check --locked --no-default-features --features reactive
 cargo check --locked --no-default-features --features reactive-polling
 cargo check --locked --no-default-features --features reactive-ws
+cargo check --locked --no-default-features --features raw-flashblocks-json
 cargo clippy --locked --all-targets --no-default-features --features reactive-polling --no-deps -- -D warnings
 cargo test --locked --no-default-features --features reactive-polling
+cargo clippy --locked --lib --test raw_json_flashblocks --no-default-features --features raw-flashblocks-json --no-deps -- -D warnings
+cargo test --locked --no-default-features --features raw-flashblocks-json --test raw_json_flashblocks
+cargo test --locked --no-default-features --features raw-flashblocks-json,reactive-polling --test raw_json_flashblocks_runtime
+cargo clippy --locked --example raw_json_flashblocks_subscriber_acceptance --features raw-flashblocks-json,reactive-ws --no-deps -- -D warnings
 cargo +1.90.0 check --locked --lib
 cargo bench --no-run --all-features --locked
+cargo bench --locked --bench raw_json_flashblocks --no-default-features --features raw-flashblocks-json -- raw_json_flashblocks_application_limit
+cargo bench --locked --bench raw_json_flashblocks --no-default-features --features raw-flashblocks-json -- raw_json_flashblocks_near_limit
 bash scripts/check-authoring-hygiene.sh
 bash scripts/check-security-exceptions.sh
 cargo audit --ignore RUSTSEC-2025-0055
@@ -55,6 +63,18 @@ surface are present. The source-only `tests/public_release_surface.rs` audit mus
 remain excluded because it reads CI and archival planning files that are
 intentionally absent from the consumer package. Run authenticated examples or
 probes only before this clean-tree preflight, never as part of packaging.
+For a raw-profile release candidate, run
+`raw_json_flashblocks_subscriber_acceptance` against an independent canonical
+WebSocket for 100 matched swaps or five minutes. Record the exact provider,
+window, pairing ratio, raw-first latency distribution, duplicate counts, and
+canonical-head continuity. The probe must remain opt-in and is not a publishing
+side effect.
+
+Record the near-limit frame size, Criterion latency interval, and throughput in
+`docs/raw-json-flashblocks-acceptance.md`. Treat the 16 MiB library default as a
+defensive compatibility ceiling, not an application recommendation. Verify each
+production consumer checks in explicit, source-qualified frame, index,
+transaction, and log limits before promotion.
 
 Before publishing a durable subscriber extension, exercise a real multi-block
 checkpoint restart through
@@ -67,11 +87,11 @@ the core's retained canonical history exactly.
 
 ```bash
 cargo publish --locked
-git tag -s v0.4.0-alpha.2 -m "Release evm-fork-cache v0.4.0-alpha.2"
-git push origin v0.4.0-alpha.2
+git tag -s v0.4.0-alpha.3 -m "Release evm-fork-cache v0.4.0-alpha.3"
+git push origin v0.4.0-alpha.3
 ```
 
-Wait for 0.4.0-alpha.2 to appear in the crates.io index before removing sibling path
+Wait for 0.4.0-alpha.3 to appear in the crates.io index before removing sibling path
 dependencies and verifying downstream extension packages. Publish only after
 explicit authorization; preparing or running this checklist is not permission
 to publish, tag, or push.

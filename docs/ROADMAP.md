@@ -627,11 +627,14 @@ acceptance contract in the spec (`tests/liveness_*`).
    tracked in `docs/KNOWN_ISSUES.md`).
 3. **Transport depth.** The live `AlloySubscriber` ships log/block/pending-hash
    subscriptions, exponential-backoff reconnect, `get_logs` backfill, and
-   journaled parent-hash reorg recovery. The remaining transport gaps are full
-   block bodies, full pending-transaction hydration (today only pending-tx
-   hashes), and non-log historical backfill. Log interests can request
-   owner-scoped `get_logs` backfill from a block anchor. Remaining gaps are
-   tracked in `docs/KNOWN_ISSUES.md`.
+   journaled parent-hash reorg recovery. The default-off
+   `raw-flashblocks-json` feature also converts one receipt-enriched indexed
+   JSON Flashblocks profile while deliberately leaving its socket lifecycle to
+   the application. The remaining transport gaps are full block bodies, full
+   pending-transaction hydration (today only pending-tx hashes), non-log
+   historical backfill, and additional raw Flashblocks wire profiles. Log
+   interests can request owner-scoped `get_logs` backfill from a block anchor.
+   Remaining gaps are tracked in `docs/KNOWN_ISSUES.md`.
 4. **Snapshot consistency point in continuous ingestion.** Closed in 0.2.0:
    `EvmCache::snapshot_generation()` is the crate-provided generation guard —
    read it around `snapshot()` and re-snapshot when it moved, so simulations

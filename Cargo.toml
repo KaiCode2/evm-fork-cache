@@ -1,6 +1,6 @@
 [package]
 name = "evm-fork-cache"
-version = "0.4.0-alpha.2"
+version = "0.4.0-alpha.3"
 edition = "2024"
 rust-version = "1.90"
 license = "MIT OR Apache-2.0"
@@ -25,9 +25,9 @@ exclude = [
 
 # Build the docs.rs page with every feature enabled so the full surface — the
 # reactive runtime, the default WebSocket subscriber, the opt-in polling
-# transport, and cold-start — is all documented (docs.rs builds with default
-# features otherwise). `--cfg docsrs` is the conventional hook for any
-# feature-gated doc annotations.
+# transport, the transport-free raw JSON Flashblocks adapter, and cold-start —
+# is all documented (docs.rs builds with default features otherwise). `--cfg
+# docsrs` is the conventional hook for any feature-gated doc annotations.
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
@@ -41,6 +41,10 @@ default = ["reactive", "reactive-ws"]
 reactive = []
 reactive-ws = ["reactive", "alloy-provider/ws", "dep:rustls", "rustls/ring"]
 reactive-polling = ["reactive"]
+# Receipt-enriched indexed JSON conversion plus a bounded in-process handoff.
+# The application owns the source socket and its complete lifecycle; this
+# feature adds no network transport.
+raw-flashblocks-json = ["reactive", "tokio/sync"]
 
 [dependencies]
 alloy-consensus = ">=1.1.2, <1.7"
@@ -74,6 +78,7 @@ tracing = "0.1.41"
 
 [dev-dependencies]
 anyhow = "1.0.98"
+alloy-json-rpc = ">=1.0.38, <1.7"
 alloy-node-bindings = ">=1.1.2, <1.7"
 alloy-rpc-client = { version = ">=1.0.38, <1.7", features = ["reqwest"] }
 alloy-transport = ">=1.0.38, <1.7"
@@ -88,6 +93,8 @@ reqwest = { version = "0.12", default-features = false, features = ["gzip"] }
 # `macros` powers `#[tokio::main]`/`#[tokio::test]` in the examples and tests.
 # `time` lets live RPC examples bound their subscription windows.
 tokio = { version = "1.48.0", features = ["macros", "rt-multi-thread", "time"] }
+tokio-tungstenite = { version = "=0.26.2", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+tower = "0.5"
 
 [[bench]]
 name = "revert_decoding"
@@ -118,6 +125,11 @@ name = "state_update"
 harness = false
 
 [[bench]]
+name = "raw_json_flashblocks"
+harness = false
+required-features = ["raw-flashblocks-json"]
+
+[[bench]]
 name = "event_pipeline"
 harness = false
 
@@ -145,6 +157,10 @@ required-features = ["reactive"]
 [[example]]
 name = "cold_start"
 required-features = ["reactive"]
+
+[[example]]
+name = "raw_json_flashblocks_subscriber_acceptance"
+required-features = ["raw-flashblocks-json", "reactive-ws"]
 
 # RPC-gated real-contract benchmarks. Skipped (not failed) when RPC_URL is unset,
 # so `cargo bench` stays offline by default.

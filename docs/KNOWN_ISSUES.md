@@ -306,12 +306,40 @@ surface was moved out of this crate.
   tests). Composing `AlloySubscriber` output into `ReactiveRuntime::ingest_batch`
   end-to-end is now covered offline in `tests/reactive_subscriber_ingest.rs` (a
   real subscriber batch, produced via the mockable `get_logs` backfill path,
-  drives a real runtime ingest and asserts the cache write). The remaining paths
-  without dedicated integration coverage are the `EventDecoderHandler` adapter
+  drives a real runtime ingest and asserts the cache write). Raw JSON preview,
+  invalidation, replacement, and canonical reconciliation are likewise covered
+  in `tests/raw_json_flashblocks_runtime.rs`. The paths without dedicated
+  integration coverage are the `EventDecoderHandler` adapter
   and custom pending-tx matcher/route-key routing. Block-header ingestion is
   covered in `tests/block_context.rs`, and decoded-report delivery is asserted
   in `tests/reactive_engine.rs`. The live WebSocket transport plumbing is
-  covered by reconnect/termination unit tests but not by a networked end-to-end
-  test. These are tracked follow-ups, not known defects.
+  covered by reconnect/termination unit tests. The opt-in
+  `raw_json_flashblocks_subscriber_acceptance` example covers one caller-owned
+  raw socket through standardized speculative/canonical subscriber delivery,
+  but it is intentionally not part of offline CI and does not validate every
+  provider wire profile. These are tracked follow-ups, not known defects.
+- **The optional raw JSON Flashblocks adapter supports one exact wire profile,
+  not arbitrary raw feeds.** With `raw-flashblocks-json`, callers may convert
+  receipt-enriched indexed JSON containing `payload_id`, `index`, an index-zero
+  `base`/`static` header, `diff.transactions`, and exact
+  `metadata.receipts`. JSON-RPC envelopes, receipt-less previews, and binary SSZ
+  require separate adapters. The core deliberately does not own the source
+  socket, authentication, liveness timeout, raw-frame receive queue, retry,
+  backoff, rate limit, or provider rotation. The optional standardized-update
+  handoff queue is bounded and exposes backpressure, but does not make any of
+  those lifecycle decisions. A caller must forward `reset()`'s
+  invalidation before retrying after disconnect, replacement, or an untrusted
+  application-data error. Schema drift is therefore an application acceptance
+  failure, never permission to synthesize missing receipts or poll HTTP. Queue
+  admission is distinct from subscriber acceptance: awaited sends return the
+  subscriber verdict, while non-blocking sends return an acknowledgement receipt.
+  A rejection requires caller-owned generation revocation/reconnect; local
+  subscriber capacity rejection does not permanently quarantine the endpoint.
+- **Speculative runtime state requires exact canonical lineage.** A
+  pre-confirmed batch is accepted only after the runtime has adopted a canonical
+  coverage head and only when the preview is its exact numbered child with the
+  matching parent hash. Applications must establish the canonical baseline
+  before enabling speculative delivery; missing or stale lineage fails closed
+  and revokes the active overlay.
 - **Recent toolchain.** MSRV 1.90 and edition 2024 are intentional and
   CI-enforced; consumers on older toolchains are not supported.

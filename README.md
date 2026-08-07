@@ -110,6 +110,10 @@ The reactive subscriber contract became asynchronous and explicitly durable in
 - Attach a `ProviderRef` to Flashblocks-enabled `AlloySubscriber` sessions. The
   endpoint ID is propagated into every preconfirmed record so pending reads can
   remain pinned to the announcing provider and later canonical reads can prefer it.
+- Enable `raw-flashblocks-json` only when an application receives the supported
+  receipt-enriched indexed JSON profile on a separate source socket. The crate
+  converts application-data frames but never opens, reconnects, or rate-limits
+  that socket.
 
 ## What it provides today
 
@@ -315,7 +319,7 @@ The reactive subscriber contract became asynchronous and explicitly durable in
   crates implement the versioned remote service client and a durable HyperSync
   source without coupling provider-native types into this core crate.
 
-### Flashblocks on Base and OP
+### Flashblocks delivery profiles
 
 Flashblocks are an opt-in subscriber mode layered onto the same handler and
 runtime path as canonical events:
@@ -353,6 +357,9 @@ let subscriber = AlloySubscriber::new(provider, SubscriberMode::PubSub, config)
   complete speculative generation before reconnect I/O.
 - On Base Flashblocks endpoints, canonical progress is certified at
   `canonical_head_poll_interval` through `eth_getBlockByNumber("latest")`.
+  Each certification is bounded by `canonical_head_request_timeout` (three
+  seconds by default); expiry fails the subscriber generation closed so its
+  owner can rotate the pinned provider.
   The provider's `newHeads` feed is not trusted because Flashblocks-aware
   endpoints may expose partial/preconfirmed progress through it.
 - **OP** (`10`, `11155420`) uses one generation-pinned sampler for the standard
@@ -367,13 +374,17 @@ let subscriber = AlloySubscriber::new(provider, SubscriberMode::PubSub, config)
   for canonical streams while routing OP pending reads through the matching
   provider's request/response endpoint.
 
-Both adapters emit `ChainStatus::Preconfirmed`, `InputSource::Flashblocks`, and
+The built-in adapters emit `ChainStatus::Preconfirmed`, `InputSource::Flashblocks`, and
 `DeliveryScope::Preconfirmed`. `ReactiveRuntime` applies each cumulative
 Flashblock to a disposable overlay: a newer payload/provider generation replaces
 the previous preview, canonical input restores the saved canonical state before
 commit, and `discard_preconfirmation` restores it explicitly. The cache pins
 preconfirmed reads to `pending` and installs the preview's complete available
-EVM block environment. Preconfirmed resyncs also use the `pending` block tag.
+EVM block environment. Admission requires an adopted canonical coverage head:
+the preview number must be exactly `canonical + 1` and its parent hash must equal
+the canonical coverage hash. A missing baseline, wrong or missing parent, or
+stale replay after canonical advancement revokes the active overlay and fails
+closed. Preconfirmed resyncs also use the `pending` block tag.
 The overlay never advances canonical
 coverage, finality, health, rollback journals, or durable checkpoints; the
 checkpointed engine rejects speculative batches rather than persisting them.
@@ -388,6 +399,82 @@ the covered stream set explicit. Endpoint
 qualification still requires a live acceptance window that observes advancing
 Flashblocks and a correlated active-pool pending log; acknowledgement or a
 successful probe alone is not liveness.
+
+#### Receipt-enriched raw JSON adapter
+
+The default-off `raw-flashblocks-json` feature adds a chain-neutral converter
+for one explicit wire profile: `payload_id`, a monotonically increasing `index`,
+an index-zero `base` (or `static`) header, transaction deltas in
+`diff.transactions`, and an exact receipt map in `metadata.receipts`. It does
+not accept JSON-RPC subscription envelopes, receipt-less previews, or binary
+SSZ frames. Compatibility is determined by this schema, not by a chain allowlist
+or provider name.
+
+The adapter performs no network I/O and adds no WebSocket dependency. The
+application owns authentication, control frames, bounded channel capacity,
+inactivity detection, retry, backoff, and provider rotation. It should pass
+only complete application-data frames to the adapter:
+
+```rust,ignore
+use evm_fork_cache::reactive::{
+    AlloySubscriber, PreconfirmationMode, ProviderRef, RawJsonFlashblocksAdapter,
+    SubscriberConfig, SubscriberMode,
+};
+
+let source = ProviderRef::new("supplemental-flashblocks", generation);
+let mut adapter = RawJsonFlashblocksAdapter::new(source.clone());
+let mut subscriber = AlloySubscriber::new(canonical_provider, SubscriberMode::PubSub,
+    SubscriberConfig {
+        preconfirmations: PreconfirmationMode::Preferred,
+        ..SubscriberConfig::default()
+    });
+subscriber.configure_external_flashblock_updates(source)?;
+let updates = subscriber.open_external_flashblock_update_channel(1_024)?;
+
+// `subscriber` may now move into another runtime owner. The source task keeps
+// the bounded sender and remains responsible for socket lifecycle policy.
+
+match adapter.ingest_json(application_frame) {
+    Ok(Some(update)) => updates.send(update).await?,
+    Ok(None) => {} // identical duplicate or remainder of an invalid generation
+    Err(error) => {
+        // Treat an untrusted application-data error as a source-generation
+        // failure. Forward reset()'s invalidation before reconnecting outside
+        // the crate with a fresh ProviderRef generation.
+        let next_source = ProviderRef::new(
+            adapter.provider().endpoint.clone(),
+            adapter.provider().generation.saturating_add(1),
+        );
+        if let Some(invalidation) = adapter.reset(next_source)? {
+            updates.send(invalidation).await?;
+        }
+    }
+}
+```
+
+Selecting external updates suppresses only the built-in native/pending
+Flashblocks source. Ordinary canonical log and block-header subscriptions stay
+active, so speculative delivery remains additive and canonical reconciliation
+is unchanged. `ingest_flashblock_update` is synchronous, validates source
+generation, exact indexed sequencing, stable base identity, cumulative
+transaction prefixes, delta-log membership, log identity, and the content
+commitment, and performs no provider request. Stale snapshots and invalidations
+cannot revoke a newer generation. The optional bounded channel is an in-process
+ownership seam, not a transport or retry loop. `send(...).await` completes only
+after subscriber validation; `try_send` returns an acknowledgement receipt whose
+`wait` method reports that later verdict. `Rejected` requires the application to
+revoke and reconnect the source generation. Recoverable local-capacity rejection
+does not permanently quarantine the endpoint. Channel closure revokes the active
+preview, keeps canonical delivery alive in preferred mode, and fails required
+mode closed. Call `RawJsonFlashblocksAdapter::reset` and forward its returned
+invalidation whenever the source disconnects, is replaced, or returns an
+application-data or subscriber-admission error that cannot be proven irrelevant.
+
+For an externally managed source,
+`establish_flashblocks_preflight(expected_chain_id)` verifies the canonical
+subscriber's chain and stream topology but deliberately performs zero
+Flashblocks request/response calls. Notification liveness, schema compatibility,
+and active-interest coverage remain application acceptance checks.
 
 ### Execution read-set warming
 
@@ -678,18 +765,33 @@ endpoint (they print instructions and exit if it is unset):
 | `bulk_storage_bench` | Advanced | Benchmark bulk `eth_call` storage extraction vs point reads: scaling, multicall dispatch, a full Uniswap V3 tick-range load, gzip, verified code-seed cold starts, and the provider's chunk ceiling. |
 | `fork_override_balance` | Intermediate | Discover a real token's balance slot and override it. |
 | `reactive_alloy_amm_live_probe` | Advanced | Subscribe to live mainnet AMM logs through the WebSocket-backed `AlloySubscriber`. |
+| `raw_json_flashblocks_subscriber_acceptance` | Advanced | Feed a caller-owned receipt-enriched raw WebSocket through the standardized subscriber path and correlate swap logs with an independent canonical WebSocket. Requires the default-off raw adapter feature and performs no HTTP RPC. |
 
 ```sh
 cargo run --example revert_decoding
 RPC_URL=https://eth.llamarpc.com cargo run --example fork_token_balance
 WS_RPC_URL=wss://example-mainnet-endpoint cargo run --example reactive_alloy_amm_live_probe
+RAW_FLASHBLOCKS_WS_URL=wss://raw-endpoint.example \
+CANONICAL_WS_URL=wss://canonical-endpoint.example \
+cargo run --release --features raw-flashblocks-json,reactive-ws \
+  --example raw_json_flashblocks_subscriber_acceptance
 ```
+
+The point-in-time raw/canonical acceptance results and their exact safety
+boundary are recorded in
+[`docs/raw-json-flashblocks-acceptance.md`](docs/raw-json-flashblocks-acceptance.md).
+They qualify the supported wire profile observed in that run, not every raw
+Flashblocks provider or future schema revision.
 
 ## Feature Flags
 
 Default features enable the reactive runtime and WebSocket/pubsub subscriber
 support (`reactive`, `reactive-ws`). The HTTP polling subscriber is opt-in:
 consumers that disable defaults can enable `reactive,reactive-polling`.
+The receipt-enriched raw JSON adapter is separately opt-in through
+`raw-flashblocks-json`. Its networked acceptance example owns one passive raw
+socket solely to demonstrate the consumer boundary; the library dependency
+surface still contains no raw-socket transport or reconnect policy.
 
 ## Foundry artifact etching
 
@@ -925,6 +1027,24 @@ provider) so they are reproducible:
 | `create3` | CREATE3 address derivation. |
 | `mapping_probe` | **Trace-based slot discovery.** `discover_erc20_balance_slot` across Solidity/Vyper/Solady (near-identical — the sim dominates, layout detection is a few hash checks); end-to-end balance forging **cold vs. descriptor-cached**; overlay `mock_balance`; and typed `call_sol` vs. `call_raw` + manual decode (within noise). |
 | `reactive_routing` | Indexed log hit/miss routing versus compatibility scans, plus fallback/distinct/shared-key handler churn at 16–4,096 handlers. |
+| `raw_json_flashblocks` | Default-off receipt-enriched JSON conversion at one- and two-index fixtures, a 250-transaction/500-log payload, a bounded stress frame close to the 16 MiB compatibility ceiling, and standardized-update queue admission. No socket or provider I/O. |
+
+An Apple M1 Pro `arm64` release run on 2026-08-06 measured Criterion point
+estimates of 4.814 µs for index-zero conversion, 3.440 µs for a following
+delta, 459.46 µs (217.36 MiB/s) for the 250-transaction/500-log payload, and
+9.496 µs for batched non-blocking queue admission. Subscriber validation and
+its acknowledgement are excluded from that microbenchmark. These are offline
+CPU regression baselines, not notification-lead or end-to-end provider latency.
+The much larger stress case exists to make the worst permitted parsing budget
+visible; the 16 MiB library default is not a recommended production setting.
+Applications should record source frame/count distributions, add explicit
+headroom, and set the four `RawJsonFlashblocksLimits` bounds accordingly. On the
+same Apple M1 Pro in a 2026-08-07 release run, a 15,521,468-byte frame with
+17,000 transactions and 34,000 logs measured 38.861 ms (38.356–39.504 ms 95%
+confidence interval) and 380.90 MiB/s across 20 flat Criterion samples. A
+4,108,968-byte application-limit frame with 4,500 transactions and 9,000 logs
+measured 9.642 ms (9.291–10.209 ms) and 406.40 MiB/s; two of its 20 samples were
+high severe outliers.
 
 ```sh
 cargo bench                      # all offline benches

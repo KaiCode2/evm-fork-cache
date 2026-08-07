@@ -77,8 +77,12 @@ jobs:
           cargo check --locked --no-default-features --features reactive
           cargo check --locked --no-default-features --features reactive-polling
           cargo check --locked --no-default-features --features reactive-ws
+          cargo check --locked --no-default-features --features raw-flashblocks-json
           cargo clippy --locked --all-targets --no-default-features --features reactive-polling --no-deps -- -D warnings
           cargo test --locked --no-default-features --features reactive-polling
+          cargo clippy --locked --lib --test raw_json_flashblocks --no-default-features --features raw-flashblocks-json --no-deps -- -D warnings
+          cargo test --locked --no-default-features --features raw-flashblocks-json --test raw_json_flashblocks
+          cargo test --locked --no-default-features --features raw-flashblocks-json,reactive-polling --test raw_json_flashblocks_runtime
 
       - name: Benchmarks compile
         run: cargo bench --locked --no-run --all-features
@@ -127,4 +131,6 @@ jobs:
       # Scoped to --lib so the dev-only example/bench toolchain requirements
       # (e.g. criterion) do not constrain the consumer-facing MSRV.
       - name: Check library builds on MSRV
-        run: cargo check --lib --locked
+        run: |
+          cargo check --lib --locked
+          cargo check --lib --locked --no-default-features --features raw-flashblocks-json

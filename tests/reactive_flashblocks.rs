@@ -39,6 +39,15 @@ fn flashblock(provider: ProviderRef, index: u64, hash: B256) -> FlashblockRef {
     }
 }
 
+fn canonical_parent() -> BlockRef {
+    BlockRef {
+        number: 100,
+        hash: B256::repeat_byte(0x64),
+        parent_hash: Some(B256::repeat_byte(0x63)),
+        timestamp: Some(1_700_000_100),
+    }
+}
+
 fn rpc_log(address: Address, block: BlockRef, tx: u8) -> Log {
     Log {
         inner: PrimitiveLog::new_unchecked(address, Vec::new(), Bytes::new()),
@@ -169,6 +178,10 @@ fn flashblocks_policy_is_disabled_by_default_and_canonical_certification_is_boun
     let default = SubscriberConfig::default();
     assert_eq!(default.preconfirmations, PreconfirmationMode::Disabled);
     assert_eq!(default.canonical_head_poll_interval.as_millis(), 500);
+    assert_eq!(
+        default.canonical_head_request_timeout,
+        std::time::Duration::from_secs(3)
+    );
 }
 
 #[tokio::test]
@@ -193,6 +206,7 @@ async fn preconfirmed_updates_are_visible_then_discarded_before_canonical_ingest
         slot,
         value: speculative_value,
     }))?;
+    runtime.adopt_canonical_baseline(canonical_parent())?;
 
     let record = preconfirmed_record(address, flashblock.clone());
     assert_eq!(record.provider.as_ref(), Some(&provider));
@@ -206,7 +220,7 @@ async fn preconfirmed_updates_are_visible_then_discarded_before_canonical_ingest
         Some(speculative_value)
     );
     assert_eq!(runtime.active_preconfirmation(), Some(&flashblock));
-    assert!(runtime.last_canonical_block().is_none());
+    assert_eq!(runtime.last_canonical_block(), Some(canonical_parent()));
 
     runtime.ingest_batch(
         &mut cache,
@@ -247,6 +261,7 @@ async fn preconfirmed_branch_installs_pending_rpc_pin_and_complete_block_environ
         slot,
         value: U256::from(99),
     }))?;
+    runtime.adopt_canonical_baseline(canonical_parent())?;
     let pending = flashblock(
         ProviderRef::new("base-flashblocks", 3),
         2,
@@ -298,6 +313,7 @@ async fn cumulative_previews_preserve_generation_local_fills_without_leaking_the
         slot,
         value: U256::from(99),
     }))?;
+    runtime.adopt_canonical_baseline(canonical_parent())?;
 
     let provider = ProviderRef::new("base-flashblocks", 3);
     runtime.ingest_batch(
@@ -376,6 +392,7 @@ async fn conflicting_duplicate_index_revokes_the_speculative_branch() -> Result<
         slot,
         value: U256::from(99),
     }))?;
+    runtime.adopt_canonical_baseline(canonical_parent())?;
     let provider = ProviderRef::new("base-flashblocks", 3);
     runtime.ingest_batch(
         &mut cache,

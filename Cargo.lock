@@ -2061,11 +2061,12 @@ dependencies = [
 
 [[package]]
 name = "evm-fork-cache"
-version = "0.4.0-alpha.2"
+version = "0.4.0-alpha.3"
 dependencies = [
  "alloy-consensus",
  "alloy-contract",
  "alloy-eips",
+ "alloy-json-rpc",
  "alloy-network",
  "alloy-node-bindings",
  "alloy-primitives",
@@ -2090,6 +2091,8 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tokio",
+ "tokio-tungstenite",
+ "tower",
  "tracing",
 ]
 

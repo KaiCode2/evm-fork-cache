@@ -12,6 +12,69 @@ surface freezes at 1.0.
 
 ## [Unreleased]
 
+### Changed
+
+- Canonical-head certification requests used by Flashblocks generations now
+  fail closed after `SubscriberConfig::canonical_head_request_timeout` (three
+  seconds by default). A silently wedged request can therefore surface through
+  subscriber-driver failure and provider rotation instead of leaving canonical
+  progress indefinitely stalled.
+
+## [0.4.0-alpha.3] - 2026-08-07
+
+### Added
+
+- Added the default-off `raw-flashblocks-json` feature with a chain-neutral,
+  transport-free adapter for receipt-enriched indexed JSON Flashblocks. It
+  validates payload sequencing, exact receipt/transaction membership, bounded
+  resource use, cumulative identity, and structured log provenance before
+  emitting the existing standardized preconfirmation types.
+- Added the construction-only, fallible
+  `AlloySubscriber::configure_external_flashblock_updates` API and synchronous
+  `ingest_flashblock_update` so application-managed sources can enter the same
+  speculative overlay, invalidation, and canonical reconciliation path without
+  adding provider requests.
+- Added a single-open, bounded update channel so an application can retain a
+  cloneable sender after moving `AlloySubscriber` into a downstream runtime
+  owner. Every send now returns the subscriber's validation verdict rather than
+  queue admission alone; non-blocking sends return an awaitable acknowledgement.
+  Channel closure revokes the active preview; preferred mode retains canonical
+  delivery, while required mode fails closed.
+- Added an opt-in, caller-owned WebSocket acceptance example that forwards the
+  supported raw profile through `AlloySubscriber` and measures speculative to
+  canonical swap-log reconciliation without HTTP RPC or source retries.
+
+### Changed
+
+- Selecting an externally managed standardized source suppresses the built-in
+  chain-specific Flashblocks source while retaining ordinary canonical pubsub
+  logs and block headers. Socket control, timeout, retry, backoff, rate limiting,
+  and provider rotation remain application responsibilities.
+- External snapshots now reject an unexpected endpoint, invalid content
+  commitment, duplicate JSON receipt-map key, duplicate transaction or log
+  identity, or log/block membership mismatch, while stale generations are
+  ignored and cannot revoke newer state.
+  Subscriber-level validation now independently enforces an index-zero start,
+  exact index progression, exact same-index duplicates, stable base identity,
+  cumulative transaction prefixes, and delta logs belonging only to appended
+  transactions. A missing initial index, gap, conflicting duplicate, or caller
+  reset emits an explicit generation-scoped invalidation.
+- Recoverable local-capacity rejection no longer quarantines a provider
+  generation. Queued rejection is reported to the application so it can revoke
+  and reconnect the source while canonical delivery stays active.
+- Complete interest-owner replacement now preserves an invalidation when it
+  retires an active or queued speculative preview, preventing stale overlay
+  state from surviving a topology reset.
+- `ReactiveRuntime` now admits pre-confirmed state only when its pending block
+  is the exact numbered child of the adopted canonical coverage hash. Missing
+  baselines, missing or wrong parents, and stale replays after canonical
+  advancement fail closed and revoke any active overlay.
+- Added a bounded near-limit conversion benchmark. The crate's 16 MiB default
+  is a defensive compatibility ceiling, not a recommended application latency
+  budget; consumers should qualify their exact source and configure materially
+  smaller byte, index, transaction, and log limits where its observed profile
+  permits.
+
 ## [0.4.0-alpha.2] - 2026-08-05
 
 ### Migration checklist
@@ -1139,7 +1202,8 @@ pre-release development phases (see [`docs/ROADMAP.md`](docs/ROADMAP.md)).
 - `EvmCache` requires a multi-thread tokio runtime for any RPC-touching path.
 - See [`docs/KNOWN_ISSUES.md`](docs/KNOWN_ISSUES.md) for current limitations.
 
-[Unreleased]: https://github.com/KaiCode2/evm-fork-cache/compare/v0.4.0-alpha.2...HEAD
+[Unreleased]: https://github.com/KaiCode2/evm-fork-cache/compare/v0.4.0-alpha.3...HEAD
+[0.4.0-alpha.3]: https://github.com/KaiCode2/evm-fork-cache/compare/v0.4.0-alpha.2...v0.4.0-alpha.3
 [0.4.0-alpha.2]: https://github.com/KaiCode2/evm-fork-cache/compare/v0.4.0-alpha.1...v0.4.0-alpha.2
 [0.4.0-alpha.1]: https://github.com/KaiCode2/evm-fork-cache/compare/v0.3.0...v0.4.0-alpha.1
 [0.3.0]: https://github.com/KaiCode2/evm-fork-cache/compare/v0.2.1...v0.3.0

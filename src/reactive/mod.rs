@@ -62,6 +62,15 @@ use crate::{
     state_update::{AccountPatch, PurgeScope, StateDiff, StateUpdate},
 };
 
+#[cfg(feature = "raw-flashblocks-json")]
+mod raw_json_flashblocks;
+#[cfg(feature = "raw-flashblocks-json")]
+pub use raw_json_flashblocks::{
+    FlashblockInvalidation, FlashblockInvalidationReason, FlashblockSnapshot, FlashblockUpdate,
+    FlashblockUpdateAcknowledgement, FlashblockUpdateChannelError, FlashblockUpdateSender,
+    RawJsonFlashblocksAdapter, RawJsonFlashblocksError, RawJsonFlashblocksLimits,
+};
+
 /// Input accepted by the reactive runtime.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ReactiveInput<N: Network = Ethereum> {
@@ -206,6 +215,17 @@ impl FlashblockRef {
                     self.block_number == other.block_number && self.parent_hash == other.parent_hash
                 }
             }
+    }
+
+    #[cfg(feature = "raw-flashblocks-json")]
+    fn same_base_identity(&self, other: &Self) -> bool {
+        self.block_number == other.block_number
+            && self.parent_hash == other.parent_hash
+            && self.timestamp == other.timestamp
+            && self.base_fee_per_gas == other.base_fee_per_gas
+            && self.beneficiary == other.beneficiary
+            && self.prevrandao == other.prevrandao
+            && self.gas_limit == other.gas_limit
     }
 
     fn is_cumulative_successor_of(&self, previous: &Self) -> bool {
@@ -510,6 +530,94 @@ fn flashblock_content_hash(content: FlashblockContentCommitment<'_>) -> B256 {
     } else {
         hash
     }
+}
+
+#[cfg(feature = "raw-flashblocks-json")]
+fn validate_standard_flashblock_snapshot(
+    snapshot: &FlashblockSnapshot,
+) -> Result<(), SubscriberError> {
+    let flashblock = &snapshot.flashblock;
+    if flashblock.payload_id.is_none() || flashblock.index.is_none() {
+        return Err(SubscriberError::Provider(
+            "external Flashblock snapshot is missing its indexed payload identity".into(),
+        ));
+    }
+    let expected_content_hash = flashblock_content_hash(FlashblockContentCommitment {
+        provider: &flashblock.provider,
+        payload_id: flashblock.payload_id,
+        index: flashblock.index,
+        block_number: flashblock.block_number,
+        partial_block_hash: flashblock.partial_block_hash,
+        parent_hash: flashblock.parent_hash,
+        state_root: flashblock.state_root,
+        transactions_root: flashblock.transactions_root,
+        transaction_hashes: &flashblock.transaction_hashes,
+        timestamp: flashblock.timestamp,
+        base_fee_per_gas: flashblock.base_fee_per_gas,
+        beneficiary: flashblock.beneficiary,
+        prevrandao: flashblock.prevrandao,
+        gas_limit: flashblock.gas_limit,
+    });
+    if flashblock.content_hash != expected_content_hash {
+        return Err(SubscriberError::Provider(
+            "external Flashblock content commitment is invalid".into(),
+        ));
+    }
+
+    let mut transactions = HashSet::with_capacity(flashblock.transaction_hashes.len());
+    if flashblock
+        .transaction_hashes
+        .iter()
+        .any(|hash| !transactions.insert(*hash))
+    {
+        return Err(SubscriberError::Provider(
+            "external Flashblock cumulative transaction membership contains a duplicate hash"
+                .into(),
+        ));
+    }
+
+    let mut log_ids = HashSet::with_capacity(snapshot.logs.len());
+    for log in &snapshot.logs {
+        if log.removed || log.block_number != Some(flashblock.block_number) {
+            return Err(SubscriberError::Provider(
+                "external pre-confirmed log disagrees with its Flashblock block identity".into(),
+            ));
+        }
+        if log.block_hash != Some(flashblock.content_hash) {
+            return Err(SubscriberError::Provider(
+                "external pre-confirmed log is not bound to its Flashblock content commitment"
+                    .into(),
+            ));
+        }
+        let transaction_hash = log.transaction_hash.ok_or_else(|| {
+            SubscriberError::Provider(
+                "external pre-confirmed log is missing its transaction hash".into(),
+            )
+        })?;
+        let expected_transaction_index = flashblock
+            .transaction_index(&transaction_hash)
+            .ok_or_else(|| {
+                SubscriberError::Provider(
+                    "external pre-confirmed log transaction is absent from the cumulative Flashblock"
+                        .into(),
+                )
+            })?;
+        if log.transaction_index != Some(expected_transaction_index) {
+            return Err(SubscriberError::Provider(
+                "external pre-confirmed log transaction index disagrees with cumulative membership"
+                    .into(),
+            ));
+        }
+        let log_index = log.log_index.ok_or_else(|| {
+            SubscriberError::Provider("external pre-confirmed log is missing its log index".into())
+        })?;
+        if !log_ids.insert((transaction_hash, log_index)) {
+            return Err(SubscriberError::Provider(
+                "external Flashblock snapshot contains a duplicate log identity".into(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn commit_optional_bytes(commitment: &mut Keccak256, value: Option<&[u8]>) {
@@ -4723,7 +4831,10 @@ impl<N: Network> ReactiveRuntime<N> {
     ///
     /// Returns [`ReactiveError`] when records or controls are invalid, canonical
     /// continuity cannot be proven, a handler rejects input, or an effect cannot
-    /// be applied. Cache and canonical runtime state are restored before return.
+    /// be applied. A pre-confirmed batch additionally requires an adopted
+    /// canonical coverage head and must identify its exact child by number and
+    /// parent hash. Cache and canonical runtime state are restored before
+    /// return; a lineage failure revokes any active speculative branch.
     pub fn ingest_batch(
         &mut self,
         cache: &mut EvmCache,
@@ -4831,6 +4942,28 @@ impl<N: Network> ReactiveRuntime<N> {
         cache: &mut EvmCache,
         incoming: &FlashblockRef,
     ) -> Result<(), ReactiveError> {
+        let Some(canonical) = self.coverage_head else {
+            self.discard_preconfirmed_branch(cache);
+            return Err(ReactiveError::InvalidInputRecord {
+                message: "pre-confirmed state requires an exact canonical coverage baseline".into(),
+            });
+        };
+        if canonical.number.checked_add(1) != Some(incoming.block_number) {
+            self.discard_preconfirmed_branch(cache);
+            return Err(ReactiveError::InvalidInputRecord {
+                message: format!(
+                    "pre-confirmed block {} is not the exact successor of canonical block {}",
+                    incoming.block_number, canonical.number
+                ),
+            });
+        }
+        if incoming.parent_hash != Some(canonical.hash) {
+            self.discard_preconfirmed_branch(cache);
+            return Err(ReactiveError::InvalidInputRecord {
+                message: "pre-confirmed block parent does not match the canonical coverage hash"
+                    .into(),
+            });
+        }
         if let Some(active) = self.preconfirmed_branch.as_ref()
             && active.flashblock.same_payload(incoming)
         {
@@ -9848,6 +9981,9 @@ pub struct SubscriberConfig {
     /// Cadence for certifying sealed canonical heads while connected to a
     /// Flashblocks endpoint whose `newHeads` stream may contain partial heads.
     pub canonical_head_poll_interval: Duration,
+    /// Maximum time allowed for one provider request that certifies a
+    /// canonical head while Flashblocks are active.
+    pub canonical_head_request_timeout: Duration,
     /// Optimism pending-state sampling cadence.
     ///
     /// Base uses native `newFlashblocks` plus `pendingLogs`. Optimism providers
@@ -9921,6 +10057,7 @@ impl Default for SubscriberConfig {
         Self {
             preconfirmations: PreconfirmationMode::Disabled,
             canonical_head_poll_interval: Duration::from_millis(500),
+            canonical_head_request_timeout: Duration::from_secs(3),
             flashblock_poll_interval: Duration::from_millis(250),
             max_consecutive_flashblock_poll_failures: 10,
             max_pending_transaction_receipts_per_tick: 32,
@@ -9945,6 +10082,9 @@ pub enum FlashblocksDelivery {
     NativeSubscriptions,
     /// Generation-pinned `pending` block and log sampling.
     PendingStatePolling,
+    /// Standardized updates supplied by an application-managed transport.
+    #[cfg(feature = "raw-flashblocks-json")]
+    ExternalUpdates,
 }
 
 /// Request/response traffic issued by one Flashblocks subscriber generation.
@@ -10033,10 +10173,11 @@ impl FlashblocksRpcMetrics {
 /// Successful initial Flashblocks endpoint preflight.
 ///
 /// This proves chain identity and either subscription acknowledgement for
-/// Base's `newFlashblocks` plus every pool-filtered `pendingLogs` stream, or
-/// method support for OP's bounded pending block/log sampler. Notification
-/// liveness and an active-pool pending log remain acceptance-window checks: a
-/// successful preflight alone must not qualify an endpoint for live trading.
+/// Base's `newFlashblocks` plus every pool-filtered `pendingLogs` stream, method
+/// support for OP's bounded pending block/log sampler, or the canonical stream
+/// topology paired with an application-managed standardized source.
+/// Notification liveness and active-interest coverage remain acceptance-window
+/// checks: a successful preflight alone must not qualify a source for live use.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FlashblocksPreflight {
     chain_id: u64,
@@ -10053,8 +10194,11 @@ impl FlashblocksPreflight {
         self.chain_id
     }
 
-    /// Provider generation whose HTTP state and both WebSocket streams were
-    /// preflighted together.
+    /// Provider generation selected for speculative updates.
+    ///
+    /// Built-in profiles preflight this provider's coupled request/subscription
+    /// surfaces. External profiles retain caller-supplied provenance while the
+    /// application qualifies the supplemental socket separately.
     pub const fn provider(&self) -> &ProviderRef {
         &self.provider
     }
@@ -10065,12 +10209,14 @@ impl FlashblocksPreflight {
     }
 
     /// Number of acknowledged pool-filtered `pendingLogs` subscriptions.
+    ///
+    /// This is zero for sampled and externally managed delivery profiles.
     pub const fn pending_log_subscriptions(&self) -> usize {
         self.pending_log_subscriptions
     }
 
-    /// Number of provider-facing pending-log filters covered by the native or
-    /// sampled delivery surface.
+    /// Number of provider-facing log filters whose interests must be covered by
+    /// the selected native, sampled, or external delivery surface.
     pub const fn pending_log_filters(&self) -> usize {
         self.pending_log_filters
     }
@@ -12249,6 +12395,24 @@ type FlashblockReconnectFuture<N> = Pin<
 /// `Ok(None)`.
 pub struct AlloySubscriber<P, N: Network = Ethereum> {
     provider: P,
+    /// Stable identity of an application-managed standardized Flashblock
+    /// update source. The application owns its transport and lifecycle.
+    #[cfg(feature = "raw-flashblocks-json")]
+    external_flashblocks_provider: Option<ProviderRef>,
+    /// Receiving half of the optional bounded application-to-subscriber queue.
+    #[cfg(feature = "raw-flashblocks-json")]
+    external_flashblock_updates:
+        Option<tokio::sync::mpsc::Receiver<raw_json_flashblocks::QueuedFlashblockUpdate>>,
+    /// Whether an external update queue was opened for this subscriber.
+    #[cfg(feature = "raw-flashblocks-json")]
+    external_flashblock_update_channel_opened: bool,
+    /// Highest external generation rejected by subscriber-level validation.
+    #[cfg(feature = "raw-flashblocks-json")]
+    rejected_external_flashblock_generation: Option<u64>,
+    /// Last accepted externally standardized snapshot, retained so callers
+    /// cannot bypass indexed-payload continuity enforced by the raw adapter.
+    #[cfg(feature = "raw-flashblocks-json")]
+    last_external_flashblock_snapshot: Option<FlashblockSnapshot>,
     /// Optional request/response half of the same configured provider lease.
     /// OP Flashblocks pending reads use this transport when WebSocket JSON-RPC
     /// does not expose the provider's pending-state surface.
@@ -12404,6 +12568,16 @@ impl<P, N: Network> AlloySubscriber<P, N> {
         ensure_ring_crypto_provider();
         Self {
             provider,
+            #[cfg(feature = "raw-flashblocks-json")]
+            external_flashblocks_provider: None,
+            #[cfg(feature = "raw-flashblocks-json")]
+            external_flashblock_updates: None,
+            #[cfg(feature = "raw-flashblocks-json")]
+            external_flashblock_update_channel_opened: false,
+            #[cfg(feature = "raw-flashblocks-json")]
+            rejected_external_flashblock_generation: None,
+            #[cfg(feature = "raw-flashblocks-json")]
+            last_external_flashblock_snapshot: None,
             flashblocks_state_provider: None,
             provider_ref: None,
             log_verification_provider: None,
@@ -12464,6 +12638,113 @@ impl<P, N: Network> AlloySubscriber<P, N> {
     pub fn with_provider_ref(mut self, provider: ProviderRef) -> Self {
         self.provider_ref = Some(provider);
         self
+    }
+
+    /// Select application-managed standardized Flashblock updates before
+    /// subscriber registration begins.
+    ///
+    /// This suppresses the subscriber's chain-specific native or pending-state
+    /// Flashblocks source. Canonical logs and block headers continue through the
+    /// configured subscriber transport. The application owns the raw socket,
+    /// control frames, bounded queue, timeout, retry, backoff, and provider
+    /// rotation, and passes decoded updates to
+    /// [`Self::ingest_flashblock_update`].
+    ///
+    /// Call [`Self::ingest_flashblock_update`] directly while retaining mutable
+    /// subscriber ownership, or open a bounded handoff with
+    /// [`Self::open_external_flashblock_update_channel`] before moving the
+    /// subscriber into another runtime owner.
+    ///
+    /// This is deliberately a fallible construction-time configuration method,
+    /// not a live reconfiguration API. Replacing a source after canonical or
+    /// speculative processing begins requires a new subscriber so existing
+    /// streams and overlays cannot survive under ambiguous provider ownership.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SubscriberError::InvalidConfig`] when an external source was
+    /// already selected or subscriber registration, stream installation, or
+    /// event processing has begun.
+    #[cfg(feature = "raw-flashblocks-json")]
+    pub fn configure_external_flashblock_updates(
+        &mut self,
+        provider: ProviderRef,
+    ) -> Result<(), SubscriberError> {
+        if self.external_flashblocks_provider.is_some() {
+            return Err(SubscriberError::InvalidConfig(
+                "external Flashblock updates were already configured",
+            ));
+        }
+        if self.external_flashblock_update_channel_opened
+            || self.external_flashblock_updates.is_some()
+            || self.chain_id.is_some()
+            || !self.base_interests.is_empty()
+            || !self.owned_interests.is_empty()
+            || !self.interests.is_empty()
+            || !self.pending_records.is_empty()
+            || !self.pending_chain_controls.is_empty()
+            || !self.pending_backfills.is_empty()
+            || !matches!(self.state, AlloySubscriberState::Uninitialized)
+        {
+            return Err(SubscriberError::InvalidConfig(
+                "external Flashblock updates must be configured before subscriber registration",
+            ));
+        }
+        self.external_flashblocks_provider = Some(provider);
+        Ok(())
+    }
+
+    /// Open one bounded standardized-update queue and return its application handle.
+    ///
+    /// The queue is useful when the subscriber will be moved into a runtime
+    /// driver: the application retains the cloneable sender while the subscriber
+    /// continues to own all validation, speculative deduplication, and canonical
+    /// reconciliation. Opening a queue does not create a socket or background
+    /// task, and does not implement retry or backoff. Awaited sends complete
+    /// only after subscriber validation; non-blocking sends return an explicit
+    /// acknowledgement receipt.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SubscriberError::InvalidConfig`] if external updates were not
+    /// selected first, `capacity` is zero, or a queue was already opened.
+    #[cfg(feature = "raw-flashblocks-json")]
+    pub fn open_external_flashblock_update_channel(
+        &mut self,
+        capacity: usize,
+    ) -> Result<FlashblockUpdateSender, SubscriberError> {
+        if capacity == 0 {
+            return Err(SubscriberError::InvalidConfig(
+                "external Flashblock update channel capacity must be greater than zero",
+            ));
+        }
+        let provider = self.external_flashblocks_provider.clone().ok_or(
+            SubscriberError::InvalidConfig(
+                "external Flashblock update channel requires configure_external_flashblock_updates",
+            ),
+        )?;
+        if self.external_flashblock_update_channel_opened {
+            return Err(SubscriberError::InvalidConfig(
+                "external Flashblock update channel was already opened",
+            ));
+        }
+        let (sender, receiver) =
+            raw_json_flashblocks::flashblock_update_channel(provider, capacity);
+        self.external_flashblock_updates = Some(receiver);
+        self.external_flashblock_update_channel_opened = true;
+        self.sources_dirty = true;
+        Ok(sender)
+    }
+
+    fn uses_external_flashblock_updates(&self) -> bool {
+        #[cfg(feature = "raw-flashblocks-json")]
+        {
+            self.external_flashblocks_provider.is_some()
+        }
+        #[cfg(not(feature = "raw-flashblocks-json"))]
+        {
+            false
+        }
     }
 
     /// Pair the subscriber's event transport with the request/response
@@ -13139,12 +13420,22 @@ impl<P, N: Network> AlloySubscriber<P, N> {
         // delivery after the cache snapshot, so reset all stale delivery and
         // dedupe state from the prior topology before publishing the exact
         // replacement plus its global historical work.
+        let revoke_preconfirmation = self.latest_preconfirmation.is_some()
+            || self.pending_preconfirmation_invalidation
+            || self.pending_records.iter().any(|record| {
+                record.scope == SubscriberInputScope::Preconfirmed
+                    || matches!(
+                        &record.record.context.chain_status,
+                        ChainStatus::Preconfirmed { .. }
+                    )
+            });
         self.base_interests.clear();
         self.owned_interests = next_owned;
         self.interests = next_registered;
         self.reset_delivery_state();
+        self.pending_preconfirmation_invalidation = revoke_preconfirmation;
         self.pending_backfills = replacement_backfills;
-        self.state = AlloySubscriberState::Uninitialized;
+        self.reset_stream_topology();
         Ok(())
     }
 
@@ -13607,6 +13898,8 @@ impl<P, N: Network> AlloySubscriber<P, N> {
                     | SubscriberStreamSource::PubSubPendingHashes
                     | SubscriberStreamSource::PubSubBlockHeaders
                     | SubscriberStreamSource::PollingPendingHashes => {}
+                    #[cfg(feature = "raw-flashblocks-json")]
+                    SubscriberStreamSource::ExternalFlashblockUpdates => {}
                 }
             }
         }
@@ -13692,6 +13985,28 @@ impl<P, N: Network> AlloySubscriber<P, N> {
         self.reset_flashblock_tracking();
     }
 
+    fn reset_stream_topology(&mut self) {
+        #[cfg(feature = "raw-flashblocks-json")]
+        let external = match &mut self.state {
+            AlloySubscriberState::Active(streams) => streams
+                .entries
+                .iter()
+                .position(|entry| entry.source.is_external_flashblocks())
+                .map(|index| streams.entries.remove(index)),
+            AlloySubscriberState::Uninitialized | AlloySubscriberState::Empty => None,
+        };
+
+        #[cfg(feature = "raw-flashblocks-json")]
+        if let Some(external) = external {
+            let mut streams = SubscriberStreams::new();
+            streams.entries.push(external);
+            self.state = AlloySubscriberState::Active(streams);
+            return;
+        }
+
+        self.state = AlloySubscriberState::Uninitialized;
+    }
+
     fn reset_flashblock_tracking(&mut self) {
         self.base_flashblock_header = None;
         self.base_flashblock_transactions = None;
@@ -13700,6 +14015,10 @@ impl<P, N: Network> AlloySubscriber<P, N> {
         self.preconfirmed_seen_logs.clear();
         self.preconfirmed_receipted_transactions.clear();
         self.preconfirmed_unavailable_receipts.clear();
+        #[cfg(feature = "raw-flashblocks-json")]
+        {
+            self.last_external_flashblock_snapshot = None;
+        }
         self.consecutive_flashblock_poll_failures = 0;
     }
 
@@ -13948,15 +14267,25 @@ enum SubscriberTransport {
 
 #[derive(Clone, Debug)]
 enum SubscriberStreamSource {
-    PubSubLog { id: usize, filter: Filter },
-    BasePendingLog { id: usize, filter: Filter },
+    PubSubLog {
+        id: usize,
+        filter: Filter,
+    },
+    BasePendingLog {
+        id: usize,
+        filter: Filter,
+    },
     BaseFlashblocks,
     OpPendingFlashblocks,
     CanonicalHeadPolling,
     PubSubPendingHashes,
     PubSubBlockHeaders,
-    PollingLog { filter: Filter },
+    PollingLog {
+        filter: Filter,
+    },
     PollingPendingHashes,
+    #[cfg(feature = "raw-flashblocks-json")]
+    ExternalFlashblockUpdates,
 }
 
 impl SubscriberStreamSource {
@@ -13971,6 +14300,8 @@ impl SubscriberStreamSource {
             Self::PubSubBlockHeaders => "pubsub block header",
             Self::PollingLog { .. } => "polling log",
             Self::PollingPendingHashes => "polling pending transaction hash",
+            #[cfg(feature = "raw-flashblocks-json")]
+            Self::ExternalFlashblockUpdates => "external standardized Flashblock update",
         }
     }
 
@@ -14009,7 +14340,20 @@ impl SubscriberStreamSource {
             | (Self::PubSubPendingHashes, Self::PubSubPendingHashes)
             | (Self::PubSubBlockHeaders, Self::PubSubBlockHeaders)
             | (Self::PollingPendingHashes, Self::PollingPendingHashes) => true,
+            #[cfg(feature = "raw-flashblocks-json")]
+            (Self::ExternalFlashblockUpdates, Self::ExternalFlashblockUpdates) => true,
             _ => false,
+        }
+    }
+
+    fn is_external_flashblocks(&self) -> bool {
+        #[cfg(feature = "raw-flashblocks-json")]
+        {
+            matches!(self, Self::ExternalFlashblockUpdates)
+        }
+        #[cfg(not(feature = "raw-flashblocks-json"))]
+        {
+            false
         }
     }
 }
@@ -14041,6 +14385,8 @@ enum SubscriberEvent<N: Network> {
     },
     FlashblockInvalidated,
     FlashblockObserved,
+    #[cfg(feature = "raw-flashblocks-json")]
+    ExternalFlashblockUpdate(raw_json_flashblocks::QueuedFlashblockUpdate),
     StreamTerminated(SubscriberStreamSource),
 }
 
@@ -14202,8 +14548,9 @@ where
             capabilities.push(SubscriberCapability::BlockHeaders);
         }
         if self.config.preconfirmations != PreconfirmationMode::Disabled
-            && self.provider_ref.is_some()
-            && self.chain_id.and_then(flashblocks_adapter).is_some()
+            && (self.uses_external_flashblock_updates()
+                || (self.provider_ref.is_some()
+                    && self.chain_id.and_then(flashblocks_adapter).is_some()))
         {
             capabilities.push(SubscriberCapability::Preconfirmations);
         }
@@ -14227,7 +14574,7 @@ where
             self.owned_interests.clear();
             self.rebuild_registered_interests();
             self.reset_delivery_state();
-            self.state = AlloySubscriberState::Uninitialized;
+            self.reset_stream_topology();
             Ok(())
         })
     }
@@ -14248,16 +14595,23 @@ where
     N: Network + 'static,
     N::HeaderResponse: Send + 'static,
 {
-    /// Validate one pinned OP Stack provider generation and establish its
-    /// chain-specific Flashblocks surface.
+    /// Validate one configured provider generation and establish its selected
+    /// Flashblocks delivery surface.
     ///
     /// The caller must register at least one active log interest first. The
-    /// method requires a matching chain id and stable [`ProviderRef`]. Base
-    /// additionally requires pubsub, `newFlashblocks`, and one `pendingLogs`
-    /// acknowledgement per planned provider filter. Optimism probes the
-    /// bounded pending block/log/receipt surface. `op_supportedCapabilities`
-    /// is queried opportunistically and retained as opaque evidence because
-    /// provider implementations do not expose a uniform capability vocabulary.
+    /// built-in profiles require a matching chain id and stable [`ProviderRef`].
+    /// Base additionally requires pubsub, `newFlashblocks`, and one
+    /// `pendingLogs` acknowledgement per planned provider filter. Optimism
+    /// probes the bounded pending block/log/receipt surface.
+    /// `op_supportedCapabilities` is queried opportunistically and retained as
+    /// opaque evidence because provider implementations do not expose a uniform
+    /// capability vocabulary.
+    ///
+    /// With `raw-flashblocks-json` and
+    /// [`Self::configure_external_flashblock_updates`], preflight instead verifies
+    /// the canonical subscriber chain and installed canonical stream topology.
+    /// The application owns supplemental-source qualification, and this method
+    /// performs no Flashblocks request/response calls for that profile.
     ///
     /// A successful return is deliberately not a liveness qualification. The
     /// acceptance window must still observe a Flashblock whose pending state
@@ -14289,6 +14643,18 @@ where
             });
         }
         self.validate_flashblocks_setup()?;
+        #[cfg(feature = "raw-flashblocks-json")]
+        if let Some(provider) = self.external_flashblocks_provider.clone() {
+            self.ensure_streams().await?;
+            return Ok(FlashblocksPreflight {
+                chain_id,
+                provider,
+                delivery: FlashblocksDelivery::ExternalUpdates,
+                pending_log_subscriptions: 0,
+                pending_log_filters: self.log_stream_filters().len(),
+                advertised_capabilities: None,
+            });
+        }
         let adapter = flashblocks_adapter(chain_id).ok_or(SubscriberError::Unsupported(
             "Flashblocks are currently implemented for Base and OP chains",
         ))?;
@@ -14398,6 +14764,180 @@ where
             pending_log_filters: pending_log_filters.len(),
             advertised_capabilities,
         })
+    }
+
+    /// Ingest one standardized update from an application-managed source.
+    ///
+    /// This method is synchronous and performs no provider I/O. The update is
+    /// validated against the configured source identity, normalized through
+    /// the same preconfirmation deduplication used by provider subscriptions,
+    /// and queued for ordinary [`EventSubscriber`] delivery. Stale provider
+    /// generations and stale invalidations cannot revoke newer speculative
+    /// state. Indexed snapshots must begin at zero, advance exactly one index at
+    /// a time, preserve their base identity and cumulative transaction prefix,
+    /// and bind delta logs only to newly appended transactions.
+    #[cfg(feature = "raw-flashblocks-json")]
+    pub fn ingest_flashblock_update(
+        &mut self,
+        update: FlashblockUpdate,
+    ) -> Result<(), SubscriberError> {
+        validate_subscriber_config(&self.config)?;
+        self.validate_flashblocks_setup()?;
+        let configured =
+            self.external_flashblocks_provider
+                .as_ref()
+                .ok_or(SubscriberError::InvalidConfig(
+                    "standardized Flashblock updates require configure_external_flashblock_updates",
+                ))?;
+
+        match update {
+            FlashblockUpdate::Snapshot(batch) => {
+                if batch.flashblock.provider.endpoint != configured.endpoint {
+                    return Err(SubscriberError::Provider(
+                        "external Flashblock update came from an unexpected provider endpoint"
+                            .into(),
+                    ));
+                }
+                if batch.flashblock.provider.generation < configured.generation
+                    || self.latest_preconfirmation.as_ref().is_some_and(|latest| {
+                        latest.provider.endpoint == batch.flashblock.provider.endpoint
+                            && latest.provider.generation > batch.flashblock.provider.generation
+                    })
+                {
+                    return Ok(());
+                }
+                if self
+                    .rejected_external_flashblock_generation
+                    .is_some_and(|rejected| batch.flashblock.provider.generation <= rejected)
+                {
+                    return Err(SubscriberError::Provider(
+                        "external Flashblock provider generation was previously rejected".into(),
+                    ));
+                }
+                validate_standard_flashblock_snapshot(&batch)?;
+                if self.validate_external_flashblock_sequence(&batch)? {
+                    return Ok(());
+                }
+                let required = self.pending_record_count().saturating_add(batch.logs.len());
+                if required > self.config.max_pending_records {
+                    self.invalidate_preconfirmation_snapshot();
+                    self.last_external_flashblock_snapshot = None;
+                    return Err(SubscriberError::ResourceExhausted(format!(
+                        "external preconfirmation records require {required} pending records, above the configured limit of {}",
+                        self.config.max_pending_records
+                    )));
+                }
+                let accepted_snapshot = (*batch).clone();
+                let FlashblockSnapshot { flashblock, logs } = *batch;
+                let logs = self.filter_preconfirmed_logs(&flashblock, logs)?;
+                self.last_external_flashblock_snapshot = Some(accepted_snapshot);
+                if let Some(provider) = self.external_flashblocks_provider.as_mut() {
+                    provider.generation = provider.generation.max(flashblock.provider.generation);
+                }
+                if !logs.is_empty() {
+                    self.enqueue_event(SubscriberEvent::PreconfirmedLogs { flashblock, logs });
+                }
+            }
+            FlashblockUpdate::Invalidated(invalidation) => {
+                if invalidation.provider.endpoint != configured.endpoint {
+                    return Err(SubscriberError::Provider(
+                        "external Flashblock invalidation came from an unexpected provider endpoint"
+                            .into(),
+                    ));
+                }
+                if self.latest_preconfirmation.as_ref().is_some_and(|latest| {
+                    latest.provider == invalidation.provider
+                        && latest.payload_id == Some(invalidation.payload_id)
+                }) {
+                    self.invalidate_preconfirmation_snapshot();
+                    self.last_external_flashblock_snapshot = None;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "raw-flashblocks-json")]
+    fn validate_external_flashblock_sequence(
+        &self,
+        snapshot: &FlashblockSnapshot,
+    ) -> Result<bool, SubscriberError> {
+        let Some(previous) = self.last_external_flashblock_snapshot.as_ref() else {
+            if snapshot.flashblock.index != Some(0) {
+                return Err(SubscriberError::Provider(
+                    "external Flashblock payload generation must begin at index zero".into(),
+                ));
+            }
+            return Ok(false);
+        };
+
+        if previous.flashblock.provider == snapshot.flashblock.provider
+            && previous.flashblock.payload_id == snapshot.flashblock.payload_id
+        {
+            let previous_index = previous
+                .flashblock
+                .index
+                .expect("validated indexed snapshot");
+            let current_index = snapshot
+                .flashblock
+                .index
+                .expect("validated indexed snapshot");
+            if current_index == previous_index {
+                if previous == snapshot {
+                    return Ok(true);
+                }
+                return Err(SubscriberError::Provider(
+                    "external Flashblock repeated the same index with conflicting content".into(),
+                ));
+            }
+            if current_index < previous_index {
+                return Err(SubscriberError::Provider(format!(
+                    "external Flashblock index regressed from {previous_index} to {current_index}"
+                )));
+            }
+            if current_index > previous_index.saturating_add(1) {
+                return Err(SubscriberError::Provider(format!(
+                    "external Flashblock index skipped from {previous_index} to {current_index}"
+                )));
+            }
+            if current_index == previous_index.saturating_add(1)
+                && !previous.flashblock.same_base_identity(&snapshot.flashblock)
+            {
+                return Err(SubscriberError::Provider(
+                    "external Flashblock base identity changed within one payload generation"
+                        .into(),
+                ));
+            }
+            if current_index == previous_index.saturating_add(1)
+                && !snapshot
+                    .flashblock
+                    .transaction_hashes
+                    .starts_with(&previous.flashblock.transaction_hashes)
+            {
+                return Err(SubscriberError::Provider(
+                    "external Flashblock cumulative transaction membership changed its prior prefix"
+                        .into(),
+                ));
+            }
+            let prior_transaction_count =
+                u64::try_from(previous.flashblock.transaction_hashes.len()).unwrap_or(u64::MAX);
+            if current_index == previous_index.saturating_add(1)
+                && snapshot.logs.iter().any(|log| {
+                    log.transaction_index
+                        .is_some_and(|index| index < prior_transaction_count)
+                })
+            {
+                return Err(SubscriberError::Provider(
+                    "external Flashblock delta log does not belong to a newly appended transaction"
+                        .into(),
+                ));
+            }
+        } else if snapshot.flashblock.index != Some(0) {
+            return Err(SubscriberError::Provider(
+                "external Flashblock payload generation must begin at index zero".into(),
+            ));
+        }
+        Ok(false)
     }
 
     async fn probe_pending_state(&mut self, filters: &[Filter]) -> Result<(), SubscriberError> {
@@ -14525,6 +15065,14 @@ where
 
     fn validate_flashblocks_setup(&self) -> Result<(), SubscriberError> {
         if self.config.preconfirmations == PreconfirmationMode::Disabled {
+            if self.uses_external_flashblock_updates() {
+                return Err(SubscriberError::InvalidConfig(
+                    "external Flashblock updates require preconfirmations to be preferred or required",
+                ));
+            }
+            return Ok(());
+        }
+        if self.uses_external_flashblock_updates() {
             return Ok(());
         }
         if self.provider_ref.is_none() {
@@ -15223,10 +15771,19 @@ where
     }
 
     fn stream_sources(&mut self) -> Result<Vec<SubscriberStreamSource>, SubscriberError> {
-        match resolve_subscriber_transport(self.mode)? {
-            SubscriberTransport::PubSub => Ok(self.pubsub_stream_sources()),
-            SubscriberTransport::Polling => Ok(self.polling_stream_sources()),
-        }
+        let sources = match resolve_subscriber_transport(self.mode)? {
+            SubscriberTransport::PubSub => self.pubsub_stream_sources(),
+            SubscriberTransport::Polling => self.polling_stream_sources(),
+        };
+        #[cfg(feature = "raw-flashblocks-json")]
+        let sources = {
+            let mut sources = sources;
+            if self.external_flashblock_update_channel_opened {
+                sources.push(SubscriberStreamSource::ExternalFlashblockUpdates);
+            }
+            sources
+        };
+        Ok(sources)
     }
 
     fn pubsub_stream_sources(&mut self) -> Vec<SubscriberStreamSource> {
@@ -15246,7 +15803,8 @@ where
         }
 
         if needs_header_block_stream(&self.interests) {
-            if self.config.preconfirmations != PreconfirmationMode::Disabled
+            if !self.uses_external_flashblock_updates()
+                && self.config.preconfirmations != PreconfirmationMode::Disabled
                 && self.chain_id.and_then(flashblocks_adapter).is_some()
             {
                 sources.push(SubscriberStreamSource::CanonicalHeadPolling);
@@ -15255,7 +15813,9 @@ where
             }
         }
 
-        if self.config.preconfirmations != PreconfirmationMode::Disabled {
+        if self.config.preconfirmations != PreconfirmationMode::Disabled
+            && !self.uses_external_flashblock_updates()
+        {
             match self.chain_id.and_then(flashblocks_adapter) {
                 Some(FlashblocksAdapter::NativeSubscriptions) => {
                     sources.push(SubscriberStreamSource::BaseFlashblocks);
@@ -15286,6 +15846,7 @@ where
         }
 
         if self.config.preconfirmations != PreconfirmationMode::Disabled
+            && !self.uses_external_flashblock_updates()
             && self.chain_id.and_then(flashblocks_adapter)
                 == Some(FlashblocksAdapter::PendingStatePolling)
         {
@@ -15335,6 +15896,24 @@ where
             }
             SubscriberStreamSource::PollingPendingHashes => {
                 self.connect_polling_pending_hash_stream().await
+            }
+            #[cfg(feature = "raw-flashblocks-json")]
+            SubscriberStreamSource::ExternalFlashblockUpdates => {
+                let receiver = self.external_flashblock_updates.take().ok_or_else(|| {
+                    SubscriberError::Provider(
+                        "external Flashblock update channel receiver is unavailable".into(),
+                    )
+                })?;
+                let updates = stream::unfold(receiver, |mut receiver| async move {
+                    receiver
+                        .recv()
+                        .await
+                        .map(|update| (SubscriberEvent::ExternalFlashblockUpdate(update), receiver))
+                });
+                Ok(stream_with_termination(
+                    updates,
+                    SubscriberStreamSource::ExternalFlashblockUpdates,
+                ))
             }
         }
     }
@@ -15644,6 +16223,25 @@ where
 
             match event {
                 SubscriberEvent::StreamTerminated(source) => {
+                    if source.is_external_flashblocks() {
+                        #[cfg(feature = "raw-flashblocks-json")]
+                        {
+                            self.external_flashblock_update_channel_opened = false;
+                        }
+                        if let AlloySubscriberState::Active(streams) = &mut self.state {
+                            streams
+                                .entries
+                                .retain(|entry| !entry.source.is_external_flashblocks());
+                            streams.normalize_next_index();
+                        }
+                        self.invalidate_preconfirmation_snapshot();
+                        if self.config.preconfirmations == PreconfirmationMode::Required {
+                            return Err(SubscriberError::Provider(
+                                "required external Flashblock update channel closed".into(),
+                            ));
+                        }
+                        return Ok(Some(SubscriberEvent::FlashblockInvalidated));
+                    }
                     // Persist the missing-source intent before the first await.
                     // If a control command cancels this poll during reconnect,
                     // the next poll will reconcile the desired/live diff.
@@ -15713,6 +16311,54 @@ where
         event: SubscriberEvent<N>,
     ) -> Result<Option<SubscriberEvent<N>>, SubscriberError> {
         match event {
+            #[cfg(feature = "raw-flashblocks-json")]
+            SubscriberEvent::ExternalFlashblockUpdate(queued) => {
+                let provider = queued.update.provider().clone();
+                match self.ingest_flashblock_update(queued.update) {
+                    Ok(()) => {
+                        let _ = queued.acknowledgement.send(Ok(()));
+                        Ok(Some(SubscriberEvent::FlashblockObserved))
+                    }
+                    Err(error)
+                        if self.config.preconfirmations == PreconfirmationMode::Preferred =>
+                    {
+                        let recoverable_capacity =
+                            matches!(error, SubscriberError::ResourceExhausted(_));
+                        if !recoverable_capacity
+                            && let Some(configured) = self.external_flashblocks_provider.as_mut()
+                            && configured.endpoint == provider.endpoint
+                        {
+                            self.rejected_external_flashblock_generation = Some(
+                                self.rejected_external_flashblock_generation
+                                    .map_or(provider.generation, |rejected| {
+                                        rejected.max(provider.generation)
+                                    }),
+                            );
+                            configured.generation = configured
+                                .generation
+                                .max(provider.generation.saturating_add(1));
+                        }
+                        self.invalidate_preconfirmation_snapshot();
+                        self.last_external_flashblock_snapshot = None;
+                        let _ = queued
+                            .acknowledgement
+                            .send(Err(FlashblockUpdateChannelError::Rejected));
+                        tracing::warn!(
+                            provider = %provider.endpoint,
+                            generation = provider.generation,
+                            error = %error,
+                            "external Flashblock update rejected; canonical delivery remains active"
+                        );
+                        Ok(Some(SubscriberEvent::FlashblockInvalidated))
+                    }
+                    Err(error) => {
+                        let _ = queued
+                            .acknowledgement
+                            .send(Err(FlashblockUpdateChannelError::Rejected));
+                        Err(error)
+                    }
+                }
+            }
             SubscriberEvent::BasePendingLog { source_id, log } => {
                 let block_number = log.block_number.ok_or_else(|| {
                     SubscriberError::Provider(
@@ -15826,6 +16472,22 @@ where
     }
 
     async fn fetch_certified_canonical_head(
+        &mut self,
+    ) -> Result<Option<SubscriberEvent<N>>, SubscriberError> {
+        tokio::time::timeout(
+            self.config.canonical_head_request_timeout,
+            self.fetch_certified_canonical_head_inner(),
+        )
+        .await
+        .map_err(|_| {
+            SubscriberError::Provider(format!(
+                "canonical head certification timed out after {:?}",
+                self.config.canonical_head_request_timeout
+            ))
+        })?
+    }
+
+    async fn fetch_certified_canonical_head_inner(
         &mut self,
     ) -> Result<Option<SubscriberEvent<N>>, SubscriberError> {
         if self.chain_id.and_then(flashblocks_adapter)
@@ -16626,9 +17288,11 @@ where
             }
             let reported_hash = log.block_hash.and_then(non_placeholder_hash);
             if !samples_pending_range
-                && let (Some(reported), Some(expected)) =
-                    (reported_hash, flashblock.partial_block_hash)
-                && reported != expected
+                && let Some(reported) = reported_hash
+                && reported != flashblock.content_hash
+                && flashblock
+                    .partial_block_hash
+                    .is_some_and(|expected| reported != expected)
             {
                 return Err(SubscriberError::Provider(
                     "pre-confirmed log partial block hash disagrees with its Flashblock snapshot"
@@ -16664,6 +17328,8 @@ where
                 }
                 Ok(())
             }
+            #[cfg(feature = "raw-flashblocks-json")]
+            SubscriberEvent::ExternalFlashblockUpdate(_) => Ok(()),
             SubscriberEvent::BlockHeader(_)
             | SubscriberEvent::PendingHash(_)
             | SubscriberEvent::PendingHashes(_)
@@ -16760,6 +17426,8 @@ where
                     self.buffer_reconcile_log_for_owners(log, InputSource::Poll, target_epochs);
                 }
             }
+            #[cfg(feature = "raw-flashblocks-json")]
+            SubscriberEvent::ExternalFlashblockUpdate(_) => {}
             SubscriberEvent::BlockHeader(_)
             | SubscriberEvent::PendingHash(_)
             | SubscriberEvent::PendingHashes(_)
@@ -16912,6 +17580,8 @@ where
             | SubscriberEvent::OpFlashblockTick
             | SubscriberEvent::CanonicalHeadTick
             | SubscriberEvent::FlashblockObserved => {}
+            #[cfg(feature = "raw-flashblocks-json")]
+            SubscriberEvent::ExternalFlashblockUpdate(_) => {}
             SubscriberEvent::StreamTerminated(_) => {}
         }
     }
@@ -17619,6 +18289,10 @@ where
             SubscriberStreamSource::BasePendingLog { .. }
             | SubscriberStreamSource::BaseFlashblocks
             | SubscriberStreamSource::OpPendingFlashblocks => unreachable!(),
+            #[cfg(feature = "raw-flashblocks-json")]
+            SubscriberStreamSource::ExternalFlashblockUpdates => {
+                "Flashblocks reconnect cannot own an application-managed source"
+            }
         })),
     }
 }
@@ -17670,8 +18344,29 @@ fn should_dedupe_record<N: Network>(record: &ReactiveInputRecord<N>) -> bool {
 #[cfg(test)]
 mod subscriber_helper_tests {
     use super::*;
+    use alloy_json_rpc::{RequestPacket, ResponsePacket};
     use alloy_provider::ProviderBuilder;
-    use alloy_transport::mock::Asserter;
+    use alloy_rpc_client::RpcClient;
+    use alloy_transport::{TransportError, TransportFut, mock::Asserter};
+    use std::task::{Context, Poll};
+    use tower::Service;
+
+    #[derive(Clone, Debug)]
+    struct NeverRespondingTransport;
+
+    impl Service<RequestPacket> for NeverRespondingTransport {
+        type Response = ResponsePacket;
+        type Error = TransportError;
+        type Future = TransportFut<'static>;
+
+        fn poll_ready(&mut self, _context: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _request: RequestPacket) -> Self::Future {
+            Box::pin(futures::future::pending())
+        }
+    }
 
     fn indexed_flashblock(transaction_hash: B256, state_root: B256) -> BaseFlashblockWirePayload {
         BaseFlashblockWirePayload::Indexed(BaseFlashblockPayload {
@@ -18011,6 +18706,576 @@ mod subscriber_helper_tests {
         );
     }
 
+    #[test]
+    #[cfg(feature = "raw-flashblocks-json")]
+    fn external_flashblocks_keep_normal_canonical_pubsub_sources_on_any_chain() {
+        let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig {
+                preconfirmations: PreconfirmationMode::Required,
+                ..SubscriberConfig::default()
+            },
+        );
+        subscriber
+            .configure_external_flashblock_updates(ProviderRef::new("raw-json", 4))
+            .expect("configure external source");
+        subscriber.chain_id = Some(1);
+        subscriber.base_interests = vec![
+            ReactiveInterest::Blocks(BlockInterest::default()),
+            log_interest_matching_rpc_log(),
+        ];
+        subscriber.interests = subscriber.base_interests.clone();
+
+        let pubsub = subscriber.pubsub_stream_sources();
+        assert!(
+            pubsub
+                .iter()
+                .any(|source| matches!(source, SubscriberStreamSource::PubSubBlockHeaders))
+        );
+        assert!(
+            pubsub
+                .iter()
+                .any(|source| matches!(source, SubscriberStreamSource::PubSubLog { .. }))
+        );
+        assert!(pubsub.iter().all(|source| !matches!(
+            source,
+            SubscriberStreamSource::BaseFlashblocks
+                | SubscriberStreamSource::BasePendingLog { .. }
+                | SubscriberStreamSource::OpPendingFlashblocks
+                | SubscriberStreamSource::CanonicalHeadPolling
+        )));
+        assert!(
+            subscriber
+                .polling_stream_sources()
+                .iter()
+                .all(|source| { !matches!(source, SubscriberStreamSource::OpPendingFlashblocks) })
+        );
+        assert!(
+            subscriber
+                .capabilities()
+                .supports(SubscriberCapability::Preconfirmations)
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "raw-flashblocks-json")]
+    fn external_flashblocks_are_rejected_when_preconfirmations_are_disabled() {
+        let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig::default(),
+        );
+        subscriber
+            .configure_external_flashblock_updates(ProviderRef::new("raw-json", 4))
+            .expect("configure external source");
+        subscriber.chain_id = Some(1);
+
+        assert!(matches!(
+            subscriber.validate_flashblocks_setup(),
+            Err(SubscriberError::InvalidConfig(message))
+                if message.contains("require preconfirmations")
+        ));
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "raw-flashblocks-json")]
+    async fn external_flashblocks_configuration_is_rejected_after_registration_starts() {
+        let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
+        let mut fresh = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig {
+                preconfirmations: PreconfirmationMode::Preferred,
+                ..SubscriberConfig::default()
+            },
+        );
+        fresh
+            .configure_external_flashblock_updates(ProviderRef::new("raw-json", 4))
+            .expect("construction-time external source");
+
+        let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
+        let mut started = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig {
+                preconfirmations: PreconfirmationMode::Preferred,
+                ..SubscriberConfig::default()
+            },
+        )
+        .with_provider_ref(ProviderRef::new("canonical", 3));
+        started.chain_id = Some(8_453);
+        started
+            .register_interests(&[log_interest_matching_rpc_log()])
+            .await
+            .expect("register canonical topology");
+
+        assert!(matches!(
+            started.configure_external_flashblock_updates(ProviderRef::new("raw-json", 4)),
+            Err(SubscriberError::InvalidConfig(message))
+                if message.contains("before subscriber registration")
+        ));
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "raw-flashblocks-json")]
+    async fn external_flashblocks_preflight_performs_no_flashblocks_rpc() {
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        let source = ProviderRef::new("raw-json", 4);
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig {
+                preconfirmations: PreconfirmationMode::Required,
+                ..SubscriberConfig::default()
+            },
+        );
+        subscriber
+            .configure_external_flashblock_updates(source.clone())
+            .expect("configure external source");
+        subscriber.chain_id = Some(1);
+        subscriber.base_interests = vec![log_interest_matching_rpc_log()];
+        subscriber.interests = subscriber.base_interests.clone();
+        let desired = subscriber.pubsub_stream_sources();
+        let mut streams = SubscriberStreams::new();
+        for source in desired {
+            streams.push(source, stream::pending().boxed());
+        }
+        subscriber.state = AlloySubscriberState::Active(streams);
+        subscriber.sources_dirty = false;
+
+        let preflight = subscriber
+            .establish_flashblocks_preflight(1)
+            .await
+            .expect("external source preflight");
+        assert_eq!(preflight.provider(), &source);
+        assert_eq!(preflight.delivery(), FlashblocksDelivery::ExternalUpdates);
+        assert_eq!(preflight.pending_log_subscriptions(), 0);
+        assert_eq!(subscriber.flashblocks_rpc_metrics().total_requests(), 0);
+        assert!(asserter.read_q().is_empty());
+    }
+
+    #[tokio::test]
+    #[cfg(all(feature = "raw-flashblocks-json", feature = "reactive-ws"))]
+    async fn bounded_external_channel_survives_subscriber_move_and_closure_keeps_canonical_stream()
+    {
+        let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
+        let source = ProviderRef::new("raw-json", 4);
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig {
+                preconfirmations: PreconfirmationMode::Preferred,
+                ..SubscriberConfig::default()
+            },
+        );
+        subscriber
+            .configure_external_flashblock_updates(source.clone())
+            .expect("configure external source");
+        subscriber.chain_id = Some(1);
+        subscriber.base_interests = vec![log_interest_matching_rpc_log()];
+        subscriber.interests = subscriber.base_interests.clone();
+        let filter = subscriber.log_stream_filters().remove(0);
+        let source_id = subscriber.log_source_id(&filter);
+        let mut streams = SubscriberStreams::new();
+        streams.push(
+            SubscriberStreamSource::PubSubLog {
+                id: source_id,
+                filter,
+            },
+            stream::pending().boxed(),
+        );
+        subscriber.state = AlloySubscriberState::Active(streams);
+        subscriber.sources_dirty = false;
+
+        let sender = subscriber
+            .open_external_flashblock_update_channel(2)
+            .expect("bounded external queue");
+        let external = SubscriberStreamSource::ExternalFlashblockUpdates;
+        let update_stream = subscriber
+            .connect_source_stream(external.clone())
+            .await
+            .expect("attach receiver as subscriber source");
+        subscriber.install_source_stream(external, update_stream);
+        subscriber.sources_dirty = false;
+
+        let mut adapter = RawJsonFlashblocksAdapter::new(source);
+        let frame = br#"{
+            "payload_id":"0x1111111111111111",
+            "index":0,
+            "base":{
+                "parent_hash":"0x0606060606060606060606060606060606060606060606060606060606060606",
+                "block_number":"0x7",
+                "timestamp":"0x6553f107"
+            },
+            "diff":{
+                "state_root":"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "block_hash":"0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "transactions":["0x01"]
+            },
+            "metadata":{
+                "block_number":7,
+                "receipts":{
+                    "0x5fe7f977e71dba2ea1a68e21057beebb9be2ac30c6410aa38d4f3fbe41dcffd2":{
+                        "logs":[{
+                            "address":"0x4242424242424242424242424242424242424242",
+                            "topics":["0x0101010101010101010101010101010101010101010101010101010101010101"],
+                            "data":"0x"
+                        }]
+                    }
+                }
+            }
+        }"#;
+        let update = adapter
+            .ingest_json(frame)
+            .expect("valid raw update")
+            .expect("snapshot update");
+        let valid_update = update.clone();
+        let sending = {
+            let sender = sender.clone();
+            tokio::spawn(async move { sender.send(update).await })
+        };
+
+        let preview = subscriber
+            .next_scoped_batch()
+            .await
+            .expect("poll preview")
+            .expect("preview batch");
+        assert_eq!(preview.records().len(), 1);
+        assert!(preview.records()[0].scope().is_preconfirmed());
+        assert_eq!(
+            preview.records()[0].context.source,
+            InputSource::Flashblocks
+        );
+        assert!(subscriber.latest_preconfirmation.is_some());
+        assert_eq!(sending.await.expect("sender task"), Ok(()));
+
+        let mut invalid_update = valid_update.clone();
+        let FlashblockUpdate::Snapshot(snapshot) = &mut invalid_update else {
+            unreachable!("fixture is a snapshot")
+        };
+        snapshot.logs[0].block_hash = Some(B256::repeat_byte(0xee));
+        let rejecting = {
+            let sender = sender.clone();
+            tokio::spawn(async move { sender.send(invalid_update).await })
+        };
+        let rejected = subscriber
+            .next_scoped_batch()
+            .await
+            .expect("preferred mode keeps polling")
+            .expect("rejected update invalidation");
+        assert!(rejected.preconfirmation_invalidated());
+        assert!(rejected.records().is_empty());
+        assert!(subscriber.latest_preconfirmation.is_none());
+        assert_eq!(
+            rejecting.await.expect("sender task"),
+            Err(FlashblockUpdateChannelError::Rejected)
+        );
+        subscriber
+            .ingest_flashblock_update(valid_update)
+            .expect("rejected generation is ignored thereafter");
+        assert!(subscriber.latest_preconfirmation.is_none());
+
+        let _reset = adapter
+            .reset(ProviderRef::new("raw-json", 5))
+            .expect("advance rejected source generation");
+        let recovered_update = adapter
+            .ingest_json(frame)
+            .expect("valid replacement generation")
+            .expect("replacement snapshot update");
+        let recovering = {
+            let sender = sender.clone();
+            tokio::spawn(async move { sender.send(recovered_update).await })
+        };
+        let recovered = subscriber
+            .next_scoped_batch()
+            .await
+            .expect("poll replacement generation")
+            .expect("replacement preview batch");
+        assert_eq!(recovered.records().len(), 1);
+        assert!(matches!(
+            &recovered.records()[0].context.chain_status,
+            ChainStatus::Preconfirmed { flashblock }
+                if flashblock.provider == ProviderRef::new("raw-json", 5)
+        ));
+        assert_eq!(recovering.await.expect("sender task"), Ok(()));
+
+        drop(sender);
+        let invalidation = subscriber
+            .next_scoped_batch()
+            .await
+            .expect("poll channel closure")
+            .expect("closure invalidation");
+        assert!(invalidation.preconfirmation_invalidated());
+        assert!(invalidation.records().is_empty());
+        assert!(subscriber.latest_preconfirmation.is_none());
+        assert!(matches!(
+            &subscriber.state,
+            AlloySubscriberState::Active(streams)
+                if streams.entries.iter().any(|entry| matches!(
+                    entry.source,
+                    SubscriberStreamSource::PubSubLog { id, .. } if id == source_id
+                ))
+        ));
+    }
+
+    #[tokio::test]
+    #[cfg(all(feature = "raw-flashblocks-json", feature = "reactive-ws"))]
+    async fn required_external_channel_closure_fails_the_subscriber_closed() {
+        let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
+        let source = ProviderRef::new("raw-json", 4);
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig {
+                preconfirmations: PreconfirmationMode::Required,
+                ..SubscriberConfig::default()
+            },
+        );
+        subscriber
+            .configure_external_flashblock_updates(source)
+            .expect("configure external source");
+        subscriber.chain_id = Some(1);
+        subscriber.base_interests = vec![log_interest_matching_rpc_log()];
+        subscriber.interests = subscriber.base_interests.clone();
+        subscriber.state = AlloySubscriberState::Active(SubscriberStreams::new());
+        subscriber.sources_dirty = false;
+
+        let sender = subscriber
+            .open_external_flashblock_update_channel(1)
+            .expect("bounded external queue");
+        let external = SubscriberStreamSource::ExternalFlashblockUpdates;
+        let update_stream = subscriber
+            .connect_source_stream(external.clone())
+            .await
+            .expect("attach receiver as subscriber source");
+        subscriber.install_source_stream(external, update_stream);
+        subscriber.sources_dirty = false;
+        drop(sender);
+
+        assert!(matches!(
+            subscriber.next_scoped_batch().await,
+            Err(SubscriberError::Provider(ref message))
+                if message.contains("required external Flashblock update channel closed")
+        ));
+    }
+
+    #[tokio::test]
+    #[cfg(all(feature = "raw-flashblocks-json", feature = "reactive-ws"))]
+    async fn required_external_channel_rejects_a_queued_malformed_update() {
+        let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
+        let source = ProviderRef::new("raw-json", 4);
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig {
+                preconfirmations: PreconfirmationMode::Required,
+                ..SubscriberConfig::default()
+            },
+        );
+        subscriber
+            .configure_external_flashblock_updates(source.clone())
+            .expect("configure external source");
+        subscriber.chain_id = Some(1);
+        subscriber.base_interests = vec![log_interest_matching_rpc_log()];
+        subscriber.interests = subscriber.base_interests.clone();
+        subscriber.state = AlloySubscriberState::Active(SubscriberStreams::new());
+        subscriber.sources_dirty = false;
+
+        let sender = subscriber
+            .open_external_flashblock_update_channel(1)
+            .expect("bounded external queue");
+        let external = SubscriberStreamSource::ExternalFlashblockUpdates;
+        let update_stream = subscriber
+            .connect_source_stream(external.clone())
+            .await
+            .expect("attach receiver as subscriber source");
+        subscriber.install_source_stream(external, update_stream);
+        subscriber.sources_dirty = false;
+
+        let mut adapter = RawJsonFlashblocksAdapter::new(source);
+        let mut update = adapter
+            .ingest_json(
+                br#"{
+                    "payload_id":"0x1111111111111111",
+                    "index":0,
+                    "base":{
+                        "parent_hash":"0x0606060606060606060606060606060606060606060606060606060606060606",
+                        "block_number":"0x7",
+                        "timestamp":"0x6553f107"
+                    },
+                    "diff":{
+                        "state_root":"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                        "block_hash":"0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                        "transactions":[]
+                    },
+                    "metadata":{"block_number":7,"receipts":{}}
+                }"#,
+            )
+            .expect("valid raw frame")
+            .expect("snapshot update");
+        let FlashblockUpdate::Snapshot(snapshot) = &mut update else {
+            unreachable!("fixture is a snapshot")
+        };
+        snapshot.flashblock.content_hash = B256::ZERO;
+        let sending = tokio::spawn(async move { sender.send(update).await });
+
+        assert!(matches!(
+            subscriber.next_scoped_batch().await,
+            Err(SubscriberError::Provider(ref message))
+                if message.contains("content commitment is invalid")
+        ));
+        assert_eq!(
+            sending.await.expect("sender task"),
+            Err(FlashblockUpdateChannelError::Rejected)
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(all(feature = "raw-flashblocks-json", feature = "reactive-ws"))]
+    async fn bounded_external_channel_reports_capacity_rejection_and_accepts_a_new_generation() {
+        let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
+        let source = ProviderRef::new("raw-json", 4);
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig {
+                preconfirmations: PreconfirmationMode::Preferred,
+                max_pending_records: 1,
+                ..SubscriberConfig::default()
+            },
+        );
+        subscriber
+            .configure_external_flashblock_updates(source.clone())
+            .expect("configure external source");
+        subscriber.chain_id = Some(1);
+        subscriber.base_interests = vec![log_interest_matching_rpc_log()];
+        subscriber.interests = subscriber.base_interests.clone();
+        subscriber.state = AlloySubscriberState::Active(SubscriberStreams::new());
+        subscriber.sources_dirty = false;
+
+        let sender = subscriber
+            .open_external_flashblock_update_channel(1)
+            .expect("bounded external queue");
+        let external = SubscriberStreamSource::ExternalFlashblockUpdates;
+        let update_stream = subscriber
+            .connect_source_stream(external.clone())
+            .await
+            .expect("attach receiver as subscriber source");
+        subscriber.install_source_stream(external, update_stream);
+        subscriber.sources_dirty = false;
+
+        let first_frame = br#"{
+            "payload_id":"0x1111111111111111",
+            "index":0,
+            "base":{
+                "parent_hash":"0x0606060606060606060606060606060606060606060606060606060606060606",
+                "block_number":"0x7",
+                "timestamp":"0x6553f107"
+            },
+            "diff":{
+                "state_root":"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "block_hash":"0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "transactions":["0x01"]
+            },
+            "metadata":{
+                "block_number":7,
+                "receipts":{
+                    "0x5fe7f977e71dba2ea1a68e21057beebb9be2ac30c6410aa38d4f3fbe41dcffd2":{
+                        "logs":[{
+                            "address":"0x4242424242424242424242424242424242424242",
+                            "topics":["0x0101010101010101010101010101010101010101010101010101010101010101"],
+                            "data":"0x"
+                        }]
+                    }
+                }
+            }
+        }"#;
+        let second_frame = br#"{
+            "payload_id":"0x1111111111111111",
+            "index":1,
+            "diff":{
+                "state_root":"0xabababababababababababababababababababababababababababababababab",
+                "block_hash":"0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                "transactions":["0x02"]
+            },
+            "metadata":{
+                "block_number":7,
+                "receipts":{
+                    "0xf2ee15ea639b73fa3db9b34a245bdfa015c260c598b211bf05a1ecc4b3e3b4f2":{
+                        "logs":[
+                            {"address":"0x4444444444444444444444444444444444444444","topics":[],"data":"0x"},
+                            {"address":"0x4545454545454545454545454545454545454545","topics":[],"data":"0x"}
+                        ]
+                    }
+                }
+            }
+        }"#;
+        let mut adapter = RawJsonFlashblocksAdapter::new(source);
+        let first = adapter
+            .ingest_json(first_frame)
+            .expect("valid first frame")
+            .expect("first snapshot");
+        let first_send = {
+            let sender = sender.clone();
+            tokio::spawn(async move { sender.send(first).await })
+        };
+        let first_batch = subscriber
+            .next_scoped_batch()
+            .await
+            .expect("poll first preview")
+            .expect("first preview batch");
+        assert_eq!(first_batch.records().len(), 1);
+        assert_eq!(first_send.await.expect("sender task"), Ok(()));
+
+        let oversized = adapter
+            .ingest_json(second_frame)
+            .expect("valid oversized delta")
+            .expect("oversized standardized snapshot");
+        let rejected_send = {
+            let sender = sender.clone();
+            tokio::spawn(async move { sender.send(oversized).await })
+        };
+        let invalidation = subscriber
+            .next_scoped_batch()
+            .await
+            .expect("poll capacity rejection")
+            .expect("capacity invalidation batch");
+        assert!(invalidation.preconfirmation_invalidated());
+        assert_eq!(
+            rejected_send.await.expect("sender task"),
+            Err(FlashblockUpdateChannelError::Rejected)
+        );
+        assert_eq!(subscriber.rejected_external_flashblock_generation, None);
+
+        let _ = adapter
+            .reset(ProviderRef::new("raw-json", 5))
+            .expect("advance after local capacity rejection");
+        let recovered = adapter
+            .ingest_json(first_frame)
+            .expect("valid recovered frame")
+            .expect("recovered snapshot");
+        let recovered_send = {
+            let sender = sender.clone();
+            tokio::spawn(async move { sender.send(recovered).await })
+        };
+        let recovered_batch = subscriber
+            .next_scoped_batch()
+            .await
+            .expect("poll recovered generation")
+            .expect("recovered preview batch");
+        assert_eq!(recovered_batch.records().len(), 1);
+        assert!(matches!(
+            &recovered_batch.records()[0].context.chain_status,
+            ChainStatus::Preconfirmed { flashblock }
+                if flashblock.provider == ProviderRef::new("raw-json", 5)
+        ));
+        assert_eq!(recovered_send.await.expect("sender task"), Ok(()));
+    }
+
     #[tokio::test]
     async fn certified_canonical_heads_are_deduplicated_and_reject_placeholder_hashes() {
         let asserter = Asserter::new();
@@ -18043,6 +19308,34 @@ mod subscriber_helper_tests {
             subscriber.fetch_certified_canonical_head().await,
             Err(SubscriberError::Provider(ref message))
                 if message.contains("placeholder hash")
+        ));
+    }
+
+    #[tokio::test]
+    async fn canonical_head_certification_times_out_a_silent_provider() {
+        let provider =
+            ProviderBuilder::new().connect_client(RpcClient::new(NeverRespondingTransport, true));
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig {
+                preconfirmations: PreconfirmationMode::Required,
+                canonical_head_request_timeout: Duration::from_millis(10),
+                ..SubscriberConfig::default()
+            },
+        );
+        subscriber.chain_id = Some(8_453);
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(100),
+            subscriber.fetch_certified_canonical_head(),
+        )
+        .await
+        .expect("subscriber must bound a silent provider request");
+        assert!(matches!(
+            result,
+            Err(SubscriberError::Provider(ref message))
+                if message.contains("canonical head certification timed out")
         ));
     }
 
@@ -18180,6 +19473,22 @@ mod subscriber_helper_tests {
             validate_subscriber_config(&config),
             Err(SubscriberError::InvalidConfig(
                 "SubscriberConfig::max_flashblock_rpc_requests_per_second must be greater than zero"
+            ))
+        ));
+    }
+
+    #[test]
+    fn flashblocks_config_rejects_a_zero_canonical_head_request_timeout() {
+        let config = SubscriberConfig {
+            preconfirmations: PreconfirmationMode::Required,
+            canonical_head_request_timeout: Duration::ZERO,
+            ..SubscriberConfig::default()
+        };
+
+        assert!(matches!(
+            validate_subscriber_config(&config),
+            Err(SubscriberError::InvalidConfig(
+                "SubscriberConfig::canonical_head_request_timeout must be greater than zero"
             ))
         ));
     }
@@ -21975,6 +23284,13 @@ fn validate_subscriber_config(config: &SubscriberConfig) -> Result<(), Subscribe
     {
         return Err(SubscriberError::InvalidConfig(
             "SubscriberConfig::canonical_head_poll_interval must be greater than zero",
+        ));
+    }
+    if config.preconfirmations != PreconfirmationMode::Disabled
+        && config.canonical_head_request_timeout.is_zero()
+    {
+        return Err(SubscriberError::InvalidConfig(
+            "SubscriberConfig::canonical_head_request_timeout must be greater than zero",
         ));
     }
     if config.preconfirmations != PreconfirmationMode::Disabled
