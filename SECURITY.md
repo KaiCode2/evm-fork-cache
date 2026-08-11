@@ -106,7 +106,7 @@ The stable and MSRV jobs use the same reviewed toolchain-action commit and pass
 their requested toolchain explicitly. Updating any action requires verifying
 the new upstream ref and full commit before changing the pin.
 
-Sibling development dependencies are also immutable in CI. The alpha.2 cache
+Sibling development dependencies are also immutable in CI. The alpha.4 cache
 workflow checks out `alloy-transport-balancer` at exact commit
 `7868bea593dec5748ad7475d1909fc3a2de0d4ad`, matching the first candidate in
 the documented publish order. Changing that revision requires rerunning the

@@ -105,6 +105,13 @@ pub struct EvmSnapshot {
     /// excluded from `overlay_accounts` / `overlay_code_by_hash`.
     pub(crate) accounts_not_existing: HashSet<Address>,
     pub(crate) block_hashes: HashMap<u64, B256>,
+    /// Hash-pinned block identity captured from the cache's `BlockId`.
+    ///
+    /// This is deliberately separate from `block_hashes`: EVM `BLOCKHASH`
+    /// cannot return the current block's hash, while callers that attest an
+    /// immutable snapshot lineage still need to bind the snapshot to the
+    /// current canonical block.
+    pub(crate) block_context_hash: Option<B256>,
     // Block context
     pub(crate) block_number: Option<u64>,
     pub(crate) basefee: Option<u64>,
@@ -131,6 +138,28 @@ impl EvmSnapshot {
     /// Block number installed in the snapshot's EVM context.
     pub const fn block_number(&self) -> Option<u64> {
         self.block_number
+    }
+
+    /// Return the exact `BLOCKHASH` value resident for `number` when one was
+    /// captured by this immutable snapshot.
+    ///
+    /// This lookup is provider-free and never infers a hash from the snapshot's
+    /// EVM block context. In particular, [`block_number`](Self::block_number)
+    /// being `Some(number)` does not make that number's hash resident; callers
+    /// receive `None` unless the cache held an explicit block-hash entry when the
+    /// snapshot was created.
+    pub fn block_hash(&self, number: u64) -> Option<B256> {
+        self.block_hashes.get(&number).copied()
+    }
+
+    /// Return the hash-pinned identity of the snapshot's current block context.
+    ///
+    /// This is `Some` only when the source cache was pinned with
+    /// `BlockId::Hash`; number/tag-pinned snapshots return `None`. It is not an
+    /// EVM `BLOCKHASH` value and is therefore kept separate from
+    /// [`block_hash`](Self::block_hash).
+    pub const fn block_context_hash(&self) -> Option<B256> {
+        self.block_context_hash
     }
 
     /// Base fee installed in the snapshot's EVM context.
@@ -272,6 +301,15 @@ impl EvmSnapshot {
             .and_then(|s| s.get(&slot).copied())
     }
 
+    /// Return the runtime-code hash resident for `address` in this snapshot.
+    ///
+    /// The lookup follows the same account-shadowing and known-absent rules as
+    /// EVM account reads. It is provider-free and is intended for callers that
+    /// bind offline evaluation to a reviewed deployed runtime identity.
+    pub fn account_code_hash(&self, address: Address) -> Option<B256> {
+        self.account_info(address).map(|info| info.code_hash)
+    }
+
     /// Bytecode by `code_hash`: overlay (layer 1) wins, else the base (layer 2).
     pub(crate) fn code(&self, code_hash: B256) -> Option<&Bytecode> {
         self.overlay_code_by_hash
@@ -310,6 +348,7 @@ mod tests {
             storage_cleared: HashSet::new(),
             accounts_not_existing: HashSet::new(),
             block_hashes: HashMap::new(),
+            block_context_hash: None,
             block_number: Some(100),
             basefee: Some(1000),
             coinbase: None,

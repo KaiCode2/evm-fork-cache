@@ -7,7 +7,11 @@
 use std::time::Duration;
 
 use alloy_network::Ethereum;
-#[cfg(any(feature = "reactive-polling", feature = "reactive-ws"))]
+#[cfg(any(
+    feature = "raw-flashblocks-json",
+    feature = "reactive-polling",
+    feature = "reactive-ws"
+))]
 use alloy_primitives::U256;
 #[cfg(any(feature = "reactive-polling", feature = "reactive-ws"))]
 use alloy_primitives::{Address, keccak256};
@@ -34,9 +38,8 @@ use evm_fork_cache::reactive::SubscriberCapability;
 #[cfg(any(feature = "reactive-polling", feature = "reactive-ws"))]
 use evm_fork_cache::reactive::SubscriberOwnerError;
 use evm_fork_cache::reactive::{
-    AlloySubscriber, DeliveryAudience, DeliveryScope, EventSubscriber, InterestOwnerSubscriber,
-    PendingTxInterest, ReactiveInterest, SubscriberConfig, SubscriberError, SubscriberMode,
-    SubscriberReconnectConfig,
+    AlloySubscriber, EventSubscriber, PendingTxInterest, ReactiveInterest, SubscriberConfig,
+    SubscriberError, SubscriberMode, SubscriberReconnectConfig,
 };
 #[cfg(any(feature = "reactive-polling", feature = "reactive-ws"))]
 use evm_fork_cache::reactive::{BlockInterest, LogInterest};
@@ -47,6 +50,8 @@ use evm_fork_cache::reactive::{
 };
 #[cfg(any(feature = "reactive-polling", feature = "reactive-ws"))]
 use evm_fork_cache::reactive::{ChainStatus, InputSource, ReactiveInput};
+#[cfg(any(feature = "reactive-polling", feature = "reactive-ws"))]
+use evm_fork_cache::reactive::{DeliveryAudience, DeliveryScope, InterestOwnerSubscriber};
 
 #[cfg(any(feature = "reactive-polling", feature = "reactive-ws"))]
 fn rpc_log(address: Address, topic0: B256, block_number: u64, log_index: u64) -> Log {
@@ -108,7 +113,11 @@ fn polling_subscriber(
     )
 }
 
-#[cfg(any(feature = "reactive-polling", feature = "reactive-ws"))]
+#[cfg(any(
+    feature = "raw-flashblocks-json",
+    feature = "reactive-polling",
+    feature = "reactive-ws"
+))]
 fn asserter_with_chain_id() -> Asserter {
     let asserter = Asserter::new();
     asserter.push_success(&U256::from(1));

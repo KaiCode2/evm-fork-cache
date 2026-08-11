@@ -1,13 +1,16 @@
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    time::Instant,
+};
 
 use alloy_primitives::{Address, B256, Bytes, FixedBytes, Keccak256, Log as PrimitiveLog};
 use alloy_rpc_types_eth::Log;
 use tokio::sync::{mpsc, oneshot};
 
 use super::{
-    BaseFlashblockBase, FlashblockContentCommitment, FlashblockRef, ProviderRef,
-    deserialize_optional_rpc_u64, flashblock_content_hash, flashblock_transaction_hashes,
-    non_placeholder_hash,
+    BaseFlashblockBase, FlashblockContentCommitment, FlashblockIngressTiming, FlashblockRef,
+    ProviderRef, deserialize_optional_rpc_u64, flashblock_content_hash,
+    flashblock_transaction_hashes, non_placeholder_hash,
 };
 
 /// Resource bounds applied while converting receipt-enriched JSON Flashblocks.
@@ -108,6 +111,41 @@ pub enum FlashblockUpdate {
     Invalidated(FlashblockInvalidation),
 }
 
+/// One normalized raw update paired with its caller-clock arrival.
+///
+/// The millisecond value belongs to the monotonic clock supplied to
+/// [`BufferedRawJsonFlashblocksAdapter::ingest_json_timed_at`]. Applications
+/// convert it back to their `Instant` domain before subscriber handoff.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TimedFlashblockUpdate {
+    update: FlashblockUpdate,
+    source_ingress_millis: u64,
+}
+
+impl TimedFlashblockUpdate {
+    const fn new(update: FlashblockUpdate, source_ingress_millis: u64) -> Self {
+        Self {
+            update,
+            source_ingress_millis,
+        }
+    }
+
+    /// Borrow the normalized update.
+    pub const fn update(&self) -> &FlashblockUpdate {
+        &self.update
+    }
+
+    /// Arrival in the caller-owned monotonic millisecond domain.
+    pub const fn source_ingress_millis(&self) -> u64 {
+        self.source_ingress_millis
+    }
+
+    /// Consume the timed value into its normalized update.
+    pub fn into_update(self) -> FlashblockUpdate {
+        self.update
+    }
+}
+
 impl FlashblockUpdate {
     /// Provider generation carried by this standardized update.
     pub const fn provider(&self) -> &ProviderRef {
@@ -165,15 +203,20 @@ impl FlashblockUpdateAcknowledgement {
 
 pub(crate) struct QueuedFlashblockUpdate {
     pub(crate) update: FlashblockUpdate,
+    pub(crate) timing: FlashblockIngressTiming,
     pub(crate) acknowledgement: oneshot::Sender<Result<(), FlashblockUpdateChannelError>>,
 }
 
 impl QueuedFlashblockUpdate {
-    fn new(update: FlashblockUpdate) -> (Self, FlashblockUpdateAcknowledgement) {
+    fn new(
+        update: FlashblockUpdate,
+        timing: FlashblockIngressTiming,
+    ) -> (Self, FlashblockUpdateAcknowledgement) {
         let (acknowledgement, receiver) = oneshot::channel();
         (
             Self {
                 update,
+                timing,
                 acknowledgement,
             },
             FlashblockUpdateAcknowledgement { receiver },
@@ -219,8 +262,23 @@ impl FlashblockUpdateSender {
     /// the update but rejected its integrity or local resource requirements;
     /// revoke and replace that source generation before continuing.
     pub async fn send(&self, update: FlashblockUpdate) -> Result<(), FlashblockUpdateChannelError> {
+        self.send_with_ingress(update, FlashblockIngressTiming::new(Instant::now()))
+            .await
+    }
+
+    /// Enqueue an update with its original process-local typed source arrival.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same endpoint, closure, and subscriber-rejection errors as
+    /// [`Self::send`].
+    pub async fn send_with_ingress(
+        &self,
+        update: FlashblockUpdate,
+        timing: FlashblockIngressTiming,
+    ) -> Result<(), FlashblockUpdateChannelError> {
         self.validate_endpoint(&update)?;
-        let (queued, acknowledgement) = QueuedFlashblockUpdate::new(update);
+        let (queued, acknowledgement) = QueuedFlashblockUpdate::new(update, timing);
         self.sender
             .send(queued)
             .await
@@ -243,8 +301,22 @@ impl FlashblockUpdateSender {
         &self,
         update: FlashblockUpdate,
     ) -> Result<FlashblockUpdateAcknowledgement, FlashblockUpdateChannelError> {
+        self.try_send_with_ingress(update, FlashblockIngressTiming::new(Instant::now()))
+    }
+
+    /// Non-blockingly enqueue an update with its original typed source arrival.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same endpoint, capacity, and closure errors as
+    /// [`Self::try_send`].
+    pub fn try_send_with_ingress(
+        &self,
+        update: FlashblockUpdate,
+        timing: FlashblockIngressTiming,
+    ) -> Result<FlashblockUpdateAcknowledgement, FlashblockUpdateChannelError> {
         self.validate_endpoint(&update)?;
-        let (queued, acknowledgement) = QueuedFlashblockUpdate::new(update);
+        let (queued, acknowledgement) = QueuedFlashblockUpdate::new(update, timing);
         self.sender.try_send(queued).map_err(|error| match error {
             mpsc::error::TrySendError::Full(_) => FlashblockUpdateChannelError::Full,
             mpsc::error::TrySendError::Closed(_) => FlashblockUpdateChannelError::Closed,
@@ -308,7 +380,7 @@ pub enum RawJsonFlashblocksError {
 /// authentication, timeouts, retry, backoff, and provider rotation. On source
 /// replacement or disconnect, call [`Self::reset`] and forward the returned
 /// invalidation before accepting updates from the new provider generation.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct RawJsonFlashblocksAdapter {
     provider: ProviderRef,
     limits: RawJsonFlashblocksLimits,
@@ -399,19 +471,22 @@ impl RawJsonFlashblocksAdapter {
         &mut self,
         frame: &[u8],
     ) -> Result<Option<FlashblockUpdate>, RawJsonFlashblocksError> {
+        let payload = self.decode_json(frame)?;
+        self.ingest(payload)
+    }
+
+    fn decode_json(&self, frame: &[u8]) -> Result<RawFlashblockPayload, RawJsonFlashblocksError> {
         if frame.len() > self.limits.max_frame_bytes {
             return Err(RawJsonFlashblocksError::FrameTooLarge);
         }
         let payload: RawFlashblockPayload = serde_json::from_slice(frame)
             .map_err(|error| RawJsonFlashblocksError::InvalidPayload(error.to_string()))?;
-        self.ingest(payload)
+        self.validate_index(payload.index)?;
+        Ok(payload)
     }
 
-    fn ingest(
-        &mut self,
-        payload: RawFlashblockPayload,
-    ) -> Result<Option<FlashblockUpdate>, RawJsonFlashblocksError> {
-        if usize::try_from(payload.index)
+    fn validate_index(&self, index: u64) -> Result<(), RawJsonFlashblocksError> {
+        if usize::try_from(index)
             .ok()
             .is_none_or(|index| index >= self.limits.max_flashblocks_per_payload)
         {
@@ -419,6 +494,14 @@ impl RawJsonFlashblocksAdapter {
                 "Flashblock index",
             ));
         }
+        Ok(())
+    }
+
+    fn ingest(
+        &mut self,
+        payload: RawFlashblockPayload,
+    ) -> Result<Option<FlashblockUpdate>, RawJsonFlashblocksError> {
+        self.validate_index(payload.index)?;
         if self.ignored_payload == Some(payload.payload_id) {
             return Ok(None);
         }
@@ -674,6 +757,420 @@ impl RawJsonFlashblocksAdapter {
             reason,
         })
     }
+
+    fn invalidate_active(
+        &mut self,
+        payload_id: FixedBytes<8>,
+        reason: FlashblockInvalidationReason,
+    ) -> FlashblockUpdate {
+        self.active = None;
+        self.ignored_payload = Some(payload_id);
+        self.invalidation(payload_id, reason)
+    }
+}
+
+const MIN_BUFFERED_GAP_MILLIS: u64 = 300;
+const MAX_BUFFERED_GAP_MILLIS: u64 = 500;
+
+/// Provider-free adapter that tolerates one briefly reordered JSON Flashblock.
+///
+/// This wrapper preserves [`RawJsonFlashblocksAdapter`]'s immediate behavior
+/// except for one narrow case: when an active payload receives exactly
+/// `expected_index + 1`, it retains that one parsed frame until the missing
+/// index arrives or the caller-owned deadline expires. It performs no I/O,
+/// starts no timer, mutates no canonical state, and grants no execution or
+/// trigger authority. Applications must schedule their own timer from
+/// [`Self::buffered_gap`] and call [`Self::expire_gap_at`].
+#[derive(Clone, Debug)]
+pub struct BufferedRawJsonFlashblocksAdapter {
+    inner: RawJsonFlashblocksAdapter,
+    gap_timeout_millis: u64,
+    buffered: Option<BufferedRawFlashblock>,
+}
+
+#[derive(Clone, Debug)]
+struct BufferedRawFlashblock {
+    payload: RawFlashblockPayload,
+    commitment: B256,
+    expected_index: u64,
+    source_ingress_millis: u64,
+    expires_at_millis: u64,
+}
+
+impl BufferedRawJsonFlashblocksAdapter {
+    /// Construct a bounded one-frame reorder adapter.
+    ///
+    /// `gap_timeout_millis` must be in the reviewed inclusive range
+    /// `300..=500`. The caller supplies timestamps from one monotonic clock.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RawJsonFlashblocksError::InvalidLimits`] for an unreviewed gap
+    /// timeout or invalid raw-frame resource limits.
+    pub fn new(
+        provider: ProviderRef,
+        limits: RawJsonFlashblocksLimits,
+        gap_timeout_millis: u64,
+    ) -> Result<Self, RawJsonFlashblocksError> {
+        if !(MIN_BUFFERED_GAP_MILLIS..=MAX_BUFFERED_GAP_MILLIS).contains(&gap_timeout_millis) {
+            return Err(RawJsonFlashblocksError::InvalidLimits(
+                "buffered gap timeout must be between 300 and 500 milliseconds",
+            ));
+        }
+        Ok(Self {
+            inner: RawJsonFlashblocksAdapter::with_limits(provider, limits)?,
+            gap_timeout_millis,
+            buffered: None,
+        })
+    }
+
+    /// Provider generation attached to normalized snapshots and invalidations.
+    pub const fn provider(&self) -> &ProviderRef {
+        self.inner.provider()
+    }
+
+    /// Resource limits applied to immediate and buffered frames.
+    pub const fn limits(&self) -> RawJsonFlashblocksLimits {
+        self.inner.limits()
+    }
+
+    /// Return `(missing_index, buffered_index, expires_at_millis)` when a
+    /// caller-owned gap timer is required.
+    pub fn buffered_gap(&self) -> Option<(u64, u64, u64)> {
+        self.buffered.as_ref().map(|buffered| {
+            (
+                buffered.expected_index,
+                buffered.payload.index,
+                buffered.expires_at_millis,
+            )
+        })
+    }
+
+    /// Decode one application-data frame at a caller-supplied monotonic time.
+    ///
+    /// The returned vector has at most two entries. Two snapshots are returned
+    /// only when the missing index and the retained next index are validated
+    /// atomically and drained in order. Errors preserve the last successfully
+    /// published state and any pending gap for explicit caller reset.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RawJsonFlashblocksError`] immediately for malformed,
+    /// unsupported, or resource-exhausting input.
+    pub fn ingest_json_at(
+        &mut self,
+        frame: &[u8],
+        now_millis: u64,
+    ) -> Result<Vec<FlashblockUpdate>, RawJsonFlashblocksError> {
+        self.ingest_json_timed_at(frame, now_millis).map(|updates| {
+            updates
+                .into_iter()
+                .map(TimedFlashblockUpdate::into_update)
+                .collect()
+        })
+    }
+
+    /// Decode one application-data frame while retaining the original
+    /// caller-clock arrival for every emitted update.
+    ///
+    /// When a future frame is buffered across a one-index gap, its eventual
+    /// output retains the timestamp from the call that first supplied that
+    /// frame, not the later gap-closing call. This method is provider-free and
+    /// starts no timer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RawJsonFlashblocksError`] under the same conditions as
+    /// [`Self::ingest_json_at`].
+    pub fn ingest_json_timed_at(
+        &mut self,
+        frame: &[u8],
+        now_millis: u64,
+    ) -> Result<Vec<TimedFlashblockUpdate>, RawJsonFlashblocksError> {
+        let payload = self.inner.decode_json(frame)?;
+        let mut updates = Vec::with_capacity(2);
+
+        if self
+            .buffered
+            .as_ref()
+            .is_some_and(|buffered| now_millis >= buffered.expires_at_millis)
+        {
+            let expired = self.buffered.as_ref().expect("checked above");
+            if payload.payload_id == expired.payload.payload_id {
+                let payload_id = expired.payload.payload_id;
+                self.buffered = None;
+                updates.push(TimedFlashblockUpdate::new(
+                    self.inner
+                        .invalidate_active(payload_id, FlashblockInvalidationReason::IndexGap),
+                    now_millis,
+                ));
+                return Ok(updates);
+            }
+
+            // Validate the replacement on a clone before publishing the expiry.
+            // An application-data error therefore preserves the observable
+            // invalidation and the pending timer for an explicit retry/reset.
+            let payload_id = expired.payload.payload_id;
+            let invalidation = self
+                .inner
+                .invalidation(payload_id, FlashblockInvalidationReason::IndexGap);
+            let mut staged = self.inner.clone();
+            let replacement = staged.ingest(payload)?;
+            self.inner = staged;
+            self.buffered = None;
+            updates.push(TimedFlashblockUpdate::new(invalidation, now_millis));
+            if let Some(update) = replacement {
+                updates.push(TimedFlashblockUpdate::new(update, now_millis));
+            }
+            return Ok(updates);
+        }
+
+        if let Some(buffered) = self.buffered.as_ref() {
+            if payload.payload_id == buffered.payload.payload_id {
+                if payload.index == buffered.expected_index {
+                    let buffered = self.buffered.as_ref().expect("checked above").clone();
+                    let mut staged = self.inner.clone();
+                    if let Some(update) = staged.ingest(payload)? {
+                        updates.push(TimedFlashblockUpdate::new(update, now_millis));
+                    }
+                    if let Some(update) = staged.ingest(buffered.payload)? {
+                        updates.push(TimedFlashblockUpdate::new(
+                            update,
+                            buffered.source_ingress_millis,
+                        ));
+                    }
+                    self.inner = staged;
+                    self.buffered = None;
+                    return Ok(updates);
+                }
+
+                if payload.index == buffered.payload.index {
+                    let commitment = self.validate_bufferable_payload(&payload)?;
+                    if commitment == buffered.commitment {
+                        return Ok(updates);
+                    }
+                    let payload_id = payload.payload_id;
+                    self.buffered = None;
+                    updates.push(TimedFlashblockUpdate::new(
+                        self.inner.invalidate_active(
+                            payload_id,
+                            FlashblockInvalidationReason::ConflictingDuplicate,
+                        ),
+                        now_millis,
+                    ));
+                    return Ok(updates);
+                }
+
+                if payload.index > buffered.payload.index {
+                    self.validate_bufferable_payload(&payload)?;
+                    let payload_id = payload.payload_id;
+                    self.buffered = None;
+                    updates.push(TimedFlashblockUpdate::new(
+                        self.inner
+                            .invalidate_active(payload_id, FlashblockInvalidationReason::IndexGap),
+                        now_millis,
+                    ));
+                    return Ok(updates);
+                }
+            } else {
+                // A rejected replacement must preserve the unresolved buffer.
+                let mut staged = self.inner.clone();
+                let replacement = staged.ingest(payload)?;
+                self.inner = staged;
+                self.buffered = None;
+                if let Some(update) = replacement {
+                    updates.push(TimedFlashblockUpdate::new(update, now_millis));
+                }
+                return Ok(updates);
+            }
+        }
+
+        if self.can_buffer_one_gap(&payload) {
+            let commitment = self.validate_bufferable_payload(&payload)?;
+            let active = self
+                .inner
+                .active
+                .as_ref()
+                .expect("buffering requires active state");
+            let expected_index = active.last_index.map_or(0, |index| index.saturating_add(1));
+            self.buffered = Some(BufferedRawFlashblock {
+                payload,
+                commitment,
+                expected_index,
+                source_ingress_millis: now_millis,
+                expires_at_millis: now_millis.saturating_add(self.gap_timeout_millis),
+            });
+            return Ok(updates);
+        }
+
+        if self.is_more_than_one_index_ahead(&payload) {
+            self.validate_bufferable_payload(&payload)?;
+        }
+
+        if let Some(update) = self.inner.ingest(payload)? {
+            if matches!(update, FlashblockUpdate::Invalidated(_)) {
+                self.buffered = None;
+            }
+            updates.push(TimedFlashblockUpdate::new(update, now_millis));
+        }
+        Ok(updates)
+    }
+
+    /// Expire a buffered gap using the same caller-owned monotonic clock.
+    ///
+    /// At or after the deadline this emits one typed `IndexGap` invalidation,
+    /// clears the retained frame, and ignores the late remainder of that
+    /// payload until a new payload begins.
+    pub fn expire_gap_at(&mut self, now_millis: u64) -> Option<FlashblockUpdate> {
+        let expired = self
+            .buffered
+            .as_ref()
+            .is_some_and(|buffered| now_millis >= buffered.expires_at_millis);
+        if !expired {
+            return None;
+        }
+        let buffered = self.buffered.take().expect("checked above");
+        Some(self.inner.invalidate_active(
+            buffered.payload.payload_id,
+            FlashblockInvalidationReason::IndexGap,
+        ))
+    }
+
+    /// Revoke the active payload and clear any retained reorder frame.
+    ///
+    /// A rejected source transition preserves both the active state and buffer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RawJsonFlashblocksError::InvalidSourceTransition`] under the
+    /// same conditions as [`RawJsonFlashblocksAdapter::reset`].
+    pub fn reset(
+        &mut self,
+        provider: ProviderRef,
+    ) -> Result<Option<FlashblockUpdate>, RawJsonFlashblocksError> {
+        let invalidation = self.inner.reset(provider)?;
+        self.buffered = None;
+        Ok(invalidation)
+    }
+
+    fn can_buffer_one_gap(&self, payload: &RawFlashblockPayload) -> bool {
+        let Some(active) = self.inner.active.as_ref() else {
+            return false;
+        };
+        if active.payload_id != payload.payload_id {
+            return false;
+        }
+        let expected = active.last_index.map_or(0, |index| index.saturating_add(1));
+        payload.index == expected.saturating_add(1)
+    }
+
+    fn is_more_than_one_index_ahead(&self, payload: &RawFlashblockPayload) -> bool {
+        let Some(active) = self.inner.active.as_ref() else {
+            return false;
+        };
+        if active.payload_id != payload.payload_id {
+            return false;
+        }
+        let expected = active.last_index.map_or(0, |index| index.saturating_add(1));
+        payload.index > expected.saturating_add(1)
+    }
+
+    fn validate_bufferable_payload(
+        &self,
+        payload: &RawFlashblockPayload,
+    ) -> Result<B256, RawJsonFlashblocksError> {
+        let active = self
+            .inner
+            .active
+            .as_ref()
+            .expect("buffer validation requires active state");
+        if payload
+            .metadata
+            .block_number
+            .is_some_and(|number| number != active.base.block_number)
+            || payload
+                .base
+                .as_ref()
+                .is_some_and(|base| base != &active.base)
+        {
+            return Err(RawJsonFlashblocksError::InvalidPayload(
+                "base header or metadata block numbers disagree with the active payload".into(),
+            ));
+        }
+        let transaction_hashes = flashblock_transaction_hashes(&payload.diff.transactions)
+            .map_err(|error| RawJsonFlashblocksError::InvalidPayload(error.to_string()))?;
+        let unique_transactions = transaction_hashes.iter().copied().collect::<HashSet<_>>();
+        if unique_transactions.len() != transaction_hashes.len() {
+            return Err(RawJsonFlashblocksError::InvalidPayload(
+                "the transaction delta contains a duplicate hash".into(),
+            ));
+        }
+        let receipt_hashes = payload
+            .metadata
+            .receipts
+            .keys()
+            .copied()
+            .collect::<HashSet<_>>();
+        if receipt_hashes != unique_transactions {
+            return Err(RawJsonFlashblocksError::InvalidPayload(
+                "receipt-map membership disagrees with the transaction delta".into(),
+            ));
+        }
+        if active
+            .cumulative_transactions
+            .len()
+            .saturating_add(transaction_hashes.len())
+            > self.inner.limits.max_transactions_per_payload
+        {
+            return Err(RawJsonFlashblocksError::ResourceExhausted(
+                "transaction count",
+            ));
+        }
+        if transaction_hashes
+            .iter()
+            .any(|hash| active.transaction_set.contains(hash))
+        {
+            return Err(RawJsonFlashblocksError::InvalidPayload(
+                "a transaction appeared in more than one indexed delta".into(),
+            ));
+        }
+        let log_count =
+            payload
+                .metadata
+                .receipts
+                .values()
+                .try_fold(0_usize, |count, receipt| {
+                    for log in &receipt.logs {
+                        if log.topics.len() > 4 {
+                            return Err(RawJsonFlashblocksError::InvalidPayload(
+                                "receipt log contains more than four topics".into(),
+                            ));
+                        }
+                    }
+                    count
+                        .checked_add(receipt.logs.len())
+                        .ok_or(RawJsonFlashblocksError::ResourceExhausted("log count"))
+                })?;
+        if active.cumulative_logs.saturating_add(log_count) > self.inner.limits.max_logs_per_payload
+        {
+            return Err(RawJsonFlashblocksError::ResourceExhausted("log count"));
+        }
+        u64::try_from(
+            active
+                .cumulative_transactions
+                .len()
+                .saturating_add(transaction_hashes.len()),
+        )
+        .map_err(|_| RawJsonFlashblocksError::ResourceExhausted("transaction index"))?;
+        active
+            .next_log_index
+            .checked_add(
+                u64::try_from(log_count)
+                    .map_err(|_| RawJsonFlashblocksError::ResourceExhausted("log index"))?,
+            )
+            .ok_or(RawJsonFlashblocksError::ResourceExhausted("log index"))?;
+        Ok(raw_payload_commitment(payload, &transaction_hashes))
+    }
 }
 
 fn raw_payload_commitment(payload: &RawFlashblockPayload, transaction_hashes: &[B256]) -> B256 {
@@ -750,7 +1247,7 @@ fn commit_optional_raw_bytes(commitment: &mut Keccak256, value: Option<&[u8]>) {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct RawPayloadState {
     payload_id: FixedBytes<8>,
     base: BaseFlashblockBase,

@@ -143,6 +143,7 @@ pub mod access_set;
 pub mod bulk_storage;
 pub mod bundle;
 pub mod cache;
+pub mod cancellation;
 #[cfg(feature = "reactive")]
 pub mod cold_start;
 pub mod create3;
@@ -158,6 +159,8 @@ pub mod prefetch_registry;
 pub mod reactive;
 pub mod state_update;
 pub mod tracing;
+
+pub use cancellation::SimulationCancellationToken;
 
 pub use access_list::{DEFAULT_CREATE_ACCESS_LIST_GAS_CAP, create_access_list_read_set};
 pub use access_set::StorageAccessList;

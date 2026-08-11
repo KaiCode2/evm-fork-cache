@@ -324,7 +324,7 @@ surface was moved out of this crate.
   `base`/`static` header, `diff.transactions`, and exact
   `metadata.receipts`. JSON-RPC envelopes, receipt-less previews, and binary SSZ
   require separate adapters. The core deliberately does not own the source
-  socket, authentication, liveness timeout, raw-frame receive queue, retry,
+  socket, authentication, liveness timeout, unbounded raw-frame receive queue, retry,
   backoff, rate limit, or provider rotation. The optional standardized-update
   handoff queue is bounded and exposes backpressure, but does not make any of
   those lifecycle decisions. A caller must forward `reset()`'s
@@ -335,6 +335,11 @@ surface was moved out of this crate.
   subscriber verdict, while non-blocking sends return an acknowledgement receipt.
   A rejection requires caller-owned generation revocation/reconnect; local
   subscriber capacity rejection does not permanently quarantine the endpoint.
+  The optional `BufferedRawJsonFlashblocksAdapter` retains at most one parsed
+  future frame across exactly one missing index for a construction-bounded
+  300–500 millisecond window. It starts no timer: callers must schedule from
+  `buffered_gap()` and invoke `expire_gap_at()`. It never promotes a preview to
+  canonical state and grants no downstream trigger authority.
 - **Speculative runtime state requires exact canonical lineage.** A
   pre-confirmed batch is accepted only after the runtime has adopted a canonical
   coverage head and only when the preview is its exact numbered child with the

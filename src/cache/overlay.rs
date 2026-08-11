@@ -27,6 +27,7 @@ use super::snapshot::EvmSnapshot;
 use super::{CallSimulationResult, IERC20, SimStatus, TxConfig, unix_timestamp_secs_saturating};
 use crate::access_set::StorageAccessList;
 use crate::bundle::{BundleOptions, BundleResult, BundleTx, RevertPolicy, TxOutcome};
+use crate::cancellation::SimulationCancellationToken;
 use crate::errors::{
     OverlayError, OverlayResult as Result, SimError, SimHostError, SimulationError,
     SimulationResult,
@@ -34,6 +35,23 @@ use crate::errors::{
 use crate::inspector::TransferInspector;
 use crate::mapping_probe::HashStorageProbe;
 use alloy_sol_types::SolCall;
+
+#[derive(Clone, Debug)]
+struct SimulationCancellationInspector {
+    token: SimulationCancellationToken,
+}
+
+impl<CTX, INTR> revm::Inspector<CTX, INTR> for SimulationCancellationInspector
+where
+    INTR: revm::interpreter::InterpreterTypes,
+{
+    fn step(&mut self, interpreter: &mut revm::interpreter::Interpreter<INTR>, _context: &mut CTX) {
+        self.token.mark_started();
+        if self.token.is_cancelled() {
+            interpreter.halt(revm::interpreter::InstructionResult::Stop);
+        }
+    }
+}
 
 type OverlayEvm<'a> = revm::MainnetEvm<
     Context<BlockEnv, TxEnv, CfgEnv, &'a mut EvmOverlay, Journal<&'a mut EvmOverlay>, ()>,
@@ -1114,6 +1132,113 @@ impl EvmOverlay {
         outcome
     }
 
+    /// Execute a non-committing call with cooperative cancellation.
+    ///
+    /// This has the same transaction and access-list semantics as
+    /// [`Self::call_raw_with_access_list_with`]. The supplied cancellation scope
+    /// may be shared by related overlay calls and is checked at every EVM
+    /// instruction boundary. If cancellation is observed, execution halts, the
+    /// journal checkpoint is reverted, and [`OverlayError::Cancelled`] is
+    /// returned. An uncancelled execution returns the same result and access-list
+    /// evidence as the existing API.
+    ///
+    /// Cancellation cannot interrupt a database callback or precompile that is
+    /// already executing; it is observed at the next EVM instruction boundary.
+    /// For a wholly provider-free cancellation path, construct this overlay with
+    /// no external database. A scope cannot be reset after cancellation and must
+    /// not be reused for a later independent candidate.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OverlayError::Cancelled`] when the token is cancelled, or the
+    /// same transaction-environment and host errors as
+    /// [`Self::call_raw_with_access_list_with`].
+    pub fn call_raw_with_access_list_with_cancellation(
+        &mut self,
+        from: Address,
+        to: Address,
+        calldata: Bytes,
+        tx: &TxConfig,
+        cancellation: &SimulationCancellationToken,
+    ) -> Result<(ExecutionResult, StorageAccessList)> {
+        if cancellation.is_cancelled() {
+            return Err(OverlayError::Cancelled);
+        }
+
+        let mut builder = TxEnv::builder()
+            .caller(from)
+            .kind(TxKind::Call(to))
+            .data(calldata)
+            .value(tx.value);
+        if let Some(gas_limit) = tx.gas_limit {
+            builder = builder.gas_limit(gas_limit);
+        }
+        if let Some(gas_price) = tx.gas_price {
+            builder = builder.gas_price(gas_price);
+        }
+        if let Some(nonce) = tx.nonce {
+            builder = builder.nonce(nonce);
+        }
+        if let Some(access_list) = &tx.access_list {
+            builder = builder.access_list(access_list.clone());
+        }
+        let tx_env = builder.build().map_err(OverlayError::tx_env)?;
+
+        let buffer = Rc::new(RefCell::new(std::mem::take(&mut self.reusable_buffer)));
+        let local = LocalContext {
+            shared_memory_buffer: Rc::clone(&buffer),
+            precompile_error_message: None,
+        };
+        let inspector = SimulationCancellationInspector {
+            token: cancellation.clone(),
+        };
+
+        let outcome = {
+            let mut evm = self.build_evm_with_inspector_local(inspector, local);
+            use revm::context_interface::JournalTr;
+            let checkpoint = evm.journaled_state.checkpoint();
+            match evm.inspect_one_tx(tx_env) {
+                Ok(result) => {
+                    let cancelled = cancellation.is_cancelled();
+                    let mut access_list = StorageAccessList::default();
+                    if !cancelled {
+                        for (address, account) in evm.journaled_state.state.iter() {
+                            if account.is_touched() {
+                                access_list.accounts.insert(*address);
+                                let code_hash = account.info.code_hash;
+                                if code_hash != B256::ZERO
+                                    && code_hash != revm::primitives::KECCAK_EMPTY
+                                {
+                                    access_list.code_hashes.insert(code_hash);
+                                }
+                                for slot_key in account.storage.keys() {
+                                    access_list.slots.insert((*address, *slot_key));
+                                }
+                            }
+                        }
+                    }
+                    evm.journaled_state.checkpoint_revert(checkpoint);
+                    if cancelled {
+                        Err(OverlayError::Cancelled)
+                    } else {
+                        Ok((result, access_list))
+                    }
+                }
+                Err(error) => {
+                    evm.journaled_state.checkpoint_revert(checkpoint);
+                    if cancellation.is_cancelled() {
+                        Err(OverlayError::Cancelled)
+                    } else {
+                        Err(OverlayError::transact(error))
+                    }
+                }
+            }
+        };
+
+        self.reclaim_buffer(buffer);
+        outcome
+    }
+
     /// Write a storage value into this overlay's dirty layer.
     ///
     /// The dirty layer takes precedence over the snapshot on subsequent reads
@@ -1522,6 +1647,7 @@ mod tests {
             storage_cleared: HashSet::new(),
             accounts_not_existing: HashSet::new(),
             block_hashes,
+            block_context_hash: None,
             block_number: None,
             basefee: None,
             coinbase: None,

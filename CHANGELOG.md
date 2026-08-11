@@ -12,13 +12,56 @@ surface freezes at 1.0.
 
 ## [Unreleased]
 
+## [0.4.0-alpha.4] - 2026-08-11
+
+### Added
+
+- Added the provider-free, cloneable `SimulationCancellationToken` scope and
+  `EvmOverlay::call_raw_with_access_list_with_cancellation`. The REVM inspector
+  exposes a started latch, observes cancellation at instruction boundaries,
+  reverts the call checkpoint, and returns typed `OverlayError::Cancelled`;
+  uncancelled calls retain the existing result and access-list semantics. One
+  scope may cover related multi-chain or access-list replay calls, but cannot be
+  reset or carried into a later independent candidate. An executing database
+  callback or precompile remains cooperative only at the next instruction
+  boundary.
+- Added `EvmSnapshot::block_hash`, a provider-free read-only lookup that exposes
+  only block hashes resident when the immutable snapshot was created and never
+  infers a current block hash from EVM context alone.
+- Added `EvmSnapshot::block_context_hash`, which preserves a `BlockId::Hash`
+  current-block identity separately from EVM `BLOCKHASH` semantics, and
+  `account_code_hash(address)` for provider-free address-bound runtime
+  attestation. Both values are immutable after the snapshot is issued.
+- Added `BufferedRawJsonFlashblocksAdapter`, a provider-free wrapper that can
+  retain exactly one frame at exactly one missing index for a caller-selected
+  300–500 millisecond window. The caller owns the monotonic clock and timer;
+  expiry emits a typed `IndexGap` invalidation and quarantines the late
+  remainder until a new payload begins.
+- Added deterministic coverage for in-order drain, timeout, buffered conflicts,
+  second gaps, reset and payload replacement, malformed and resource-exhausting
+  frames, and the one-frame/one-index bound.
+- Added provider-free `FlashblockIngressTiming` metadata and timed raw/subscriber
+  handoff APIs. A buffered future frame retains its original caller-clock
+  arrival when the missing index later drains, and native Base/OP adapters stamp
+  ingress before normalization or pending-state materialization.
+- Exposed `FlashblockRef::same_base_identity` as a narrow provider-free lineage
+  predicate so consumers can avoid carrying a trace across pending-block base
+  replacement without treating a preview as canonical.
+
 ### Changed
 
+- Raw JSON Flashblocks applications may opt into bounded single-index reorder
+  tolerance without changing `RawJsonFlashblocksAdapter`'s immediate behavior.
+  The wrapper remains transport-free and has no canonical-state or execution
+  authority.
 - Canonical-head certification requests used by Flashblocks generations now
   fail closed after `SubscriberConfig::canonical_head_request_timeout` (three
   seconds by default). A silently wedged request can therefore surface through
   subscriber-driver failure and provider rotation instead of leaving canonical
   progress indefinitely stalled.
+- Preconfirmation batches now carry the earliest source ingress among their
+  contributing records. The timing is optional for compatibility and affects
+  neither Flashblock identity nor canonical or execution authority.
 
 ## [0.4.0-alpha.3] - 2026-08-07
 
@@ -1202,7 +1245,8 @@ pre-release development phases (see [`docs/ROADMAP.md`](docs/ROADMAP.md)).
 - `EvmCache` requires a multi-thread tokio runtime for any RPC-touching path.
 - See [`docs/KNOWN_ISSUES.md`](docs/KNOWN_ISSUES.md) for current limitations.
 
-[Unreleased]: https://github.com/KaiCode2/evm-fork-cache/compare/v0.4.0-alpha.3...HEAD
+[Unreleased]: https://github.com/KaiCode2/evm-fork-cache/compare/v0.4.0-alpha.4...HEAD
+[0.4.0-alpha.4]: https://github.com/KaiCode2/evm-fork-cache/compare/v0.4.0-alpha.3...v0.4.0-alpha.4
 [0.4.0-alpha.3]: https://github.com/KaiCode2/evm-fork-cache/compare/v0.4.0-alpha.2...v0.4.0-alpha.3
 [0.4.0-alpha.2]: https://github.com/KaiCode2/evm-fork-cache/compare/v0.4.0-alpha.1...v0.4.0-alpha.2
 [0.4.0-alpha.1]: https://github.com/KaiCode2/evm-fork-cache/compare/v0.3.0...v0.4.0-alpha.1

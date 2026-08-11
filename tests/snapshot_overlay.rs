@@ -11,8 +11,9 @@
 
 mod common;
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
+use alloy_eips::BlockId;
 use alloy_primitives::{Address, B256, Bytes, U256, keccak256};
 use alloy_sol_types::{SolCall, SolValue};
 use anyhow::{Result, anyhow};
@@ -23,7 +24,11 @@ use common::{
     MOCK_ERC20_BALANCE_SLOT, MockERC20, install_default_account, install_mock_erc20,
     mock_erc20_runtime, setup_cache, transfer,
 };
-use evm_fork_cache::cache::{EvmOverlay, EvmSnapshot};
+use evm_fork_cache::{
+    SimulationCancellationToken,
+    cache::{EvmOverlay, EvmSnapshot, TxConfig},
+    errors::OverlayError,
+};
 
 /// The hashed storage slot of `balanceOf[owner]` for a `MockERC20` (balances at
 /// the declared mapping slot 3): `keccak256(abi.encode(owner, 3))`.
@@ -178,6 +183,219 @@ async fn overlay_reads_reflect_snapshot_state() -> Result<()> {
     Ok(())
 }
 
+/// A superseded production simulation must stop after execution has genuinely
+/// entered the EVM. Dropping only the async waiter is insufficient because the
+/// blocking worker and its permit would continue running. The same overlay must
+/// remain reusable after its cancelled checkpoint is reverted and its shared
+/// memory buffer is reclaimed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn started_evm_execution_is_cooperatively_cancelled() -> Result<()> {
+    use revm::state::{AccountInfo, Bytecode};
+
+    let mut cache = setup_cache().await?;
+    let caller = Address::repeat_byte(0x71);
+    let contract = Address::repeat_byte(0x72);
+    let token = Address::repeat_byte(0x73);
+    let owner = Address::repeat_byte(0x74);
+    install_default_account(&mut cache, Address::ZERO);
+    install_default_account(&mut cache, caller);
+    install_default_account(&mut cache, owner);
+    install_mock_erc20(&mut cache, token);
+    cache.insert_mapping_storage_slot(
+        token,
+        U256::from(MOCK_ERC20_BALANCE_SLOT),
+        owner,
+        U256::from(42_000_u64),
+    )?;
+
+    // PUSH1 1; PUSH1 0; SSTORE; JUMPDEST; PUSH1 5; JUMP. The storage write
+    // proves checkpoint cleanup; the loop keeps execution inside REVM until the
+    // inspector observes cancellation.
+    let runtime = Bytecode::new_raw(Bytes::from_static(&[
+        0x60, 0x01, 0x60, 0x00, 0x55, 0x5b, 0x60, 0x05, 0x56,
+    ]));
+    cache.db_mut().insert_account_info(
+        contract,
+        AccountInfo {
+            code_hash: runtime.hash_slow(),
+            code: Some(runtime),
+            ..Default::default()
+        },
+    );
+    cache.insert_storage_slot(contract, U256::ZERO, U256::from(9_u64))?;
+
+    let cancellation = SimulationCancellationToken::new();
+    let worker_cancellation = cancellation.clone();
+    let snapshot = cache.snapshot();
+    let worker = tokio::task::spawn_blocking(move || {
+        let mut overlay = EvmOverlay::new(snapshot, None);
+        let cancelled = overlay.call_raw_with_access_list_with_cancellation(
+            caller,
+            contract,
+            Bytes::new(),
+            &TxConfig {
+                gas_limit: Some(u64::MAX),
+                ..Default::default()
+            },
+            &worker_cancellation,
+        );
+        let storage_after = overlay.storage(contract, U256::ZERO)?;
+        let balance_after = overlay_balance_of(&mut overlay, token, owner)?;
+        Ok::<_, anyhow::Error>((
+            cancelled,
+            storage_after,
+            balance_after,
+            overlay.missing_state().clone(),
+            overlay.blockhash_zero_fallback(),
+        ))
+    });
+
+    tokio::time::timeout(Duration::from_millis(250), async {
+        while !cancellation.has_started() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the real EVM execution must start before cancellation");
+    cancellation.cancel();
+
+    let (result, storage_after, balance_after, missing_state, blockhash_zero_fallback) =
+        tokio::time::timeout(Duration::from_millis(250), worker)
+            .await
+            .expect("cancelled EVM execution must release its blocking worker")
+            .expect("blocking worker must not panic")?;
+    assert!(matches!(result, Err(OverlayError::Cancelled)));
+    assert_eq!(
+        storage_after,
+        U256::from(9_u64),
+        "the cancelled SSTORE must be reverted to the snapshot value"
+    );
+    assert_eq!(
+        balance_after,
+        U256::from(42_000_u64),
+        "the same overlay and reclaimed buffer must remain usable"
+    );
+    assert!(
+        missing_state.is_empty(),
+        "reused overlay recorded unexpected missing state: {missing_state:?}"
+    );
+    assert!(!blockhash_zero_fallback);
+    Ok(())
+}
+
+/// A scope cancelled before execution begins must reject without entering REVM,
+/// and repeated cancellation requests must remain harmless.
+#[tokio::test(flavor = "multi_thread")]
+async fn pre_cancelled_scope_is_rejected_and_cancel_is_idempotent() -> Result<()> {
+    let mut cache = setup_cache().await?;
+    let mut overlay = EvmOverlay::new(cache.snapshot(), None);
+    let cancellation = SimulationCancellationToken::new();
+
+    cancellation.cancel();
+    cancellation.cancel();
+    assert!(cancellation.is_cancelled());
+    assert!(!cancellation.has_started());
+
+    let result = overlay.call_raw_with_access_list_with_cancellation(
+        Address::repeat_byte(0x75),
+        Address::repeat_byte(0x76),
+        Bytes::new(),
+        &TxConfig::default(),
+        &cancellation,
+    );
+    assert!(matches!(result, Err(OverlayError::Cancelled)));
+    assert!(
+        !cancellation.has_started(),
+        "a pre-cancelled scope must reject before the first EVM instruction"
+    );
+    assert!(overlay.missing_state().is_empty());
+    assert!(!overlay.blockhash_zero_fallback());
+    Ok(())
+}
+
+/// Opting into cancellation must be byte/result-equivalent when no
+/// cancellation is requested, including the captured access-list evidence.
+#[tokio::test(flavor = "multi_thread")]
+async fn uncancelled_execution_retains_result_and_access_list_evidence() -> Result<()> {
+    let mut cache = setup_cache().await?;
+    let caller = Address::repeat_byte(0x73);
+    let token = Address::repeat_byte(0x74);
+    let owner = Address::repeat_byte(0x75);
+    install_default_account(&mut cache, caller);
+    install_default_account(&mut cache, owner);
+    install_mock_erc20(&mut cache, token);
+    cache.insert_mapping_storage_slot(
+        token,
+        U256::from(MOCK_ERC20_BALANCE_SLOT),
+        owner,
+        U256::from(42_000_u64),
+    )?;
+
+    let calldata: Bytes = MockERC20::balanceOfCall { account: owner }
+        .abi_encode()
+        .into();
+    let snapshot = cache.snapshot();
+    let mut baseline_overlay = EvmOverlay::new(Arc::clone(&snapshot), None);
+    let mut cancellable_overlay = EvmOverlay::new(snapshot, None);
+    let (baseline_result, baseline_access_list) = baseline_overlay.call_raw_with_access_list_with(
+        caller,
+        token,
+        calldata.clone(),
+        &TxConfig::default(),
+    )?;
+    let cancellation = SimulationCancellationToken::new();
+    let (cancellable_result, cancellable_access_list) = cancellable_overlay
+        .call_raw_with_access_list_with_cancellation(
+            caller,
+            token,
+            calldata.clone(),
+            &TxConfig::default(),
+            &cancellation,
+        )?;
+    let (replayed_result, replayed_access_list) = cancellable_overlay
+        .call_raw_with_access_list_with_cancellation(
+            caller,
+            token,
+            calldata,
+            &TxConfig::default(),
+            &cancellation,
+        )?;
+
+    assert_eq!(cancellable_result, baseline_result);
+    assert_eq!(
+        cancellable_access_list.accounts,
+        baseline_access_list.accounts
+    );
+    assert_eq!(
+        cancellable_access_list.code_hashes,
+        baseline_access_list.code_hashes
+    );
+    assert_eq!(cancellable_access_list.slots, baseline_access_list.slots);
+    assert_eq!(
+        cancellable_access_list.block_numbers,
+        baseline_access_list.block_numbers
+    );
+    assert_eq!(replayed_result, baseline_result);
+    assert_eq!(replayed_access_list.accounts, baseline_access_list.accounts);
+    assert_eq!(
+        replayed_access_list.code_hashes,
+        baseline_access_list.code_hashes
+    );
+    assert_eq!(replayed_access_list.slots, baseline_access_list.slots);
+    assert_eq!(
+        replayed_access_list.block_numbers,
+        baseline_access_list.block_numbers
+    );
+    assert!(cancellation.has_started());
+    assert!(!cancellation.is_cancelled());
+    assert_eq!(
+        overlay_balance_of(&mut cancellable_overlay, token, owner)?,
+        U256::from(42_000_u64),
+        "the cancellable call must revert its checkpoint"
+    );
+    Ok(())
+}
+
 /// An offline overlay must make an unresolved storage read observable instead
 /// of silently treating its ZERO fallback as authoritative state. Readiness
 /// gates use this signal to reject an incompletely warmed speculative quote.
@@ -228,7 +446,8 @@ async fn snapshot_reports_its_complete_resident_read_set() -> Result<()> {
     install_mock_erc20(&mut cache, token);
     cache.insert_storage_slot(token, U256::from(7), U256::from(9))?;
 
-    let resident = cache.snapshot().resident_read_set();
+    let snapshot = cache.snapshot();
+    let resident = snapshot.resident_read_set();
 
     assert!(resident.accounts.contains(&token));
     assert!(
@@ -237,6 +456,10 @@ async fn snapshot_reports_its_complete_resident_read_set() -> Result<()> {
             .contains(&mock_erc20_runtime().hash_slow())
     );
     assert!(resident.slots.contains(&(token, U256::from(7))));
+    assert_eq!(
+        snapshot.account_code_hash(token),
+        Some(mock_erc20_runtime().hash_slow())
+    );
     Ok(())
 }
 
@@ -369,7 +592,7 @@ async fn snapshot_basic_returns_none_for_notexisting_account() -> Result<()> {
 }
 
 #[tokio::test]
-async fn snapshots_retain_resident_block_hash_dependencies_offline() -> Result<()> {
+async fn snapshot_block_hash_returns_resident_dependency_offline() -> Result<()> {
     let mut cache = setup_cache().await?;
     let number = 42_u64;
     let hash = B256::repeat_byte(0x42);
@@ -380,11 +603,101 @@ async fn snapshots_retain_resident_block_hash_dependencies_offline() -> Result<(
         .insert(U256::from(number), hash);
 
     let snapshot = cache.snapshot();
+    assert_eq!(snapshot.block_hash(number), Some(hash));
     assert!(snapshot.resident_read_set().block_numbers.contains(&number));
     let mut overlay = EvmOverlay::new(snapshot, None);
     assert_eq!(overlay.block_hash(number)?, hash);
 
     let mut deep = EvmOverlay::new(cache.snapshot_deep_clone(), None);
     assert_eq!(deep.block_hash(number)?, hash);
+    Ok(())
+}
+
+#[tokio::test]
+async fn snapshot_block_hash_does_not_infer_hash_from_block_context() -> Result<()> {
+    let mut cache = setup_cache().await?;
+    let number = 43_u64;
+    cache.set_block_context(Some(number), None);
+
+    let snapshot = cache.snapshot();
+    assert_eq!(snapshot.block_number(), Some(number));
+    assert_eq!(snapshot.block_hash(number), None);
+    assert!(!snapshot.resident_read_set().block_numbers.contains(&number));
+    Ok(())
+}
+
+#[tokio::test]
+async fn snapshot_block_hash_replacement_preserves_prior_snapshot_lineage() -> Result<()> {
+    let mut cache = setup_cache().await?;
+    let number = 44_u64;
+    let displaced_hash = B256::repeat_byte(0x44);
+    let replacement_hash = B256::repeat_byte(0x45);
+
+    cache
+        .db_mut()
+        .cache
+        .block_hashes
+        .insert(U256::from(number), displaced_hash);
+    let displaced_snapshot = cache.snapshot();
+
+    cache
+        .db_mut()
+        .cache
+        .block_hashes
+        .insert(U256::from(number), replacement_hash);
+    let replacement_snapshot = cache.snapshot();
+
+    assert_eq!(displaced_snapshot.block_hash(number), Some(displaced_hash));
+    assert_eq!(
+        replacement_snapshot.block_hash(number),
+        Some(replacement_hash)
+    );
+    assert_eq!(
+        displaced_snapshot.block_hash(number),
+        Some(displaced_hash),
+        "a replacement branch must not rewrite a previously issued snapshot"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn snapshot_block_context_hash_is_hash_pinned_and_immutable() -> Result<()> {
+    let mut cache = setup_cache().await?;
+    let displaced_hash = B256::repeat_byte(0x51);
+    let replacement_hash = B256::repeat_byte(0x52);
+
+    cache.set_block(BlockId::from((displaced_hash, Some(true))));
+    cache.set_block_context(Some(51), None);
+    let displaced_snapshot = cache.snapshot();
+    let displaced_deep = cache.snapshot_deep_clone();
+
+    cache.set_block(BlockId::from((replacement_hash, Some(true))));
+    cache.set_block_context(Some(51), None);
+    let replacement_snapshot = cache.snapshot();
+
+    assert_eq!(
+        displaced_snapshot.block_context_hash(),
+        Some(displaced_hash)
+    );
+    assert_eq!(displaced_deep.block_context_hash(), Some(displaced_hash));
+    assert_eq!(
+        replacement_snapshot.block_context_hash(),
+        Some(replacement_hash)
+    );
+    assert_eq!(
+        displaced_snapshot.block_context_hash(),
+        Some(displaced_hash),
+        "repinning the live cache must not rewrite an issued snapshot's lineage"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn snapshot_block_context_hash_is_absent_for_number_pins() -> Result<()> {
+    let mut cache = setup_cache().await?;
+    cache.set_block(BlockId::number(52));
+
+    assert_eq!(cache.snapshot().block_context_hash(), None);
+    assert_eq!(cache.snapshot_deep_clone().block_context_hash(), None);
     Ok(())
 }

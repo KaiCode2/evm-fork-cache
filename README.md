@@ -113,7 +113,19 @@ The reactive subscriber contract became asynchronous and explicitly durable in
 - Enable `raw-flashblocks-json` only when an application receives the supported
   receipt-enriched indexed JSON profile on a separate source socket. The crate
   converts application-data frames but never opens, reconnects, or rate-limits
-  that socket.
+  that socket. `BufferedRawJsonFlashblocksAdapter` optionally tolerates exactly
+  one missing index and one future frame for 300–500 milliseconds; the caller
+  still owns the monotonic timer and every lifecycle decision.
+- Use `SimulationCancellationToken` with
+  `EvmOverlay::call_raw_with_access_list_with_cancellation` when a provider-free
+  blocking simulation scope must be superseded after it has entered REVM. One
+  scope may be cloned across related multi-chain or access-list replay calls;
+  it cannot be reset and must not be carried to a later independent candidate.
+  `has_started()` reports the first instruction boundary reached by any call in
+  the scope, and a cancelled call returns `OverlayError::Cancelled` after
+  reverting its overlay checkpoint. Cancellation is observed between EVM
+  instructions, not inside an executing database callback or precompile. The
+  existing overlay call APIs remain unchanged.
 
 ## What it provides today
 
@@ -121,7 +133,11 @@ The reactive subscriber contract became asynchronous and explicitly durable in
   on-disk persistence for accounts, storage, bytecode, and immutable metadata.
 - **Snapshots and overlays** — `snapshot()` produces an immutable,
   `Send + Sync` point-in-time view; each `EvmOverlay` is a cheap clone that
-  simulates in isolation, ideal for parallel candidate evaluation.
+  simulates in isolation, ideal for parallel candidate evaluation. A caller may
+  bind a cloneable `SimulationCancellationToken` scope to related access-list
+  call paths to stop stale REVM work at an instruction boundary without
+  provider I/O or changing uncancelled results. Construct the overlay without
+  an external database for that wholly provider-free guarantee.
 - **Bundle simulation** — `simulate_bundle` applies an ordered sequence of
   transactions over cumulative block state (each transaction sees the previous
   one's writes), with an `Atomic` / `AllowReverts(indices)` revert policy and
@@ -469,6 +485,34 @@ preview, keeps canonical delivery alive in preferred mode, and fails required
 mode closed. Call `RawJsonFlashblocksAdapter::reset` and forward its returned
 invalidation whenever the source disconnects, is replaced, or returns an
 application-data or subscriber-admission error that cannot be proven irrelevant.
+
+Sources that have demonstrated occasional one-index delivery reordering may
+instead wrap the same normalization behavior with
+`BufferedRawJsonFlashblocksAdapter`. `ingest_json_at(frame, now_millis)` returns
+zero updates while it retains `expected + 1`, or the missing and retained
+snapshots in order when `expected` arrives before the deadline.
+`buffered_gap()` exposes `(missing_index, buffered_index, expires_at_millis)` so
+the application can schedule its own timer; it must call `expire_gap_at` at or
+after that deadline. Expiry emits `FlashblockInvalidationReason::IndexGap`,
+discards the one retained frame, and ignores late remainder frames until a new
+payload begins. Malformed data, conflicting duplicates, resource violations,
+and a second gap still fail immediately. The timeout is construction-bounded to
+300–500 milliseconds and the wrapper can retain only one parsed frame.
+
+This buffer is not a canonical-state cache and does not authorize trading or
+other downstream triggers. Its outputs remain speculative standardized updates
+subject to the subscriber's normal provenance, lineage, invalidation, and
+canonical reconciliation checks. `RawJsonFlashblocksAdapter` itself retains its
+existing immediate gap-invalidation semantics.
+
+Latency-sensitive callers may use `ingest_json_timed_at` and convert each
+`TimedFlashblockUpdate::source_ingress_millis` into their process-local
+`Instant` before `send_with_ingress`. A future frame retained across the single
+allowed gap keeps the arrival supplied with that frame; it is not restamped
+when the missing frame drains. `ReactiveInputBatch::preconfirmation_timing`
+then exposes the earliest contributing source arrival. This optional metadata
+is provider-free and observability-only: it never changes ordering, identity,
+canonical state, or trigger authority.
 
 For an externally managed source,
 `establish_flashblocks_preflight(expected_chain_id)` verifies the canonical
@@ -1039,12 +1083,12 @@ The much larger stress case exists to make the worst permitted parsing budget
 visible; the 16 MiB library default is not a recommended production setting.
 Applications should record source frame/count distributions, add explicit
 headroom, and set the four `RawJsonFlashblocksLimits` bounds accordingly. On the
-same Apple M1 Pro in a 2026-08-07 release run, a 15,521,468-byte frame with
-17,000 transactions and 34,000 logs measured 38.861 ms (38.356–39.504 ms 95%
-confidence interval) and 380.90 MiB/s across 20 flat Criterion samples. A
+same Apple M1 Pro in a 2026-08-10 release run, a 15,521,468-byte frame with
+17,000 transactions and 34,000 logs measured 43.051 ms (40.628–46.041 ms
+Criterion interval) and 343.83 MiB/s across 20 Criterion samples. A
 4,108,968-byte application-limit frame with 4,500 transactions and 9,000 logs
-measured 9.642 ms (9.291–10.209 ms) and 406.40 MiB/s; two of its 20 samples were
-high severe outliers.
+measured 10.522 ms (9.621–11.616 ms) and 372.42 MiB/s; three of its 20 samples
+were high severe outliers and one was high mild.
 
 ```sh
 cargo bench                      # all offline benches

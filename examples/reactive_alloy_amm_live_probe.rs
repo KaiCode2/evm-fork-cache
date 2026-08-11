@@ -17,6 +17,11 @@
 //! `--no-default-features --features reactive,reactive-polling` and set
 //! `LIVE_AMM_TRANSPORT=polling` to exercise the HTTP `watch_logs` fallback.
 
+#![cfg_attr(
+    not(any(feature = "reactive-ws", feature = "reactive-polling")),
+    allow(dead_code, unused_imports)
+)]
+
 use std::{
     collections::BTreeMap,
     time::{Duration, Instant},

@@ -21,6 +21,23 @@ both channel closure and queued malformed updates. The live probe performs the
 zero-Flashblocks-RPC preflight and rejects a canonical chain-id mismatch before
 starting its observation window.
 
+The optional buffered wrapper additionally covers exactly one future frame
+across one missing index, ordered two-frame drain within a 300–500 millisecond
+caller-timed window, deadline invalidation, late-remainder quarantine,
+same-index conflict, a second future index, source reset, payload replacement,
+malformed input, resource exhaustion, and a property check that no more distant
+index enters the buffer. The immediate adapter remains unchanged. The wrapper
+performs no provider request, starts no timer, mutates no canonical state, and
+does not authorize execution from a provisional update.
+
+Timed coverage additionally proves that each member of an ordered two-frame
+gap drain retains the monotonic arrival supplied on its original adapter call.
+The standardized subscriber handoff preserves that timing through queued
+normalization, record construction, scoped batching, and the public reactive
+batch. Native Base coverage retains the earlier pending-log arrival when the
+later cumulative preview releases that buffered log. Timing is optional
+metadata only; absence cannot be interpreted as a later inferred ingress.
+
 The public package check separately verifies that enabling only
 `raw-flashblocks-json` does not add a socket transport to the library dependency
 surface. The live example's WebSocket client is a development dependency and
@@ -79,10 +96,10 @@ or rotate the speculative source when a limit is exceeded. Canonical processing
 must remain independent in preferred mode.
 
 A 4,108,968-byte stress frame just below that application byte limit, containing
-4,500 transactions and 9,000 logs, measured 9.071 milliseconds (8.972–9.242
-milliseconds Criterion interval) and 431.98 MiB/s on the Apple M1 Pro release
-build on 2026-08-07. One of 20 samples was classified as a high mild outlier and
-one as a high severe outlier.
+4,500 transactions and 9,000 logs, measured 10.522 milliseconds (9.621–11.616
+milliseconds Criterion interval) and 372.42 MiB/s on the Apple M1 Pro release
+build on 2026-08-10. Of 20 samples, one was classified as a high mild outlier and
+three as high severe outliers.
 The parsing stage precedes downstream decision timing and remains part of
 end-to-end signal latency; the count limits independently reject more
 allocation-heavy shapes that fit under the byte ceiling.
@@ -106,9 +123,9 @@ canonical inclusion.
 
 The checked-in suite also builds a 15,521,468-byte frame containing 17,000
 transactions and 34,000 logs, below every default count ceiling and close to the
-16 MiB frame ceiling. On the same Apple M1 Pro in a release build on 2026-08-07,
-its Criterion point estimate was 39.005 milliseconds (38.082–40.312
-milliseconds Criterion interval), or 379.50 MiB/s, with two high severe
-outliers among 20 samples. Its purpose is to expose the bounded worst-case
+16 MiB frame ceiling. On the same Apple M1 Pro in a release build on 2026-08-10,
+its Criterion point estimate was 43.051 milliseconds (40.628–46.041
+milliseconds Criterion interval), or 343.83 MiB/s, with one high mild and one
+high severe outlier among 20 samples. Its purpose is to expose the bounded worst-case
 parsing cost before release. Production consumers should select smaller limits
 unless their measured source requires the broader compatibility envelope.

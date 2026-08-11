@@ -3790,6 +3790,12 @@ async fn unknown_parent_replacement_overwrites_the_stale_parent_blockhash() -> R
         .cache
         .block_hashes
         .insert(U256::from(78), stale_grandparent_hash);
+    let displaced_snapshot = cache.snapshot();
+    assert_eq!(displaced_snapshot.block_hash(79), Some(old_parent_hash));
+    assert_eq!(
+        displaced_snapshot.block_hash(78),
+        Some(stale_grandparent_hash)
+    );
 
     runtime.ingest_batch(
         &mut cache,
@@ -3807,6 +3813,22 @@ async fn unknown_parent_replacement_overwrites_the_stale_parent_blockhash() -> R
     )?;
 
     assert_eq!(runtime.last_canonical_block(), Some(replacement));
+    let replacement_snapshot = cache.snapshot();
+    assert_eq!(
+        replacement_snapshot.block_hash(79),
+        Some(replacement_parent_hash)
+    );
+    assert_eq!(replacement_snapshot.block_hash(78), None);
+    assert_eq!(
+        displaced_snapshot.block_hash(79),
+        Some(old_parent_hash),
+        "reorg recovery must not rewrite an already issued snapshot"
+    );
+    assert_eq!(
+        displaced_snapshot.block_hash(78),
+        Some(stale_grandparent_hash),
+        "reorg invalidation must remain point-in-time for prior snapshots"
+    );
     assert_eq!(
         cache
             .unchecked_blockchain_db()

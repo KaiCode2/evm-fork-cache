@@ -9,7 +9,10 @@
 
 mod common;
 
-use std::sync::Arc;
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use alloy_network::Ethereum;
 use alloy_primitives::{Address, B256, Bytes, Log as PrimitiveLog, U256};
@@ -21,12 +24,12 @@ use common::{install_mock_erc20, setup_cache_with_asserter};
 use evm_fork_cache::StateUpdate;
 use evm_fork_cache::events::StateView;
 use evm_fork_cache::reactive::{
-    AlloySubscriber, BlockRef, ChainStatus, DeliveryScope, EventSubscriber, FlashblockRef,
-    FlashblockUpdate, HandlerError, HandlerId, HandlerOutcome, InputSource, LogInterest,
-    PreconfirmationMode, ProviderRef, RawJsonFlashblocksAdapter, ReactiveConfig, ReactiveContext,
-    ReactiveEffect, ReactiveHandler, ReactiveInput, ReactiveInputBatch, ReactiveInputRecord,
-    ReactiveInterest, ReactiveRuntime, StateEffectQuality, SubscriberBackfill, SubscriberConfig,
-    SubscriberMode,
+    AlloySubscriber, BlockRef, ChainStatus, DeliveryScope, EventSubscriber,
+    FlashblockIngressTiming, FlashblockRef, FlashblockUpdate, HandlerError, HandlerId,
+    HandlerOutcome, InputSource, LogInterest, PreconfirmationMode, ProviderRef,
+    RawJsonFlashblocksAdapter, ReactiveConfig, ReactiveContext, ReactiveEffect, ReactiveHandler,
+    ReactiveInput, ReactiveInputBatch, ReactiveInputRecord, ReactiveInterest, ReactiveRuntime,
+    StateEffectQuality, SubscriberBackfill, SubscriberConfig, SubscriberMode,
 };
 
 const POOL_SLOT: u64 = 0;
@@ -258,12 +261,23 @@ async fn raw_preview_invalidation_replacement_and_canonical_reconciliation_are_o
     let first = adapter
         .ingest_json(&raw_frame(pool, topic, value))?
         .ok_or_else(|| anyhow::anyhow!("expected first raw snapshot"))?;
-    subscriber.ingest_flashblock_update(first)?;
+    let source_ingress = Instant::now() - Duration::from_millis(25);
+    subscriber.ingest_flashblock_update_with_ingress(
+        first,
+        FlashblockIngressTiming::new(source_ingress),
+    )?;
     let first_batch = subscriber
         .next_batch()
         .await?
         .ok_or_else(|| anyhow::anyhow!("expected first preconfirmation batch"))?;
     assert_eq!(first_batch.records().len(), 1);
+    assert_eq!(
+        first_batch
+            .preconfirmation_timing()
+            .expect("raw preview timing must survive subscriber batching")
+            .source_ingress(),
+        source_ingress
+    );
     assert_eq!(
         first_batch.records()[0].context.source,
         InputSource::Flashblocks

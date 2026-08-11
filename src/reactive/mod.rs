@@ -66,9 +66,10 @@ use crate::{
 mod raw_json_flashblocks;
 #[cfg(feature = "raw-flashblocks-json")]
 pub use raw_json_flashblocks::{
-    FlashblockInvalidation, FlashblockInvalidationReason, FlashblockSnapshot, FlashblockUpdate,
-    FlashblockUpdateAcknowledgement, FlashblockUpdateChannelError, FlashblockUpdateSender,
-    RawJsonFlashblocksAdapter, RawJsonFlashblocksError, RawJsonFlashblocksLimits,
+    BufferedRawJsonFlashblocksAdapter, FlashblockInvalidation, FlashblockInvalidationReason,
+    FlashblockSnapshot, FlashblockUpdate, FlashblockUpdateAcknowledgement,
+    FlashblockUpdateChannelError, FlashblockUpdateSender, RawJsonFlashblocksAdapter,
+    RawJsonFlashblocksError, RawJsonFlashblocksLimits, TimedFlashblockUpdate,
 };
 
 /// Input accepted by the reactive runtime.
@@ -137,6 +138,33 @@ impl ProviderRef {
             endpoint: endpoint.into(),
             generation,
         }
+    }
+}
+
+/// Process-local monotonic time at which a Flashblock source item first
+/// entered the typed subscriber boundary.
+///
+/// This metadata never participates in Flashblock identity, ordering,
+/// canonical state, or execution authority.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FlashblockIngressTiming {
+    source_ingress: Instant,
+}
+
+impl FlashblockIngressTiming {
+    /// Bind a source item to its earliest process-local typed arrival.
+    pub const fn new(source_ingress: Instant) -> Self {
+        Self { source_ingress }
+    }
+
+    /// Earliest process-local typed arrival for the source item.
+    pub const fn source_ingress(self) -> Instant {
+        self.source_ingress
+    }
+
+    /// Retain the earliest contributing source arrival.
+    pub fn earliest(self, other: Self) -> Self {
+        Self::new(self.source_ingress.min(other.source_ingress))
     }
 }
 
@@ -217,8 +245,15 @@ impl FlashblockRef {
             }
     }
 
+    /// Whether two cumulative previews bind the same pending-block base
+    /// fields, excluding payload index, cumulative transactions, and derived
+    /// content commitments.
+    ///
+    /// This provider-free predicate lets applications retain lineage metadata
+    /// only across snapshots that cannot have crossed a pending-block
+    /// replacement boundary. It grants no canonical or execution authority.
     #[cfg(feature = "raw-flashblocks-json")]
-    fn same_base_identity(&self, other: &Self) -> bool {
+    pub fn same_base_identity(&self, other: &Self) -> bool {
         self.block_number == other.block_number
             && self.parent_hash == other.parent_hash
             && self.timestamp == other.timestamp
@@ -1759,6 +1794,8 @@ pub struct ReactiveInputBatchParts<N: Network = Ethereum> {
     pub payload_commitment: Option<SubscriberPayloadCommitment>,
     /// Ordered chain controls sharing the delivery's commit boundary.
     pub chain_controls: Vec<ChainControl>,
+    /// Original typed source ingress for a preconfirmed-only batch.
+    pub preconfirmation_timing: Option<FlashblockIngressTiming>,
 }
 
 /// Batch of reactive input records.
@@ -1774,6 +1811,7 @@ pub struct ReactiveInputBatch<N: Network = Ethereum> {
     delivery_scope: DeliveryScope,
     record_delivery_scopes: Option<Vec<DeliveryScope>>,
     chain_controls: Vec<ChainControl>,
+    preconfirmation_timing: Option<FlashblockIngressTiming>,
 }
 
 type RuntimeInputDelivery<N> = (ReactiveInputRecord<N>, DeliveryAudience, DeliveryScope);
@@ -1793,6 +1831,7 @@ impl<N: Network> ReactiveInputBatch<N> {
             delivery_scope: DeliveryScope::Canonical,
             record_delivery_scopes: None,
             chain_controls: Vec::new(),
+            preconfirmation_timing: None,
         }
     }
 
@@ -1872,6 +1911,7 @@ impl<N: Network> ReactiveInputBatch<N> {
             delivery_scope: DeliveryScope::Canonical,
             record_delivery_scopes: None,
             chain_controls: Vec::new(),
+            preconfirmation_timing: None,
         }
     }
 
@@ -1941,7 +1981,19 @@ impl<N: Network> ReactiveInputBatch<N> {
             delivery_scope: DeliveryScope::Canonical,
             record_delivery_scopes: Some(scopes),
             chain_controls: Vec::new(),
+            preconfirmation_timing: None,
         }
+    }
+
+    /// Attach original typed source ingress to a preconfirmed-only batch.
+    pub fn with_preconfirmation_timing(mut self, timing: FlashblockIngressTiming) -> Self {
+        self.preconfirmation_timing = Some(timing);
+        self
+    }
+
+    /// Original typed source ingress for a preconfirmed-only batch.
+    pub const fn preconfirmation_timing(&self) -> Option<FlashblockIngressTiming> {
+        self.preconfirmation_timing
     }
 
     /// Attach ordered chain-lifecycle controls to this delivery.
@@ -1982,6 +2034,7 @@ impl<N: Network> ReactiveInputBatch<N> {
         let subscriber_checkpoint = self.subscriber_checkpoint;
         let payload_commitment = self.payload_commitment;
         let chain_controls = self.chain_controls;
+        let preconfirmation_timing = self.preconfirmation_timing;
         let audiences = self
             .record_audiences
             .unwrap_or_else(|| vec![self.audience; self.records.len()]);
@@ -2002,6 +2055,7 @@ impl<N: Network> ReactiveInputBatch<N> {
             subscriber_checkpoint,
             payload_commitment,
             chain_controls,
+            preconfirmation_timing,
         }
     }
 
@@ -10493,6 +10547,7 @@ impl SubscriberInputScope {
 pub struct SubscriberInputRecord<N: Network = Ethereum> {
     record: ReactiveInputRecord<N>,
     scope: SubscriberInputScope,
+    preconfirmation_timing: Option<FlashblockIngressTiming>,
 }
 
 impl<N: Network> SubscriberInputRecord<N> {
@@ -10504,6 +10559,11 @@ impl<N: Network> SubscriberInputRecord<N> {
     /// Delivery audience captured when the record was enqueued.
     pub const fn scope(&self) -> &SubscriberInputScope {
         &self.scope
+    }
+
+    /// Original typed source ingress when this is a preconfirmed record.
+    pub const fn preconfirmation_timing(&self) -> Option<FlashblockIngressTiming> {
+        self.preconfirmation_timing
     }
 
     /// Consume the scoped value into its reactive input record.
@@ -10527,6 +10587,7 @@ pub struct SubscriberInputBatch<N: Network = Ethereum> {
     chain_id: Option<u64>,
     chain_controls: Vec<ChainControl>,
     preconfirmation_invalidated: bool,
+    preconfirmation_timing: Option<FlashblockIngressTiming>,
 }
 
 /// Result of polling a scoped subscriber batch against one driver control
@@ -10562,6 +10623,11 @@ impl<N: Network> SubscriberInputBatch<N> {
         self.preconfirmation_invalidated
     }
 
+    /// Earliest typed source ingress contributing to a preconfirmed batch.
+    pub const fn preconfirmation_timing(&self) -> Option<FlashblockIngressTiming> {
+        self.preconfirmation_timing
+    }
+
     /// Consume the scoped subscriber delivery into a runtime-ready batch.
     ///
     /// Delivery audiences and the preconfirmed/canonical boundary are retained,
@@ -10570,6 +10636,7 @@ impl<N: Network> SubscriberInputBatch<N> {
     pub fn into_reactive_batch(self) -> ReactiveInputBatch<N> {
         let chain_id = self.chain_id;
         let chain_controls = self.chain_controls;
+        let preconfirmation_timing = self.preconfirmation_timing;
         let mut batch = ReactiveInputBatch::from_scoped_records_with_delivery_scope(
             self.records.into_iter().map(|scoped| {
                 let source = scoped.record.context.source;
@@ -10616,6 +10683,9 @@ impl<N: Network> SubscriberInputBatch<N> {
         .with_chain_controls(chain_controls);
         if let Some(chain_id) = chain_id {
             batch = batch.with_chain_id(chain_id);
+        }
+        if let Some(timing) = preconfirmation_timing {
+            batch = batch.with_preconfirmation_timing(timing);
         }
         batch
     }
@@ -12472,7 +12542,7 @@ pub struct AlloySubscriber<P, N: Network = Ethereum> {
     recent_compat_owner_input_ref_sets: HashMap<HandlerId, HashSet<InputRef>>,
     base_flashblock_header: Option<(FixedBytes<8>, BaseFlashblockBase)>,
     base_flashblock_transactions: Option<(FixedBytes<8>, u64, Vec<B256>, Vec<B256>)>,
-    unmatched_pending_logs: VecDeque<(usize, Log)>,
+    unmatched_pending_logs: VecDeque<(usize, Log, FlashblockIngressTiming)>,
     latest_preconfirmation: Option<FlashblockRef>,
     preconfirmed_seen_logs: HashSet<(B256, u64)>,
     /// OP transaction receipts already proven for the active cumulative
@@ -13942,6 +14012,12 @@ impl<P, N: Network> AlloySubscriber<P, N> {
                 None => record.scope != SubscriberInputScope::Preconfirmed,
             })
             .count();
+        let preconfirmation_timing = self
+            .pending_records
+            .iter()
+            .take(len)
+            .filter_map(SubscriberInputRecord::preconfirmation_timing)
+            .reduce(FlashblockIngressTiming::earliest);
         let records = self.pending_records.drain(..len).collect();
         let chain_controls = if first_preconfirmation.is_none() && self.pending_records.is_empty() {
             self.pending_chain_controls.drain(..).collect()
@@ -13955,6 +14031,7 @@ impl<P, N: Network> AlloySubscriber<P, N> {
             preconfirmation_invalidated: std::mem::take(
                 &mut self.pending_preconfirmation_invalidation,
             ),
+            preconfirmation_timing,
         })
     }
 
@@ -14181,7 +14258,7 @@ impl<N: Network> SubscriberStreams<N> {
         self.entries.push(SubscriberStreamEntry { source, stream });
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, any(feature = "reactive-polling", feature = "reactive-ws")))]
     fn len(&self) -> usize {
         self.entries.len()
     }
@@ -14376,12 +14453,23 @@ enum SubscriberEvent<N: Network> {
         source_id: usize,
         log: Log,
     },
+    BasePendingLogTimed {
+        source_id: usize,
+        log: Log,
+        timing: FlashblockIngressTiming,
+    },
     BaseFlashblock(BaseFlashblockWirePayload),
+    BaseFlashblockTimed {
+        payload: BaseFlashblockWirePayload,
+        timing: FlashblockIngressTiming,
+    },
     OpFlashblockTick,
+    OpFlashblockTickTimed(FlashblockIngressTiming),
     CanonicalHeadTick,
     PreconfirmedLogs {
         flashblock: FlashblockRef,
         logs: Vec<Log>,
+        timing: FlashblockIngressTiming,
     },
     FlashblockInvalidated,
     FlashblockObserved,
@@ -14781,6 +14869,27 @@ where
         &mut self,
         update: FlashblockUpdate,
     ) -> Result<(), SubscriberError> {
+        self.ingest_flashblock_update_with_ingress(
+            update,
+            FlashblockIngressTiming::new(Instant::now()),
+        )
+    }
+
+    /// Ingest one standardized update with its original typed source arrival.
+    ///
+    /// This timing is observability-only and cannot mutate canonical state or
+    /// grant trigger authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same validation and resource errors as
+    /// [`Self::ingest_flashblock_update`].
+    #[cfg(feature = "raw-flashblocks-json")]
+    pub fn ingest_flashblock_update_with_ingress(
+        &mut self,
+        update: FlashblockUpdate,
+        timing: FlashblockIngressTiming,
+    ) -> Result<(), SubscriberError> {
         validate_subscriber_config(&self.config)?;
         self.validate_flashblocks_setup()?;
         let configured =
@@ -14835,7 +14944,11 @@ where
                     provider.generation = provider.generation.max(flashblock.provider.generation);
                 }
                 if !logs.is_empty() {
-                    self.enqueue_event(SubscriberEvent::PreconfirmedLogs { flashblock, logs });
+                    self.enqueue_event(SubscriberEvent::PreconfirmedLogs {
+                        flashblock,
+                        logs,
+                        timing,
+                    });
                 }
             }
             FlashblockUpdate::Invalidated(invalidation) => {
@@ -15968,7 +16081,11 @@ where
                 .await
                 .map_err(provider_error)?
                 .into_stream()
-                .map(move |log| SubscriberEvent::BasePendingLog { source_id: id, log });
+                .map(move |log| SubscriberEvent::BasePendingLogTimed {
+                    source_id: id,
+                    log,
+                    timing: FlashblockIngressTiming::new(Instant::now()),
+                });
             Ok(stream_with_termination(stream, source))
         }
 
@@ -15993,7 +16110,10 @@ where
                 .await
                 .map_err(provider_error)?
                 .into_stream()
-                .map(SubscriberEvent::BaseFlashblock);
+                .map(|payload| SubscriberEvent::BaseFlashblockTimed {
+                    payload,
+                    timing: FlashblockIngressTiming::new(Instant::now()),
+                });
             Ok(stream_with_termination(
                 stream,
                 SubscriberStreamSource::BaseFlashblocks,
@@ -16032,7 +16152,12 @@ where
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let stream = stream::unfold(interval, |mut interval| async move {
             interval.tick().await;
-            Some((SubscriberEvent::OpFlashblockTick, interval))
+            Some((
+                SubscriberEvent::OpFlashblockTickTimed(
+                    FlashblockIngressTiming::new(Instant::now()),
+                ),
+                interval,
+            ))
         });
         Ok(stream_with_termination(
             stream,
@@ -16310,11 +16435,28 @@ where
         &mut self,
         event: SubscriberEvent<N>,
     ) -> Result<Option<SubscriberEvent<N>>, SubscriberError> {
+        let event = match event {
+            SubscriberEvent::BasePendingLog { source_id, log } => {
+                SubscriberEvent::BasePendingLogTimed {
+                    source_id,
+                    log,
+                    timing: FlashblockIngressTiming::new(Instant::now()),
+                }
+            }
+            SubscriberEvent::BaseFlashblock(payload) => SubscriberEvent::BaseFlashblockTimed {
+                payload,
+                timing: FlashblockIngressTiming::new(Instant::now()),
+            },
+            SubscriberEvent::OpFlashblockTick => {
+                SubscriberEvent::OpFlashblockTickTimed(FlashblockIngressTiming::new(Instant::now()))
+            }
+            event => event,
+        };
         match event {
             #[cfg(feature = "raw-flashblocks-json")]
             SubscriberEvent::ExternalFlashblockUpdate(queued) => {
                 let provider = queued.update.provider().clone();
-                match self.ingest_flashblock_update(queued.update) {
+                match self.ingest_flashblock_update_with_ingress(queued.update, queued.timing) {
                     Ok(()) => {
                         let _ = queued.acknowledgement.send(Ok(()));
                         Ok(Some(SubscriberEvent::FlashblockObserved))
@@ -16359,7 +16501,11 @@ where
                     }
                 }
             }
-            SubscriberEvent::BasePendingLog { source_id, log } => {
+            SubscriberEvent::BasePendingLogTimed {
+                source_id,
+                log,
+                timing,
+            } => {
                 let block_number = log.block_number.ok_or_else(|| {
                     SubscriberError::Provider(
                         "pendingLogs item is missing its pending block number".into(),
@@ -16387,22 +16533,33 @@ where
                             "unmatched pendingLogs exceeded max_pending_records".into(),
                         ));
                     }
-                    self.unmatched_pending_logs.push_back((source_id, log));
+                    self.unmatched_pending_logs
+                        .push_back((source_id, log, timing));
                     return Ok(None);
                 };
                 let logs = self.filter_preconfirmed_logs(&flashblock, vec![log])?;
                 Ok(Some(if logs.is_empty() {
                     SubscriberEvent::FlashblockObserved
                 } else {
-                    SubscriberEvent::PreconfirmedLogs { flashblock, logs }
+                    SubscriberEvent::PreconfirmedLogs {
+                        flashblock,
+                        logs,
+                        timing,
+                    }
                 }))
             }
-            SubscriberEvent::BaseFlashblock(payload) => {
+            SubscriberEvent::BaseFlashblockTimed {
+                payload,
+                timing: source_timing,
+            } => {
                 let (flashblock, recover_pending_snapshot) =
                     self.accept_base_flashblock(payload)?;
                 let mut logs = Vec::new();
                 let mut retained = VecDeque::new();
-                while let Some((source_id, log)) = self.unmatched_pending_logs.pop_front() {
+                let mut timing = source_timing;
+                while let Some((source_id, log, log_timing)) =
+                    self.unmatched_pending_logs.pop_front()
+                {
                     let transaction_hash = log.transaction_hash;
                     if log.block_number == Some(flashblock.block_number)
                         && transaction_hash
@@ -16410,12 +16567,13 @@ where
                             .is_some_and(|hash| flashblock.contains_transaction(hash))
                     {
                         let _ = source_id;
+                        timing = timing.earliest(log_timing);
                         logs.push(log);
                     } else if log
                         .block_number
                         .is_some_and(|number| number >= flashblock.block_number)
                     {
-                        retained.push_back((source_id, log));
+                        retained.push_back((source_id, log, log_timing));
                     } else {
                         // A late log for an older speculative block can no
                         // longer be applied to the active cumulative branch.
@@ -16440,7 +16598,7 @@ where
                 });
                 if recover_pending_snapshot {
                     if let Some(event) = self
-                        .fetch_pending_flashblock(indexed_recovery)
+                        .fetch_pending_flashblock_with_timing(indexed_recovery, timing)
                         .await
                         .map_err(PendingFlashblockPollError::into_subscriber)?
                     {
@@ -16453,20 +16611,37 @@ where
                 Ok(Some(if logs.is_empty() {
                     SubscriberEvent::FlashblockObserved
                 } else {
-                    SubscriberEvent::PreconfirmedLogs { flashblock, logs }
+                    SubscriberEvent::PreconfirmedLogs {
+                        flashblock,
+                        logs,
+                        timing,
+                    }
                 }))
             }
-            SubscriberEvent::OpFlashblockTick => self.poll_op_pending_flashblock().await,
+            SubscriberEvent::OpFlashblockTickTimed(timing) => {
+                self.poll_op_pending_flashblock(timing).await
+            }
             SubscriberEvent::CanonicalHeadTick => self.fetch_certified_canonical_head().await,
-            SubscriberEvent::PreconfirmedLogs { flashblock, logs } => {
+            SubscriberEvent::PreconfirmedLogs {
+                flashblock,
+                logs,
+                timing,
+            } => {
                 let logs = self.filter_preconfirmed_logs(&flashblock, logs)?;
                 Ok(Some(if logs.is_empty() {
                     SubscriberEvent::FlashblockObserved
                 } else {
-                    SubscriberEvent::PreconfirmedLogs { flashblock, logs }
+                    SubscriberEvent::PreconfirmedLogs {
+                        flashblock,
+                        logs,
+                        timing,
+                    }
                 }))
             }
             SubscriberEvent::FlashblockObserved => Ok(None),
+            SubscriberEvent::BasePendingLog { .. }
+            | SubscriberEvent::BaseFlashblock(_)
+            | SubscriberEvent::OpFlashblockTick => unreachable!("normalized above"),
             event => Ok(Some(event)),
         }
     }
@@ -16775,8 +16950,12 @@ where
 
     async fn poll_op_pending_flashblock(
         &mut self,
+        timing: FlashblockIngressTiming,
     ) -> Result<Option<SubscriberEvent<N>>, SubscriberError> {
-        match self.fetch_pending_flashblock(None).await {
+        match self
+            .fetch_pending_flashblock_with_timing(None, timing)
+            .await
+        {
             Ok(event) => {
                 self.consecutive_flashblock_poll_failures = 0;
                 Ok(event)
@@ -16805,9 +16984,22 @@ where
         }
     }
 
+    #[cfg(test)]
     async fn fetch_pending_flashblock(
         &mut self,
         indexed_recovery: Option<(FixedBytes<8>, u64, Vec<B256>)>,
+    ) -> Result<Option<SubscriberEvent<N>>, PendingFlashblockPollError> {
+        self.fetch_pending_flashblock_with_timing(
+            indexed_recovery,
+            FlashblockIngressTiming::new(Instant::now()),
+        )
+        .await
+    }
+
+    async fn fetch_pending_flashblock_with_timing(
+        &mut self,
+        indexed_recovery: Option<(FixedBytes<8>, u64, Vec<B256>)>,
+        timing: FlashblockIngressTiming,
     ) -> Result<Option<SubscriberEvent<N>>, PendingFlashblockPollError> {
         let samples_pending_range = self.chain_id.and_then(flashblocks_adapter)
             == Some(FlashblocksAdapter::PendingStatePolling);
@@ -17003,7 +17195,11 @@ where
             return Ok(Some(if logs.is_empty() {
                 SubscriberEvent::FlashblockObserved
             } else {
-                SubscriberEvent::PreconfirmedLogs { flashblock, logs }
+                SubscriberEvent::PreconfirmedLogs {
+                    flashblock,
+                    logs,
+                    timing,
+                }
             }));
         }
         let logs = self
@@ -17012,7 +17208,11 @@ where
         Ok(Some(if logs.is_empty() {
             SubscriberEvent::FlashblockObserved
         } else {
-            SubscriberEvent::PreconfirmedLogs { flashblock, logs }
+            SubscriberEvent::PreconfirmedLogs {
+                flashblock,
+                logs,
+                timing,
+            }
         }))
     }
 
@@ -17334,8 +17534,11 @@ where
             | SubscriberEvent::PendingHash(_)
             | SubscriberEvent::PendingHashes(_)
             | SubscriberEvent::BasePendingLog { .. }
-            | SubscriberEvent::BaseFlashblock(_)
+            | SubscriberEvent::BasePendingLogTimed { .. }
+            | SubscriberEvent::BaseFlashblock { .. }
+            | SubscriberEvent::BaseFlashblockTimed { .. }
             | SubscriberEvent::OpFlashblockTick
+            | SubscriberEvent::OpFlashblockTickTimed(_)
             | SubscriberEvent::CanonicalHeadTick
             | SubscriberEvent::PreconfirmedLogs { .. }
             | SubscriberEvent::FlashblockInvalidated
@@ -17432,8 +17635,11 @@ where
             | SubscriberEvent::PendingHash(_)
             | SubscriberEvent::PendingHashes(_)
             | SubscriberEvent::BasePendingLog { .. }
-            | SubscriberEvent::BaseFlashblock(_)
+            | SubscriberEvent::BasePendingLogTimed { .. }
+            | SubscriberEvent::BaseFlashblock { .. }
+            | SubscriberEvent::BaseFlashblockTimed { .. }
             | SubscriberEvent::OpFlashblockTick
+            | SubscriberEvent::OpFlashblockTickTimed(_)
             | SubscriberEvent::CanonicalHeadTick
             | SubscriberEvent::PreconfirmedLogs { .. }
             | SubscriberEvent::FlashblockInvalidated
@@ -17562,13 +17768,18 @@ where
                     );
                 }
             }
-            SubscriberEvent::PreconfirmedLogs { flashblock, logs } => {
+            SubscriberEvent::PreconfirmedLogs {
+                flashblock,
+                logs,
+                timing,
+            } => {
                 for log in logs {
                     let record = self
                         .with_chain_id(preconfirmed_log_input_record::<N>(log, flashblock.clone()));
                     self.push_pending_record(SubscriberInputRecord {
                         record,
                         scope: SubscriberInputScope::Preconfirmed,
+                        preconfirmation_timing: Some(timing),
                     });
                 }
             }
@@ -17576,8 +17787,11 @@ where
                 self.pending_preconfirmation_invalidation = true;
             }
             SubscriberEvent::BasePendingLog { .. }
-            | SubscriberEvent::BaseFlashblock(_)
+            | SubscriberEvent::BasePendingLogTimed { .. }
+            | SubscriberEvent::BaseFlashblock { .. }
+            | SubscriberEvent::BaseFlashblockTimed { .. }
             | SubscriberEvent::OpFlashblockTick
+            | SubscriberEvent::OpFlashblockTickTimed(_)
             | SubscriberEvent::CanonicalHeadTick
             | SubscriberEvent::FlashblockObserved => {}
             #[cfg(feature = "raw-flashblocks-json")]
@@ -17806,6 +18020,7 @@ where
                 self.push_pending_record(SubscriberInputRecord {
                     record: record.clone(),
                     scope: SubscriberInputScope::OwnerOnly { owners },
+                    preconfirmation_timing: None,
                 });
             }
             if !newly_served.is_empty() {
@@ -17817,6 +18032,7 @@ where
                     scope: SubscriberInputScope::OwnerOnlyHandlers {
                         owners: newly_served,
                     },
+                    preconfirmation_timing: None,
                 });
             }
             return;
@@ -17835,6 +18051,7 @@ where
                     excluded: already_served,
                 }
             },
+            preconfirmation_timing: None,
         });
     }
 
@@ -17849,6 +18066,7 @@ where
             scope: SubscriberInputScope::OwnerOnlyHandlers {
                 owners: vec![owner],
             },
+            preconfirmation_timing: None,
         });
     }
 
@@ -17972,6 +18190,7 @@ where
         self.push_pending_record(SubscriberInputRecord {
             record,
             scope: SubscriberInputScope::OwnerOnly { owners },
+            preconfirmation_timing: None,
         });
     }
 
@@ -18230,7 +18449,11 @@ where
                     .await
                     .map_err(provider_error)?
                     .into_stream()
-                    .map(move |log| SubscriberEvent::BasePendingLog { source_id: id, log });
+                    .map(move |log| SubscriberEvent::BasePendingLogTimed {
+                        source_id: id,
+                        log,
+                        timing: FlashblockIngressTiming::new(Instant::now()),
+                    });
                 Ok(stream_with_termination(stream, source))
             }
             #[cfg(not(feature = "reactive-ws"))]
@@ -18250,7 +18473,10 @@ where
                     .await
                     .map_err(provider_error)?
                     .into_stream()
-                    .map(SubscriberEvent::BaseFlashblock);
+                    .map(|payload| SubscriberEvent::BaseFlashblockTimed {
+                        payload,
+                        timing: FlashblockIngressTiming::new(Instant::now()),
+                    });
                 Ok(stream_with_termination(
                     stream,
                     SubscriberStreamSource::BaseFlashblocks,
@@ -18270,7 +18496,12 @@ where
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             let stream = stream::unfold(interval, |mut interval| async move {
                 interval.tick().await;
-                Some((SubscriberEvent::OpFlashblockTick, interval))
+                Some((
+                    SubscriberEvent::OpFlashblockTickTimed(FlashblockIngressTiming::new(
+                        Instant::now(),
+                    )),
+                    interval,
+                ))
             });
             Ok(stream_with_termination(
                 stream,
@@ -18391,6 +18622,13 @@ mod subscriber_helper_tests {
         })
     }
 
+    fn base_flashblock_event(payload: BaseFlashblockWirePayload) -> SubscriberEvent<Ethereum> {
+        SubscriberEvent::BaseFlashblockTimed {
+            payload,
+            timing: FlashblockIngressTiming::new(Instant::now()),
+        }
+    }
+
     #[test]
     fn duplicate_flashblock_transaction_membership_is_rejected() {
         let transaction = format!("{:#x}", B256::repeat_byte(0x41));
@@ -18444,7 +18682,7 @@ mod subscriber_helper_tests {
         subscriber.chain_id = Some(8_453);
 
         subscriber
-            .normalize_flashblock_event(SubscriberEvent::BaseFlashblock(indexed_flashblock(
+            .normalize_flashblock_event(base_flashblock_event(indexed_flashblock(
                 transaction,
                 B256::repeat_byte(0xa1),
             )))
@@ -18459,7 +18697,7 @@ mod subscriber_helper_tests {
         conflicting.diff.state_root = B256::repeat_byte(0xbb);
         assert!(matches!(
             subscriber
-                .normalize_flashblock_event(SubscriberEvent::BaseFlashblock(
+                .normalize_flashblock_event(base_flashblock_event(
                     BaseFlashblockWirePayload::Indexed(conflicting),
                 ))
                 .await,
@@ -18494,7 +18732,7 @@ mod subscriber_helper_tests {
         subscriber.chain_id = Some(8_453);
 
         subscriber
-            .normalize_flashblock_event(SubscriberEvent::BaseFlashblock(indexed_flashblock(
+            .normalize_flashblock_event(base_flashblock_event(indexed_flashblock(
                 transaction_a,
                 B256::repeat_byte(0xa1),
             )))
@@ -18509,9 +18747,9 @@ mod subscriber_helper_tests {
         gap.base = None;
         gap.metadata = Some(BaseFlashblockMetadata { block_number: 101 });
         subscriber
-            .normalize_flashblock_event(SubscriberEvent::BaseFlashblock(
-                BaseFlashblockWirePayload::Indexed(gap),
-            ))
+            .normalize_flashblock_event(base_flashblock_event(BaseFlashblockWirePayload::Indexed(
+                gap,
+            )))
             .await
             .expect("the missing index is recovered from pending state");
 
@@ -18551,7 +18789,7 @@ mod subscriber_helper_tests {
         subscriber.chain_id = Some(8_453);
 
         subscriber
-            .normalize_flashblock_event(SubscriberEvent::BaseFlashblock(indexed_flashblock(
+            .normalize_flashblock_event(base_flashblock_event(indexed_flashblock(
                 B256::repeat_byte(0x41),
                 B256::repeat_byte(0xa1),
             )))
@@ -18566,9 +18804,9 @@ mod subscriber_helper_tests {
         gap.base = None;
         gap.metadata = Some(BaseFlashblockMetadata { block_number: 101 });
         let event = subscriber
-            .normalize_flashblock_event(SubscriberEvent::BaseFlashblock(
-                BaseFlashblockWirePayload::Indexed(gap),
-            ))
+            .normalize_flashblock_event(base_flashblock_event(BaseFlashblockWirePayload::Indexed(
+                gap,
+            )))
             .await
             .expect("preferred mode fails closed without pending recovery")
             .expect("generation invalidation is observable");
@@ -18629,7 +18867,7 @@ mod subscriber_helper_tests {
         )
         .expect("decode first cumulative preview");
         subscriber
-            .normalize_flashblock_event(SubscriberEvent::BaseFlashblock(first))
+            .normalize_flashblock_event(base_flashblock_event(first))
             .await
             .expect("first preview is accepted");
 
@@ -18641,10 +18879,12 @@ mod subscriber_helper_tests {
         second_log.transaction_index = Some(0);
         second_log.log_index = Some(0);
 
+        let pending_log_ingress = Instant::now() - Duration::from_millis(25);
         let before_preview = subscriber
-            .normalize_flashblock_event(SubscriberEvent::BasePendingLog {
+            .normalize_flashblock_event(SubscriberEvent::BasePendingLogTimed {
                 source_id: 0,
                 log: second_log,
+                timing: FlashblockIngressTiming::new(pending_log_ingress),
             })
             .await
             .expect("a zero-hash log for the next block must be buffered");
@@ -18663,13 +18903,19 @@ mod subscriber_helper_tests {
         )
         .expect("decode second cumulative preview");
         let event = subscriber
-            .normalize_flashblock_event(SubscriberEvent::BaseFlashblock(second))
+            .normalize_flashblock_event(base_flashblock_event(second))
             .await
             .expect("second preview is accepted")
             .expect("the matching buffered log is released");
-        let SubscriberEvent::PreconfirmedLogs { flashblock, logs } = event else {
+        let SubscriberEvent::PreconfirmedLogs {
+            flashblock,
+            logs,
+            timing,
+        } = event
+        else {
             panic!("expected a preconfirmed log batch")
         };
+        assert_eq!(timing.source_ingress(), pending_log_ingress);
         assert_eq!(flashblock.block_number, 102);
         assert_ne!(flashblock.content_hash, B256::ZERO);
         assert_eq!(flashblock.partial_block_hash, None);
@@ -18707,7 +18953,7 @@ mod subscriber_helper_tests {
     }
 
     #[test]
-    #[cfg(feature = "raw-flashblocks-json")]
+    #[cfg(all(feature = "raw-flashblocks-json", feature = "reactive-ws"))]
     fn external_flashblocks_keep_normal_canonical_pubsub_sources_on_any_chain() {
         let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
         let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
@@ -18781,7 +19027,7 @@ mod subscriber_helper_tests {
     }
 
     #[tokio::test]
-    #[cfg(feature = "raw-flashblocks-json")]
+    #[cfg(all(feature = "raw-flashblocks-json", feature = "reactive-ws"))]
     async fn external_flashblocks_configuration_is_rejected_after_registration_starts() {
         let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
         let mut fresh = AlloySubscriber::<_, Ethereum>::new(
@@ -20615,7 +20861,11 @@ mod subscriber_helper_tests {
         }
     }
 
-    #[cfg(any(feature = "reactive-polling", feature = "reactive-ws"))]
+    #[cfg(any(
+        feature = "raw-flashblocks-json",
+        feature = "reactive-polling",
+        feature = "reactive-ws"
+    ))]
     fn rpc_block(number: u64, hash: B256) -> alloy_rpc_types_eth::Block {
         alloy_rpc_types_eth::Block::empty(alloy_rpc_types_eth::Header {
             hash,
@@ -20918,6 +21168,7 @@ mod subscriber_helper_tests {
     }
 
     #[test]
+    #[cfg(any(feature = "reactive-polling", feature = "reactive-ws"))]
     fn compatibility_owner_backfill_and_live_overlap_split_exact_audiences() {
         let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
         let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
@@ -20982,6 +21233,7 @@ mod subscriber_helper_tests {
     }
 
     #[test]
+    #[cfg(any(feature = "reactive-polling", feature = "reactive-ws"))]
     fn active_owner_replacement_commits_atomically_to_one_new_epoch() {
         let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
         let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
@@ -21022,6 +21274,7 @@ mod subscriber_helper_tests {
     }
 
     #[test]
+    #[cfg(any(feature = "reactive-polling", feature = "reactive-ws"))]
     fn compatibility_and_epoch_owner_lifecycles_cannot_mix() {
         let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
         let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
@@ -21187,6 +21440,7 @@ mod subscriber_helper_tests {
         subscriber.push_pending_record(SubscriberInputRecord {
             record: log_input_record(rpc_log(false), InputSource::Poll),
             scope: SubscriberInputScope::Canonical { owners: Vec::new() },
+            preconfirmation_timing: None,
         });
 
         let error = subscriber
@@ -21206,6 +21460,7 @@ mod subscriber_helper_tests {
     }
 
     #[test]
+    #[cfg(any(feature = "reactive-polling", feature = "reactive-ws"))]
     fn lazy_backfill_queue_capacity_failure_is_atomic() {
         let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
         let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
@@ -21249,6 +21504,7 @@ mod subscriber_helper_tests {
     }
 
     #[test]
+    #[cfg(any(feature = "reactive-polling", feature = "reactive-ws"))]
     fn exact_owner_replacement_is_atomic_and_removes_crash_stale_owners() {
         let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
         let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
@@ -21277,6 +21533,7 @@ mod subscriber_helper_tests {
         subscriber.push_pending_record(SubscriberInputRecord {
             record: log_input_record(rpc_log(false), InputSource::Poll),
             scope: SubscriberInputScope::Canonical { owners: Vec::new() },
+            preconfirmation_timing: None,
         });
         let baseline = BlockRef {
             number: 100,
@@ -21375,6 +21632,7 @@ mod subscriber_helper_tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    #[cfg(any(feature = "reactive-polling", feature = "reactive-ws"))]
     async fn exclusive_canonical_backfill_validates_the_retained_baseline_hash() {
         let asserter = Asserter::new();
         asserter.push_success(&101u64);
@@ -22869,7 +23127,11 @@ mod subscriber_helper_tests {
     }
 
     // A log interest matching `rpc_log` (address 0x42, topic0 0x01).
-    #[cfg(any(feature = "reactive-ws", feature = "reactive-polling"))]
+    #[cfg(any(
+        feature = "raw-flashblocks-json",
+        feature = "reactive-polling",
+        feature = "reactive-ws"
+    ))]
     fn log_interest_matching_rpc_log() -> ReactiveInterest<Ethereum> {
         ReactiveInterest::Logs(LogInterest {
             provider_filter: Filter::new()

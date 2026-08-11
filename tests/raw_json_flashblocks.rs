@@ -9,9 +9,9 @@ use alloy_provider::ProviderBuilder;
 use alloy_rpc_types_eth::Filter;
 use alloy_transport::mock::Asserter;
 use evm_fork_cache::reactive::{
-    AlloySubscriber, FlashblockInvalidationReason, FlashblockUpdate, FlashblockUpdateChannelError,
-    PreconfirmationMode, ProviderRef, RawJsonFlashblocksAdapter, RawJsonFlashblocksLimits,
-    SubscriberConfig, SubscriberMode,
+    AlloySubscriber, BufferedRawJsonFlashblocksAdapter, FlashblockInvalidationReason,
+    FlashblockUpdate, FlashblockUpdateChannelError, PreconfirmationMode, ProviderRef,
+    RawJsonFlashblocksAdapter, RawJsonFlashblocksLimits, SubscriberConfig, SubscriberMode,
 };
 #[cfg(feature = "reactive-ws")]
 use evm_fork_cache::reactive::{
@@ -767,6 +767,287 @@ fn sequence_failures_emit_standard_invalidations() {
         adapter.ingest_json(&replacement).expect("next payload"),
         Some(FlashblockUpdate::Snapshot(_))
     ));
+}
+
+#[test]
+fn one_missing_index_is_buffered_and_drained_in_order_inside_the_bound() {
+    let mut adapter = BufferedRawJsonFlashblocksAdapter::new(
+        ProviderRef::new("raw-json", 7),
+        RawJsonFlashblocksLimits::default(),
+        400,
+    )
+    .expect("reviewed 400ms gap bound");
+    let first = adapter
+        .ingest_json_at(&index_zero(), 1_000)
+        .expect("index zero");
+    assert_eq!(first.len(), 1);
+
+    let buffered = adapter
+        .ingest_json_at(&index_two(alloy_primitives::keccak256([3_u8])), 1_100)
+        .expect("one missing index is held briefly");
+    assert!(buffered.is_empty());
+    assert_eq!(adapter.buffered_gap(), Some((1, 2, 1_500)));
+
+    let drained = adapter
+        .ingest_json_at(&index_one(TX_TWO), 1_499)
+        .expect("late index inside the bound drains the sequence");
+    let indices = drained
+        .iter()
+        .map(|update| match update {
+            FlashblockUpdate::Snapshot(snapshot) => snapshot.flashblock.index,
+            FlashblockUpdate::Invalidated(_) => None,
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(indices, vec![Some(1), Some(2)]);
+    assert_eq!(adapter.buffered_gap(), None);
+}
+
+#[test]
+fn timed_gap_drain_retains_each_frames_original_monotonic_arrival() {
+    let mut adapter = BufferedRawJsonFlashblocksAdapter::new(
+        ProviderRef::new("raw-json", 7),
+        RawJsonFlashblocksLimits::default(),
+        400,
+    )
+    .expect("reviewed 400ms gap bound");
+    adapter
+        .ingest_json_timed_at(&index_zero(), 1_000)
+        .expect("index zero");
+    assert!(
+        adapter
+            .ingest_json_timed_at(&index_two(alloy_primitives::keccak256([3_u8])), 1_100,)
+            .expect("future frame is retained")
+            .is_empty()
+    );
+
+    let drained = adapter
+        .ingest_json_timed_at(&index_one(TX_TWO), 1_499)
+        .expect("missing frame drains the retained future");
+    assert_eq!(drained.len(), 2);
+    assert_eq!(drained[0].source_ingress_millis(), 1_499);
+    assert_eq!(drained[1].source_ingress_millis(), 1_100);
+    let FlashblockUpdate::Snapshot(first) = drained[0].update() else {
+        panic!("missing index must normalize to a snapshot")
+    };
+    let FlashblockUpdate::Snapshot(second) = drained[1].update() else {
+        panic!("retained future frame must normalize to a snapshot")
+    };
+    assert!(first.flashblock.same_base_identity(&second.flashblock));
+}
+
+#[test]
+fn missing_index_timeout_revokes_only_the_speculative_payload() {
+    let mut adapter = BufferedRawJsonFlashblocksAdapter::new(
+        ProviderRef::new("raw-json", 7),
+        RawJsonFlashblocksLimits::default(),
+        400,
+    )
+    .expect("reviewed 400ms gap bound");
+    adapter
+        .ingest_json_at(&index_zero(), 1_000)
+        .expect("index zero");
+    adapter
+        .ingest_json_at(&index_two(alloy_primitives::keccak256([3_u8])), 1_100)
+        .expect("buffer index two");
+
+    assert!(adapter.expire_gap_at(1_499).is_none());
+    let FlashblockUpdate::Invalidated(invalidation) = adapter
+        .expire_gap_at(1_500)
+        .expect("expiry revokes the provisional payload")
+    else {
+        panic!("expected invalidation")
+    };
+    assert_eq!(invalidation.provider, ProviderRef::new("raw-json", 7));
+    assert_eq!(invalidation.reason, FlashblockInvalidationReason::IndexGap);
+    assert!(
+        adapter
+            .ingest_json_at(&index_one(TX_TWO), 1_501)
+            .expect("expired payload remainder is ignored")
+            .is_empty()
+    );
+}
+
+#[test]
+fn gap_buffer_configuration_is_bounded_to_the_reviewed_window() {
+    for invalid in [0, 299, 501, u64::MAX] {
+        assert!(
+            BufferedRawJsonFlashblocksAdapter::new(
+                ProviderRef::new("raw-json", 7),
+                RawJsonFlashblocksLimits::default(),
+                invalid,
+            )
+            .is_err()
+        );
+    }
+    for valid in [300, 400, 500] {
+        assert!(
+            BufferedRawJsonFlashblocksAdapter::new(
+                ProviderRef::new("raw-json", 7),
+                RawJsonFlashblocksLimits::default(),
+                valid,
+            )
+            .is_ok()
+        );
+    }
+}
+
+#[test]
+fn conflicting_duplicate_while_buffered_invalidates_immediately() {
+    let mut adapter = BufferedRawJsonFlashblocksAdapter::new(
+        ProviderRef::new("raw-json", 7),
+        RawJsonFlashblocksLimits::default(),
+        400,
+    )
+    .expect("buffered adapter");
+    adapter
+        .ingest_json_at(&index_zero(), 1_000)
+        .expect("index zero");
+    let third_transaction = alloy_primitives::keccak256([3_u8]);
+    adapter
+        .ingest_json_at(&index_two(third_transaction), 1_100)
+        .expect("buffer one future frame");
+    let fourth_transaction = alloy_primitives::keccak256([4_u8]);
+    let conflict = String::from_utf8(index_two(fourth_transaction))
+        .expect("fixture UTF-8")
+        .replace("\"transactions\":[\"0x03\"]", "\"transactions\":[\"0x04\"]")
+        .into_bytes();
+
+    let updates = adapter
+        .ingest_json_at(&conflict, 1_101)
+        .expect("valid same-index conflict becomes an invalidation");
+    assert_eq!(updates.len(), 1);
+    let FlashblockUpdate::Invalidated(invalidation) = &updates[0] else {
+        panic!("expected conflict invalidation")
+    };
+    assert_eq!(
+        invalidation.reason,
+        FlashblockInvalidationReason::ConflictingDuplicate
+    );
+    assert_eq!(adapter.buffered_gap(), None);
+}
+
+#[test]
+fn a_second_future_index_fails_closed_without_growing_the_buffer() {
+    let mut adapter = BufferedRawJsonFlashblocksAdapter::new(
+        ProviderRef::new("raw-json", 7),
+        RawJsonFlashblocksLimits::default(),
+        400,
+    )
+    .expect("buffered adapter");
+    adapter
+        .ingest_json_at(&index_zero(), 1_000)
+        .expect("index zero");
+    adapter
+        .ingest_json_at(&index_two(alloy_primitives::keccak256([3_u8])), 1_100)
+        .expect("buffer one future frame");
+    let index_three = String::from_utf8(index_two(alloy_primitives::keccak256([3_u8])))
+        .expect("fixture UTF-8")
+        .replace("\"index\":2", "\"index\":3")
+        .into_bytes();
+
+    let updates = adapter
+        .ingest_json_at(&index_three, 1_101)
+        .expect("second future frame becomes an invalidation");
+    let FlashblockUpdate::Invalidated(invalidation) = &updates[0] else {
+        panic!("expected gap invalidation")
+    };
+    assert_eq!(invalidation.reason, FlashblockInvalidationReason::IndexGap);
+    assert_eq!(adapter.buffered_gap(), None);
+}
+
+#[test]
+fn reset_and_payload_replacement_clear_the_buffer() {
+    let source = ProviderRef::new("raw-json", 7);
+    let mut reset_adapter = BufferedRawJsonFlashblocksAdapter::new(
+        source.clone(),
+        RawJsonFlashblocksLimits::default(),
+        400,
+    )
+    .expect("buffered adapter");
+    reset_adapter
+        .ingest_json_at(&index_zero(), 1_000)
+        .expect("index zero");
+    reset_adapter
+        .ingest_json_at(&index_two(alloy_primitives::keccak256([3_u8])), 1_100)
+        .expect("buffer index two");
+    assert!(matches!(
+        reset_adapter
+            .reset(ProviderRef::new("raw-json", 8))
+            .expect("new source generation"),
+        Some(FlashblockUpdate::Invalidated(_))
+    ));
+    assert_eq!(reset_adapter.buffered_gap(), None);
+    assert_eq!(reset_adapter.provider().generation, 8);
+
+    let mut replacement_adapter =
+        BufferedRawJsonFlashblocksAdapter::new(source, RawJsonFlashblocksLimits::default(), 400)
+            .expect("buffered adapter");
+    replacement_adapter
+        .ingest_json_at(&index_zero(), 1_000)
+        .expect("index zero");
+    replacement_adapter
+        .ingest_json_at(&index_two(alloy_primitives::keccak256([3_u8])), 1_100)
+        .expect("buffer index two");
+    let replacement = String::from_utf8(index_zero())
+        .expect("fixture UTF-8")
+        .replace("0x1111111111111111", "0x2222222222222222")
+        .into_bytes();
+    let updates = replacement_adapter
+        .ingest_json_at(&replacement, 1_101)
+        .expect("new index-zero payload replaces the old payload");
+    assert!(matches!(
+        updates.as_slice(),
+        [FlashblockUpdate::Snapshot(_)]
+    ));
+    assert_eq!(replacement_adapter.buffered_gap(), None);
+}
+
+#[test]
+fn malformed_and_resource_exhausting_future_frames_are_never_buffered() {
+    let mut limits = RawJsonFlashblocksLimits::default();
+    limits.max_transactions_per_payload = 1;
+    let mut adapter =
+        BufferedRawJsonFlashblocksAdapter::new(ProviderRef::new("raw-json", 7), limits, 400)
+            .expect("buffered adapter");
+    adapter
+        .ingest_json_at(&index_zero(), 1_000)
+        .expect("index zero consumes the transaction allowance");
+    assert!(matches!(
+        adapter.ingest_json_at(&index_two(alloy_primitives::keccak256([3_u8])), 1_100),
+        Err(
+            evm_fork_cache::reactive::RawJsonFlashblocksError::ResourceExhausted(
+                "transaction count"
+            )
+        )
+    ));
+    assert_eq!(adapter.buffered_gap(), None);
+    assert!(matches!(
+        adapter.ingest_json_at(b"{", 1_101),
+        Err(evm_fork_cache::reactive::RawJsonFlashblocksError::InvalidPayload(_))
+    ));
+    assert_eq!(adapter.buffered_gap(), None);
+}
+
+proptest! {
+    #[test]
+    fn only_one_exact_future_index_can_enter_the_reorder_buffer(index in 3_u64..64) {
+        let mut adapter = BufferedRawJsonFlashblocksAdapter::new(
+            ProviderRef::new("raw-json", 7),
+            RawJsonFlashblocksLimits::default(),
+            400,
+        )
+        .expect("buffered adapter");
+        adapter.ingest_json_at(&index_zero(), 1_000).expect("index zero");
+        let frame = String::from_utf8(index_two(alloy_primitives::keccak256([3_u8])))
+            .expect("fixture UTF-8")
+            .replace("\"index\":2", &format!("\"index\":{index}"))
+            .into_bytes();
+
+        let updates = adapter.ingest_json_at(&frame, 1_100).expect("valid distant index");
+        prop_assert!(matches!(updates.as_slice(), [FlashblockUpdate::Invalidated(_)]));
+        prop_assert_eq!(adapter.buffered_gap(), None);
+    }
 }
 
 #[test]

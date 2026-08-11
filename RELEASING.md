@@ -1,11 +1,11 @@
 # Releasing
 
-`evm-fork-cache` 0.4.0-alpha.3 adds the default-off raw JSON Flashblocks
-normalization layer to the existing Flashblocks compatibility set. Publish
-`alloy-transport-balancer 0.3.0-alpha.2` first, then publish this crate before
-any extension crate that declares `evm-fork-cache = "0.4.0-alpha.3"`,
-including `evm-amm-state 0.3.0-alpha.4` and the remote/Hybrid subscriber
-packages.
+`evm-fork-cache` 0.4.0-alpha.4 adds bounded, caller-timed single-index reorder
+tolerance to the default-off raw JSON Flashblocks normalization layer, immutable
+snapshot lineage lookups, and provider-free cooperative cancellation scopes for
+related overlay calls. Publish `alloy-transport-balancer 0.3.0-alpha.2` first,
+then publish this crate before any extension crate that declares
+`evm-fork-cache = "0.4.0-alpha.4"`.
 No release step is automatic: use clean, reviewed commits and never publish
 from a credential-bearing working tree.
 
@@ -30,6 +30,7 @@ cargo test --locked --no-default-features --features raw-flashblocks-json --test
 cargo test --locked --no-default-features --features raw-flashblocks-json,reactive-polling --test raw_json_flashblocks_runtime
 cargo clippy --locked --example raw_json_flashblocks_subscriber_acceptance --features raw-flashblocks-json,reactive-ws --no-deps -- -D warnings
 cargo +1.90.0 check --locked --lib
+cargo +1.90.0 check --locked --lib --no-default-features --features raw-flashblocks-json
 cargo bench --no-run --all-features --locked
 cargo bench --locked --bench raw_json_flashblocks --no-default-features --features raw-flashblocks-json -- raw_json_flashblocks_application_limit
 cargo bench --locked --bench raw_json_flashblocks --no-default-features --features raw-flashblocks-json -- raw_json_flashblocks_near_limit
@@ -87,11 +88,11 @@ the core's retained canonical history exactly.
 
 ```bash
 cargo publish --locked
-git tag -s v0.4.0-alpha.3 -m "Release evm-fork-cache v0.4.0-alpha.3"
-git push origin v0.4.0-alpha.3
+git tag -s v0.4.0-alpha.4 -m "Release evm-fork-cache v0.4.0-alpha.4"
+git push origin v0.4.0-alpha.4
 ```
 
-Wait for 0.4.0-alpha.3 to appear in the crates.io index before removing sibling path
+Wait for 0.4.0-alpha.4 to appear in the crates.io index before removing sibling path
 dependencies and verifying downstream extension packages. Publish only after
 explicit authorization; preparing or running this checklist is not permission
 to publish, tag, or push.
