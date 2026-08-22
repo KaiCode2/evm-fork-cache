@@ -1027,7 +1027,7 @@ async fn reactive_runtime_batches_exact_resync_cancellation_in_queue_order() -> 
 
     assert_eq!(cancelled.len(), 2 * BACKLOG_EVENTS as usize);
     assert!(
-        cancelled.chunks_exact(2).all(|requests| {
+        cancelled.as_chunks::<2>().0.iter().all(|requests| {
             requests[0].id == ResyncId::new("pool-a") && requests[1].id == ResyncId::new("pool-b")
         }),
         "cancelled requests retain pending-queue order, not caller ID order"

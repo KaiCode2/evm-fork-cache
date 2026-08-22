@@ -89,6 +89,7 @@ struct EncodedRuntimeCheckpoint {
     health: CacheHealth,
     pending_resyncs: Vec<ResyncRequest>,
     coverage_head: Option<BlockRef>,
+    log_coverage_head: Option<BlockRef>,
     journal: Vec<EncodedBlockJournal>,
     freshness: Option<FreshnessRegistry>,
     tracking: HashMap<Address, TrackingPolicy>,
@@ -120,12 +121,13 @@ fn runtime_metadata_with_journal(
     journal: impl IntoIterator<Item = BlockRef>,
 ) -> DurableCheckpointMetadata {
     let checkpoint = EncodedRuntimeCheckpoint {
-        version: 3,
+        version: 4,
         safe_head: None,
         finalized_head: None,
         health: CacheHealth::Healthy,
         pending_resyncs: Vec::new(),
         coverage_head: Some(coverage),
+        log_coverage_head: None,
         journal: journal
             .into_iter()
             .map(|block| EncodedBlockJournal {
@@ -1413,12 +1415,13 @@ fn checkpoint_resume_rejects_semantically_invalid_runtime_state_before_mutation(
         timestamp: Some(1_700_000_121),
     };
     let malformed = EncodedRuntimeCheckpoint {
-        version: 3,
+        version: 4,
         safe_head: Some(block_120),
         finalized_head: Some(block_121),
         health: CacheHealth::Healthy,
         pending_resyncs: Vec::new(),
         coverage_head: Some(block_121),
+        log_coverage_head: None,
         journal: vec![
             EncodedBlockJournal {
                 block: block_121,
@@ -1579,12 +1582,13 @@ fn checkpoint_resume_rejects_finality_ahead_of_canonical_coverage() {
         timestamp: Some(1_700_000_122),
     };
     let malformed = EncodedRuntimeCheckpoint {
-        version: 3,
+        version: 4,
         safe_head: Some(future_safe),
         finalized_head: None,
         health: CacheHealth::Healthy,
         pending_resyncs: Vec::new(),
         coverage_head: Some(coverage),
+        log_coverage_head: None,
         journal: Vec::new(),
         freshness: None,
         tracking: HashMap::new(),

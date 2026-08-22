@@ -29,7 +29,7 @@ use evm_fork_cache::reactive::{
     HandlerOutcome, InputSource, LogInterest, PreconfirmationMode, ProviderRef,
     RawJsonFlashblocksAdapter, ReactiveConfig, ReactiveContext, ReactiveEffect, ReactiveHandler,
     ReactiveInput, ReactiveInputBatch, ReactiveInputRecord, ReactiveInterest, ReactiveRuntime,
-    StateEffectQuality, SubscriberBackfill, SubscriberConfig, SubscriberMode,
+    StateEffectQuality, SubscriberBackfill, SubscriberConfig, SubscriberMode, SubscriberRpcCause,
 };
 
 const POOL_SLOT: u64 = 0;
@@ -289,6 +289,15 @@ async fn raw_preview_invalidation_replacement_and_canonical_reconciliation_are_o
     );
     assert!(runtime.active_preconfirmation().is_some());
     assert_eq!(subscriber.flashblocks_rpc_metrics().total_requests(), 0);
+    // Cross-check the attributed counters against the Flashblocks-scoped ones:
+    // an application-managed source must issue no provider requests of its own.
+    for cause in [
+        SubscriberRpcCause::FlashblocksSetup,
+        SubscriberRpcCause::CanonicalHeadCertification,
+        SubscriberRpcCause::PendingStateSample,
+    ] {
+        assert_eq!(subscriber.rpc_stats().by_cause(cause), 0);
+    }
     assert!(cache_asserter.read_q().is_empty());
 
     let reset = adapter
@@ -335,6 +344,15 @@ async fn raw_preview_invalidation_replacement_and_canonical_reconciliation_are_o
     );
     assert!(runtime.active_preconfirmation().is_none());
     assert_eq!(subscriber.flashblocks_rpc_metrics().total_requests(), 0);
+    // Cross-check the attributed counters against the Flashblocks-scoped ones:
+    // an application-managed source must issue no provider requests of its own.
+    for cause in [
+        SubscriberRpcCause::FlashblocksSetup,
+        SubscriberRpcCause::CanonicalHeadCertification,
+        SubscriberRpcCause::PendingStateSample,
+    ] {
+        assert_eq!(subscriber.rpc_stats().by_cause(cause), 0);
+    }
     assert!(cache_asserter.read_q().is_empty());
     assert!(subscriber_asserter.read_q().is_empty());
 

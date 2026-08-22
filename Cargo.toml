@@ -1,6 +1,6 @@
 [package]
 name = "evm-fork-cache"
-version = "0.4.0-alpha.4"
+version = "0.4.0-alpha.5"
 edition = "2024"
 rust-version = "1.90"
 license = "MIT OR Apache-2.0"
@@ -39,7 +39,12 @@ rustdoc-args = ["--cfg", "docsrs"]
 [features]
 default = ["reactive", "reactive-ws"]
 reactive = []
-reactive-ws = ["reactive", "alloy-provider/ws", "dep:rustls", "rustls/ring"]
+# `tokio/sync` exposes `broadcast::error::RecvError`, which the pubsub log and
+# header streams match on so a dropped notification is observable instead of
+# being silently skipped. alloy-pubsub already enables it, but relying on
+# feature unification from a transitive dependency would break a build that
+# resolved it differently.
+reactive-ws = ["reactive", "alloy-provider/ws", "dep:rustls", "rustls/ring", "tokio/sync", "dep:alloy-pubsub"]
 reactive-polling = ["reactive"]
 # Receipt-enriched indexed JSON conversion plus a bounded in-process handoff.
 # The application owns the source socket and its complete lifecycle; this
@@ -52,6 +57,12 @@ alloy-contract = ">=1.0.38, <1.7"
 alloy-eips = ">=1.0.38, <1.7"
 alloy-network = ">=1.0.38, <1.7"
 alloy-primitives = { version = ">=1.4, <1.7", features = ["map"] }
+# Pulled by `reactive-ws` only. `alloy-provider/ws` already brings this in; it is
+# declared explicitly because the pubsub log and header streams consume
+# `Subscription::into_raw()` directly, so a dropped notification surfaces as a
+# `broadcast::error::RecvError::Lagged` instead of being silently skipped by
+# `Subscription::into_stream()`.
+alloy-pubsub = { version = ">=1.0.38, <1.7", optional = true }
 alloy-provider = ">=1.0.38, <1.7"
 alloy-rlp = "0.3"
 alloy-rpc-client = ">=1.0.38, <1.7"

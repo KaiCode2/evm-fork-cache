@@ -15,7 +15,7 @@ use evm_fork_cache::reactive::{
 };
 #[cfg(feature = "reactive-ws")]
 use evm_fork_cache::reactive::{
-    ChainStatus, EventSubscriber, LogInterest, ReactiveInput, ReactiveInterest,
+    ChainStatus, EventSubscriber, LogInterest, ReactiveInput, ReactiveInterest, SubscriberRpcCause,
 };
 use proptest::prelude::*;
 
@@ -1420,6 +1420,15 @@ async fn standardized_updates_enter_the_existing_preconfirmation_pipeline() {
             if flashblock.provider == ProviderRef::new("raw-json", 7)
     ));
     assert_eq!(subscriber.flashblocks_rpc_metrics().total_requests(), 0);
+    // Cross-check the attributed counters against the Flashblocks-scoped ones:
+    // an application-managed source must issue no provider requests of its own.
+    for cause in [
+        SubscriberRpcCause::FlashblocksSetup,
+        SubscriberRpcCause::CanonicalHeadCertification,
+        SubscriberRpcCause::PendingStateSample,
+    ] {
+        assert_eq!(subscriber.rpc_stats().by_cause(cause), 0);
+    }
 
     let reset = adapter
         .reset(ProviderRef::new("raw-json", 8))

@@ -10,7 +10,118 @@ versions (`0.x.0`); patch versions (`0.x.y`) are non-breaking. The roadmap in
 [`docs/ROADMAP.md`](docs/ROADMAP.md) deliberately reshapes the API before the
 surface freezes at 1.0.
 
-## [Unreleased]
+## [0.4.0-alpha.5] - 2026-08-22
+
+### Migration checklist
+
+- Add the new `SubscriberConfig::log_channel_size` field, or use
+  `..SubscriberConfig::default()` in struct literals. `None` preserves the
+  previous behaviour of sizing log subscriptions from `max_batch_size`.
+- Handle `ChainControl::LogCoverage` and `CanonicalSequenceMutation::LogCoverage`
+  in any exhaustive match. Both enums are `#[non_exhaustive]`, so a wildcard arm
+  already compiles; a source that cannot prove the attestation should ignore the
+  control rather than treat it as canonical progress.
+- Existing durable checkpoints are rejected as `InvalidFormat` and must be
+  rebuilt. `CHECKPOINT_VERSION` is now 7, the reactive runtime blob 4, and the
+  delivery witness 2, because each independently encodes state or controls whose
+  shape changed. A stale file fails closed instead of being decoded against the
+  newer layout.
+
+### Changed
+
+- Canonical head certification is now driven by the flashblock stream rather than
+  by a blind interval. A Flashblocks endpoint replaces the `newHeads`
+  subscription with a fixed-interval certification poll, because its `newHeads`
+  may carry partial heads — but the timer spent a request every interval whether
+  or not a block had sealed, so on a chain whose blocks are slower than the
+  interval most of those requests bought nothing.
+
+  A `newFlashblocks` payload opening a new block proves the previous one sealed,
+  which is the moment a certification is worth spending; the timer now suppresses
+  itself when a certification already happened inside its window. On Base this is
+  roughly one request per block instead of one per interval, and the head is
+  detected sooner because the trigger is a signal rather than a deadline.
+
+  `SubscriberConfig::canonical_head_poll_interval` is unchanged and keeps its
+  meaning as the liveness fallback: with no flashblock stream to drive
+  certification, nothing is suppressed and polling behaves exactly as before.
+  `FlashblocksRpcMetrics::suppressed_canonical_head_polls` reports how often the
+  timer stood down.
+
+### Fixed
+
+- Pubsub log, block-header, and OP Stack `pendingLogs` streams no longer lose
+  notifications silently. `alloy-pubsub`'s typed subscription stream treats both
+  a lagged broadcast receiver and an undecodable payload as `continue`, logging
+  at `debug` and moving on, so a bounded-channel overflow discarded canonical
+  logs with no error, no counter, and nothing a consumer could act on — while
+  still reporting an apparently complete stream. These streams now consume the
+  raw subscription, so a dropped notification becomes an observable gap and a
+  closed channel still terminates the stream for the existing reconnect path.
+
+  Recovery is scoped to what each stream costs. A canonical log gap refetches
+  exactly that source's window from its delivery anchor to the current head,
+  attributed to the new `SubscriberRpcCause::GapBackfill` so backpressure loss
+  is distinguishable from reconnect churn; a gap with no anchor yet fails closed
+  rather than continuing past known loss. A header gap is counted but not
+  refetched, because a consumer that walks a replacement header's parent lineage
+  back to retained canonical history already recovers the skipped blocks. A
+  pre-confirmation gap discards the speculative snapshot instead of publishing a
+  punctured preview.
+
+### Added
+
+- Added `ChainControl::LogCoverage`, a watermark attesting that no
+  log-notification loss went unhealed at or below the named block, plus
+  `ReactiveRuntime::log_coverage_head`,
+  `CanonicalSequenceState::with_log_coverage_head` / `log_coverage_head`,
+  `CanonicalSequenceMutation::LogCoverage`, and
+  `SubscriberCapability::LogCoverageAttestation`.
+
+  The guarantee is deliberately negative. A source cannot prove from its own log
+  stream that every matching log through block `N` arrived — a filter that
+  matched nothing for a hundred blocks is indistinguishable from one whose
+  notifications were dropped — but it can prove it detected no loss it did not
+  repair, which is exactly the fact a consumer cannot establish for itself. A
+  consumer combines the watermark with its own ordering evidence to decide when a
+  block's log set is closed.
+
+  The attestation makes no claim about chain progress and never advances the
+  cache's pinned block or the canonical coverage head. Validation rejects a
+  watermark that regresses, that outruns canonical coverage, or whose identity
+  disagrees with retained history; it is never inferred, so `None` means unknown
+  rather than complete, and a source that cannot detect loss neither advertises
+  the capability nor emits the control. `AlloySubscriber` attests only on the
+  pubsub transport, and withdraws a pending attestation when a gap is detected so
+  a block observed before the loss was known is never vouched for. The watermark
+  is carried through validation snapshots, staged mutations, and durable
+  checkpoints so it survives restore.
+- Added `AlloySubscriber::stream_gap_stats`, `SubscriberStreamGapStats`, and
+  `SubscriberStreamGap`, reporting notification loss observed on live
+  subscriptions and what healing it cost: lagged and undecodable notification
+  counts, canonical log gaps healed, header gaps, and pre-confirmation gaps. A
+  subscription reporting zeroes here is the evidence that its delivered log set
+  is complete, which is what makes treating the stream as authoritative safe
+  rather than optimistic. `reset_stream_gap_stats` opens a bounded window.
+- Added `SubscriberConfig::log_channel_size` so pubsub log backpressure can be
+  sized independently of `max_batch_size`. A high-volume filter sharing a
+  subscriber with small delivery batches previously had no way to buy headroom
+  without also enlarging every delivered batch.
+- Added `AlloySubscriber::rpc_stats` and `SubscriberRpcStats`, a complete account
+  of every provider request the reactive stack issues, attributed to both the
+  JSON-RPC method (`SubscriberRpcMethod`) and the mechanism responsible for it
+  (`SubscriberRpcCause`). Previously only the Flashblocks path was counted, so
+  canonical-path consumption — subscription installs, chain identity, owner
+  reconciliation, lazy and reconnect backfills, log-context verification, and
+  canonical head certification — was invisible from inside the process and
+  observable only on a provider invoice. Bulk owner catch-up and the free
+  functions it calls record through a shared counter, so a request is charged to
+  the mechanism that asked for it rather than to the helper both mechanisms
+  share. Counts are cumulative for the subscriber's lifetime and survive
+  reconnects and delivery-state resets; `reset_rpc_stats` opens a bounded
+  measurement window. This differs deliberately from `FlashblocksRpcMetrics`,
+  which stays scoped to one Flashblocks generation and remains the place for
+  outcomes that are not request counts.
 
 ## [0.4.0-alpha.4] - 2026-08-11
 

@@ -31,7 +31,10 @@ use super::{
 };
 
 const CHECKPOINT_MAGIC: &[u8; 8] = b"EFCCKPT\0";
-const CHECKPOINT_VERSION: u32 = 6;
+// 7: the reactive runtime blob gained `log_coverage_head`, and `ChainControl`
+// gained `LogCoverage`. A version 6 file is rejected as `InvalidFormat`
+// rather than decoded against the newer shape.
+const CHECKPOINT_VERSION: u32 = 7;
 const CHECKPOINT_LABEL: &str = "durable reactive checkpoint";
 const CHECKPOINT_CHECKSUM_BYTES: usize = 32;
 const CHECKPOINT_HEADER_BYTES: u64 =

@@ -2061,7 +2061,7 @@ dependencies = [
 
 [[package]]
 name = "evm-fork-cache"
-version = "0.4.0-alpha.4"
+version = "0.4.0-alpha.5"
 dependencies = [
  "alloy-consensus",
  "alloy-contract",
@@ -2071,6 +2071,7 @@ dependencies = [
  "alloy-node-bindings",
  "alloy-primitives",
  "alloy-provider",
+ "alloy-pubsub",
  "alloy-rlp",
  "alloy-rpc-client",
  "alloy-rpc-types-eth",

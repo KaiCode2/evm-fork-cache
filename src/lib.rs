@@ -225,6 +225,8 @@ pub use reactive::{
     CheckpointedIngest, InterestOwnerSubscriber, ReactiveBaselineError, ReactiveCanonicalBaseline,
     ReactiveCheckpointRestoreError, ReactiveConfig, ReactiveEngine, ReactiveEngineError,
     ReactiveEngineRegisterError, ReactiveHandler, ReactiveRuntime, SubscriberPayloadCommitment,
+    SubscriberRpcCause, SubscriberRpcMethod, SubscriberRpcStats, SubscriberStreamGap,
+    SubscriberStreamGapStats,
 };
 pub use state_update::{
     AccountChange, AccountPatch, PurgeRecord, PurgeScope, SkippedAccountPatch, SkippedBalanceDelta,

@@ -49,6 +49,8 @@ use futures::{
     future::{Either, poll_fn, select},
     stream::{BoxStream, FuturesUnordered},
 };
+#[cfg(feature = "reactive-ws")]
+use tokio::sync::broadcast;
 
 use crate::{
     cache::{
@@ -724,6 +726,30 @@ pub enum ChainControl {
     /// and installs known `NUMBER`/timestamp values, but clears unproven
     /// header-only environment fields such as base fee and beneficiary.
     CanonicalProgress(BlockRef),
+    /// Attest that no notification loss has gone unhealed on any log source at
+    /// or below this block.
+    ///
+    /// This is a *negative* guarantee, and deliberately so. A source cannot
+    /// prove from its own log stream that every matching log through block `N`
+    /// arrived — a filter that matched nothing for a hundred blocks is
+    /// indistinguishable from one whose notifications were dropped. What a
+    /// source can prove is that it detected no loss it did not repair, which is
+    /// exactly the fact a consumer cannot establish for itself.
+    ///
+    /// A consumer combines this with its own ordering evidence to decide when a
+    /// block's log set is closed. That evidence must come from the log stream
+    /// itself — a delivered log for a strictly later block — or from a positive
+    /// proof of absence such as the block's `logsBloom` excluding every
+    /// interest. A header for a later block is *not* such evidence: `newHeads`
+    /// is an independent subscription, so it establishes nothing about whether
+    /// an earlier block's logs have been delivered. Neither is a timer. Sources that cannot make this promise simply
+    /// never emit it, and advertise the absence through
+    /// [`SubscriberCapability::LogCoverageAttestation`]; that distinction is why
+    /// silence here must never be read as an attestation.
+    ///
+    /// Unlike [`Self::CanonicalProgress`] this makes no claim about chain
+    /// progress and never advances the cache's pinned block.
+    LogCoverage(BlockRef),
     /// Ordered cutover or synchronization fence.
     Barrier {
         /// Subscriber-defined opaque barrier identity.
@@ -757,6 +783,7 @@ pub struct CanonicalSequenceState {
     coverage_head: Option<BlockRef>,
     safe_head: Option<BlockRef>,
     finalized_head: Option<BlockRef>,
+    log_coverage_head: Option<BlockRef>,
 }
 
 impl CanonicalSequenceState {
@@ -776,7 +803,19 @@ impl CanonicalSequenceState {
             coverage_head,
             safe_head,
             finalized_head,
+            log_coverage_head: None,
         }
+    }
+
+    /// Seed the attested log-coverage watermark.
+    ///
+    /// Kept separate from [`Self::new`] so restoring durable state that predates
+    /// log-coverage attestation stays a compile-time no-op: an absent watermark
+    /// means "no source has attested", never "attested at genesis".
+    #[must_use]
+    pub fn with_log_coverage_head(mut self, log_coverage_head: Option<BlockRef>) -> Self {
+        self.log_coverage_head = log_coverage_head;
+        self
     }
 
     /// Sparse retained canonical history in ascending processing order.
@@ -797,6 +836,15 @@ impl CanonicalSequenceState {
     /// Latest finalized head accepted by the validator, when known.
     pub const fn finalized_head(&self) -> Option<&BlockRef> {
         self.finalized_head.as_ref()
+    }
+
+    /// Highest block at or below which no log-notification loss went unhealed.
+    ///
+    /// `None` means no source has attested, which is not an attestation of
+    /// anything: treat it as unknown, never as complete. See
+    /// [`ChainControl::LogCoverage`].
+    pub const fn log_coverage_head(&self) -> Option<&BlockRef> {
+        self.log_coverage_head.as_ref()
     }
 
     /// Retain at most the newest `max_entries` canonical history identities.
@@ -854,6 +902,8 @@ pub enum CanonicalSequenceMutation {
     Safe(BlockRef),
     /// Accept a finalized-head update with metadata resolved against prior state.
     Finalized(BlockRef),
+    /// Advance the attested log-coverage watermark.
+    LogCoverage(BlockRef),
 }
 
 /// Successful result of provider-neutral canonical envelope validation.
@@ -2554,6 +2604,16 @@ pub enum RootGateCadence {
 
 impl RootGateCadence {
     /// Probe at most once every `n` canonical blocks, clamping `0` to `1`.
+    ///
+    /// # Cost
+    ///
+    /// Each firing issues one `eth_getProof` per tracked account — the most
+    /// expensive read this crate makes — so the request rate is
+    /// `tracked accounts / n` per canonical block. A few hundred tracked
+    /// accounts on a fast chain is a substantial standing budget. The gate is
+    /// inert until [`ReactiveRuntime::track_account`] is called, so a runtime
+    /// that never tracks accounts never pays it.
+    #[must_use]
     pub fn every_n_blocks(n: u64) -> Self {
         Self::EveryNBlocks(NonZeroU64::new(n.max(1)).expect("clamped to at least 1"))
     }
@@ -3614,6 +3674,9 @@ pub struct ReactiveRuntime<N: Network = Ethereum> {
     config: ReactiveConfig,
     journal: VecDeque<BlockJournal<N>>,
     coverage_head: Option<BlockRef>,
+    /// Highest block a source has attested carries no unhealed log-notification
+    /// loss. Never inferred: absent until a source says so.
+    log_coverage_head: Option<BlockRef>,
     pending_resyncs: Vec<ResyncRequest>,
     health: CacheHealth,
     safe_head: Option<BlockRef>,
@@ -3668,7 +3731,8 @@ struct BlockJournal<N: Network = Ethereum> {
     rollback_diffs: Vec<StateDiff>,
 }
 
-const DURABLE_RUNTIME_CHECKPOINT_VERSION: u32 = 3;
+// 4: adds `log_coverage_head`, the attested log-completeness watermark.
+const DURABLE_RUNTIME_CHECKPOINT_VERSION: u32 = 4;
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct DurableRuntimeCheckpoint {
@@ -3678,6 +3742,7 @@ struct DurableRuntimeCheckpoint {
     health: CacheHealth,
     pending_resyncs: Vec<ResyncRequest>,
     coverage_head: Option<BlockRef>,
+    log_coverage_head: Option<BlockRef>,
     journal: Vec<DurableBlockJournal>,
     freshness: Option<FreshnessRegistry>,
     tracking: HashMap<Address, TrackingPolicy>,
@@ -3713,6 +3778,7 @@ impl DurableRuntimeRestorePlan {
 struct ReactiveRuntimeState<N: Network> {
     journal: VecDeque<BlockJournal<N>>,
     coverage_head: Option<BlockRef>,
+    log_coverage_head: Option<BlockRef>,
     pending_resyncs: Vec<ResyncRequest>,
     health: CacheHealth,
     safe_head: Option<BlockRef>,
@@ -4098,6 +4164,7 @@ impl<N: Network> ReactiveRuntime<N> {
             config,
             journal: VecDeque::new(),
             coverage_head: None,
+            log_coverage_head: None,
             pending_resyncs: Vec::new(),
             health: CacheHealth::Healthy,
             safe_head: None,
@@ -4117,6 +4184,7 @@ impl<N: Network> ReactiveRuntime<N> {
         ReactiveRuntimeState {
             journal: self.journal.clone(),
             coverage_head: self.coverage_head,
+            log_coverage_head: self.log_coverage_head,
             pending_resyncs: self.pending_resyncs.clone(),
             health: self.health,
             safe_head: self.safe_head,
@@ -4176,6 +4244,7 @@ impl<N: Network> ReactiveRuntime<N> {
     fn restore_state(&mut self, state: ReactiveRuntimeState<N>) {
         self.journal = state.journal;
         self.coverage_head = state.coverage_head;
+        self.log_coverage_head = state.log_coverage_head;
         self.pending_resyncs = state.pending_resyncs;
         self.health = state.health;
         self.safe_head = state.safe_head;
@@ -4207,6 +4276,7 @@ impl<N: Network> ReactiveRuntime<N> {
             health: self.health,
             pending_resyncs: self.pending_resyncs.clone(),
             coverage_head: self.coverage_head,
+            log_coverage_head: self.log_coverage_head,
             journal: self
                 .journal
                 .iter()
@@ -4286,6 +4356,7 @@ impl<N: Network> ReactiveRuntime<N> {
         self.health = checkpoint.health;
         self.pending_resyncs = checkpoint.pending_resyncs;
         self.coverage_head = checkpoint.coverage_head;
+        self.log_coverage_head = checkpoint.log_coverage_head;
         self.journal = checkpoint
             .journal
             .into_iter()
@@ -4488,6 +4559,13 @@ impl<N: Network> ReactiveRuntime<N> {
     /// [`ReactiveReport::CoverageGap`] and schedules a
     /// [`ResyncReason::RootMoved`] repair. [`Slots`](TrackingPolicy::Slots)
     /// accounts are never root-gated (spec Decision 3).
+    /// # Cost
+    ///
+    /// Tracking an account with a root-gated policy enrols it in the root gate,
+    /// which issues one `eth_getProof` per tracked account every
+    /// [`RootGateCadence`] window. That is the most expensive read this crate
+    /// makes, and it is standing traffic for as long as the account is tracked;
+    /// [`TrackingPolicy::Slots`] opts out of the gate entirely.
     pub fn track_account(&mut self, address: Address, policy: TrackingPolicy) {
         self.tracking.insert(address, policy);
         self.tracked_roots.remove(&address);
@@ -4512,6 +4590,17 @@ impl<N: Network> ReactiveRuntime<N> {
         self.root_gate_cadence = cadence;
         self.last_gate_block = None;
         self.touched_since_gate.clear();
+    }
+
+    /// Highest block a source has attested carries no unhealed log-notification
+    /// loss, when any source has attested.
+    ///
+    /// `None` means unknown, not complete. A consumer deciding whether it may
+    /// treat a buffered log set as authoritative must require a watermark at or
+    /// above the block in question — never infer completeness from silence. See
+    /// [`ChainControl::LogCoverage`].
+    pub const fn log_coverage_head(&self) -> Option<&BlockRef> {
+        self.log_coverage_head.as_ref()
     }
 
     /// The configured [`RootGateCadence`].
@@ -5800,6 +5889,11 @@ impl<N: Network> ReactiveRuntime<N> {
                 advance_or_enrich_coverage(&mut self.coverage_head, &enriched);
                 self.trim_journal();
             }
+            ChainControl::LogCoverage(block) => {
+                // An attestation, not progress: never advances the pinned block
+                // or the canonical coverage head.
+                set_or_enrich_block_ref(&mut self.log_coverage_head, block);
+            }
             ChainControl::Barrier { block: None, .. } => {}
             ChainControl::Reorg {
                 common_ancestor,
@@ -5913,7 +6007,8 @@ impl<N: Network> ReactiveRuntime<N> {
             self.coverage_head,
             self.safe_head,
             self.finalized_head,
-        );
+        )
+        .with_log_coverage_head(self.log_coverage_head);
         let record_metadata = records
             .iter()
             .map(|(record, _, scope)| (record, *scope))
@@ -7216,6 +7311,14 @@ fn validate_canonical_sequence_parts<N: Network>(
                 }
                 mutations.push(CanonicalSequenceMutation::Canonical(*block));
             }
+            ChainControl::LogCoverage(block) => {
+                set_or_enrich_block_ref(&mut state.log_coverage_head, block);
+                mutations.push(CanonicalSequenceMutation::LogCoverage(
+                    state
+                        .log_coverage_head
+                        .expect("log coverage head was just installed"),
+                ));
+            }
             ChainControl::Barrier { block: None, .. } => {}
             ChainControl::Reorg { .. } => {
                 unreachable!("phase validation excludes post-record reorg controls")
@@ -7506,6 +7609,31 @@ fn validate_sequence_control(
                 return Err(invalid(format!(
                     "canonical coverage {}:{:?} does not descend from current {}:{:?}",
                     block.number, block.hash, current.number, current.hash
+                )));
+            }
+        }
+        ChainControl::LogCoverage(block) => {
+            validate_sequence_known_identity(state, block, "log coverage")?;
+            // Monotonic: an attestation may be re-sent for the same block but
+            // must never retreat, or a consumer could widen a window it had
+            // already narrowed.
+            if let Some(current) = state.log_coverage_head.as_ref()
+                && (block.number < current.number
+                    || (block.number == current.number && block.hash != current.hash))
+            {
+                return Err(invalid(format!(
+                    "log coverage {}:{:?} conflicts with current {}:{:?}",
+                    block.number, block.hash, current.number, current.hash
+                )));
+            }
+            // Logs cannot be attested complete for a block the source has not
+            // established canonical coverage for.
+            if let Some(coverage) = state.coverage_head.as_ref()
+                && block.number > coverage.number
+            {
+                return Err(invalid(format!(
+                    "log coverage {}:{:?} is ahead of canonical coverage {}:{:?}",
+                    block.number, block.hash, coverage.number, coverage.hash
                 )));
             }
         }
@@ -8120,9 +8248,11 @@ fn canonical_coverage_control_block(control: &ChainControl) -> Option<&BlockRef>
         | ChainControl::Barrier {
             block: Some(block), ..
         } => Some(block),
+        // An attestation names a canonical block but claims no progress to it.
         ChainControl::Reorg { .. }
         | ChainControl::Safe(_)
         | ChainControl::Finalized(_)
+        | ChainControl::LogCoverage(_)
         | ChainControl::Barrier { block: None, .. } => None,
     }
 }
@@ -8132,6 +8262,7 @@ fn chain_control_canonical_assertion(control: &ChainControl) -> Option<&BlockRef
         ChainControl::Safe(block)
         | ChainControl::Finalized(block)
         | ChainControl::CanonicalProgress(block)
+        | ChainControl::LogCoverage(block)
         | ChainControl::Barrier {
             block: Some(block), ..
         } => Some(block),
@@ -8147,6 +8278,7 @@ fn assert_chain_control_identities(
         ChainControl::Safe(block)
         | ChainControl::Finalized(block)
         | ChainControl::CanonicalProgress(block)
+        | ChainControl::LogCoverage(block)
         | ChainControl::Barrier {
             block: Some(block), ..
         } => assert_canonical_block_identity(asserted_blocks, block, "chain control"),
@@ -9801,6 +9933,15 @@ pub enum SubscriberCapability {
     HistoricalBackfill,
     /// Follow live chain data.
     Live,
+    /// Attest, via [`ChainControl::LogCoverage`], that no log-notification loss
+    /// went unhealed at or below a stated block.
+    ///
+    /// Advertise this only when loss is actually detectable: a source that can
+    /// silently drop a notification must not claim it, because a consumer treats
+    /// the capability as licence to trust a delivered log set instead of
+    /// re-fetching it. Absence of the capability and absence of an attestation
+    /// mean the same thing — unknown — and neither may be read as complete.
+    LogCoverageAttestation,
     /// Recover the complete committed consumer position after reconnect or
     /// restart, including any unacknowledged delivery.
     ///
@@ -10045,6 +10186,27 @@ pub struct SubscriberConfig {
     /// `pending` RPC reads, so one generation-pinned sampler reads the
     /// cumulative pending block, its exact hash-addressed parent, filtered
     /// pending-block logs, and bounded exact transaction receipts.
+    ///
+    /// # Cost
+    ///
+    /// This is the most request-hungry setting in the crate, and unlike the
+    /// canonical paths it cannot be made event-driven: the pending surface is
+    /// only observable by asking. Every tick issues one pending-block read, one
+    /// `eth_getLogs` **per provider-facing log filter**, and up to
+    /// [`Self::max_pending_transaction_receipts_per_tick`] receipt calls. At the
+    /// 250 ms default that is four ticks a second, bounded overall by
+    /// [`Self::max_flashblock_rpc_requests_per_second`] — a ceiling of 40
+    /// requests per second, or roughly 3.4 M per day on one chain.
+    ///
+    /// It is reached only by enabling pre-confirmations on a chain whose adapter
+    /// samples pending state (Optimism and its testnet), which in a transport
+    /// configuration means marking one of that chain's endpoints
+    /// `flashblocks = true`. Raise this interval, lower
+    /// `max_flashblock_rpc_requests_per_second`, or leave
+    /// [`Self::preconfirmations`] disabled if that budget is not intended;
+    /// [`AlloySubscriber::rpc_stats`] attributes the traffic to
+    /// [`SubscriberRpcCause::PendingStateSample`] so it is visible before it
+    /// arrives on an invoice.
     pub flashblock_poll_interval: Duration,
     /// Consecutive pending-state request failure allowance.
     ///
@@ -10070,10 +10232,31 @@ pub struct SubscriberConfig {
     /// ticks. The default leaves headroom below common paid-provider limits of
     /// 50 requests per second.
     pub max_flashblock_rpc_requests_per_second: usize,
+    /// Bounded notification capacity for pubsub log streams.
+    ///
+    /// `None` reuses [`Self::max_batch_size`]. Size this independently when a
+    /// high-volume log filter shares a subscriber with small delivery batches:
+    /// the transport drops notifications once the channel is full, and while
+    /// that loss is now detected and healed by an exact-window refetch, each
+    /// occurrence costs an `eth_getLogs`. Watch
+    /// [`SubscriberStreamGapStats::lagged_notifications`] to tell whether this
+    /// is too small.
+    pub log_channel_size: Option<usize>,
     /// Hydrate pending transaction hashes into full bodies when possible.
     pub hydrate_pending_transactions: bool,
     /// Verify each canonical log's block identity through RPC and enrich its
     /// context with the exact parent hash before delivery.
+    ///
+    /// # This is not the way to trust a log stream
+    ///
+    /// Enabling this to decide whether delivered logs can be trusted is the
+    /// expensive wrong answer: it costs a request per distinct canonical block
+    /// and proves strictly less than [`ChainControl::LogCoverage`], which is
+    /// free. Verification confirms that each log it *received* names a real
+    /// block; it says nothing about logs that never arrived, which is the
+    /// failure that matters. Use the attestation for completeness, and reserve
+    /// this for a strict coordinator that needs exact parent-hash enrichment on
+    /// log-only pubsub events.
     ///
     /// Enable this when a strict coordinator (such as a hybrid historical/live
     /// source) must prove canonical ancestry from log-only pubsub events.
@@ -10109,6 +10292,7 @@ pub struct SubscriberConfig {
 impl Default for SubscriberConfig {
     fn default() -> Self {
         Self {
+            log_channel_size: None,
             preconfirmations: PreconfirmationMode::Disabled,
             canonical_head_poll_interval: Duration::from_millis(500),
             canonical_head_request_timeout: Duration::from_secs(3),
@@ -10154,6 +10338,7 @@ pub struct FlashblocksRpcMetrics {
     pending_receipts_unavailable: u64,
     failed_requests: u64,
     raced_samples: u64,
+    suppressed_canonical_head_polls: u64,
 }
 
 impl FlashblocksRpcMetrics {
@@ -10205,6 +10390,16 @@ impl FlashblocksRpcMetrics {
         self.failed_requests
     }
 
+    /// Timer-driven canonical head polls that issued no request because the
+    /// flashblock stream had already certified the head inside the poll window.
+    ///
+    /// On a chain whose flashblock cadence is faster than the poll interval,
+    /// most ticks land here: the certification is event-driven and the timer is
+    /// only a liveness fallback.
+    pub const fn suppressed_canonical_head_polls(self) -> u64 {
+        self.suppressed_canonical_head_polls
+    }
+
     /// Samples discarded because the pending-log response advanced beyond
     /// the separately fetched cumulative block. The next tick retries from a
     /// fresh block/log pair; no partial speculative view is published.
@@ -10221,6 +10416,499 @@ impl FlashblocksRpcMetrics {
             .saturating_add(self.pending_block_requests)
             .saturating_add(self.pending_log_requests)
             .saturating_add(self.pending_receipt_requests)
+    }
+}
+
+/// JSON-RPC method issued by the reactive stack on a consumer's behalf.
+///
+/// `EthSubscribe` covers every `eth_subscribe`/`eth_newFilter` handshake the
+/// subscriber performs when it installs a stream source, including the OP Stack
+/// `newFlashblocks` and `pendingLogs` channels. Notifications delivered over an
+/// established subscription are not requests and are not counted here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
+pub enum SubscriberRpcMethod {
+    /// `eth_chainId`.
+    EthChainId,
+    /// `eth_blockNumber`.
+    EthBlockNumber,
+    /// `eth_getBlockByNumber`.
+    EthGetBlockByNumber,
+    /// `eth_getBlockByHash`.
+    EthGetBlockByHash,
+    /// `eth_getLogs`.
+    EthGetLogs,
+    /// `eth_getTransactionReceipt`.
+    EthGetTransactionReceipt,
+    /// Stream installation: `eth_subscribe`, or the polling transport's
+    /// `eth_newFilter` handshake.
+    EthSubscribe,
+    /// `op_supportedCapabilities`.
+    OpSupportedCapabilities,
+}
+
+impl SubscriberRpcMethod {
+    /// Every method the reactive stack can issue, in reporting order.
+    pub const ALL: [Self; 8] = [
+        Self::EthChainId,
+        Self::EthBlockNumber,
+        Self::EthGetBlockByNumber,
+        Self::EthGetBlockByHash,
+        Self::EthGetLogs,
+        Self::EthGetTransactionReceipt,
+        Self::EthSubscribe,
+        Self::OpSupportedCapabilities,
+    ];
+
+    /// Number of distinct methods.
+    pub const COUNT: usize = Self::ALL.len();
+
+    /// Wire name, suitable for a metrics label.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::EthChainId => "eth_chainId",
+            Self::EthBlockNumber => "eth_blockNumber",
+            Self::EthGetBlockByNumber => "eth_getBlockByNumber",
+            Self::EthGetBlockByHash => "eth_getBlockByHash",
+            Self::EthGetLogs => "eth_getLogs",
+            Self::EthGetTransactionReceipt => "eth_getTransactionReceipt",
+            Self::EthSubscribe => "eth_subscribe",
+            Self::OpSupportedCapabilities => "op_supportedCapabilities",
+        }
+    }
+
+    const fn index(self) -> usize {
+        match self {
+            Self::EthChainId => 0,
+            Self::EthBlockNumber => 1,
+            Self::EthGetBlockByNumber => 2,
+            Self::EthGetBlockByHash => 3,
+            Self::EthGetLogs => 4,
+            Self::EthGetTransactionReceipt => 5,
+            Self::EthSubscribe => 6,
+            Self::OpSupportedCapabilities => 7,
+        }
+    }
+}
+
+impl fmt::Display for SubscriberRpcMethod {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Mechanism that caused the subscriber to issue a provider request.
+///
+/// This is the dimension that matters for an RPC budget: a consumer asks for
+/// interests and reads batches, and every request below is a consequence the
+/// consumer never named. Attributing by cause is what makes an unexpected bill
+/// diagnosable from inside the process.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
+pub enum SubscriberRpcCause {
+    /// Resolving the provider's chain identity once, before any record escapes.
+    ChainIdentity,
+    /// Installing a live stream source.
+    StreamSubscription,
+    /// Qualifying a Flashblocks endpoint: capability probe and paired
+    /// pending-state provider verification.
+    FlashblocksSetup,
+    /// Certifying a sealed canonical head while Flashblocks are active, because
+    /// a Flashblocks endpoint's `newHeads` may carry partial heads.
+    CanonicalHeadCertification,
+    /// Sampling OP Stack pending state on the bounded pre-confirmation cadence.
+    PendingStateSample,
+    /// Proving a canonical log's block identity when
+    /// [`SubscriberConfig::verify_log_block_context`] is set.
+    LogBlockVerification,
+    /// Bulk owner catch-up requested through
+    /// [`AlloySubscriber::reconcile_interest_owners`].
+    OwnerReconcile,
+    /// Draining a queued adoption or continuity backfill.
+    LazyBackfill,
+    /// Closing the window missed while a terminated stream was reconnecting.
+    ReconnectBackfill,
+    /// Closing the window a live stream dropped: the subscription stayed
+    /// connected but notifications were lost, so only the missed range is
+    /// refetched.
+    GapBackfill,
+}
+
+impl SubscriberRpcCause {
+    /// Every cause the reactive stack can attribute a request to, in reporting
+    /// order.
+    pub const ALL: [Self; 10] = [
+        Self::ChainIdentity,
+        Self::StreamSubscription,
+        Self::FlashblocksSetup,
+        Self::CanonicalHeadCertification,
+        Self::PendingStateSample,
+        Self::LogBlockVerification,
+        Self::OwnerReconcile,
+        Self::LazyBackfill,
+        Self::ReconnectBackfill,
+        Self::GapBackfill,
+    ];
+
+    /// Number of distinct causes.
+    pub const COUNT: usize = Self::ALL.len();
+
+    /// Stable snake_case name, suitable for a metrics label.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ChainIdentity => "chain_identity",
+            Self::StreamSubscription => "stream_subscription",
+            Self::FlashblocksSetup => "flashblocks_setup",
+            Self::CanonicalHeadCertification => "canonical_head_certification",
+            Self::PendingStateSample => "pending_state_sample",
+            Self::LogBlockVerification => "log_block_verification",
+            Self::OwnerReconcile => "owner_reconcile",
+            Self::LazyBackfill => "lazy_backfill",
+            Self::ReconnectBackfill => "reconnect_backfill",
+            Self::GapBackfill => "gap_backfill",
+        }
+    }
+
+    const fn index(self) -> usize {
+        match self {
+            Self::ChainIdentity => 0,
+            Self::StreamSubscription => 1,
+            Self::FlashblocksSetup => 2,
+            Self::CanonicalHeadCertification => 3,
+            Self::PendingStateSample => 4,
+            Self::LogBlockVerification => 5,
+            Self::OwnerReconcile => 6,
+            Self::LazyBackfill => 7,
+            Self::ReconnectBackfill => 8,
+            Self::GapBackfill => 9,
+        }
+    }
+}
+
+impl fmt::Display for SubscriberRpcCause {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Every provider request the reactive stack has issued, by method and by the
+/// mechanism responsible for it.
+///
+/// Counts are **cumulative for the subscriber's lifetime**. They deliberately
+/// survive reconnects, stream-topology changes, and delivery-state resets, so a
+/// long-running process can report total RPC consumption; call
+/// [`AlloySubscriber::reset_rpc_stats`] to measure a bounded window instead.
+/// This is the difference from [`FlashblocksRpcMetrics`], which is scoped to one
+/// Flashblocks subscriber generation and resets with it.
+///
+/// Every request the subscriber makes is counted here, including the ones also
+/// tallied by `FlashblocksRpcMetrics` — reading both never requires adding them
+/// together. `FlashblocksRpcMetrics` remains the place for outcomes that are not
+/// request counts, such as receipts that were unavailable or samples discarded
+/// for racing the pending block.
+///
+/// ```no_run
+/// # use evm_fork_cache::reactive::{AlloySubscriber, SubscriberRpcCause, SubscriberRpcMethod};
+/// # fn report<P, N: alloy_network::Network>(subscriber: &AlloySubscriber<P, N>) {
+/// let stats = subscriber.rpc_stats();
+/// println!("total provider requests: {}", stats.total());
+/// println!("eth_getLogs: {}", stats.by_method(SubscriberRpcMethod::EthGetLogs));
+/// for (cause, method, requests) in stats.nonzero() {
+///     println!("{cause} / {method}: {requests}");
+/// }
+/// # }
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SubscriberRpcStats {
+    counts: [[u64; SubscriberRpcMethod::COUNT]; SubscriberRpcCause::COUNT],
+}
+
+impl Default for SubscriberRpcStats {
+    fn default() -> Self {
+        Self {
+            counts: [[0; SubscriberRpcMethod::COUNT]; SubscriberRpcCause::COUNT],
+        }
+    }
+}
+
+impl SubscriberRpcStats {
+    /// Requests issued for one exact cause/method pair.
+    pub const fn get(&self, cause: SubscriberRpcCause, method: SubscriberRpcMethod) -> u64 {
+        self.counts[cause.index()][method.index()]
+    }
+
+    /// Requests issued for one cause, across every method.
+    pub fn by_cause(&self, cause: SubscriberRpcCause) -> u64 {
+        self.counts[cause.index()]
+            .iter()
+            .fold(0u64, |total, count| total.saturating_add(*count))
+    }
+
+    /// Requests issued for one method, across every cause.
+    pub fn by_method(&self, method: SubscriberRpcMethod) -> u64 {
+        self.counts
+            .iter()
+            .fold(0u64, |total, row| total.saturating_add(row[method.index()]))
+    }
+
+    /// Every provider request the subscriber has issued.
+    pub fn total(&self) -> u64 {
+        SubscriberRpcCause::ALL
+            .into_iter()
+            .fold(0u64, |total, cause| {
+                total.saturating_add(self.by_cause(cause))
+            })
+    }
+
+    /// Every cause/method pair in reporting order, including zeroes.
+    pub fn entries(
+        &self,
+    ) -> impl Iterator<Item = (SubscriberRpcCause, SubscriberRpcMethod, u64)> + '_ {
+        SubscriberRpcCause::ALL.into_iter().flat_map(move |cause| {
+            SubscriberRpcMethod::ALL
+                .into_iter()
+                .map(move |method| (cause, method, self.get(cause, method)))
+        })
+    }
+
+    /// Only the cause/method pairs that actually issued a request — the useful
+    /// shape for logging or a metrics export.
+    pub fn nonzero(
+        &self,
+    ) -> impl Iterator<Item = (SubscriberRpcCause, SubscriberRpcMethod, u64)> + '_ {
+        self.entries().filter(|(_, _, requests)| *requests > 0)
+    }
+}
+
+/// Interior-mutable counter set behind [`SubscriberRpcStats`].
+///
+/// Shared through an `Arc` because provider work runs off the subscriber's
+/// `&mut self`: bulk owner catch-up is driven as an independent future while
+/// live events continue to drain, and the free functions it calls record without
+/// any subscriber borrow. `Relaxed` ordering is correct for counters whose only
+/// consumer is a diagnostic snapshot.
+#[derive(Debug)]
+pub(crate) struct SubscriberRpcCounters {
+    counts: [[AtomicU64; SubscriberRpcMethod::COUNT]; SubscriberRpcCause::COUNT],
+}
+
+impl Default for SubscriberRpcCounters {
+    fn default() -> Self {
+        Self {
+            counts: std::array::from_fn(|_| std::array::from_fn(|_| AtomicU64::new(0))),
+        }
+    }
+}
+
+/// Why a live subscription lost data without disconnecting.
+///
+/// Both cases were previously invisible: `alloy-pubsub`'s typed subscription
+/// stream logs a lagged receiver at `debug` and continues, and discards an
+/// undecodable notification the same way. A consumer whose contract is
+/// *completeness* cannot build on a stream that loses records silently, so these
+/// are surfaced and healed instead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SubscriberStreamGap {
+    /// The bounded notification channel overflowed and the transport dropped
+    /// `skipped` notifications before this receiver observed them.
+    ///
+    /// This is backpressure, not a transport fault: the subscriber was not
+    /// draining as fast as the endpoint pushed. Raising
+    /// [`SubscriberConfig::log_channel_size`] is the direct remedy.
+    Lagged {
+        /// Notifications the transport dropped.
+        skipped: u64,
+    },
+    /// A notification arrived but did not decode into the expected type.
+    ///
+    /// Treated as lost data rather than skipped, because a filter's matched set
+    /// cannot be proven complete while one of its notifications is unreadable.
+    Undecodable,
+}
+
+impl SubscriberStreamGap {
+    /// Notifications known to be missing, when the transport reported a count.
+    pub const fn skipped(self) -> Option<u64> {
+        match self {
+            Self::Lagged { skipped } => Some(skipped),
+            Self::Undecodable => None,
+        }
+    }
+
+    /// Stable snake_case name, suitable for a metrics label.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Lagged { .. } => "lagged",
+            Self::Undecodable => "undecodable",
+        }
+    }
+}
+
+impl fmt::Display for SubscriberStreamGap {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Lagged { skipped } => write!(f, "lagged({skipped})"),
+            Self::Undecodable => f.write_str("undecodable"),
+        }
+    }
+}
+
+/// Notification loss observed on live subscriptions, and what it cost to heal.
+///
+/// A non-zero `lagged_notifications` means the subscriber could not keep up with
+/// its endpoint. That is recoverable — the missed window is refetched — but each
+/// occurrence buys an `eth_getLogs`, so a steadily climbing count is a signal to
+/// raise [`SubscriberConfig::log_channel_size`] rather than to keep paying.
+///
+/// Counts are cumulative for the subscriber's lifetime, matching
+/// [`SubscriberRpcStats`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SubscriberStreamGapStats {
+    lagged_notifications: u64,
+    undecodable_notifications: u64,
+    log_gaps_healed: u64,
+    header_gaps: u64,
+    preconfirmation_gaps: u64,
+}
+
+impl SubscriberStreamGapStats {
+    /// Notifications dropped by the transport because a bounded channel filled.
+    pub const fn lagged_notifications(self) -> u64 {
+        self.lagged_notifications
+    }
+
+    /// Notifications that arrived but could not be decoded.
+    pub const fn undecodable_notifications(self) -> u64 {
+        self.undecodable_notifications
+    }
+
+    /// Canonical log gaps closed by refetching the exact missed range.
+    ///
+    /// Each of these issued provider requests attributed to
+    /// [`SubscriberRpcCause::GapBackfill`].
+    pub const fn log_gaps_healed(self) -> u64 {
+        self.log_gaps_healed
+    }
+
+    /// Gaps observed on the canonical block-header stream.
+    ///
+    /// These are not refetched here: a consumer that walks a replacement
+    /// header's parent lineage back to retained canonical history recovers the
+    /// skipped blocks on the next header it receives. The count exists so that
+    /// self-healing is visible rather than assumed.
+    pub const fn header_gaps(self) -> u64 {
+        self.header_gaps
+    }
+
+    /// Gaps observed on a pre-confirmation log stream, each of which discarded
+    /// the speculative snapshot rather than publishing an incomplete one.
+    pub const fn preconfirmation_gaps(self) -> u64 {
+        self.preconfirmation_gaps
+    }
+
+    /// Every observed notification loss, across all stream kinds.
+    pub const fn total_gaps(self) -> u64 {
+        self.lagged_notifications
+            .saturating_add(self.undecodable_notifications)
+    }
+}
+
+/// Interior-mutable counters behind [`SubscriberStreamGapStats`].
+#[derive(Debug, Default)]
+pub(crate) struct SubscriberStreamGapCounters {
+    lagged_notifications: AtomicU64,
+    undecodable_notifications: AtomicU64,
+    log_gaps_healed: AtomicU64,
+    header_gaps: AtomicU64,
+    preconfirmation_gaps: AtomicU64,
+}
+
+impl SubscriberStreamGapCounters {
+    fn bump(counter: &AtomicU64, amount: u64) {
+        counter.fetch_add(amount, Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "reactive-ws")]
+    pub(crate) fn record_gap(&self, gap: SubscriberStreamGap) {
+        match gap {
+            SubscriberStreamGap::Lagged { skipped } => {
+                Self::bump(&self.lagged_notifications, skipped.max(1));
+            }
+            SubscriberStreamGap::Undecodable => {
+                Self::bump(&self.undecodable_notifications, 1);
+            }
+        }
+    }
+
+    pub(crate) fn record_log_gap_healed(&self) {
+        Self::bump(&self.log_gaps_healed, 1);
+    }
+
+    pub(crate) fn record_header_gap(&self) {
+        Self::bump(&self.header_gaps, 1);
+    }
+
+    pub(crate) fn record_preconfirmation_gap(&self) {
+        Self::bump(&self.preconfirmation_gaps, 1);
+    }
+
+    pub(crate) fn snapshot(&self) -> SubscriberStreamGapStats {
+        let load = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
+        SubscriberStreamGapStats {
+            lagged_notifications: load(&self.lagged_notifications),
+            undecodable_notifications: load(&self.undecodable_notifications),
+            log_gaps_healed: load(&self.log_gaps_healed),
+            header_gaps: load(&self.header_gaps),
+            preconfirmation_gaps: load(&self.preconfirmation_gaps),
+        }
+    }
+
+    pub(crate) fn reset(&self) {
+        for counter in [
+            &self.lagged_notifications,
+            &self.undecodable_notifications,
+            &self.log_gaps_healed,
+            &self.header_gaps,
+            &self.preconfirmation_gaps,
+        ] {
+            counter.store(0, Ordering::Relaxed);
+        }
+    }
+}
+
+impl SubscriberRpcCounters {
+    /// Record one issued request.
+    pub(crate) fn record(&self, cause: SubscriberRpcCause, method: SubscriberRpcMethod) {
+        self.record_many(cause, method, 1);
+    }
+
+    /// Record `requests` issued requests, for a batch that ships several calls
+    /// of one method in a single round trip.
+    pub(crate) fn record_many(
+        &self,
+        cause: SubscriberRpcCause,
+        method: SubscriberRpcMethod,
+        requests: u64,
+    ) {
+        self.counts[cause.index()][method.index()].fetch_add(requests, Ordering::Relaxed);
+    }
+
+    /// Snapshot every counter.
+    pub(crate) fn snapshot(&self) -> SubscriberRpcStats {
+        SubscriberRpcStats {
+            counts: std::array::from_fn(|cause| {
+                std::array::from_fn(|method| self.counts[cause][method].load(Ordering::Relaxed))
+            }),
+        }
+    }
+
+    /// Zero every counter.
+    pub(crate) fn reset(&self) {
+        for row in &self.counts {
+            for counter in row {
+                counter.store(0, Ordering::Relaxed);
+            }
+        }
     }
 }
 
@@ -11084,7 +11772,10 @@ enum HandlerRegistrationCatchup {
     CoordinatedCanonical(BlockRef),
 }
 
-const DELIVERY_WITNESS_VERSION: u32 = 1;
+// 2: `ChainControl` gained `LogCoverage`, so a witness can encode a control
+// shape version 1 readers cannot interpret. Bumping keeps a replayed token from
+// an older process from being matched against a newer encoding.
+const DELIVERY_WITNESS_VERSION: u32 = 2;
 const DELIVERY_WITNESS_DOMAIN: &[u8] = b"evm-fork-cache/reactive-delivery-witness";
 
 #[derive(serde::Serialize)]
@@ -11964,7 +12655,8 @@ where
             self.runtime.coverage_head,
             self.runtime.safe_head,
             self.runtime.finalized_head,
-        );
+        )
+        .with_log_coverage_head(self.runtime.log_coverage_head);
         match validate_canonical_sequence_internal(
             &state,
             batch,
@@ -12129,6 +12821,7 @@ fn latest_canonical_batch_block<N: Network>(
             | ChainControl::CanonicalProgress(block) => Some(block),
             ChainControl::Safe(_)
             | ChainControl::Finalized(_)
+            | ChainControl::LogCoverage(_)
             | ChainControl::Barrier { block: None, .. } => None,
         })
         .max_by_key(|block| block.number)
@@ -12555,10 +13248,34 @@ pub struct AlloySubscriber<P, N: Network = Ethereum> {
     /// bounded request budget.
     preconfirmed_unavailable_receipts: HashSet<B256>,
     last_certified_canonical_head: Option<BlockRef>,
+    /// When the canonical head was last certified against the provider.
+    ///
+    /// A Flashblocks endpoint replaces the `newHeads` subscription with a
+    /// fixed-interval certification poll, because its `newHeads` may carry
+    /// partial heads. Recording the last certification lets the timer suppress
+    /// itself when the flashblock stream already proved a block sealed, so the
+    /// poll spends a request only when nothing else did.
+    last_canonical_head_certification: Option<Instant>,
+    /// Set when a `newFlashblocks` payload opens a block, which means the
+    /// previous block sealed and its canonical head is worth certifying.
+    sealed_block_pending_certification: bool,
+    /// Highest canonical block observed while every log source was whole, and
+    /// the last value attested to the consumer. Advances only through
+    /// `note_attestable_canonical_block`, which a live gap resets.
+    attestable_canonical_head: Option<BlockRef>,
+    attested_log_coverage: Option<BlockRef>,
     pending_preconfirmation_invalidation: bool,
     pending_flashblock_reconnects: FuturesUnordered<FlashblockReconnectFuture<N>>,
     pending_flashblock_reconnect_sources: Vec<SubscriberStreamSource>,
     flashblocks_rpc_metrics: FlashblocksRpcMetrics,
+    /// Every provider request this subscriber has issued, by method and cause.
+    /// Shared so catch-up futures and the free functions they call can record
+    /// without borrowing the subscriber; see [`SubscriberRpcCounters`].
+    rpc_counters: Arc<SubscriberRpcCounters>,
+    /// Notification loss observed on live subscriptions. Shared for the same
+    /// reason as `rpc_counters`: stream adapters record without a subscriber
+    /// borrow.
+    gap_counters: Arc<SubscriberStreamGapCounters>,
     consecutive_flashblock_poll_failures: usize,
     flashblock_rpc_request_times: VecDeque<Instant>,
     _network: PhantomData<N>,
@@ -12593,6 +13310,9 @@ struct SubscriberOwnerCatchupOptions {
     max_logs: usize,
     max_log_bytes: usize,
     max_requests_in_flight: usize,
+    /// Which mechanism asked for this catch-up, so its provider requests are
+    /// attributed to the caller rather than to the shared fetch helper.
+    cause: SubscriberRpcCause,
 }
 
 struct SubscriberOwnerReconcileFilter {
@@ -12686,10 +13406,16 @@ impl<P, N: Network> AlloySubscriber<P, N> {
             preconfirmed_receipted_transactions: HashSet::new(),
             preconfirmed_unavailable_receipts: HashSet::new(),
             last_certified_canonical_head: None,
+            last_canonical_head_certification: None,
+            sealed_block_pending_certification: false,
+            attestable_canonical_head: None,
+            attested_log_coverage: None,
             pending_preconfirmation_invalidation: false,
             pending_flashblock_reconnects: FuturesUnordered::new(),
             pending_flashblock_reconnect_sources: Vec::new(),
             flashblocks_rpc_metrics: FlashblocksRpcMetrics::default(),
+            rpc_counters: Arc::new(SubscriberRpcCounters::default()),
+            gap_counters: Arc::new(SubscriberStreamGapCounters::default()),
             consecutive_flashblock_poll_failures: 0,
             flashblock_rpc_request_times: VecDeque::new(),
             _network: PhantomData,
@@ -12856,6 +13582,56 @@ impl<P, N: Network> AlloySubscriber<P, N> {
     /// pending-state sampling since the last full interest reset.
     pub const fn flashblocks_rpc_metrics(&self) -> FlashblocksRpcMetrics {
         self.flashblocks_rpc_metrics
+    }
+
+    /// Every provider request this subscriber has issued, attributed to the
+    /// method and the mechanism responsible for it.
+    ///
+    /// Cumulative for the subscriber's lifetime: unlike
+    /// [`flashblocks_rpc_metrics`](Self::flashblocks_rpc_metrics), these counts
+    /// survive reconnects and delivery-state resets so a long-running process
+    /// can report total RPC consumption. Use
+    /// [`reset_rpc_stats`](Self::reset_rpc_stats) to measure a bounded window.
+    pub fn rpc_stats(&self) -> SubscriberRpcStats {
+        self.rpc_counters.snapshot()
+    }
+
+    /// Zero every [`rpc_stats`](Self::rpc_stats) counter, starting a new
+    /// measurement window. Takes `&self` so a window can be opened while
+    /// catch-up work holds the subscriber.
+    pub fn reset_rpc_stats(&self) {
+        self.rpc_counters.reset();
+    }
+
+    /// Notification loss observed on live subscriptions, and what healing it
+    /// cost.
+    ///
+    /// A subscription that never lags reports zeroes here. That is evidence
+    /// nothing was *lost*, which is necessary before treating the stream as
+    /// authoritative — but it is not evidence that everything has *arrived*.
+    /// Deciding a particular block's set is closed needs ordering evidence from
+    /// the log stream itself; see [`ChainControl::LogCoverage`].
+    pub fn stream_gap_stats(&self) -> SubscriberStreamGapStats {
+        self.gap_counters.snapshot()
+    }
+
+    /// Zero every [`stream_gap_stats`](Self::stream_gap_stats) counter.
+    pub fn reset_stream_gap_stats(&self) {
+        self.gap_counters.reset();
+    }
+
+    /// Record one issued provider request against this subscriber's counters.
+    fn record_rpc(&self, cause: SubscriberRpcCause, method: SubscriberRpcMethod) {
+        self.rpc_counters.record(cause, method);
+    }
+
+    /// Bounded notification capacity for a pubsub log stream.
+    #[cfg(feature = "reactive-ws")]
+    fn log_channel_size(&self) -> usize {
+        self.config
+            .log_channel_size
+            .unwrap_or(self.config.max_batch_size)
+            .max(1)
     }
 
     /// Registered interests across base and owner-scoped registrations.
@@ -13980,7 +14756,77 @@ impl<P, N: Network> AlloySubscriber<P, N> {
             .retain(|id, _| live_ids.contains(id));
     }
 
+    /// Record a canonical header observed while every log source was whole.
+    ///
+    /// Called before the header is enqueued, so a gap discovered later in the
+    /// same poll cannot retroactively attest a block whose logs it may have
+    /// dropped: `reset_log_attestation` clears the candidate, and it only
+    /// re-advances once a later header arrives after the gap was healed.
+    fn note_attestable_canonical_block(&mut self, record: &ReactiveInputRecord<N>) {
+        if !self.attests_log_coverage() {
+            return;
+        }
+        let Some(block) = record.context.block.as_ref() else {
+            return;
+        };
+        let advances = self
+            .attestable_canonical_head
+            .as_ref()
+            .is_none_or(|current| block.number > current.number);
+        if advances {
+            self.attestable_canonical_head = Some(*block);
+        }
+    }
+
+    /// Withdraw the pending attestation candidate after detected loss.
+    ///
+    /// The healed window is refetched, but the candidate is still dropped: a
+    /// consumer must not be told a block was whole on the strength of an
+    /// observation made before the loss was known.
+    fn reset_log_attestation(&mut self) {
+        self.attestable_canonical_head = None;
+    }
+
+    /// Whether this subscriber can prove the attestation it would emit.
+    ///
+    /// Mirrors [`SubscriberCapability::LogCoverageAttestation`]: only the pubsub
+    /// log streams surface a dropped notification, and only a subscriber with log
+    /// interests has anything to attest about.
+    fn attests_log_coverage(&self) -> bool {
+        matches!(
+            resolve_subscriber_transport(self.mode),
+            Ok(SubscriberTransport::PubSub)
+        ) && self
+            .interests
+            .iter()
+            .any(|interest| matches!(interest, ReactiveInterest::Logs(_)))
+    }
+
+    /// Queue a `LogCoverage` control when the attested watermark advances.
+    fn queue_log_coverage_attestation(&mut self) {
+        if !self.attests_log_coverage() {
+            return;
+        }
+        let Some(candidate) = self.attestable_canonical_head else {
+            return;
+        };
+        let advances = self
+            .attested_log_coverage
+            .as_ref()
+            .is_none_or(|attested| candidate.number > attested.number);
+        if !advances {
+            return;
+        }
+        self.attested_log_coverage = Some(candidate);
+        self.pending_chain_controls
+            .push_back(ChainControl::LogCoverage(candidate));
+    }
+
     fn drain_next_scoped_batch(&mut self) -> Option<SubscriberInputBatch<N>> {
+        // Attest before the emptiness check: the watermark may be the only thing
+        // this batch has to say. Controls still drain only once every record
+        // ahead of them has left, so an attestation never precedes its header.
+        self.queue_log_coverage_attestation();
         if self.pending_records.is_empty()
             && self.pending_chain_controls.is_empty()
             && !self.pending_preconfirmation_invalidation
@@ -14059,6 +14905,10 @@ impl<P, N: Network> AlloySubscriber<P, N> {
         self.next_log_source_id = 0;
         self.sources_dirty = true;
         self.last_certified_canonical_head = None;
+        self.last_canonical_head_certification = None;
+        self.sealed_block_pending_certification = false;
+        self.attestable_canonical_head = None;
+        self.attested_log_coverage = None;
         self.reset_flashblock_tracking();
     }
 
@@ -14476,6 +15326,13 @@ enum SubscriberEvent<N: Network> {
     #[cfg(feature = "raw-flashblocks-json")]
     ExternalFlashblockUpdate(raw_json_flashblocks::QueuedFlashblockUpdate),
     StreamTerminated(SubscriberStreamSource),
+    /// A live stream lost notifications without disconnecting. The subscription
+    /// is still installed, so only the missed window is recovered rather than
+    /// the source being reconnected.
+    StreamGap {
+        source: SubscriberStreamSource,
+        gap: SubscriberStreamGap,
+    },
 }
 
 enum SubscriberReady<N: Network> {
@@ -14634,6 +15491,11 @@ where
         ];
         if transport == SubscriberTransport::PubSub {
             capabilities.push(SubscriberCapability::BlockHeaders);
+            // Only the pubsub log streams are consumed through
+            // `gap_observing_stream`, so only they can prove no loss went
+            // unhealed. The polling transport's watcher cannot, and must not
+            // claim it.
+            capabilities.push(SubscriberCapability::LogCoverageAttestation);
         }
         if self.config.preconfirmations != PreconfirmationMode::Disabled
             && (self.uses_external_flashblock_updates()
@@ -14752,6 +15614,10 @@ where
             .ok_or(SubscriberError::InvalidConfig(
                 "Flashblocks preflight requires a stable provider ref",
             ))?;
+        self.record_rpc(
+            SubscriberRpcCause::FlashblocksSetup,
+            SubscriberRpcMethod::OpSupportedCapabilities,
+        );
         self.flashblocks_rpc_metrics.capability_requests = self
             .flashblocks_rpc_metrics
             .capability_requests
@@ -14814,6 +15680,10 @@ where
             }
             FlashblocksAdapter::PendingStatePolling => {
                 if let Some(state_provider) = self.flashblocks_state_provider.as_ref() {
+                    self.record_rpc(
+                        SubscriberRpcCause::FlashblocksSetup,
+                        SubscriberRpcMethod::EthChainId,
+                    );
                     self.flashblocks_rpc_metrics.provider_pair_chain_requests = self
                         .flashblocks_rpc_metrics
                         .provider_pair_chain_requests
@@ -15071,6 +15941,10 @@ where
             .await
             .map_err(PendingFlashblockPollError::into_subscriber)?;
         for filter in filters {
+            self.record_rpc(
+                SubscriberRpcCause::PendingStateSample,
+                SubscriberRpcMethod::EthGetLogs,
+            );
             self.flashblocks_rpc_metrics.pending_log_requests = self
                 .flashblocks_rpc_metrics
                 .pending_log_requests
@@ -15087,6 +15961,10 @@ where
                 .await
                 .map_err(provider_error)?;
         }
+        self.record_rpc(
+            SubscriberRpcCause::PendingStateSample,
+            SubscriberRpcMethod::EthGetTransactionReceipt,
+        );
         self.flashblocks_rpc_metrics.pending_receipt_requests = self
             .flashblocks_rpc_metrics
             .pending_receipt_requests
@@ -15115,6 +15993,10 @@ where
                 ),
             ));
         }
+        self.record_rpc(
+            SubscriberRpcCause::CanonicalHeadCertification,
+            SubscriberRpcMethod::EthGetBlockByHash,
+        );
         self.flashblocks_rpc_metrics.canonical_head_requests = self
             .flashblocks_rpc_metrics
             .canonical_head_requests
@@ -15147,6 +16029,10 @@ where
     async fn fetch_op_pending_block(
         &mut self,
     ) -> Result<Option<N::BlockResponse>, PendingFlashblockPollError> {
+        self.record_rpc(
+            SubscriberRpcCause::PendingStateSample,
+            SubscriberRpcMethod::EthGetBlockByNumber,
+        );
         let state_provider = self
             .flashblocks_state_provider
             .as_ref()
@@ -15171,6 +16057,10 @@ where
         if let Some(chain_id) = self.chain_id {
             return Ok(chain_id);
         }
+        self.record_rpc(
+            SubscriberRpcCause::ChainIdentity,
+            SubscriberRpcMethod::EthChainId,
+        );
         let chain_id = self.provider.get_chain_id().await.map_err(provider_error)?;
         self.chain_id = Some(chain_id);
         Ok(chain_id)
@@ -15361,7 +16251,9 @@ where
                 max_logs: self.config.max_pending_records,
                 max_log_bytes: self.config.max_backfill_log_bytes,
                 max_requests_in_flight: self.config.max_reconcile_requests_in_flight,
+                cause: SubscriberRpcCause::OwnerReconcile,
             },
+            Arc::clone(&self.rpc_counters),
         );
         let SubscriberOwnerCatchup { logs, certified } =
             self.drive_reconcile_fetch(fetch, &target_epochs).await?;
@@ -15717,6 +16609,7 @@ where
                 self.config.reconnect.clone(),
                 first_delay,
                 self.config.flashblock_poll_interval,
+                Arc::clone(&self.rpc_counters),
             ));
     }
 
@@ -15772,11 +16665,16 @@ where
 
             let to_block = match backfill.end_block() {
                 Some(to_block) => to_block,
-                None => self
-                    .provider
-                    .get_block_number()
-                    .await
-                    .map_err(provider_error)?,
+                None => {
+                    self.record_rpc(
+                        SubscriberRpcCause::LazyBackfill,
+                        SubscriberRpcMethod::EthBlockNumber,
+                    );
+                    self.provider
+                        .get_block_number()
+                        .await
+                        .map_err(provider_error)?
+                }
             };
             if to_block < backfill.start_block() {
                 // An exclusive post-baseline range can be empty when the
@@ -15784,8 +16682,13 @@ where
                 // work only after validating that head and seed the filter at
                 // the proven baseline so reconnect catch-up starts at C + 1.
                 let certified = if let Some(retained) = backfill.retained_anchor() {
-                    let actual =
-                        fetch_provider_block_ref::<P, N>(&self.provider, retained.number).await?;
+                    let actual = fetch_provider_block_ref::<P, N>(
+                        &self.provider,
+                        retained.number,
+                        &self.rpc_counters,
+                        SubscriberRpcCause::LazyBackfill,
+                    )
+                    .await?;
                     if !block_ref_satisfies_expected(&actual, retained) {
                         return Err(SubscriberError::InvalidBackfill(format!(
                             "retained anchor {}:{:?} conflicts with provider block {}:{:?}",
@@ -15824,7 +16727,13 @@ where
                 continue;
             }
 
-            let through = fetch_provider_block_ref::<P, N>(&self.provider, to_block).await?;
+            let through = fetch_provider_block_ref::<P, N>(
+                &self.provider,
+                to_block,
+                &self.rpc_counters,
+                SubscriberRpcCause::LazyBackfill,
+            )
+            .await?;
             let request_filters =
                 merged_lazy_backfill_filters(&filters, backfill.start_block(), through.number);
             let retained = backfill.retained_anchor().copied().into_iter().collect();
@@ -15841,7 +16750,9 @@ where
                     max_logs: self.config.max_pending_records,
                     max_log_bytes: self.config.max_backfill_log_bytes,
                     max_requests_in_flight: self.config.max_reconcile_requests_in_flight,
+                    cause: SubscriberRpcCause::LazyBackfill,
                 },
+                Arc::clone(&self.rpc_counters),
             )
             .await
             .map_err(lazy_backfill_error)?;
@@ -16042,15 +16953,22 @@ where
                 id,
                 filter: filter.clone(),
             };
-            let stream = self
+            self.record_rpc(
+                SubscriberRpcCause::StreamSubscription,
+                SubscriberRpcMethod::EthSubscribe,
+            );
+            let subscription = self
                 .provider
                 .subscribe_logs(&filter)
-                .channel_size(self.config.max_batch_size.max(1))
+                .channel_size(self.log_channel_size())
                 .await
-                .map_err(provider_error)?
-                .into_stream()
-                .map(move |log| SubscriberEvent::Log { source_id: id, log });
-            Ok(stream_with_termination(stream, source))
+                .map_err(provider_error)?;
+            Ok(gap_observing_stream(
+                subscription,
+                source,
+                Arc::clone(&self.gap_counters),
+                move |log| SubscriberEvent::Log { source_id: id, log },
+            ))
         }
 
         #[cfg(not(feature = "reactive-ws"))]
@@ -16074,19 +16992,26 @@ where
                 filter: filter.clone(),
             };
             let params = base_pending_log_filter(&filter)?;
-            let stream = self
+            self.record_rpc(
+                SubscriberRpcCause::StreamSubscription,
+                SubscriberRpcMethod::EthSubscribe,
+            );
+            let subscription = self
                 .provider
                 .subscribe::<_, Log>(("pendingLogs", params))
-                .channel_size(self.config.max_batch_size.max(1))
+                .channel_size(self.log_channel_size())
                 .await
-                .map_err(provider_error)?
-                .into_stream()
-                .map(move |log| SubscriberEvent::BasePendingLogTimed {
+                .map_err(provider_error)?;
+            Ok(gap_observing_stream(
+                subscription,
+                source,
+                Arc::clone(&self.gap_counters),
+                move |log| SubscriberEvent::BasePendingLogTimed {
                     source_id: id,
                     log,
                     timing: FlashblockIngressTiming::new(Instant::now()),
-                });
-            Ok(stream_with_termination(stream, source))
+                },
+            ))
         }
 
         #[cfg(not(feature = "reactive-ws"))]
@@ -16103,6 +17028,10 @@ where
     ) -> Result<BoxStream<'static, SubscriberEvent<N>>, SubscriberError> {
         #[cfg(feature = "reactive-ws")]
         {
+            self.record_rpc(
+                SubscriberRpcCause::StreamSubscription,
+                SubscriberRpcMethod::EthSubscribe,
+            );
             let stream = self
                 .provider
                 .subscribe::<_, BaseFlashblockWirePayload>(("newFlashblocks",))
@@ -16170,6 +17099,10 @@ where
     ) -> Result<BoxStream<'static, SubscriberEvent<N>>, SubscriberError> {
         #[cfg(feature = "reactive-ws")]
         {
+            self.record_rpc(
+                SubscriberRpcCause::StreamSubscription,
+                SubscriberRpcMethod::EthSubscribe,
+            );
             let stream = self
                 .provider
                 .subscribe_pending_transactions()
@@ -16197,17 +17130,21 @@ where
     ) -> Result<BoxStream<'static, SubscriberEvent<N>>, SubscriberError> {
         #[cfg(feature = "reactive-ws")]
         {
-            let stream = self
+            self.record_rpc(
+                SubscriberRpcCause::StreamSubscription,
+                SubscriberRpcMethod::EthSubscribe,
+            );
+            let subscription = self
                 .provider
                 .subscribe_blocks()
                 .channel_size(self.config.max_batch_size.max(1))
                 .await
-                .map_err(provider_error)?
-                .into_stream()
-                .map(SubscriberEvent::BlockHeader);
-            Ok(stream_with_termination(
-                stream,
+                .map_err(provider_error)?;
+            Ok(gap_observing_stream(
+                subscription,
                 SubscriberStreamSource::PubSubBlockHeaders,
+                Arc::clone(&self.gap_counters),
+                SubscriberEvent::BlockHeader,
             ))
         }
 
@@ -16228,6 +17165,10 @@ where
             let source = SubscriberStreamSource::PollingLog {
                 filter: filter.clone(),
             };
+            self.record_rpc(
+                SubscriberRpcCause::StreamSubscription,
+                SubscriberRpcMethod::EthSubscribe,
+            );
             let stream = self
                 .provider
                 .watch_logs(&filter)
@@ -16253,6 +17194,10 @@ where
     ) -> Result<BoxStream<'static, SubscriberEvent<N>>, SubscriberError> {
         #[cfg(feature = "reactive-polling")]
         {
+            self.record_rpc(
+                SubscriberRpcCause::StreamSubscription,
+                SubscriberRpcMethod::EthSubscribe,
+            );
             let stream = self
                 .provider
                 .watch_pending_transactions()
@@ -16386,6 +17331,12 @@ where
                         }
                     }
                     self.sources_dirty = false;
+                }
+                SubscriberEvent::StreamGap { source, gap } => {
+                    if let Some(backfill_event) = self.recover_stream_gap(&source, gap).await? {
+                        self.verify_event_log_blocks(&backfill_event).await?;
+                        return Ok(Some(backfill_event));
+                    }
                 }
                 event => {
                     let Some(event) = self.normalize_flashblock_event(event).await? else {
@@ -16554,6 +17505,14 @@ where
             } => {
                 let (flashblock, recover_pending_snapshot) =
                     self.accept_base_flashblock(payload)?;
+                if std::mem::take(&mut self.sealed_block_pending_certification)
+                    && let Some(header_event) =
+                        self.certify_canonical_head_on_sealed_block().await?
+                {
+                    // Queued rather than returned: the flashblock event this
+                    // arm is normalizing still has to reach the consumer.
+                    self.enqueue_event(header_event);
+                }
                 let mut logs = Vec::new();
                 let mut retained = VecDeque::new();
                 let mut timing = source_timing;
@@ -16621,7 +17580,19 @@ where
             SubscriberEvent::OpFlashblockTickTimed(timing) => {
                 self.poll_op_pending_flashblock(timing).await
             }
-            SubscriberEvent::CanonicalHeadTick => self.fetch_certified_canonical_head().await,
+            SubscriberEvent::CanonicalHeadTick => {
+                if self.canonical_head_certification_is_current() {
+                    // The flashblock stream already drove a certification inside
+                    // this window; polling again would buy nothing.
+                    self.flashblocks_rpc_metrics.suppressed_canonical_head_polls = self
+                        .flashblocks_rpc_metrics
+                        .suppressed_canonical_head_polls
+                        .saturating_add(1);
+                    Ok(None)
+                } else {
+                    self.fetch_certified_canonical_head().await
+                }
+            }
             SubscriberEvent::PreconfirmedLogs {
                 flashblock,
                 logs,
@@ -16646,9 +17617,35 @@ where
         }
     }
 
+    /// Whether a certification already happened inside the current poll window.
+    fn canonical_head_certification_is_current(&self) -> bool {
+        self.last_canonical_head_certification
+            .is_some_and(|at| at.elapsed() < self.config.canonical_head_poll_interval)
+    }
+
+    /// Certify the sealed canonical head because a new block just started.
+    ///
+    /// A `newFlashblocks` payload at index zero opens a block, which means the
+    /// previous one sealed — the exact moment a certification is worth
+    /// spending. Driving it from that signal instead of a blind timer costs one
+    /// request per block rather than one per interval, and detects the head
+    /// sooner.
+    async fn certify_canonical_head_on_sealed_block(
+        &mut self,
+    ) -> Result<Option<SubscriberEvent<N>>, SubscriberError> {
+        if !needs_header_block_stream(&self.interests) {
+            return Ok(None);
+        }
+        if self.canonical_head_certification_is_current() {
+            return Ok(None);
+        }
+        self.fetch_certified_canonical_head().await
+    }
+
     async fn fetch_certified_canonical_head(
         &mut self,
     ) -> Result<Option<SubscriberEvent<N>>, SubscriberError> {
+        self.last_canonical_head_certification = Some(Instant::now());
         tokio::time::timeout(
             self.config.canonical_head_request_timeout,
             self.fetch_certified_canonical_head_inner(),
@@ -16700,6 +17697,10 @@ where
             self.last_certified_canonical_head = Some(certified);
             return Ok(Some(SubscriberEvent::BlockHeader(header)));
         }
+        self.record_rpc(
+            SubscriberRpcCause::CanonicalHeadCertification,
+            SubscriberRpcMethod::EthGetBlockByNumber,
+        );
         self.flashblocks_rpc_metrics.canonical_head_requests = self
             .flashblocks_rpc_metrics
             .canonical_head_requests
@@ -16751,6 +17752,16 @@ where
                             "indexed newFlashblocks item zero omitted its base header".into(),
                         )
                     })?;
+                    // A new payload id at index zero opens a block, so the
+                    // previous one just sealed. Certifying on that signal is
+                    // what lets the interval timer stop guessing.
+                    if self
+                        .base_flashblock_header
+                        .as_ref()
+                        .is_none_or(|(known, _)| *known != payload.payload_id)
+                    {
+                        self.sealed_block_pending_certification = true;
+                    }
                     self.base_flashblock_header = Some((payload.payload_id, base));
                 }
 
@@ -17019,6 +18030,10 @@ where
         let latest = if samples_pending_range {
             None
         } else {
+            self.record_rpc(
+                SubscriberRpcCause::CanonicalHeadCertification,
+                SubscriberRpcMethod::EthBlockNumber,
+            );
             self.flashblocks_rpc_metrics.canonical_head_requests = self
                 .flashblocks_rpc_metrics
                 .canonical_head_requests
@@ -17037,6 +18052,10 @@ where
         let pending_block = if samples_pending_range {
             self.fetch_op_pending_block().await?
         } else {
+            self.record_rpc(
+                SubscriberRpcCause::PendingStateSample,
+                SubscriberRpcMethod::EthGetBlockByNumber,
+            );
             self.provider
                 .get_block_by_number(BlockNumberOrTag::Pending)
                 .await
@@ -17231,6 +18250,10 @@ where
             &self.provider
         };
         for filter in self.log_stream_filters() {
+            self.record_rpc(
+                SubscriberRpcCause::PendingStateSample,
+                SubscriberRpcMethod::EthGetLogs,
+            );
             self.flashblocks_rpc_metrics.pending_log_requests = self
                 .flashblocks_rpc_metrics
                 .pending_log_requests
@@ -17305,6 +18328,11 @@ where
         if !reserved {
             return Ok((Vec::new(), Vec::new(), Vec::new()));
         }
+        self.rpc_counters.record_many(
+            SubscriberRpcCause::PendingStateSample,
+            SubscriberRpcMethod::EthGetTransactionReceipt,
+            transaction_hashes.len() as u64,
+        );
         self.flashblocks_rpc_metrics.pending_receipt_requests = self
             .flashblocks_rpc_metrics
             .pending_receipt_requests
@@ -17543,7 +18571,8 @@ where
             | SubscriberEvent::PreconfirmedLogs { .. }
             | SubscriberEvent::FlashblockInvalidated
             | SubscriberEvent::FlashblockObserved
-            | SubscriberEvent::StreamTerminated(_) => Ok(()),
+            | SubscriberEvent::StreamTerminated(_)
+            | SubscriberEvent::StreamGap { .. } => Ok(()),
         }
     }
 
@@ -17569,6 +18598,10 @@ where
             .log_verification_provider
             .as_ref()
             .unwrap_or(&self.provider);
+        self.rpc_counters.record(
+            SubscriberRpcCause::LogBlockVerification,
+            SubscriberRpcMethod::EthGetBlockByNumber,
+        );
         let block = provider
             .get_block_by_number(BlockNumberOrTag::Number(number))
             .await
@@ -17644,7 +18677,8 @@ where
             | SubscriberEvent::PreconfirmedLogs { .. }
             | SubscriberEvent::FlashblockInvalidated
             | SubscriberEvent::FlashblockObserved
-            | SubscriberEvent::StreamTerminated(_) => {}
+            | SubscriberEvent::StreamTerminated(_)
+            | SubscriberEvent::StreamGap { .. } => {}
         }
     }
 
@@ -17753,6 +18787,7 @@ where
             SubscriberEvent::BlockHeader(header) => {
                 if needs_header_block_stream(&self.interests) {
                     let record = block_header_input_record::<N>(header);
+                    self.note_attestable_canonical_block(&record);
                     self.enqueue_record_with_excluded_owners(record, excluded);
                 }
             }
@@ -17796,7 +18831,9 @@ where
             | SubscriberEvent::FlashblockObserved => {}
             #[cfg(feature = "raw-flashblocks-json")]
             SubscriberEvent::ExternalFlashblockUpdate(_) => {}
-            SubscriberEvent::StreamTerminated(_) => {}
+            // `next_event` intercepts a gap and recovers it before delivery;
+            // this arm keeps the classification exhaustive.
+            SubscriberEvent::StreamTerminated(_) | SubscriberEvent::StreamGap { .. } => {}
         }
     }
 
@@ -17959,9 +18996,83 @@ where
         Ok(backfill_event)
     }
 
+    /// Recover from notification loss on a still-connected stream.
+    ///
+    /// The policy differs by stream because what a gap costs differs:
+    ///
+    /// - **Canonical logs** are authoritative and unrecoverable downstream, so
+    ///   the exact missed range is refetched. This is the only case that spends
+    ///   an RPC, and it spends the minimum: one bounded window per gap.
+    /// - **Canonical headers** are self-healing at the consumer. A driver that
+    ///   walks a replacement header's parent lineage back to retained canonical
+    ///   history recovers the skipped blocks from the next header it receives,
+    ///   so refetching here would duplicate that work. The gap is counted so the
+    ///   self-healing is visible rather than assumed.
+    /// - **Pre-confirmation logs** are speculative by construction. A punctured
+    ///   preview must not be published, so the snapshot is discarded and the
+    ///   next complete generation replaces it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a canonical log gap cannot be bounded because the
+    /// source has no delivery anchor yet. Silently continuing would mean knowing
+    /// that logs were lost and doing nothing, which is exactly the failure this
+    /// machinery exists to eliminate.
+    async fn recover_stream_gap(
+        &mut self,
+        source: &SubscriberStreamSource,
+        gap: SubscriberStreamGap,
+    ) -> Result<Option<SubscriberEvent<N>>, SubscriberError> {
+        match source {
+            SubscriberStreamSource::PubSubLog { id, .. } => {
+                self.reset_log_attestation();
+                if !self.last_seen_log_blocks.contains_key(id) {
+                    return Err(SubscriberError::Provider(format!(
+                        "Alloy subscriber {} lost notifications ({gap}) before establishing a \
+                         delivery anchor, so the missed range cannot be bounded",
+                        source.label()
+                    )));
+                }
+                let event = self
+                    .backfill_source_window(source, SubscriberRpcCause::GapBackfill)
+                    .await?;
+                self.gap_counters.record_log_gap_healed();
+                Ok(event)
+            }
+            SubscriberStreamSource::PubSubBlockHeaders => {
+                self.gap_counters.record_header_gap();
+                Ok(None)
+            }
+            SubscriberStreamSource::BasePendingLog { .. } => {
+                self.gap_counters.record_preconfirmation_gap();
+                self.invalidate_preconfirmation_snapshot();
+                Ok(Some(SubscriberEvent::FlashblockInvalidated))
+            }
+            _ => Ok(None),
+        }
+    }
+
     async fn backfill_reconnected_source(
         &mut self,
         source: &SubscriberStreamSource,
+    ) -> Result<Option<SubscriberEvent<N>>, SubscriberError> {
+        self.backfill_source_window(source, SubscriberRpcCause::ReconnectBackfill)
+            .await
+    }
+
+    /// Refetch a log source's window from its delivery anchor to the current
+    /// head.
+    ///
+    /// Shared by the two situations that lose a bounded range of canonical logs
+    /// — a stream that terminated and reconnected, and a stream that stayed
+    /// connected but dropped notifications. `cause` attributes the requests to
+    /// whichever of those spent them, so
+    /// [`rpc_stats`](Self::rpc_stats) can distinguish reconnect churn from
+    /// backpressure loss.
+    async fn backfill_source_window(
+        &mut self,
+        source: &SubscriberStreamSource,
+        cause: SubscriberRpcCause,
     ) -> Result<Option<SubscriberEvent<N>>, SubscriberError> {
         if source.is_flashblocks() {
             return Ok(None);
@@ -17973,6 +19084,7 @@ where
             return Ok(None);
         };
 
+        self.record_rpc(cause, SubscriberRpcMethod::EthBlockNumber);
         let latest = self
             .provider
             .get_block_number()
@@ -17982,6 +19094,7 @@ where
             return Ok(None);
         }
 
+        self.record_rpc(cause, SubscriberRpcMethod::EthGetLogs);
         let logs = self
             .provider
             .get_logs(&filter.clone().from_block(from_block).to_block(latest))
@@ -18346,6 +19459,86 @@ where
     }
 }
 
+/// Turn a pubsub subscription into a stream that reports dropped notifications
+/// instead of hiding them.
+///
+/// [`Subscription::into_stream`] is deliberately not used: it treats both a
+/// lagged receiver and an undecodable payload as `continue`, logging at `debug`
+/// and moving on, so a consumer cannot distinguish a complete stream from a
+/// punctured one. Consuming the raw subscription makes a broadcast `Lagged` a
+/// first-class [`SubscriberEvent::StreamGap`], while `Closed` still ends the
+/// stream so the existing reconnect path handles a genuine disconnect unchanged.
+///
+/// [`Subscription::into_stream`]: alloy_pubsub::Subscription::into_stream
+#[cfg(feature = "reactive-ws")]
+fn gap_observing_stream<N, T, F>(
+    subscription: alloy_pubsub::Subscription<T>,
+    source: SubscriberStreamSource,
+    gap_counters: Arc<SubscriberStreamGapCounters>,
+    to_event: F,
+) -> BoxStream<'static, SubscriberEvent<N>>
+where
+    N: Network + 'static,
+    T: serde::de::DeserializeOwned + Send + 'static,
+    F: FnMut(T) -> SubscriberEvent<N> + Send + 'static,
+{
+    // The decode closure and the receiver both live in the unfold state, so no
+    // borrow is held across an await point.
+    struct GapState<T, F> {
+        raw: alloy_pubsub::RawSubscription,
+        to_event: F,
+        source: SubscriberStreamSource,
+        gap_counters: Arc<SubscriberStreamGapCounters>,
+        _item: PhantomData<fn() -> T>,
+    }
+
+    let state = GapState {
+        raw: subscription.into_raw(),
+        to_event,
+        source: source.clone(),
+        gap_counters,
+        _item: PhantomData::<fn() -> T>,
+    };
+
+    let stream = stream::unfold(state, |mut state| async move {
+        let gap = match state.raw.recv().await {
+            Ok(value) => match serde_json::from_str::<T>(value.get()) {
+                Ok(item) => {
+                    let event = (state.to_event)(item);
+                    return Some((event, state));
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        stream = state.source.label(),
+                        error = %error,
+                        "pubsub notification did not decode; treating it as lost data"
+                    );
+                    SubscriberStreamGap::Undecodable
+                }
+            },
+            Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                tracing::warn!(
+                    stream = state.source.label(),
+                    skipped,
+                    "pubsub notification channel overflowed; the missed window will be recovered"
+                );
+                SubscriberStreamGap::Lagged { skipped }
+            }
+            // A closed channel is a disconnect, not a gap. Ending the stream
+            // lets `stream_with_termination` drive the existing reconnect.
+            Err(broadcast::error::RecvError::Closed) => return None,
+        };
+        state.gap_counters.record_gap(gap);
+        let event = SubscriberEvent::StreamGap {
+            source: state.source.clone(),
+            gap,
+        };
+        Some((event, state))
+    });
+
+    stream_with_termination(stream, source)
+}
+
 fn stream_with_termination<N, S>(
     stream: S,
     source: SubscriberStreamSource,
@@ -18368,6 +19561,7 @@ fn flashblock_reconnect_future<N>(
     reconnect: SubscriberReconnectConfig,
     first_delay: Duration,
     flashblock_poll_interval: Duration,
+    counters: Arc<SubscriberRpcCounters>,
 ) -> FlashblockReconnectFuture<N>
 where
     N: Network + 'static,
@@ -18394,6 +19588,7 @@ where
                 source.clone(),
                 channel_size,
                 flashblock_poll_interval,
+                counters.as_ref(),
             )
             .await
             {
@@ -18427,12 +19622,13 @@ async fn connect_flashblock_source_once<N>(
     source: SubscriberStreamSource,
     channel_size: usize,
     flashblock_poll_interval: Duration,
+    counters: &SubscriberRpcCounters,
 ) -> Result<BoxStream<'static, SubscriberEvent<N>>, SubscriberError>
 where
     N: Network + 'static,
 {
     #[cfg(not(feature = "reactive-ws"))]
-    let _ = provider;
+    let _ = (provider, counters);
 
     match source {
         SubscriberStreamSource::BasePendingLog { id, filter } => {
@@ -18443,6 +19639,10 @@ where
                     filter: filter.clone(),
                 };
                 let params = base_pending_log_filter(&filter)?;
+                counters.record(
+                    SubscriberRpcCause::StreamSubscription,
+                    SubscriberRpcMethod::EthSubscribe,
+                );
                 let stream = provider
                     .subscribe::<_, Log>(("pendingLogs", params))
                     .channel_size(channel_size.max(1))
@@ -18467,6 +19667,10 @@ where
         SubscriberStreamSource::BaseFlashblocks => {
             #[cfg(feature = "reactive-ws")]
             {
+                counters.record(
+                    SubscriberRpcCause::StreamSubscription,
+                    SubscriberRpcMethod::EthSubscribe,
+                );
                 let stream = provider
                     .subscribe::<_, BaseFlashblockWirePayload>(("newFlashblocks",))
                     .channel_size(channel_size.max(1))
@@ -20025,6 +21229,7 @@ mod subscriber_helper_tests {
                 pending_receipts_unavailable: 0,
                 failed_requests: 0,
                 raced_samples: 0,
+                suppressed_canonical_head_polls: 0,
             }
         );
         assert!(asserter.read_q().is_empty());
@@ -23782,11 +24987,14 @@ fn validate_backfill_resource_limits(
 async fn fetch_provider_block_ref<P, N>(
     provider: &P,
     number: u64,
+    counters: &SubscriberRpcCounters,
+    cause: SubscriberRpcCause,
 ) -> Result<BlockRef, SubscriberError>
 where
     P: Provider<N> + Send + Sync,
     N: Network,
 {
+    counters.record(cause, SubscriberRpcMethod::EthGetBlockByNumber);
     let block = provider
         .get_block_by_number(BlockNumberOrTag::Number(number))
         .await
@@ -23954,13 +25162,17 @@ async fn fetch_owner_catchup<P, N>(
     retained: Vec<BlockRef>,
     through: BlockRef,
     options: SubscriberOwnerCatchupOptions,
+    counters: Arc<SubscriberRpcCounters>,
 ) -> Result<SubscriberOwnerCatchup, SubscriberOwnerError>
 where
     P: Provider<N> + Send + Sync,
     N: Network,
 {
+    let counters = counters.as_ref();
     if !options.target_preverified {
-        let _ = verify_provider_reconcile_target::<P, N>(&provider, &through).await?;
+        let _ =
+            verify_provider_reconcile_target::<P, N>(&provider, &through, counters, options.cause)
+                .await?;
     }
     let mut certified_positions = HashSet::new();
     for position in retained {
@@ -23968,7 +25180,13 @@ where
             || (position.number.checked_add(1) == Some(through.number)
                 && through.parent_hash == Some(position.hash));
         if !target_certifies_position && certified_positions.insert(position) {
-            let _ = verify_provider_reconcile_target::<P, N>(&provider, &position).await?;
+            let _ = verify_provider_reconcile_target::<P, N>(
+                &provider,
+                &position,
+                counters,
+                options.cause,
+            )
+            .await?;
         }
     }
     let mut logs = Vec::new();
@@ -23976,6 +25194,7 @@ where
     let requests = stream::iter(filters.into_iter().map(|filter| {
         let provider = &provider;
         async move {
+            counters.record(options.cause, SubscriberRpcMethod::EthGetLogs);
             let logs = provider
                 .get_logs(&filter.filter)
                 .await
@@ -24008,18 +25227,23 @@ where
         logs.extend(fetched);
     }
     validate_owner_backfill_log_set(&logs)?;
-    let certified = verify_provider_reconcile_target::<P, N>(&provider, &through).await?;
+    let certified =
+        verify_provider_reconcile_target::<P, N>(&provider, &through, counters, options.cause)
+            .await?;
     Ok(SubscriberOwnerCatchup { logs, certified })
 }
 
 async fn verify_provider_reconcile_target<P, N>(
     provider: &P,
     expected: &BlockRef,
+    counters: &SubscriberRpcCounters,
+    cause: SubscriberRpcCause,
 ) -> Result<BlockRef, SubscriberOwnerError>
 where
     P: Provider<N> + Send + Sync,
     N: Network,
 {
+    counters.record(cause, SubscriberRpcMethod::EthGetBlockByNumber);
     let block = provider
         .get_block_by_number(BlockNumberOrTag::Number(expected.number))
         .await
@@ -24203,4 +25427,680 @@ pub enum SubscriberError {
     /// A configured subscriber memory/concurrency boundary was exceeded.
     #[error("subscriber resource limit exceeded: {0}")]
     ResourceExhausted(String),
+}
+
+/// Canonical head certification is the second unrequested request stream in the
+/// live path: on a Flashblocks endpoint it replaces the `newHeads` subscription
+/// with a fixed-interval poll, so it bills a request per tick regardless of
+/// whether the head actually moved.
+#[cfg(test)]
+mod canonical_head_rpc_stats_tests {
+    use super::*;
+    use alloy_provider::ProviderBuilder;
+    use alloy_rpc_types_eth::{Block, Header as RpcHeader};
+    use alloy_transport::mock::Asserter;
+
+    fn sealed_head() -> Block {
+        Block::empty(RpcHeader {
+            hash: B256::repeat_byte(0x65),
+            inner: alloy_consensus::Header {
+                number: 101,
+                parent_hash: B256::repeat_byte(0x64),
+                timestamp: 1_700_000_101,
+                ..alloy_consensus::Header::default()
+            },
+            total_difficulty: None,
+            size: None,
+        })
+    }
+
+    /// Two ticks, one new head: the poll that observes no change still costs a
+    /// request, and `rpc_stats` reports both. This is the in-process form of the
+    /// measured Base head-poll volume — the counter tracks requests issued, not
+    /// events produced.
+    #[tokio::test]
+    async fn unchanged_head_still_counts_its_certification_request() {
+        let asserter = Asserter::new();
+        asserter.push_success(&Some(sealed_head()));
+        asserter.push_success(&Some(sealed_head()));
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig::default(),
+        );
+        subscriber.chain_id = Some(8_453);
+
+        let first = subscriber
+            .fetch_certified_canonical_head()
+            .await
+            .expect("first certification succeeds");
+        assert!(
+            matches!(first, Some(SubscriberEvent::BlockHeader(_))),
+            "a newly certified head is delivered"
+        );
+
+        let second = subscriber
+            .fetch_certified_canonical_head()
+            .await
+            .expect("second certification succeeds");
+        assert!(
+            second.is_none(),
+            "an unchanged head produces no event to deliver"
+        );
+
+        let stats = subscriber.rpc_stats();
+        assert_eq!(
+            stats.get(
+                SubscriberRpcCause::CanonicalHeadCertification,
+                SubscriberRpcMethod::EthGetBlockByNumber,
+            ),
+            2,
+            "both polls are billed even though only one advanced the head"
+        );
+        assert_eq!(stats.total(), 2, "certification is the only request issued");
+        assert_eq!(
+            subscriber
+                .flashblocks_rpc_metrics()
+                .canonical_head_requests(),
+            2,
+            "the attributed counter agrees with the Flashblocks-scoped one"
+        );
+        assert!(asserter.read_q().is_empty());
+    }
+}
+
+/// Notification loss on a live subscription must be observable and recoverable.
+///
+/// The premise of sourcing canonical logs from a subscription is that loss can be
+/// detected; `alloy-pubsub`'s typed stream defeats that by treating a lagged
+/// receiver and an undecodable payload as `continue`. These tests drive a real
+/// broadcast channel — overflowing it for real rather than simulating the error —
+/// and pin both the detection and the bounded recovery it triggers.
+#[cfg(all(test, feature = "reactive-ws"))]
+mod stream_gap_tests {
+    use super::*;
+    use alloy_provider::ProviderBuilder;
+    use alloy_transport::mock::Asserter;
+    use serde_json::value::RawValue;
+
+    fn raw_json(value: &serde_json::Value) -> Box<RawValue> {
+        RawValue::from_string(value.to_string()).expect("valid JSON")
+    }
+
+    fn wire_log(block_number: u64, log_index: u64) -> Box<RawValue> {
+        raw_json(&serde_json::json!({
+            "address": "0x0000000000000000000000000000000000000077",
+            "topics": ["0x1111111111111111111111111111111111111111111111111111111111111111"],
+            "data": "0x",
+            "blockHash": format!("0x{:064x}", block_number),
+            "blockNumber": format!("0x{block_number:x}"),
+            "transactionHash": format!("0x{:064x}", 0x20 + log_index),
+            "transactionIndex": format!("0x{log_index:x}"),
+            "logIndex": format!("0x{log_index:x}"),
+            "removed": false,
+        }))
+    }
+
+    fn log_source(id: usize) -> SubscriberStreamSource {
+        SubscriberStreamSource::PubSubLog {
+            id,
+            filter: Filter::new().address(Address::repeat_byte(0x77)),
+        }
+    }
+
+    /// Build a `Subscription<Log>` over a real broadcast channel so the test can
+    /// overflow it, feed it garbage, or close it.
+    fn wired_subscription(
+        capacity: usize,
+    ) -> (
+        tokio::sync::broadcast::Sender<Box<RawValue>>,
+        alloy_pubsub::Subscription<Log>,
+    ) {
+        let (tx, rx) = tokio::sync::broadcast::channel(capacity);
+        let raw = alloy_pubsub::RawSubscription {
+            rx,
+            local_id: B256::repeat_byte(0x5b),
+        };
+        (tx, raw.into_typed())
+    }
+
+    fn gap_stream(
+        subscription: alloy_pubsub::Subscription<Log>,
+        source: SubscriberStreamSource,
+        counters: Arc<SubscriberStreamGapCounters>,
+    ) -> BoxStream<'static, SubscriberEvent<Ethereum>> {
+        gap_observing_stream(subscription, source, counters, |log| SubscriberEvent::Log {
+            source_id: 0,
+            log,
+        })
+    }
+
+    /// A channel that overflows reports the loss. Under
+    /// `Subscription::into_stream` this same sequence yields only the surviving
+    /// notification, with the drop visible nowhere.
+    #[tokio::test]
+    async fn overflowing_channel_reports_the_gap_instead_of_skipping_it() {
+        let counters = Arc::new(SubscriberStreamGapCounters::default());
+        let (tx, subscription) = wired_subscription(2);
+        // Publish past capacity before the stream is ever polled.
+        for index in 0..5 {
+            tx.send(wire_log(100 + index, index))
+                .expect("receiver alive");
+        }
+        let mut stream = gap_stream(subscription, log_source(0), Arc::clone(&counters));
+
+        let first = stream.next().await.expect("an event is produced");
+        let SubscriberEvent::StreamGap { source, gap } = first else {
+            panic!("expected the dropped notifications to surface as a gap, got a delivery");
+        };
+        assert!(
+            matches!(source, SubscriberStreamSource::PubSubLog { id: 0, .. }),
+            "the gap must name the source that lost data"
+        );
+        assert_eq!(gap, SubscriberStreamGap::Lagged { skipped: 3 });
+        assert_eq!(gap.skipped(), Some(3));
+
+        // The surviving notifications still arrive after the gap is reported.
+        assert!(matches!(
+            stream.next().await,
+            Some(SubscriberEvent::Log { .. })
+        ));
+        assert_eq!(counters.snapshot().lagged_notifications(), 3);
+        assert_eq!(counters.snapshot().undecodable_notifications(), 0);
+    }
+
+    /// An unreadable payload is lost data, not a skippable curiosity: a filter's
+    /// matched set cannot be called complete while one notification is opaque.
+    #[tokio::test]
+    async fn undecodable_notification_fails_closed_as_a_gap() {
+        let counters = Arc::new(SubscriberStreamGapCounters::default());
+        let (tx, subscription) = wired_subscription(8);
+        tx.send(raw_json(&serde_json::json!({"not": "a log"})))
+            .expect("receiver alive");
+        tx.send(wire_log(101, 0)).expect("receiver alive");
+        let mut stream = gap_stream(subscription, log_source(0), Arc::clone(&counters));
+
+        assert_eq!(
+            stream.next().await.map(|event| matches!(
+                event,
+                SubscriberEvent::StreamGap {
+                    gap: SubscriberStreamGap::Undecodable,
+                    ..
+                }
+            )),
+            Some(true),
+        );
+        assert!(matches!(
+            stream.next().await,
+            Some(SubscriberEvent::Log { .. })
+        ));
+        let stats = counters.snapshot();
+        assert_eq!(stats.undecodable_notifications(), 1);
+        assert_eq!(stats.lagged_notifications(), 0);
+        assert_eq!(stats.total_gaps(), 1);
+    }
+
+    /// A closed channel is a disconnect, not a gap: it must still end the stream
+    /// so the existing reconnect path runs unchanged.
+    #[tokio::test]
+    async fn closed_channel_terminates_the_stream_for_reconnect() {
+        let counters = Arc::new(SubscriberStreamGapCounters::default());
+        let (tx, subscription) = wired_subscription(8);
+        tx.send(wire_log(101, 0)).expect("receiver alive");
+        drop(tx);
+        let mut stream = gap_stream(subscription, log_source(0), Arc::clone(&counters));
+
+        assert!(matches!(
+            stream.next().await,
+            Some(SubscriberEvent::Log { .. })
+        ));
+        assert!(
+            matches!(
+                stream.next().await,
+                Some(SubscriberEvent::StreamTerminated(
+                    SubscriberStreamSource::PubSubLog { id: 0, .. }
+                ))
+            ),
+            "a closed subscription must terminate, not report a gap"
+        );
+        assert_eq!(counters.snapshot().total_gaps(), 0);
+    }
+
+    fn mocked_subscriber(
+        asserter: Asserter,
+    ) -> AlloySubscriber<impl alloy_provider::Provider<Ethereum> + Clone, Ethereum> {
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        AlloySubscriber::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig::default(),
+        )
+    }
+
+    /// A canonical log gap refetches the source's window from its delivery
+    /// anchor to the current head, and charges the requests to `GapBackfill` so
+    /// backpressure loss is distinguishable from reconnect churn.
+    #[tokio::test]
+    async fn log_gap_refetches_the_missed_window_and_attributes_it() {
+        let asserter = Asserter::new();
+        asserter.push_success(&U256::from(104)); // eth_blockNumber
+        asserter.push_success(&vec![
+            serde_json::from_str::<Log>(wire_log(103, 0).get()).expect("log"),
+        ]);
+        let mut subscriber = mocked_subscriber(asserter.clone());
+        subscriber.chain_id = Some(1);
+        // The source has delivered through block 102.
+        subscriber.last_seen_log_blocks.insert(0, 102);
+
+        let event = subscriber
+            .recover_stream_gap(&log_source(0), SubscriberStreamGap::Lagged { skipped: 2 })
+            .await
+            .expect("a bounded window is recoverable");
+
+        assert!(
+            matches!(
+                event,
+                Some(SubscriberEvent::BackfilledLogs { source_id: 0, ref logs }) if logs.len() == 1
+            ),
+            "the missed window is delivered as backfill"
+        );
+        let stats = subscriber.rpc_stats();
+        assert_eq!(
+            stats.by_cause(SubscriberRpcCause::GapBackfill),
+            2,
+            "one head read plus one bounded eth_getLogs"
+        );
+        assert_eq!(
+            stats.by_cause(SubscriberRpcCause::ReconnectBackfill),
+            0,
+            "a live-stream gap is not reconnect churn"
+        );
+        assert_eq!(subscriber.stream_gap_stats().log_gaps_healed(), 1);
+        assert!(asserter.read_q().is_empty());
+    }
+
+    /// Without a delivery anchor the missed range has no lower bound. Continuing
+    /// would mean knowing logs were lost and doing nothing, so this fails closed.
+    #[tokio::test]
+    async fn log_gap_without_a_delivery_anchor_fails_closed() {
+        let mut subscriber = mocked_subscriber(Asserter::new());
+        subscriber.chain_id = Some(1);
+
+        let Err(error) = subscriber
+            .recover_stream_gap(&log_source(0), SubscriberStreamGap::Lagged { skipped: 9 })
+            .await
+        else {
+            panic!("an unbounded gap must not be silently ignored");
+        };
+
+        assert!(
+            matches!(&error, SubscriberError::Provider(message)
+                if message.contains("delivery anchor") && message.contains("lagged(9)")),
+            "the error must name the cause and the loss: {error}"
+        );
+        assert_eq!(subscriber.stream_gap_stats().log_gaps_healed(), 0);
+    }
+
+    /// Header gaps are recovered by the consumer's parent-lineage walk, so they
+    /// are counted rather than refetched — no provider request is spent.
+    #[tokio::test]
+    async fn header_gap_is_counted_without_spending_a_request() {
+        let asserter = Asserter::new();
+        let mut subscriber = mocked_subscriber(asserter.clone());
+        subscriber.chain_id = Some(1);
+
+        let event = subscriber
+            .recover_stream_gap(
+                &SubscriberStreamSource::PubSubBlockHeaders,
+                SubscriberStreamGap::Lagged { skipped: 1 },
+            )
+            .await
+            .expect("a header gap is not fatal");
+
+        assert!(event.is_none(), "no synthetic header is fabricated");
+        assert_eq!(subscriber.stream_gap_stats().header_gaps(), 1);
+        assert_eq!(
+            subscriber.rpc_stats().total(),
+            0,
+            "the lineage walk already covers this; refetching would duplicate it"
+        );
+        assert!(asserter.read_q().is_empty());
+    }
+
+    /// A punctured pre-confirmation must never be published: the speculative
+    /// snapshot is discarded and the next complete generation replaces it.
+    #[tokio::test]
+    async fn preconfirmation_gap_discards_the_speculative_snapshot() {
+        let mut subscriber = mocked_subscriber(Asserter::new());
+        subscriber.chain_id = Some(8_453);
+
+        let event = subscriber
+            .recover_stream_gap(
+                &SubscriberStreamSource::BasePendingLog {
+                    id: 0,
+                    filter: Filter::new(),
+                },
+                SubscriberStreamGap::Undecodable,
+            )
+            .await
+            .expect("a preview gap is recoverable by discarding it");
+
+        assert!(
+            matches!(event, Some(SubscriberEvent::FlashblockInvalidated)),
+            "the incomplete preview must be invalidated, not delivered"
+        );
+        assert_eq!(subscriber.stream_gap_stats().preconfirmation_gaps(), 1);
+        assert_eq!(subscriber.rpc_stats().total(), 0);
+    }
+
+    /// Gap counters are diagnostics and must not perturb the delivery path.
+    #[tokio::test]
+    async fn resetting_gap_stats_opens_a_new_window() {
+        let counters = Arc::new(SubscriberStreamGapCounters::default());
+        counters.record_gap(SubscriberStreamGap::Lagged { skipped: 4 });
+        counters.record_gap(SubscriberStreamGap::Undecodable);
+        counters.record_header_gap();
+        assert_eq!(counters.snapshot().total_gaps(), 5);
+
+        counters.reset();
+
+        assert_eq!(counters.snapshot(), SubscriberStreamGapStats::default());
+    }
+
+    /// Labels are part of the diagnostic contract for a metrics export.
+    #[test]
+    fn gap_labels_are_stable() {
+        assert_eq!(
+            SubscriberStreamGap::Lagged { skipped: 7 }.as_str(),
+            "lagged"
+        );
+        assert_eq!(SubscriberStreamGap::Undecodable.as_str(), "undecodable");
+        assert_eq!(
+            SubscriberStreamGap::Lagged { skipped: 7 }.to_string(),
+            "lagged(7)"
+        );
+        assert_eq!(SubscriberRpcCause::GapBackfill.as_str(), "gap_backfill");
+        assert_eq!(SubscriberStreamGap::Undecodable.skipped(), None);
+    }
+}
+
+/// The attestation must never outrun what the subscriber actually observed
+/// whole. These tests drive the watermark directly, because the interesting
+/// cases are the ones where it must *refuse* to advance.
+#[cfg(all(test, feature = "reactive-ws"))]
+mod log_coverage_attestation_tests {
+    use super::*;
+    use alloy_provider::ProviderBuilder;
+    use alloy_rpc_types_eth::Header as RpcHeader;
+    use alloy_transport::mock::Asserter;
+
+    fn header_record(number: u64) -> ReactiveInputRecord<Ethereum> {
+        block_header_input_record::<Ethereum>(RpcHeader {
+            hash: B256::repeat_byte(number as u8),
+            inner: alloy_consensus::Header {
+                number,
+                parent_hash: B256::repeat_byte((number - 1) as u8),
+                timestamp: 1_700_000_000 + number,
+                ..alloy_consensus::Header::default()
+            },
+            total_difficulty: None,
+            size: None,
+        })
+    }
+
+    fn subscriber(
+        mode: SubscriberMode,
+        with_log_interest: bool,
+    ) -> AlloySubscriber<impl alloy_provider::Provider<Ethereum> + Clone, Ethereum> {
+        let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
+        let mut subscriber = AlloySubscriber::new(provider, mode, SubscriberConfig::default());
+        if with_log_interest {
+            subscriber.interests = vec![ReactiveInterest::Logs(LogInterest {
+                provider_filter: Filter::new().address(Address::repeat_byte(0x77)),
+                local_matcher: None,
+                route_key: None,
+            })];
+        }
+        subscriber
+    }
+
+    fn queued_coverage(
+        subscriber: &mut AlloySubscriber<impl alloy_provider::Provider<Ethereum> + Clone, Ethereum>,
+    ) -> Vec<u64> {
+        subscriber.queue_log_coverage_attestation();
+        subscriber
+            .pending_chain_controls
+            .drain(..)
+            .filter_map(|control| match control {
+                ChainControl::LogCoverage(block) => Some(block.number),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn attestation_advances_with_observed_canonical_headers() {
+        let mut subscriber = subscriber(SubscriberMode::PubSub, true);
+
+        subscriber.note_attestable_canonical_block(&header_record(101));
+        assert_eq!(queued_coverage(&mut subscriber), vec![101]);
+
+        // Re-attesting the same block says nothing new and must not be emitted.
+        assert!(queued_coverage(&mut subscriber).is_empty());
+
+        subscriber.note_attestable_canonical_block(&header_record(102));
+        assert_eq!(queued_coverage(&mut subscriber), vec![102]);
+    }
+
+    /// The safety property: a gap discovered after a header was observed must
+    /// withdraw that header's candidacy. Attesting it would tell the consumer a
+    /// block was whole on the strength of an observation made before the loss
+    /// was known.
+    #[test]
+    fn a_detected_gap_withdraws_the_pending_attestation() {
+        let mut subscriber = subscriber(SubscriberMode::PubSub, true);
+        subscriber.note_attestable_canonical_block(&header_record(101));
+
+        subscriber.reset_log_attestation();
+
+        assert!(
+            queued_coverage(&mut subscriber).is_empty(),
+            "a withdrawn candidate must not be attested"
+        );
+
+        // Only a header observed after the gap re-establishes the watermark.
+        subscriber.note_attestable_canonical_block(&header_record(102));
+        assert_eq!(queued_coverage(&mut subscriber), vec![102]);
+    }
+
+    /// A withdrawn candidate must not let a *lower* block be attested later
+    /// either — the watermark is monotonic at the source, not just downstream.
+    #[test]
+    fn attestation_never_regresses_after_a_gap() {
+        let mut subscriber = subscriber(SubscriberMode::PubSub, true);
+        subscriber.note_attestable_canonical_block(&header_record(105));
+        assert_eq!(queued_coverage(&mut subscriber), vec![105]);
+
+        subscriber.reset_log_attestation();
+        subscriber.note_attestable_canonical_block(&header_record(103));
+
+        assert!(
+            queued_coverage(&mut subscriber).is_empty(),
+            "an older block must never be attested after a newer one"
+        );
+    }
+
+    /// The polling transport's watcher cannot observe a dropped notification, so
+    /// it must neither claim the capability nor emit the control.
+    #[test]
+    #[cfg(feature = "reactive-polling")]
+    fn polling_transport_neither_claims_nor_emits_the_attestation() {
+        let mut subscriber = subscriber(SubscriberMode::Polling, true);
+        assert!(!subscriber.attests_log_coverage());
+
+        subscriber.note_attestable_canonical_block(&header_record(101));
+
+        assert!(queued_coverage(&mut subscriber).is_empty());
+        assert!(
+            !EventSubscriber::capabilities(&subscriber)
+                .supports(SubscriberCapability::LogCoverageAttestation)
+        );
+    }
+
+    #[test]
+    fn pubsub_transport_claims_the_capability() {
+        let subscriber = subscriber(SubscriberMode::PubSub, true);
+        assert!(
+            EventSubscriber::capabilities(&subscriber)
+                .supports(SubscriberCapability::LogCoverageAttestation)
+        );
+    }
+
+    /// Nothing to attest about without log interests, so stay silent rather than
+    /// emit a vacuously true watermark a consumer might lean on.
+    #[test]
+    fn subscriber_without_log_interests_stays_silent() {
+        let mut subscriber = subscriber(SubscriberMode::PubSub, false);
+        assert!(!subscriber.attests_log_coverage());
+
+        subscriber.note_attestable_canonical_block(&header_record(101));
+
+        assert!(queued_coverage(&mut subscriber).is_empty());
+    }
+}
+
+/// The canonical head poll exists because a Flashblocks endpoint's `newHeads`
+/// may carry partial heads — but a fixed interval spends a request whether or
+/// not anything sealed. These tests pin that a certification driven by the
+/// flashblock stream suppresses the redundant tick, and that the timer still
+/// works unaided when no such signal exists.
+#[cfg(all(test, feature = "reactive-ws"))]
+mod canonical_head_suppression_tests {
+    use super::*;
+    use alloy_provider::ProviderBuilder;
+    use alloy_rpc_types_eth::{Block, Header as RpcHeader};
+    use alloy_transport::mock::Asserter;
+
+    fn sealed_head(number: u64) -> Block {
+        Block::empty(RpcHeader {
+            hash: B256::repeat_byte(number as u8),
+            inner: alloy_consensus::Header {
+                number,
+                parent_hash: B256::repeat_byte((number - 1) as u8),
+                timestamp: 1_700_000_000 + number,
+                ..alloy_consensus::Header::default()
+            },
+            total_difficulty: None,
+            size: None,
+        })
+    }
+
+    fn subscriber(
+        asserter: Asserter,
+    ) -> AlloySubscriber<impl alloy_provider::Provider<Ethereum> + Clone, Ethereum> {
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig::default(),
+        );
+        subscriber.chain_id = Some(8_453);
+        subscriber.interests = vec![ReactiveInterest::Blocks(BlockInterest::default())];
+        subscriber
+    }
+
+    /// A tick inside the window after a certification issues no request. This is
+    /// the whole saving: on a chain whose blocks seal faster than the interval,
+    /// most ticks cost nothing.
+    #[tokio::test]
+    async fn a_tick_inside_the_window_after_a_certification_costs_nothing() {
+        let asserter = Asserter::new();
+        asserter.push_success(&Some(sealed_head(101)));
+        let mut subscriber = subscriber(asserter.clone());
+
+        // One real certification, as the flashblock stream would drive.
+        let certified = subscriber
+            .certify_canonical_head_on_sealed_block()
+            .await
+            .expect("certification succeeds");
+        assert!(matches!(certified, Some(SubscriberEvent::BlockHeader(_))));
+
+        // A tick immediately afterwards is inside the poll window.
+        assert!(subscriber.canonical_head_certification_is_current());
+        let suppressed = subscriber
+            .certify_canonical_head_on_sealed_block()
+            .await
+            .expect("a suppressed certification is not an error");
+
+        assert!(suppressed.is_none());
+        assert_eq!(
+            subscriber.rpc_stats().get(
+                SubscriberRpcCause::CanonicalHeadCertification,
+                SubscriberRpcMethod::EthGetBlockByNumber,
+            ),
+            1,
+            "only the first certification may spend a request"
+        );
+        assert!(
+            asserter.read_q().is_empty(),
+            "the suppressed call must not consume a queued response"
+        );
+    }
+
+    /// Once the window lapses the certification runs again, so a stalled
+    /// flashblock stream degrades to the previous polling behaviour rather than
+    /// to silence.
+    #[tokio::test]
+    async fn certification_resumes_once_the_window_lapses() {
+        let asserter = Asserter::new();
+        asserter.push_success(&Some(sealed_head(101)));
+        asserter.push_success(&Some(sealed_head(102)));
+        let mut subscriber = subscriber(asserter.clone());
+
+        let _ = subscriber
+            .certify_canonical_head_on_sealed_block()
+            .await
+            .expect("first certification");
+
+        // Age the record past the poll interval.
+        subscriber.last_canonical_head_certification = Some(
+            Instant::now()
+                - subscriber.config.canonical_head_poll_interval
+                - Duration::from_millis(1),
+        );
+        assert!(!subscriber.canonical_head_certification_is_current());
+
+        let second = subscriber
+            .certify_canonical_head_on_sealed_block()
+            .await
+            .expect("second certification");
+
+        assert!(matches!(second, Some(SubscriberEvent::BlockHeader(_))));
+        assert_eq!(
+            subscriber
+                .rpc_stats()
+                .by_cause(SubscriberRpcCause::CanonicalHeadCertification),
+            2
+        );
+        assert!(asserter.read_q().is_empty());
+    }
+
+    /// A subscriber with no block-header interest has no head to certify, so the
+    /// signal must not manufacture a request.
+    #[tokio::test]
+    async fn without_a_header_interest_nothing_is_certified() {
+        let asserter = Asserter::new();
+        let mut subscriber = subscriber(asserter.clone());
+        subscriber.interests = Vec::new();
+
+        let certified = subscriber
+            .certify_canonical_head_on_sealed_block()
+            .await
+            .expect("no interest is not an error");
+
+        assert!(certified.is_none());
+        assert_eq!(subscriber.rpc_stats().total(), 0);
+        assert!(asserter.read_q().is_empty());
+    }
 }
