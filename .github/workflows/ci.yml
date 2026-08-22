@@ -7,81 +7,130 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  TRANSPORT_REF: 7868bea593dec5748ad7475d1909fc3a2de0d4ad
 
 permissions:
   contents: read
-  checks: write
+
+defaults:
+  run:
+    working-directory: evm-fork-cache
 
 jobs:
   check:
     name: release gates
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Check out cache
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          path: evm-fork-cache
+          fetch-depth: 0
+
+      - name: Check out exact transport candidate
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: KaiCode2/alloy-transport-balancer
+          ref: ${{ env.TRANSPORT_REF }}
+          path: alloy-transport-balancer
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
+          toolchain: stable
           components: clippy, rustfmt
 
       - name: Cache cargo artifacts
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: evm-fork-cache -> target
+
+      - name: Authoring hygiene
+        run: bash scripts/check-authoring-hygiene.sh
 
       - name: Formatting
         run: cargo fmt --all --check
 
+      - name: Diff hygiene
+        run: git diff --check
+
       - name: Clippy (all features)
-        run: cargo clippy --all-targets --all-features --no-deps -- -D warnings
+        run: cargo clippy --locked --all-targets --all-features --no-deps -- -D warnings
 
       - name: Tests (all targets, all features)
-        run: cargo test --all-targets --all-features
+        run: cargo test --locked --all-targets --all-features
 
       - name: Doc tests (all features)
-        run: cargo test --doc --all-features
+        run: cargo test --locked --doc --all-features
 
       - name: Docs (all features)
-        run: cargo doc --no-deps --all-features
+        run: cargo doc --locked --no-deps --all-features
         env:
           RUSTDOCFLAGS: "-D warnings"
 
       # --all-features enables reactive-ws, which shadows the polling-only and
       # no-reactive cfg branches. Exercise those distinct compile paths too so a
       # feature-gated regression cannot slip through.
-      - name: Feature matrix (polling-only + no-reactive core)
+      - name: Feature matrix
         run: |
-          cargo clippy --all-targets --no-default-features --features reactive-polling --no-deps -- -D warnings
-          cargo test --no-default-features --features reactive-polling
-          cargo build --no-default-features
+          cargo check --locked --no-default-features
+          cargo check --locked --no-default-features --features reactive
+          cargo check --locked --no-default-features --features reactive-polling
+          cargo check --locked --no-default-features --features reactive-ws
+          cargo check --locked --no-default-features --features raw-flashblocks-json
+          cargo clippy --locked --all-targets --no-default-features --features reactive-polling --no-deps -- -D warnings
+          cargo test --locked --no-default-features --features reactive-polling
+          cargo clippy --locked --lib --test raw_json_flashblocks --no-default-features --features raw-flashblocks-json --no-deps -- -D warnings
+          cargo test --locked --no-default-features --features raw-flashblocks-json --test raw_json_flashblocks
+          cargo test --locked --no-default-features --features raw-flashblocks-json,reactive-polling --test raw_json_flashblocks_runtime
 
       - name: Benchmarks compile
-        run: cargo bench --no-run --all-features
+        run: cargo bench --locked --no-run --all-features
 
       - name: Package
         run: cargo package --locked
 
+      - name: Verify security-exception scopes
+        run: bash scripts/check-security-exceptions.sh
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked --version 0.22.2
+
       - name: Security audit
-        uses: rustsec/audit-check@v2.0.0
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          # ark-relations records tracing-subscriber 0.2.25 as an optional
-          # dependency, but it is absent from the active all-target/all-feature
-          # graph (`cargo tree -i tracing-subscriber@0.2.25 --target all`).
-          ignore: RUSTSEC-2025-0055
+        # The scope script requires the exact unreachable 0.2.25 lock entry and
+        # proves every active tracing-subscriber is patched (>= 0.3.20).
+        run: cargo audit --ignore RUSTSEC-2025-0055
 
   msrv:
-    name: msrv (1.88)
+    name: msrv (1.90)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Check out cache
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          path: evm-fork-cache
 
-      - name: Install Rust 1.88 (declared MSRV)
-        uses: dtolnay/rust-toolchain@1.88.0
+      - name: Check out exact transport candidate
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: KaiCode2/alloy-transport-balancer
+          ref: ${{ env.TRANSPORT_REF }}
+          path: alloy-transport-balancer
+
+      - name: Install Rust 1.90 (declared MSRV)
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: 1.90.0
 
       - name: Cache cargo artifacts
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: evm-fork-cache -> target
 
       # The published library must build on the MSRV advertised in Cargo.toml.
       # Scoped to --lib so the dev-only example/bench toolchain requirements
       # (e.g. criterion) do not constrain the consumer-facing MSRV.
       - name: Check library builds on MSRV
-        run: cargo check --lib --locked
+        run: |
+          cargo check --lib --locked
+          cargo check --lib --locked --no-default-features --features raw-flashblocks-json

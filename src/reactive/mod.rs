@@ -20,12 +20,13 @@ use std::{
     hash::Hash,
     marker::PhantomData,
     num::NonZeroU64,
+    path::PathBuf,
     pin::Pin,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use alloy_consensus::{BlockHeader as _, Transaction as _};
@@ -37,22 +38,40 @@ use alloy_network::{
         TransactionResponse as TransactionResponseTrait,
     },
 };
-use alloy_primitives::{Address, B256, Bytes, U256};
-use alloy_provider::Provider;
+use alloy_primitives::{Address, B256, Bytes, FixedBytes, Keccak256, U256};
+use alloy_provider::{Provider, RootProvider};
+use alloy_rpc_client::BatchRequest;
 use alloy_rpc_types_eth::{Filter, FilterSet, Log};
-#[cfg(any(feature = "reactive-ws", feature = "reactive-polling", test))]
+pub use alloy_transport_balancer::EndpointId;
+use bincode::Options;
 use futures::{StreamExt, stream};
 use futures::{
-    future::{Either, poll_fn, select, try_join_all},
-    stream::BoxStream,
+    future::{Either, poll_fn, select},
+    stream::{BoxStream, FuturesUnordered},
 };
+#[cfg(feature = "reactive-ws")]
+use tokio::sync::broadcast;
 
 use crate::{
-    cache::{AccountProof, BlockStateDiff, EvmCache},
+    cache::{
+        AccountProof, BlockStateDiff, DurableCheckpointBlock, DurableCheckpointError,
+        DurableCheckpointIdentity, DurableCheckpointMetadata, DurableCheckpointStore, EvmCache,
+        EvmCacheStateSnapshot, LoadedDurableCheckpoint,
+    },
     errors::{BlockContextError, StorageFetchResult},
     events::{EventDecoder, StateView},
     freshness::FreshnessRegistry,
     state_update::{AccountPatch, PurgeScope, StateDiff, StateUpdate},
+};
+
+#[cfg(feature = "raw-flashblocks-json")]
+mod raw_json_flashblocks;
+#[cfg(feature = "raw-flashblocks-json")]
+pub use raw_json_flashblocks::{
+    BufferedRawJsonFlashblocksAdapter, FlashblockInvalidation, FlashblockInvalidationReason,
+    FlashblockSnapshot, FlashblockUpdate, FlashblockUpdateAcknowledgement,
+    FlashblockUpdateChannelError, FlashblockUpdateSender, RawJsonFlashblocksAdapter,
+    RawJsonFlashblocksError, RawJsonFlashblocksLimits, TimedFlashblockUpdate,
 };
 
 /// Input accepted by the reactive runtime.
@@ -71,7 +90,7 @@ pub enum ReactiveInput<N: Network = Ethereum> {
 }
 
 /// Context supplied with each [`ReactiveInput`].
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ReactiveContext {
     /// Chain id, when known.
     pub chain_id: Option<u64>,
@@ -88,7 +107,7 @@ pub struct ReactiveContext {
 }
 
 /// Minimal block identity carried through reports.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct BlockRef {
     /// Block number.
     pub number: u64,
@@ -100,11 +119,848 @@ pub struct BlockRef {
     pub timestamp: Option<u64>,
 }
 
-/// Lifecycle status for an input.
+/// Stable provider identity attached to provider-originated input.
+///
+/// `generation` changes whenever a caller replaces or reconnects the concrete
+/// provider session behind the same configured endpoint. Follow-up reads can
+/// use this value to prefer the exact source that announced speculative state
+/// without putting URLs or credentials into event payloads.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct ProviderRef {
+    /// Operator-defined endpoint identity.
+    pub endpoint: EndpointId,
+    /// Concrete connection/session generation.
+    pub generation: u64,
+}
+
+impl ProviderRef {
+    /// Construct provider provenance for one connection generation.
+    pub fn new(endpoint: impl Into<EndpointId>, generation: u64) -> Self {
+        Self {
+            endpoint: endpoint.into(),
+            generation,
+        }
+    }
+}
+
+/// Process-local monotonic time at which a Flashblock source item first
+/// entered the typed subscriber boundary.
+///
+/// This metadata never participates in Flashblock identity, ordering,
+/// canonical state, or execution authority.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FlashblockIngressTiming {
+    source_ingress: Instant,
+}
+
+impl FlashblockIngressTiming {
+    /// Bind a source item to its earliest process-local typed arrival.
+    pub const fn new(source_ingress: Instant) -> Self {
+        Self { source_ingress }
+    }
+
+    /// Earliest process-local typed arrival for the source item.
+    pub const fn source_ingress(self) -> Instant {
+        self.source_ingress
+    }
+
+    /// Retain the earliest contributing source arrival.
+    pub fn earliest(self, other: Self) -> Self {
+        Self::new(self.source_ingress.min(other.source_ingress))
+    }
+}
+
+/// Identity of one cumulative pre-confirmed Flashblock snapshot.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct FlashblockRef {
+    /// Provider session that supplied this snapshot.
+    pub provider: ProviderRef,
+    /// Sequencer payload id shared by every Flashblock in the full block.
+    ///
+    /// Some provider wire shapes omit this indexed-payload identifier.
+    pub payload_id: Option<FixedBytes<8>>,
+    /// Zero-based Flashblock index, when exposed by the endpoint.
+    pub index: Option<u64>,
+    /// Pending block number represented by this cumulative snapshot.
+    pub block_number: u64,
+    /// Provider-generation-scoped commitment to this exact cumulative view.
+    ///
+    /// This is deliberately not a canonical or provider-reported block hash.
+    /// It remains non-zero even when a pending endpoint uses the zero hash
+    /// placeholder permitted by the Flashblocks specification.
+    pub content_hash: B256,
+    /// Non-placeholder partial block hash reported by the provider, when any.
+    pub partial_block_hash: Option<B256>,
+    /// Canonical parent of the pending block, when exposed.
+    pub parent_hash: Option<B256>,
+    /// State root after this cumulative snapshot, when exposed.
+    pub state_root: Option<B256>,
+    /// Transaction-trie root committed by a cumulative block-shaped preview.
+    pub transactions_root: Option<B256>,
+    /// Ordered cumulative transaction membership for this preview.
+    pub transaction_hashes: Vec<B256>,
+    /// Pending block timestamp, when exposed.
+    pub timestamp: Option<u64>,
+    /// Pending EIP-1559 base fee, when exposed.
+    pub base_fee_per_gas: Option<u64>,
+    /// Pending block beneficiary / fee recipient, when exposed.
+    pub beneficiary: Option<Address>,
+    /// Pending block randomness value, when exposed.
+    pub prevrandao: Option<B256>,
+    /// Pending block gas limit, when exposed.
+    pub gas_limit: Option<u64>,
+}
+
+impl FlashblockRef {
+    /// Convert the pre-confirmed identity into the block metadata used by
+    /// ordinary log routing. The hash is the provider-generation-scoped
+    /// [`content_hash`](Self::content_hash), never a canonical block hash, and
+    /// must not advance canonical coverage.
+    pub const fn block_ref(&self) -> BlockRef {
+        BlockRef {
+            number: self.block_number,
+            hash: self.content_hash,
+            parent_hash: self.parent_hash,
+            timestamp: self.timestamp,
+        }
+    }
+
+    /// Whether the cumulative preview contains `transaction_hash`.
+    pub fn contains_transaction(&self, transaction_hash: &B256) -> bool {
+        self.transaction_hashes.contains(transaction_hash)
+    }
+
+    fn transaction_index(&self, transaction_hash: &B256) -> Option<u64> {
+        self.transaction_hashes
+            .iter()
+            .position(|candidate| candidate == transaction_hash)
+            .and_then(|index| u64::try_from(index).ok())
+    }
+
+    fn same_payload(&self, other: &Self) -> bool {
+        self.provider == other.provider
+            && match (self.payload_id, other.payload_id) {
+                (Some(left), Some(right)) => left == right,
+                _ => {
+                    self.block_number == other.block_number && self.parent_hash == other.parent_hash
+                }
+            }
+    }
+
+    /// Whether two cumulative previews bind the same pending-block base
+    /// fields, excluding payload index, cumulative transactions, and derived
+    /// content commitments.
+    ///
+    /// This provider-free predicate lets applications retain lineage metadata
+    /// only across snapshots that cannot have crossed a pending-block
+    /// replacement boundary. It grants no canonical or execution authority.
+    #[cfg(feature = "raw-flashblocks-json")]
+    pub fn same_base_identity(&self, other: &Self) -> bool {
+        self.block_number == other.block_number
+            && self.parent_hash == other.parent_hash
+            && self.timestamp == other.timestamp
+            && self.base_fee_per_gas == other.base_fee_per_gas
+            && self.beneficiary == other.beneficiary
+            && self.prevrandao == other.prevrandao
+            && self.gas_limit == other.gas_limit
+    }
+
+    fn is_cumulative_successor_of(&self, previous: &Self) -> bool {
+        self.same_payload(previous)
+            && self.transaction_hashes.len() >= previous.transaction_hashes.len()
+            && self
+                .transaction_hashes
+                .starts_with(&previous.transaction_hashes)
+            && match (previous.index, self.index) {
+                (Some(previous), Some(current)) => current >= previous,
+                _ => true,
+            }
+    }
+}
+
+/// Whether the subscriber may use Flashblocks for speculative delivery.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum PreconfirmationMode {
+    /// Use only canonical subscription/polling behavior.
+    #[default]
+    Disabled,
+    /// Prefer Flashblocks, but retain canonical operation when the selected
+    /// chain/provider cannot establish the pre-confirmation stream.
+    Preferred,
+    /// Fail setup/reconnect closed unless Flashblocks can be established.
+    Required,
+}
+
+/// Indexed OP Stack `newFlashblocks` subscription payload.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
+pub struct BaseFlashblockPayload {
+    /// Block-builder payload id shared by every incremental snapshot.
+    pub payload_id: FixedBytes<8>,
+    /// Zero-based incremental snapshot index.
+    pub index: u64,
+    /// Header fields present on index zero.
+    pub base: Option<BaseFlashblockBase>,
+    /// Cumulative state commitments for this snapshot.
+    pub diff: BaseFlashblockDiff,
+    /// Supplemental block identity retained across current Base versions.
+    #[serde(default)]
+    pub metadata: Option<BaseFlashblockMetadata>,
+}
+
+/// Stable index-zero header subset from Base's Flashblocks wire format.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
+pub struct BaseFlashblockBase {
+    /// Canonical parent block hash.
+    pub parent_hash: B256,
+    /// Pending block number.
+    #[serde(deserialize_with = "deserialize_rpc_u64")]
+    pub block_number: u64,
+    /// Pending block timestamp.
+    #[serde(deserialize_with = "deserialize_rpc_u64")]
+    pub timestamp: u64,
+    /// Pending block gas limit.
+    #[serde(default, deserialize_with = "deserialize_optional_rpc_u64")]
+    pub gas_limit: Option<u64>,
+    /// Pending EIP-1559 base fee.
+    #[serde(default, deserialize_with = "deserialize_optional_rpc_u64")]
+    pub base_fee_per_gas: Option<u64>,
+    /// Pending block beneficiary / fee recipient.
+    #[serde(default, alias = "fee_recipient", alias = "feeRecipient")]
+    pub beneficiary: Option<Address>,
+    /// Pending block randomness value.
+    #[serde(
+        default,
+        alias = "prev_randao",
+        alias = "prevRandao",
+        alias = "mixHash"
+    )]
+    pub prevrandao: Option<B256>,
+}
+
+/// Stable commitment subset from Base's Flashblocks wire format.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
+pub struct BaseFlashblockDiff {
+    /// State root after this cumulative snapshot.
+    pub state_root: B256,
+    /// Partial block hash after this cumulative snapshot.
+    pub block_hash: B256,
+    /// Transactions added by this indexed Flashblock diff.
+    #[serde(default)]
+    pub transactions: Vec<serde_json::Value>,
+    /// Transaction root when exposed by the provider.
+    #[serde(default)]
+    pub transactions_root: Option<B256>,
+}
+
+/// Stable metadata subset used when index-greater-than-zero payloads omit the
+/// Base header object.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
+pub struct BaseFlashblockMetadata {
+    /// Pending block number (currently encoded as a JSON integer).
+    #[serde(deserialize_with = "deserialize_rpc_u64")]
+    pub block_number: u64,
+}
+
+/// Cumulative block-shaped `newFlashblocks` wire shape used by some OP Stack
+/// providers.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BaseFlashblockBlockPayload {
+    hash: B256,
+    #[serde(deserialize_with = "deserialize_rpc_u64")]
+    number: u64,
+    parent_hash: B256,
+    state_root: B256,
+    #[serde(default)]
+    transactions_root: Option<B256>,
+    #[serde(default)]
+    transactions: Vec<serde_json::Value>,
+    #[serde(deserialize_with = "deserialize_rpc_u64")]
+    timestamp: u64,
+    #[serde(default, deserialize_with = "deserialize_optional_rpc_u64")]
+    base_fee_per_gas: Option<u64>,
+    #[serde(default, alias = "beneficiary", alias = "feeRecipient")]
+    miner: Option<Address>,
+    #[serde(default, alias = "prevRandao")]
+    mix_hash: Option<B256>,
+    #[serde(default, deserialize_with = "deserialize_optional_rpc_u64")]
+    gas_limit: Option<u64>,
+}
+
+/// OP Stack providers expose either an indexed diff envelope or a cumulative
+/// block-shaped envelope for `newFlashblocks`. Accept both so provider rollout
+/// differences do not force callers onto separate subscriber paths.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
+#[serde(untagged)]
+enum BaseFlashblockWirePayload {
+    Indexed(BaseFlashblockPayload),
+    Block(BaseFlashblockBlockPayload),
+}
+
+fn deserialize_rpc_u64<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum RpcU64 {
+        Number(u64),
+        String(String),
+    }
+
+    match <RpcU64 as serde::Deserialize>::deserialize(deserializer)? {
+        RpcU64::Number(number) => Ok(number),
+        RpcU64::String(value) => {
+            let value = value.strip_prefix("0x").unwrap_or(&value);
+            u64::from_str_radix(value, 16).map_err(serde::de::Error::custom)
+        }
+    }
+}
+
+fn deserialize_optional_rpc_u64<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum RpcU64 {
+        Number(u64),
+        String(String),
+    }
+
+    let Some(value) = <Option<RpcU64> as serde::Deserialize>::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+    match value {
+        RpcU64::Number(number) => Ok(Some(number)),
+        RpcU64::String(value) => {
+            let value = value.strip_prefix("0x").unwrap_or(&value);
+            u64::from_str_radix(value, 16)
+                .map(Some)
+                .map_err(serde::de::Error::custom)
+        }
+    }
+}
+
+fn non_placeholder_hash(hash: B256) -> Option<B256> {
+    (!hash.is_zero()).then_some(hash)
+}
+
+fn flashblock_transaction_hashes(
+    transactions: &[serde_json::Value],
+) -> Result<Vec<B256>, SubscriberError> {
+    let hashes: Vec<B256> = transactions
+        .iter()
+        .map(|transaction| {
+            let value = match transaction {
+                serde_json::Value::String(value) => value.as_str(),
+                serde_json::Value::Object(object) => object
+                    .get("hash")
+                    .or_else(|| object.get("transactionHash"))
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| {
+                        SubscriberError::Provider(
+                            "Flashblock transaction object is missing its hash".into(),
+                        )
+                    })?,
+                _ => {
+                    return Err(SubscriberError::Provider(
+                        "Flashblock transaction must be a hash, raw transaction, or object".into(),
+                    ));
+                }
+            };
+            if value.len() == 66 {
+                return value.parse::<B256>().map_err(|error| {
+                    SubscriberError::Provider(format!(
+                        "Flashblock transaction hash is invalid: {error}"
+                    ))
+                });
+            }
+            let encoded = value.strip_prefix("0x").unwrap_or(value);
+            let raw = alloy_primitives::hex::decode(encoded).map_err(|error| {
+                SubscriberError::Provider(format!(
+                    "Flashblock raw transaction is invalid hex: {error}"
+                ))
+            })?;
+            Ok(alloy_primitives::keccak256(raw))
+        })
+        .collect::<Result<_, _>>()?;
+    let mut unique = HashSet::with_capacity(hashes.len());
+    if hashes.iter().any(|hash| !unique.insert(*hash)) {
+        return Err(SubscriberError::Provider(
+            "Flashblock cumulative transaction membership contains a duplicate hash".into(),
+        ));
+    }
+    Ok(hashes)
+}
+
+struct FlashblockContentCommitment<'a> {
+    provider: &'a ProviderRef,
+    payload_id: Option<FixedBytes<8>>,
+    index: Option<u64>,
+    block_number: u64,
+    partial_block_hash: Option<B256>,
+    parent_hash: Option<B256>,
+    state_root: Option<B256>,
+    transactions_root: Option<B256>,
+    transaction_hashes: &'a [B256],
+    timestamp: Option<u64>,
+    base_fee_per_gas: Option<u64>,
+    beneficiary: Option<Address>,
+    prevrandao: Option<B256>,
+    gas_limit: Option<u64>,
+}
+
+fn flashblock_content_hash(content: FlashblockContentCommitment<'_>) -> B256 {
+    let mut commitment = Keccak256::new();
+    commitment.update(b"evm-fork-cache/flashblock-content/v1");
+    let endpoint = content.provider.endpoint.as_str().as_bytes();
+    commitment.update((endpoint.len() as u64).to_be_bytes());
+    commitment.update(endpoint);
+    commitment.update(content.provider.generation.to_be_bytes());
+    commitment.update(content.block_number.to_be_bytes());
+    commit_optional_bytes(
+        &mut commitment,
+        content.payload_id.as_ref().map(FixedBytes::as_slice),
+    );
+    commit_optional_u64(&mut commitment, content.index);
+    commit_optional_bytes(
+        &mut commitment,
+        content
+            .partial_block_hash
+            .as_ref()
+            .map(FixedBytes::as_slice),
+    );
+    commit_optional_bytes(
+        &mut commitment,
+        content.parent_hash.as_ref().map(FixedBytes::as_slice),
+    );
+    commit_optional_bytes(
+        &mut commitment,
+        content.state_root.as_ref().map(FixedBytes::as_slice),
+    );
+    commit_optional_bytes(
+        &mut commitment,
+        content.transactions_root.as_ref().map(FixedBytes::as_slice),
+    );
+    commitment.update((content.transaction_hashes.len() as u64).to_be_bytes());
+    for transaction_hash in content.transaction_hashes {
+        commitment.update(transaction_hash);
+    }
+    commit_optional_u64(&mut commitment, content.timestamp);
+    commit_optional_u64(&mut commitment, content.base_fee_per_gas);
+    commit_optional_bytes(
+        &mut commitment,
+        content
+            .beneficiary
+            .as_ref()
+            .map(|address| address.as_slice()),
+    );
+    commit_optional_bytes(
+        &mut commitment,
+        content.prevrandao.as_ref().map(FixedBytes::as_slice),
+    );
+    commit_optional_u64(&mut commitment, content.gas_limit);
+    let hash = commitment.finalize();
+    if hash.is_zero() {
+        B256::with_last_byte(1)
+    } else {
+        hash
+    }
+}
+
+#[cfg(feature = "raw-flashblocks-json")]
+fn validate_standard_flashblock_snapshot(
+    snapshot: &FlashblockSnapshot,
+) -> Result<(), SubscriberError> {
+    let flashblock = &snapshot.flashblock;
+    if flashblock.payload_id.is_none() || flashblock.index.is_none() {
+        return Err(SubscriberError::Provider(
+            "external Flashblock snapshot is missing its indexed payload identity".into(),
+        ));
+    }
+    let expected_content_hash = flashblock_content_hash(FlashblockContentCommitment {
+        provider: &flashblock.provider,
+        payload_id: flashblock.payload_id,
+        index: flashblock.index,
+        block_number: flashblock.block_number,
+        partial_block_hash: flashblock.partial_block_hash,
+        parent_hash: flashblock.parent_hash,
+        state_root: flashblock.state_root,
+        transactions_root: flashblock.transactions_root,
+        transaction_hashes: &flashblock.transaction_hashes,
+        timestamp: flashblock.timestamp,
+        base_fee_per_gas: flashblock.base_fee_per_gas,
+        beneficiary: flashblock.beneficiary,
+        prevrandao: flashblock.prevrandao,
+        gas_limit: flashblock.gas_limit,
+    });
+    if flashblock.content_hash != expected_content_hash {
+        return Err(SubscriberError::Provider(
+            "external Flashblock content commitment is invalid".into(),
+        ));
+    }
+
+    let mut transactions = HashSet::with_capacity(flashblock.transaction_hashes.len());
+    if flashblock
+        .transaction_hashes
+        .iter()
+        .any(|hash| !transactions.insert(*hash))
+    {
+        return Err(SubscriberError::Provider(
+            "external Flashblock cumulative transaction membership contains a duplicate hash"
+                .into(),
+        ));
+    }
+
+    let mut log_ids = HashSet::with_capacity(snapshot.logs.len());
+    for log in &snapshot.logs {
+        if log.removed || log.block_number != Some(flashblock.block_number) {
+            return Err(SubscriberError::Provider(
+                "external pre-confirmed log disagrees with its Flashblock block identity".into(),
+            ));
+        }
+        if log.block_hash != Some(flashblock.content_hash) {
+            return Err(SubscriberError::Provider(
+                "external pre-confirmed log is not bound to its Flashblock content commitment"
+                    .into(),
+            ));
+        }
+        let transaction_hash = log.transaction_hash.ok_or_else(|| {
+            SubscriberError::Provider(
+                "external pre-confirmed log is missing its transaction hash".into(),
+            )
+        })?;
+        let expected_transaction_index = flashblock
+            .transaction_index(&transaction_hash)
+            .ok_or_else(|| {
+                SubscriberError::Provider(
+                    "external pre-confirmed log transaction is absent from the cumulative Flashblock"
+                        .into(),
+                )
+            })?;
+        if log.transaction_index != Some(expected_transaction_index) {
+            return Err(SubscriberError::Provider(
+                "external pre-confirmed log transaction index disagrees with cumulative membership"
+                    .into(),
+            ));
+        }
+        let log_index = log.log_index.ok_or_else(|| {
+            SubscriberError::Provider("external pre-confirmed log is missing its log index".into())
+        })?;
+        if !log_ids.insert((transaction_hash, log_index)) {
+            return Err(SubscriberError::Provider(
+                "external Flashblock snapshot contains a duplicate log identity".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn commit_optional_bytes(commitment: &mut Keccak256, value: Option<&[u8]>) {
+    match value {
+        Some(value) => {
+            commitment.update([1]);
+            commitment.update((value.len() as u64).to_be_bytes());
+            commitment.update(value);
+        }
+        None => commitment.update([0]),
+    }
+}
+
+fn commit_optional_u64(commitment: &mut Keccak256, value: Option<u64>) {
+    match value {
+        Some(value) => {
+            commitment.update([1]);
+            commitment.update(value.to_be_bytes());
+        }
+        None => commitment.update([0]),
+    }
+}
+
+/// Exact chain/block identity of an RPC cache snapshot adopted as the starting
+/// point for reactive event continuity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ReactiveCanonicalBaseline {
+    /// Chain whose state the cache snapshot contains.
+    pub chain_id: u64,
+    /// Canonical block through which the snapshot already embodies state.
+    pub block: BlockRef,
+}
+
+impl ReactiveCanonicalBaseline {
+    /// Construct an exact cache snapshot baseline.
+    pub const fn new(chain_id: u64, block: BlockRef) -> Self {
+        Self { chain_id, block }
+    }
+}
+
+/// Ordered chain-lifecycle control delivered by an event subscriber.
+///
+/// Controls live inside [`ReactiveInputBatch`] so they share the same delivery
+/// token, durable checkpoint, and ordering guarantees as ordinary event data.
+/// Reorg controls are applied in declaration order before replacement records;
+/// progress, barrier, safe, and finalized controls are committed in declaration
+/// order after the records. A reorg declared after a post-record control is
+/// rejected because its ordering would otherwise be ambiguous.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
+pub enum ChainControl {
+    /// Replace the old canonical branch after `common_ancestor` with `new_tip`.
+    Reorg {
+        /// Last block common to the old and new canonical branches.
+        common_ancestor: BlockRef,
+        /// Tip of the branch that ceased to be canonical.
+        old_tip: BlockRef,
+        /// Tip of the newly canonical branch known by the source.
+        new_tip: BlockRef,
+    },
+    /// Update the source's safe head.
+    Safe(BlockRef),
+    /// Update the source's finalized head.
+    Finalized(BlockRef),
+    /// Advance authoritative canonical coverage without fabricating a full header.
+    ///
+    /// Indexers that only know compact block identity should emit this control.
+    /// It never runs block handlers. The runtime exact-hash pins provider reads
+    /// and installs known `NUMBER`/timestamp values, but clears unproven
+    /// header-only environment fields such as base fee and beneficiary.
+    CanonicalProgress(BlockRef),
+    /// Attest that no notification loss has gone unhealed on any log source at
+    /// or below this block.
+    ///
+    /// This is a *negative* guarantee, and deliberately so. A source cannot
+    /// prove from its own log stream that every matching log through block `N`
+    /// arrived — a filter that matched nothing for a hundred blocks is
+    /// indistinguishable from one whose notifications were dropped. What a
+    /// source can prove is that it detected no loss it did not repair, which is
+    /// exactly the fact a consumer cannot establish for itself.
+    ///
+    /// A consumer combines this with its own ordering evidence to decide when a
+    /// block's log set is closed. That evidence must come from the log stream
+    /// itself — a delivered log for a strictly later block — or from a positive
+    /// proof of absence such as the block's `logsBloom` excluding every
+    /// interest. A header for a later block is *not* such evidence: `newHeads`
+    /// is an independent subscription, so it establishes nothing about whether
+    /// an earlier block's logs have been delivered. Neither is a timer. Sources that cannot make this promise simply
+    /// never emit it, and advertise the absence through
+    /// [`SubscriberCapability::LogCoverageAttestation`]; that distinction is why
+    /// silence here must never be read as an attestation.
+    ///
+    /// Unlike [`Self::CanonicalProgress`] this makes no claim about chain
+    /// progress and never advances the cache's pinned block.
+    LogCoverage(BlockRef),
+    /// Ordered cutover or synchronization fence.
+    Barrier {
+        /// Subscriber-defined opaque barrier identity.
+        id: Vec<u8>,
+        /// Highest canonical event block included before the fence, if known.
+        block: Option<BlockRef>,
+    },
+}
+
+/// Provider-neutral snapshot consumed by [`validate_canonical_sequence`].
+///
+/// Composite subscribers can persist this small chain-state view beside their
+/// own delivery checkpoint and validate a complete delivery envelope before it
+/// reaches a [`ReactiveRuntime`]. The retained history may be sparse (blocks
+/// without matching events need not be present), but it must contain at most
+/// one compatible identity per height. Its oldest entry is also the durable
+/// rollback horizon: an unretained explicit ancestor is accepted only when that
+/// oldest entry is at or below the ancestor. This type carries no cache data,
+/// event payloads, handler state, or transport-specific cursor.
+///
+/// The serde representation is a convenience for caller-owned persistence; it
+/// is not a versioned wire or checkpoint format. Durable protocols should wrap
+/// it in their own versioned envelope and define migrations before upgrading
+/// this pre-1.0 crate. External callers also own retention: successful
+/// validation appends canonical identities but does not silently discard the
+/// rollback proof window. Bound it with [`Self::retain_recent_history`] after
+/// committing the matching source cursor/ACK.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CanonicalSequenceState {
+    retained_canonical_history: Vec<BlockRef>,
+    coverage_head: Option<BlockRef>,
+    safe_head: Option<BlockRef>,
+    finalized_head: Option<BlockRef>,
+    log_coverage_head: Option<BlockRef>,
+}
+
+impl CanonicalSequenceState {
+    /// Construct a validation snapshot from retained canonical metadata.
+    ///
+    /// Construction does not validate ordering, adjacency, coverage, or
+    /// finality invariants. Call [`Self::validate`] before installing decoded or
+    /// externally assembled state.
+    pub fn new(
+        retained_canonical_history: Vec<BlockRef>,
+        coverage_head: Option<BlockRef>,
+        safe_head: Option<BlockRef>,
+        finalized_head: Option<BlockRef>,
+    ) -> Self {
+        Self {
+            retained_canonical_history,
+            coverage_head,
+            safe_head,
+            finalized_head,
+            log_coverage_head: None,
+        }
+    }
+
+    /// Seed the attested log-coverage watermark.
+    ///
+    /// Kept separate from [`Self::new`] so restoring durable state that predates
+    /// log-coverage attestation stays a compile-time no-op: an absent watermark
+    /// means "no source has attested", never "attested at genesis".
+    #[must_use]
+    pub fn with_log_coverage_head(mut self, log_coverage_head: Option<BlockRef>) -> Self {
+        self.log_coverage_head = log_coverage_head;
+        self
+    }
+
+    /// Sparse retained canonical history in ascending processing order.
+    pub fn retained_canonical_history(&self) -> &[BlockRef] {
+        &self.retained_canonical_history
+    }
+
+    /// Highest canonical identity covered by this state, when known.
+    pub const fn coverage_head(&self) -> Option<&BlockRef> {
+        self.coverage_head.as_ref()
+    }
+
+    /// Latest safe head accepted by the validator, when known.
+    pub const fn safe_head(&self) -> Option<&BlockRef> {
+        self.safe_head.as_ref()
+    }
+
+    /// Latest finalized head accepted by the validator, when known.
+    pub const fn finalized_head(&self) -> Option<&BlockRef> {
+        self.finalized_head.as_ref()
+    }
+
+    /// Highest block at or below which no log-notification loss went unhealed.
+    ///
+    /// `None` means no source has attested, which is not an attestation of
+    /// anything: treat it as unknown, never as complete. See
+    /// [`ChainControl::LogCoverage`].
+    pub const fn log_coverage_head(&self) -> Option<&BlockRef> {
+        self.log_coverage_head.as_ref()
+    }
+
+    /// Retain at most the newest `max_entries` canonical history identities.
+    ///
+    /// Coverage and safe/finalized heads are unchanged. The oldest retained
+    /// identity defines how far strict validation can prove a complete
+    /// rollback, so choose a bound at least as large as the deployment's
+    /// supported reorg depth and trim only after atomically committing the
+    /// corresponding validated state and source cursor. `0` intentionally
+    /// produces a coverage-only snapshot.
+    pub fn retain_recent_history(&mut self, max_entries: usize) {
+        let remove = self
+            .retained_canonical_history
+            .len()
+            .saturating_sub(max_entries);
+        self.retained_canonical_history.drain(..remove);
+    }
+
+    /// Validate a decoded/checkpointed snapshot before installing it.
+    ///
+    /// This rejects out-of-order or conflicting retained identities,
+    /// broken adjacent parent links, retained history without coverage,
+    /// incompatible coverage/finality aliases, hash reuse across heights,
+    /// known parent hashes at non-adjacent heights, finality beyond coverage,
+    /// and a finalized head beyond or conflicting with the safe head.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReactiveError`] when any retained identity, parent link,
+    /// coverage alias, or safe/finalized relationship violates the canonical
+    /// snapshot invariants described above.
+    pub fn validate(&self) -> Result<(), ReactiveError> {
+        validate_canonical_sequence_snapshot(self)
+    }
+}
+
+/// Cache-free canonical transition proven by [`validate_canonical_sequence`].
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CanonicalSequenceMutation {
+    /// Rewind the listed retained identities and continue from `common_ancestor`.
+    Rewind {
+        /// Surviving canonical anchor, when one is retained or authenticated.
+        /// `None` is a transient same-envelope state: callers must stage the
+        /// complete validation atomically and may checkpoint only the returned
+        /// `next_state`, after a later canonical mutation installs the proven
+        /// replacement.
+        common_ancestor: Option<BlockRef>,
+        /// Exact retained identities removed by the transition.
+        dropped: Vec<BlockRef>,
+    },
+    /// Accept or enrich one canonical identity.
+    Canonical(BlockRef),
+    /// Accept a safe-head update with metadata resolved against prior state.
+    Safe(BlockRef),
+    /// Accept a finalized-head update with metadata resolved against prior state.
+    Finalized(BlockRef),
+    /// Advance the attested log-coverage watermark.
+    LogCoverage(BlockRef),
+}
+
+/// Successful result of provider-neutral canonical envelope validation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CanonicalSequenceValidation {
+    pre_record_state: CanonicalSequenceState,
+    next_state: CanonicalSequenceState,
+    mutations: Vec<CanonicalSequenceMutation>,
+    normalized_chain_controls: Vec<ChainControl>,
+}
+
+impl CanonicalSequenceValidation {
+    /// State after pre-record explicit reorg controls and before event records.
+    pub const fn pre_record_state(&self) -> &CanonicalSequenceState {
+        &self.pre_record_state
+    }
+
+    /// Fully validated state after records and post-record controls.
+    pub const fn next_state(&self) -> &CanonicalSequenceState {
+        &self.next_state
+    }
+
+    /// Ordered cache-free canonical mutations proven by this envelope.
+    pub fn mutations(&self) -> &[CanonicalSequenceMutation] {
+        &self.mutations
+    }
+
+    /// Controls safe to forward after composite overlap normalization.
+    ///
+    /// Ordinary validation retains the original controls. See
+    /// [`normalize_and_validate_canonical_sequence`] for the mode that removes
+    /// compatible stale progress and converts a stale blockful barrier into the
+    /// same barrier identity without a block assertion. Equal-height controls
+    /// that add previously absent parent/timestamp metadata remain present;
+    /// older compatible enrichment is intentionally not applied because the
+    /// corresponding regressive control is not forwarded to the runtime.
+    pub fn normalized_chain_controls(&self) -> &[ChainControl] {
+        &self.normalized_chain_controls
+    }
+}
+
+/// Lifecycle status for an input.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
 pub enum ChainStatus {
     /// The input is mempool-only and must not mutate canonical cache state.
     Pending,
+    /// The input is ordered into an ephemeral sequencer-built Flashblock.
+    ///
+    /// Handlers may update the runtime's speculative overlay for this status,
+    /// but the update never advances canonical coverage or durable journals.
+    Preconfirmed {
+        /// Shared exact cumulative pre-confirmation snapshot observed by the
+        /// source. Sharing keeps ordinary canonical records compact and makes
+        /// multi-log Flashblock delivery cheap to clone.
+        flashblock: Arc<FlashblockRef>,
+    },
     /// The input is included in a block with a confirmation count.
     Included {
         /// Included block.
@@ -130,7 +986,8 @@ pub enum ChainStatus {
 }
 
 /// Source of an input batch.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
 pub enum InputSource {
     /// Caller-supplied batch.
     Batch,
@@ -140,12 +997,14 @@ pub enum InputSource {
     Poll,
     /// Historical backfill.
     Backfill,
+    /// Sequencer pre-confirmation / Flashblocks surface.
+    Flashblocks,
     /// Test or synthetic input.
     Synthetic,
 }
 
 /// Stable identity used for input deduplication and reports.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum InputRef {
     /// Stable log identity.
     Log {
@@ -176,6 +1035,110 @@ pub enum InputRef {
     },
 }
 
+/// Representation and lifecycle class retained alongside an [`InputRef`].
+///
+/// `InputRef` identifies the underlying chain object. This discriminator keeps
+/// distinct handler inputs from collapsing merely because they commit to the
+/// same object: a header and full block, a pending hash and hydrated body, and
+/// canonical versus reorg-signalling log delivery are independently routable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
+pub enum ReactiveInputKind {
+    /// Canonical log data.
+    CanonicalLog,
+    /// Removed or otherwise reorg-signalling log data.
+    ReorgSignalLog,
+    /// Header-only block representation.
+    BlockHeader,
+    /// Full block representation.
+    FullBlock,
+    /// Hash-only pending transaction representation.
+    PendingTxHash,
+    /// Hydrated pending transaction representation.
+    PendingTx,
+}
+
+/// Validated, representation-aware identity for one reactive input.
+///
+/// Composite subscribers can use this as a dedupe key without conflating
+/// independently routable representations. When a key repeats, use
+/// [`ReactiveInputRecord::same_deduplicable_payload`] to distinguish a true
+/// provider overlap from a conflicting payload.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct ReactiveInputIdentity {
+    input_ref: InputRef,
+    kind: ReactiveInputKind,
+}
+
+impl ReactiveInputIdentity {
+    /// Validate and construct an identity from explicit wire/codec parts.
+    ///
+    /// `InputRef` identifies the underlying object, while `kind` identifies its
+    /// representation/lifecycle. Only log kinds may pair with [`InputRef::Log`],
+    /// block representations with [`InputRef::Block`], and pending-transaction
+    /// representations with [`InputRef::PendingTx`]. This constructor lets
+    /// external codecs rebuild the otherwise-private invariant without serde or
+    /// layout-dependent decoding.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReactiveInputIdentityError`] when `input_ref` does not belong
+    /// to the supplied representation `kind`.
+    pub fn try_from_parts(
+        input_ref: InputRef,
+        kind: ReactiveInputKind,
+    ) -> Result<Self, ReactiveInputIdentityError> {
+        let compatible = matches!(
+            (input_ref, kind),
+            (
+                InputRef::Log { .. },
+                ReactiveInputKind::CanonicalLog | ReactiveInputKind::ReorgSignalLog
+            ) | (
+                InputRef::Block { .. },
+                ReactiveInputKind::BlockHeader | ReactiveInputKind::FullBlock
+            ) | (
+                InputRef::PendingTx { .. },
+                ReactiveInputKind::PendingTxHash | ReactiveInputKind::PendingTx
+            )
+        );
+        if !compatible {
+            return Err(ReactiveInputIdentityError { input_ref, kind });
+        }
+        Ok(Self { input_ref, kind })
+    }
+
+    /// Underlying stable chain-object reference.
+    pub const fn input_ref(&self) -> InputRef {
+        self.input_ref
+    }
+
+    /// Exact handler-input representation and lifecycle class.
+    pub const fn kind(&self) -> ReactiveInputKind {
+        self.kind
+    }
+}
+
+/// An explicit [`InputRef`] and [`ReactiveInputKind`] describe incompatible
+/// object/representation classes.
+#[derive(Clone, Copy, Debug, thiserror::Error, PartialEq, Eq)]
+#[error("reactive input kind {kind:?} is incompatible with input reference {input_ref:?}")]
+pub struct ReactiveInputIdentityError {
+    input_ref: InputRef,
+    kind: ReactiveInputKind,
+}
+
+impl ReactiveInputIdentityError {
+    /// Rejected stable object reference.
+    pub const fn input_ref(&self) -> InputRef {
+        self.input_ref
+    }
+
+    /// Rejected representation/lifecycle kind.
+    pub const fn kind(&self) -> ReactiveInputKind {
+        self.kind
+    }
+}
+
 /// Reliability of state effects emitted by a handler.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum StateEffectQuality {
@@ -192,13 +1155,32 @@ pub enum StateEffectQuality {
 }
 
 /// Identifier for a reactive handler.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize)]
 pub struct HandlerId(String);
 
 impl HandlerId {
-    /// Create a handler id.
+    /// Create a non-empty handler id.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `id` is empty. Use [`try_new`](Self::try_new) for untrusted
+    /// configuration or wire input.
     pub fn new(id: impl Into<String>) -> Self {
-        Self(id.into())
+        Self::try_new(id).expect("handler id must not be empty")
+    }
+
+    /// Validate and create a handler id from untrusted input.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HandlerIdError`] when `id` is empty. The empty identity is
+    /// reserved for canonical/global protocol scope.
+    pub fn try_new(id: impl Into<String>) -> Result<Self, HandlerIdError> {
+        let id = id.into();
+        if id.is_empty() {
+            return Err(HandlerIdError);
+        }
+        Ok(Self(id))
     }
 
     /// Return the id as a string slice.
@@ -206,6 +1188,22 @@ impl HandlerId {
         &self.0
     }
 }
+
+impl<'de> serde::Deserialize<'de> for HandlerId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let id = <String as serde::Deserialize>::deserialize(deserializer)?;
+        Self::try_new(id).map_err(serde::de::Error::custom)
+    }
+}
+
+/// An empty handler identity cannot be represented portably across subscriber
+/// protocols because the empty owner is reserved for canonical/global scope.
+#[derive(Clone, Copy, Debug, thiserror::Error, PartialEq, Eq)]
+#[error("handler id must not be empty")]
+pub struct HandlerIdError;
 
 impl fmt::Display for HandlerId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -300,30 +1298,768 @@ pub struct ReactiveInputRecord<N: Network = Ethereum> {
     pub input: ReactiveInput<N>,
     /// Input context.
     pub context: ReactiveContext,
+    /// Provider session that originated this input, when it came from a
+    /// concrete provider rather than a synthetic or aggregate source.
+    pub provider: Option<ProviderRef>,
 }
 
 impl<N: Network> ReactiveInputRecord<N> {
     /// Create an input record.
     pub fn new(input: ReactiveInput<N>, context: ReactiveContext) -> Self {
-        Self { input, context }
+        Self {
+            input,
+            context,
+            provider: None,
+        }
+    }
+
+    /// Attach provider provenance used to route follow-up reads.
+    #[must_use]
+    pub fn with_provider(mut self, provider: ProviderRef) -> Self {
+        self.provider = Some(provider);
+        self
     }
 
     /// Compute the stable input reference used for deduplication.
     pub fn input_ref(&self) -> InputRef {
         input_ref(&self.input, &self.context)
     }
+
+    /// Validate payload/context coherence and return a representation-aware
+    /// identity suitable for subscriber and runtime deduplication.
+    ///
+    /// Validation is fail-closed for canonical logs: their block, transaction,
+    /// and log positions must be complete and agree with the context. Block and
+    /// pending-transaction representations receive the corresponding lifecycle,
+    /// inclusion-wrapper, and payload/context checks. This does not recompute a
+    /// claimed header hash, transaction root, or transaction signature; exact
+    /// subscriber payload commitments remain the transport-integrity boundary
+    /// for those cryptographic claims.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReactiveError::InvalidInputRecord`] when the payload,
+    /// lifecycle, inclusion metadata, or context is incomplete or internally
+    /// inconsistent.
+    pub fn validated_identity(&self) -> Result<ReactiveInputIdentity, ReactiveError> {
+        validate_input_record(self)?;
+        let kind = match &self.input {
+            ReactiveInput::Log(log)
+                if log.removed
+                    || matches!(self.context.chain_status, ChainStatus::Reorged { .. }) =>
+            {
+                ReactiveInputKind::ReorgSignalLog
+            }
+            ReactiveInput::Log(_) => ReactiveInputKind::CanonicalLog,
+            ReactiveInput::BlockHeader(_) => ReactiveInputKind::BlockHeader,
+            ReactiveInput::FullBlock(_) => ReactiveInputKind::FullBlock,
+            ReactiveInput::PendingTxHash(_) => ReactiveInputKind::PendingTxHash,
+            ReactiveInput::PendingTx(_) => ReactiveInputKind::PendingTx,
+        };
+        ReactiveInputIdentity::try_from_parts(self.input_ref(), kind).map_err(|error| {
+            ReactiveError::InvalidInputRecord {
+                message: error.to_string(),
+            }
+        })
+    }
+
+    /// Whether two same-identity records carry the same deduplicable payload.
+    ///
+    /// This deliberately ignores [`ReactiveContext`]: the same provider object
+    /// can legitimately arrive from backfill and subscription transports with
+    /// different provenance or confirmation metadata. Callers must first
+    /// compare [`validated_identity`](Self::validated_identity) and reconcile
+    /// lifecycle/context authority separately. Logs are compared structurally;
+    /// block and transaction hashes are cryptographic commitments for the
+    /// remaining same-representation payloads. Full block responses and
+    /// hydrated pending transaction bodies deliberately return `false`: the
+    /// core does not currently prove a supplied body against the header's
+    /// transaction root or compare every response field, so a composite source
+    /// must preserve both rather than suppress one based only on its hash.
+    pub fn same_deduplicable_payload(&self, other: &Self) -> bool {
+        match (&self.input, &other.input) {
+            (ReactiveInput::Log(left), ReactiveInput::Log(right)) => {
+                left.inner == right.inner
+                    && left.block_hash == right.block_hash
+                    && left.block_number == right.block_number
+                    && optional_metadata_compatible(
+                        left.block_timestamp.as_ref(),
+                        right.block_timestamp.as_ref(),
+                    )
+                    && left.transaction_hash == right.transaction_hash
+                    && left.transaction_index == right.transaction_index
+                    && left.log_index == right.log_index
+                    && left.removed == right.removed
+            }
+            (ReactiveInput::BlockHeader(left), ReactiveInput::BlockHeader(right)) => {
+                left.hash() == right.hash()
+            }
+            (ReactiveInput::FullBlock(_), ReactiveInput::FullBlock(_)) => false,
+            (ReactiveInput::PendingTxHash(left), ReactiveInput::PendingTxHash(right)) => {
+                left == right
+            }
+            (ReactiveInput::PendingTx(_), ReactiveInput::PendingTx(_)) => false,
+            _ => false,
+        }
+    }
+
+    /// Whether this representation has a complete payload-equivalence contract
+    /// and may participate in duplicate suppression.
+    ///
+    /// Full block and hydrated pending transaction bodies are intentionally
+    /// excluded until their complete body/response integrity is validated.
+    pub fn is_payload_deduplicable(&self) -> bool {
+        matches!(
+            &self.input,
+            ReactiveInput::Log(_) | ReactiveInput::BlockHeader(_) | ReactiveInput::PendingTxHash(_)
+        )
+    }
+
+    /// Merge `other` when it is the same safely deduplicable provider object.
+    ///
+    /// Returns `Ok(false)` for a different identity or a representation whose
+    /// complete payload cannot be proven equivalent. A same-identity payload or
+    /// semantic conflict returns an error. Successful merges are deterministic:
+    /// optional block/timestamp metadata is enriched, canonical lifecycle moves
+    /// toward `Finalized` then `Safe` then the highest-confirmation `Included`,
+    /// and provenance uses a stable source priority. The result is therefore
+    /// independent of historical/live arrival order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReactiveError`] when either record is invalid, or when equal
+    /// identities carry conflicting payload or semantic context.
+    pub fn merge_compatible_duplicate(&mut self, other: &Self) -> Result<bool, ReactiveError> {
+        let identity = self.validated_identity()?;
+        let other_identity = other.validated_identity()?;
+        if identity != other_identity
+            || !self.is_payload_deduplicable()
+            || !other.is_payload_deduplicable()
+        {
+            return Ok(false);
+        }
+        if !self.same_deduplicable_payload(other) || !self.dedupe_context_is_compatible(other) {
+            return Err(ReactiveError::InvalidInputRecord {
+                message: format!(
+                    "conflicting payload or semantic context for identity {identity:?}"
+                ),
+            });
+        }
+        let mut merged = self.clone();
+        merge_deduplicable_record(&mut merged, other);
+        merged.validated_identity()?;
+        *self = merged;
+        Ok(true)
+    }
+
+    /// Whether semantic context agrees for deduplication across transports.
+    ///
+    /// Provenance source and confirmation count may legitimately differ at a
+    /// historical/live overlap and are ignored. Chain id, lifecycle class, and
+    /// transaction/log positions must agree. Block number/hash are exact;
+    /// optional parent/timestamp metadata may be enriched by one source but two
+    /// present conflicting values are rejected.
+    pub fn dedupe_context_is_compatible(&self, other: &Self) -> bool {
+        let left = &self.context;
+        let right = &other.context;
+        left.chain_id == right.chain_id
+            && optional_block_refs_are_compatible(left.block.as_ref(), right.block.as_ref())
+            && left.transaction_index == right.transaction_index
+            && left.log_index == right.log_index
+            && chain_statuses_are_dedupe_compatible(&left.chain_status, &right.chain_status)
+    }
+}
+
+fn chain_statuses_are_dedupe_compatible(left: &ChainStatus, right: &ChainStatus) -> bool {
+    match (left, right) {
+        (ChainStatus::Pending, ChainStatus::Pending)
+        | (ChainStatus::Reorged { .. }, ChainStatus::Reorged { .. }) => true,
+        (
+            ChainStatus::Preconfirmed { flashblock: left },
+            ChainStatus::Preconfirmed { flashblock: right },
+        ) => left == right,
+        (
+            ChainStatus::Included { .. } | ChainStatus::Safe { .. } | ChainStatus::Finalized { .. },
+            ChainStatus::Included { .. } | ChainStatus::Safe { .. } | ChainStatus::Finalized { .. },
+        ) => true,
+        _ => false,
+    }
+}
+
+fn optional_metadata_compatible<T: PartialEq>(left: Option<&T>, right: Option<&T>) -> bool {
+    left.zip(right).is_none_or(|(left, right)| left == right)
+}
+
+fn optional_block_refs_are_compatible(left: Option<&BlockRef>, right: Option<&BlockRef>) -> bool {
+    match (left, right) {
+        (None, None) => true,
+        (Some(left), Some(right)) => {
+            left.number == right.number
+                && left.hash == right.hash
+                && optional_metadata_compatible(
+                    left.parent_hash.as_ref(),
+                    right.parent_hash.as_ref(),
+                )
+                && optional_metadata_compatible(left.timestamp.as_ref(), right.timestamp.as_ref())
+        }
+        _ => false,
+    }
+}
+
+fn merge_deduplicable_record<N: Network>(
+    retained: &mut ReactiveInputRecord<N>,
+    incoming: &ReactiveInputRecord<N>,
+) {
+    if let (ReactiveInput::Log(retained), ReactiveInput::Log(incoming)) =
+        (&mut retained.input, &incoming.input)
+        && retained.block_timestamp.is_none()
+    {
+        retained.block_timestamp = incoming.block_timestamp;
+    }
+    if let (Some(retained), Some(incoming)) =
+        (&mut retained.context.block, incoming.context.block.as_ref())
+    {
+        enrich_block_ref(retained, incoming);
+    }
+    retained.context.chain_status = merged_chain_status(
+        &retained.context.chain_status,
+        &incoming.context.chain_status,
+    );
+    if input_source_rank(incoming.context.source) > input_source_rank(retained.context.source) {
+        retained.context.source = incoming.context.source;
+    }
+    if retained.provider.is_none() {
+        retained.provider = incoming.provider.clone();
+    }
+}
+
+fn enrich_block_ref(retained: &mut BlockRef, incoming: &BlockRef) {
+    if retained.parent_hash.is_none() {
+        retained.parent_hash = incoming.parent_hash;
+    }
+    if retained.timestamp.is_none() {
+        retained.timestamp = incoming.timestamp;
+    }
+}
+
+fn merged_chain_status(retained: &ChainStatus, incoming: &ChainStatus) -> ChainStatus {
+    let merged_block = |left: &BlockRef, right: &BlockRef| {
+        let mut block = *left;
+        enrich_block_ref(&mut block, right);
+        block
+    };
+    match (retained, incoming) {
+        (ChainStatus::Pending, ChainStatus::Pending) => ChainStatus::Pending,
+        (
+            ChainStatus::Preconfirmed { flashblock: left },
+            ChainStatus::Preconfirmed { flashblock: right },
+        ) => {
+            debug_assert_eq!(left, right, "compatible pre-confirmed records agree");
+            ChainStatus::Preconfirmed {
+                flashblock: left.clone(),
+            }
+        }
+        (
+            ChainStatus::Reorged { dropped_from: left },
+            ChainStatus::Reorged {
+                dropped_from: right,
+            },
+        ) => ChainStatus::Reorged {
+            dropped_from: merged_block(left, right),
+        },
+        (left, right) => {
+            let (left_block, left_rank, left_confirmations) = canonical_status_parts(left)
+                .expect("compatible duplicate has a canonical lifecycle");
+            let (right_block, right_rank, right_confirmations) = canonical_status_parts(right)
+                .expect("compatible duplicate has a canonical lifecycle");
+            let block = merged_block(left_block, right_block);
+            let rank = left_rank.max(right_rank);
+            match rank {
+                3 => ChainStatus::Finalized { block },
+                2 => ChainStatus::Safe { block },
+                _ => ChainStatus::Included {
+                    block,
+                    confirmations: left_confirmations.max(right_confirmations),
+                },
+            }
+        }
+    }
+}
+
+fn canonical_status_parts(status: &ChainStatus) -> Option<(&BlockRef, u8, u64)> {
+    match status {
+        ChainStatus::Included {
+            block,
+            confirmations,
+        } => Some((block, 1, *confirmations)),
+        ChainStatus::Safe { block } => Some((block, 2, 0)),
+        ChainStatus::Finalized { block } => Some((block, 3, 0)),
+        ChainStatus::Pending | ChainStatus::Preconfirmed { .. } | ChainStatus::Reorged { .. } => {
+            None
+        }
+    }
+}
+
+fn input_source_rank(source: InputSource) -> u8 {
+    match source {
+        InputSource::Backfill => 0,
+        InputSource::Poll => 1,
+        InputSource::Subscription => 2,
+        InputSource::Flashblocks => 3,
+        InputSource::Batch => 4,
+        InputSource::Synthetic => 5,
+    }
+}
+
+/// Opaque subscriber-owned token attached to a delivered input batch.
+///
+/// Subscribers that provide durable, at-least-once delivery can use this token
+/// to identify the batch that becomes committable after runtime ingestion
+/// succeeds. The runtime never interprets the bytes. A token must be immutable,
+/// stable across replay, and must never identify two different batch payloads.
+/// Subscriber implementations must preserve delivery order while one token is
+/// awaiting acknowledgement; [`ReactiveEngine`] retries it before polling a
+/// later batch.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct SubscriberDeliveryToken(Vec<u8>);
+
+impl SubscriberDeliveryToken {
+    /// Create an opaque delivery token from subscriber-owned bytes.
+    pub fn new(bytes: Vec<u8>) -> Self {
+        Self(bytes)
+    }
+
+    /// Borrow the opaque token bytes.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+
+    /// Consume the token into its opaque bytes.
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.0
+    }
+}
+
+/// Opaque source checkpoint associated with a delivered batch.
+///
+/// Unlike [`SubscriberDeliveryToken`], which identifies the delivery to
+/// acknowledge, this value describes provider-specific resume state. The core
+/// crate persists and returns the bytes without interpreting their format.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct SubscriberCheckpoint(Vec<u8>);
+
+impl SubscriberCheckpoint {
+    /// Create an opaque source checkpoint from subscriber-owned bytes.
+    pub fn new(bytes: Vec<u8>) -> Self {
+        Self(bytes)
+    }
+
+    /// Borrow the opaque checkpoint bytes.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+
+    /// Consume the checkpoint into its opaque bytes.
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.0
+    }
+}
+
+/// Subscriber-supplied commitment to the exact canonical wire payload of one
+/// delivered batch.
+///
+/// The core includes this value in its durable replay witness. It is required
+/// for tokened block-header, full-block, and hydrated-transaction payloads whose
+/// network-generic Rust response types cannot be serialized completely by the
+/// core. The source must recompute the commitment from a stable canonical
+/// encoding on every replay; reusing a commitment for changed bytes violates the
+/// [`EventSubscriber`] contract.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct SubscriberPayloadCommitment(B256);
+
+impl SubscriberPayloadCommitment {
+    /// Wrap a cryptographic commitment produced by the subscriber.
+    pub const fn new(commitment: B256) -> Self {
+        Self(commitment)
+    }
+
+    /// Return the committed digest.
+    pub const fn digest(&self) -> B256 {
+        self.0
+    }
+}
+
+/// Durable subscriber position restored together with cache/runtime state.
+///
+/// The core never interprets provider checkpoint bytes. Composite and remote
+/// subscribers use this synchronous hand-off to seed their source cursors,
+/// replay fences, and canonical overlap journals before polling resumes.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
+pub struct SubscriberResumePosition {
+    /// Chain whose canonical position and provider cursor are being restored.
+    pub chain_id: u64,
+    /// Authoritative canonical coverage embodied by the restored cache.
+    pub coverage_head: BlockRef,
+    /// Ordered canonical identities still retained for in-window reconciliation.
+    pub canonical_history: Vec<BlockRef>,
+    /// Last delivery token whose effects are already represented by the cache.
+    /// It may still be pending at the source when the process stopped after its
+    /// durable save but before the source acknowledgement committed.
+    pub delivery_token: Option<SubscriberDeliveryToken>,
+    /// Provider-specific durable cursor committed with that delivery.
+    pub subscriber_checkpoint: Option<SubscriberCheckpoint>,
+}
+
+impl SubscriberResumePosition {
+    /// Construct a complete restored subscriber position.
+    pub fn new(
+        chain_id: u64,
+        coverage_head: BlockRef,
+        canonical_history: Vec<BlockRef>,
+        delivery_token: Option<SubscriberDeliveryToken>,
+        subscriber_checkpoint: Option<SubscriberCheckpoint>,
+    ) -> Self {
+        Self {
+            chain_id,
+            coverage_head,
+            canonical_history,
+            delivery_token,
+            subscriber_checkpoint,
+        }
+    }
+}
+
+/// Runtime routing audience for one delivered subscriber batch.
+///
+/// Historical catch-up for a newly registered handler must not be routed
+/// through older handlers whose filters happen to overlap. Subscribers retain
+/// that provenance by targeting the batch at the exact logical owners that
+/// requested it. Ordinary canonical delivery remains broadcast to every
+/// matching handler.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
+pub enum DeliveryAudience {
+    /// Route each record through every matching registered handler.
+    #[default]
+    All,
+    /// Route each record only through the named matching handlers.
+    Owners(Vec<HandlerId>),
+    /// Route through every matching handler except the named owners.
+    ///
+    /// Composite subscribers use this to deliver the residual audience after an
+    /// overlapping source already committed the same input for selected owners.
+    AllExcept(Vec<HandlerId>),
+}
+
+/// How one delivered record participates in the runtime's canonical state machine.
+///
+/// Routing and chain authority are deliberately independent: [`DeliveryAudience`]
+/// selects handlers, while this value decides whether a record may advance or
+/// rewind global chain state. Historical replay for a newly added owner must use
+/// [`OwnerCatchup`](Self::OwnerCatchup), even though its original on-chain status
+/// is canonical.
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[non_exhaustive]
+pub enum DeliveryScope {
+    /// Authoritative live canonical delivery.
+    #[default]
+    Canonical,
+    /// Authoritative historical/recovery delivery that advances canonical progress.
+    CanonicalProgress,
+    /// Historical replay routed to selected owners without changing global chain state.
+    OwnerCatchup,
+    /// Ephemeral pre-confirmation delivery applied only to the speculative
+    /// cache overlay.
+    Preconfirmed,
+}
+
+impl DeliveryScope {
+    const fn advances_canonical_state(self) -> bool {
+        matches!(self, Self::Canonical | Self::CanonicalProgress)
+    }
+}
+
+/// One input together with its routing and canonical-processing provenance.
+#[derive(Clone, Debug)]
+pub struct ReactiveInputDelivery<N: Network = Ethereum> {
+    record: ReactiveInputRecord<N>,
+    audience: DeliveryAudience,
+    scope: DeliveryScope,
+}
+
+impl<N: Network> ReactiveInputDelivery<N> {
+    /// Construct one lossless delivered record.
+    pub fn new(
+        record: ReactiveInputRecord<N>,
+        audience: DeliveryAudience,
+        scope: DeliveryScope,
+    ) -> Self {
+        Self {
+            record,
+            audience,
+            scope,
+        }
+    }
+
+    /// Borrow the runtime input record.
+    pub const fn record(&self) -> &ReactiveInputRecord<N> {
+        &self.record
+    }
+
+    /// Borrow the exact routing audience.
+    pub const fn audience(&self) -> &DeliveryAudience {
+        &self.audience
+    }
+
+    /// Return the record's canonical-processing scope.
+    pub const fn scope(&self) -> DeliveryScope {
+        self.scope
+    }
+
+    /// Consume this value into its complete parts.
+    pub fn into_parts(self) -> (ReactiveInputRecord<N>, DeliveryAudience, DeliveryScope) {
+        (self.record, self.audience, self.scope)
+    }
+}
+
+/// Complete contents of a consumed [`ReactiveInputBatch`].
+///
+/// Use this instead of [`ReactiveInputBatch::into_records`], which intentionally
+/// discards subscriber commit and chain-lifecycle metadata.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct ReactiveInputBatchParts<N: Network = Ethereum> {
+    /// Authoritative chain identity for controls and records in this batch.
+    pub chain_id: Option<u64>,
+    /// Records with per-record routing and chain provenance.
+    pub deliveries: Vec<ReactiveInputDelivery<N>>,
+    /// Subscriber delivery token committed after ingestion.
+    pub delivery_token: Option<SubscriberDeliveryToken>,
+    /// Provider-specific resume cursor associated with the delivery.
+    pub subscriber_checkpoint: Option<SubscriberCheckpoint>,
+    /// Exact opaque wire-payload commitment supplied by the subscriber.
+    pub payload_commitment: Option<SubscriberPayloadCommitment>,
+    /// Ordered chain controls sharing the delivery's commit boundary.
+    pub chain_controls: Vec<ChainControl>,
+    /// Original typed source ingress for a preconfirmed-only batch.
+    pub preconfirmation_timing: Option<FlashblockIngressTiming>,
 }
 
 /// Batch of reactive input records.
 #[derive(Clone, Debug)]
 pub struct ReactiveInputBatch<N: Network = Ethereum> {
     records: Vec<ReactiveInputRecord<N>>,
+    chain_id: Option<u64>,
+    delivery_token: Option<SubscriberDeliveryToken>,
+    subscriber_checkpoint: Option<SubscriberCheckpoint>,
+    payload_commitment: Option<SubscriberPayloadCommitment>,
+    audience: DeliveryAudience,
+    record_audiences: Option<Vec<DeliveryAudience>>,
+    delivery_scope: DeliveryScope,
+    record_delivery_scopes: Option<Vec<DeliveryScope>>,
+    chain_controls: Vec<ChainControl>,
+    preconfirmation_timing: Option<FlashblockIngressTiming>,
 }
+
+type RuntimeInputDelivery<N> = (ReactiveInputRecord<N>, DeliveryAudience, DeliveryScope);
 
 impl<N: Network> ReactiveInputBatch<N> {
     /// Create a batch from records.
     pub fn new(records: Vec<ReactiveInputRecord<N>>) -> Self {
-        Self { records }
+        let chain_id = common_record_chain_id(&records);
+        Self {
+            records,
+            chain_id,
+            delivery_token: None,
+            subscriber_checkpoint: None,
+            payload_commitment: None,
+            audience: DeliveryAudience::All,
+            record_audiences: None,
+            delivery_scope: DeliveryScope::Canonical,
+            record_delivery_scopes: None,
+            chain_controls: Vec::new(),
+            preconfirmation_timing: None,
+        }
+    }
+
+    /// Bind the complete batch, including control-only progress/finality, to a
+    /// chain. Runtime ingestion rejects a different cache chain.
+    pub fn with_chain_id(mut self, chain_id: u64) -> Self {
+        self.chain_id = Some(chain_id);
+        self
+    }
+
+    /// Authoritative batch chain identity, when supplied or unambiguously
+    /// derived from its records.
+    pub const fn chain_id(&self) -> Option<u64> {
+        self.chain_id
+    }
+
+    /// Attach the subscriber-owned token committed after successful ingestion.
+    pub fn with_delivery_token(mut self, token: SubscriberDeliveryToken) -> Self {
+        self.delivery_token = Some(token);
+        self
+    }
+
+    /// Borrow the subscriber-owned delivery token, when present.
+    pub fn delivery_token(&self) -> Option<&SubscriberDeliveryToken> {
+        self.delivery_token.as_ref()
+    }
+
+    /// Attach provider-specific resume state included by this delivery.
+    pub fn with_subscriber_checkpoint(mut self, checkpoint: SubscriberCheckpoint) -> Self {
+        self.subscriber_checkpoint = Some(checkpoint);
+        self
+    }
+
+    /// Borrow provider-specific resume state, when present.
+    pub fn subscriber_checkpoint(&self) -> Option<&SubscriberCheckpoint> {
+        self.subscriber_checkpoint.as_ref()
+    }
+
+    /// Attach a commitment to the exact canonical wire payload represented by
+    /// this batch.
+    pub fn with_payload_commitment(mut self, commitment: SubscriberPayloadCommitment) -> Self {
+        self.payload_commitment = Some(commitment);
+        self
+    }
+
+    /// Borrow the subscriber-supplied exact payload commitment, when present.
+    pub const fn payload_commitment(&self) -> Option<&SubscriberPayloadCommitment> {
+        self.payload_commitment.as_ref()
+    }
+
+    /// Restrict runtime routing to exact logical interest owners.
+    pub fn with_audience(mut self, audience: DeliveryAudience) -> Self {
+        self.audience = audience;
+        self.record_audiences = None;
+        self
+    }
+
+    /// Delivery audience captured by the subscriber.
+    pub const fn audience(&self) -> &DeliveryAudience {
+        &self.audience
+    }
+
+    /// Create a batch whose records retain independent delivery audiences.
+    pub fn from_scoped_records(
+        records: impl IntoIterator<Item = (ReactiveInputRecord<N>, DeliveryAudience)>,
+    ) -> Self {
+        let (records, record_audiences): (Vec<_>, Vec<_>) = records.into_iter().unzip();
+        let chain_id = common_record_chain_id(&records);
+        Self {
+            records,
+            chain_id,
+            delivery_token: None,
+            subscriber_checkpoint: None,
+            payload_commitment: None,
+            audience: DeliveryAudience::All,
+            record_audiences: Some(record_audiences),
+            delivery_scope: DeliveryScope::Canonical,
+            record_delivery_scopes: None,
+            chain_controls: Vec::new(),
+            preconfirmation_timing: None,
+        }
+    }
+
+    /// Create a batch with independent routing and canonical provenance per record.
+    pub fn from_deliveries(deliveries: impl IntoIterator<Item = ReactiveInputDelivery<N>>) -> Self {
+        Self::from_scoped_records_with_delivery_scope(
+            deliveries
+                .into_iter()
+                .map(ReactiveInputDelivery::into_parts),
+        )
+    }
+
+    /// Audience for the record at `index`.
+    pub fn record_audience(&self, index: usize) -> Option<&DeliveryAudience> {
+        if index >= self.records.len() {
+            return None;
+        }
+        Some(
+            self.record_audiences
+                .as_ref()
+                .and_then(|audiences| audiences.get(index))
+                .unwrap_or(&self.audience),
+        )
+    }
+
+    /// Set how every record in this batch participates in canonical state.
+    pub fn with_delivery_scope(mut self, scope: DeliveryScope) -> Self {
+        self.delivery_scope = scope;
+        self.record_delivery_scopes = None;
+        self
+    }
+
+    /// Canonical-processing scope for the record at `index`.
+    pub fn record_delivery_scope(&self, index: usize) -> Option<DeliveryScope> {
+        if index >= self.records.len() {
+            return None;
+        }
+        Some(
+            self.record_delivery_scopes
+                .as_ref()
+                .and_then(|scopes| scopes.get(index))
+                .copied()
+                .unwrap_or(self.delivery_scope),
+        )
+    }
+
+    fn from_scoped_records_with_delivery_scope(
+        records: impl IntoIterator<Item = (ReactiveInputRecord<N>, DeliveryAudience, DeliveryScope)>,
+    ) -> Self {
+        let mut input_records = Vec::new();
+        let mut audiences = Vec::new();
+        let mut scopes = Vec::new();
+        for (record, audience, scope) in records {
+            input_records.push(record);
+            audiences.push(audience);
+            scopes.push(scope);
+        }
+        let chain_id = common_record_chain_id(&input_records);
+        Self {
+            records: input_records,
+            chain_id,
+            delivery_token: None,
+            subscriber_checkpoint: None,
+            payload_commitment: None,
+            audience: DeliveryAudience::All,
+            record_audiences: Some(audiences),
+            delivery_scope: DeliveryScope::Canonical,
+            record_delivery_scopes: Some(scopes),
+            chain_controls: Vec::new(),
+            preconfirmation_timing: None,
+        }
+    }
+
+    /// Attach original typed source ingress to a preconfirmed-only batch.
+    pub fn with_preconfirmation_timing(mut self, timing: FlashblockIngressTiming) -> Self {
+        self.preconfirmation_timing = Some(timing);
+        self
+    }
+
+    /// Original typed source ingress for a preconfirmed-only batch.
+    pub const fn preconfirmation_timing(&self) -> Option<FlashblockIngressTiming> {
+        self.preconfirmation_timing
+    }
+
+    /// Attach ordered chain-lifecycle controls to this delivery.
+    ///
+    /// A control-only batch must also call [`with_chain_id`](Self::with_chain_id).
+    /// When records are present, their unanimous chain id is derived by the
+    /// constructor; a missing or cache-mismatched authoritative batch identity
+    /// is rejected before any control mutates runtime state.
+    pub fn with_chain_controls(mut self, controls: impl IntoIterator<Item = ChainControl>) -> Self {
+        self.chain_controls = controls.into_iter().collect();
+        self
+    }
+
+    /// Ordered chain-lifecycle controls in this delivery.
+    pub fn chain_controls(&self) -> &[ChainControl] {
+        &self.chain_controls
     }
 
     /// Borrow the records in this batch.
@@ -331,10 +2067,80 @@ impl<N: Network> ReactiveInputBatch<N> {
         &self.records
     }
 
-    /// Consume the batch into its records.
+    /// Consume the batch into only its input records.
+    ///
+    /// This is intentionally lossy: it discards the authoritative batch chain
+    /// identity, routing audiences, delivery scopes, ordered chain controls,
+    /// acknowledgement tokens, and provider checkpoints. Adapters should use
+    /// [`into_parts`](Self::into_parts) instead.
     pub fn into_records(self) -> Vec<ReactiveInputRecord<N>> {
         self.records
     }
+
+    /// Consume the batch without losing subscriber or chain-lifecycle metadata.
+    pub fn into_parts(self) -> ReactiveInputBatchParts<N> {
+        let chain_id = self.chain_id;
+        let delivery_token = self.delivery_token;
+        let subscriber_checkpoint = self.subscriber_checkpoint;
+        let payload_commitment = self.payload_commitment;
+        let chain_controls = self.chain_controls;
+        let preconfirmation_timing = self.preconfirmation_timing;
+        let audiences = self
+            .record_audiences
+            .unwrap_or_else(|| vec![self.audience; self.records.len()]);
+        let scopes = self
+            .record_delivery_scopes
+            .unwrap_or_else(|| vec![self.delivery_scope; self.records.len()]);
+        let deliveries = self
+            .records
+            .into_iter()
+            .zip(audiences)
+            .zip(scopes)
+            .map(|((record, audience), scope)| ReactiveInputDelivery::new(record, audience, scope))
+            .collect();
+        ReactiveInputBatchParts {
+            chain_id,
+            deliveries,
+            delivery_token,
+            subscriber_checkpoint,
+            payload_commitment,
+            chain_controls,
+            preconfirmation_timing,
+        }
+    }
+
+    fn into_runtime_parts(self) -> (Vec<RuntimeInputDelivery<N>>, Vec<ChainControl>, Option<u64>) {
+        let audiences = self
+            .record_audiences
+            .unwrap_or_else(|| vec![self.audience; self.records.len()]);
+        let scopes = self
+            .record_delivery_scopes
+            .unwrap_or_else(|| vec![self.delivery_scope; self.records.len()]);
+        let records = self
+            .records
+            .into_iter()
+            .zip(audiences)
+            .zip(scopes)
+            .map(|((record, audience), scope)| (record, audience, scope))
+            .collect();
+        (records, self.chain_controls, self.chain_id)
+    }
+
+    fn take_delivery_token(&mut self) -> Option<SubscriberDeliveryToken> {
+        self.delivery_token.take()
+    }
+
+    fn take_subscriber_checkpoint(&mut self) -> Option<SubscriberCheckpoint> {
+        self.subscriber_checkpoint.take()
+    }
+}
+
+fn common_record_chain_id<N: Network>(records: &[ReactiveInputRecord<N>]) -> Option<u64> {
+    let chain_id = records.first()?.context.chain_id?;
+    records
+        .iter()
+        .all(|record| record.context.chain_id == Some(chain_id))
+        .then_some(chain_id)
 }
 
 /// Pure synchronous handler for reactive inputs.
@@ -365,6 +2171,14 @@ pub trait ReactiveHandler<N: Network = Ethereum>: Send + Sync {
 }
 
 /// Hook invoked after reports are built and cache mutation phases have ended.
+///
+/// Hooks are synchronous in-process observers, not a durable transactional
+/// outbox. The runtime never dispatches reports for a batch it rejects or rolls
+/// back during checkpoint staging, and it dispatches a successfully staged
+/// batch at most once per live engine. A process crash can still occur between
+/// hook dispatch and durable checkpoint or transport acknowledgement. External
+/// side effects therefore need their own idempotency key (normally an
+/// [`InputRef`] or [`SubscriberDeliveryToken`]) and durable delivery mechanism.
 pub trait ReactiveHook<N: Network = Ethereum>: Send + Sync {
     /// Observe a runtime report.
     fn on_report(&self, report: Arc<ReactiveReport<N>>);
@@ -743,7 +2557,7 @@ pub trait PendingTxMatcher<N: Network = Ethereum>: Send + Sync {
 ///
 /// [`Slots`]: TrackingPolicy::Slots
 /// [`WholeAccount`]: TrackingPolicy::WholeAccount
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[non_exhaustive]
 pub enum TrackingPolicy {
     /// Sparse interest (e.g. WETH: a few balance slots). The root churns on
@@ -778,7 +2592,7 @@ pub enum TrackingPolicy {
 /// cost, never eventual detection. The decoder-touched set accumulates across
 /// skipped blocks and drains per firing, so a covered write in a skipped
 /// block never false-positives as a [`ReactiveReport::CoverageGap`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum RootGateCadence {
     /// Probe at most once every `n` canonical blocks (the first canonical
     /// block ever seen always fires, so baseline adoption does not wait a
@@ -790,6 +2604,16 @@ pub enum RootGateCadence {
 
 impl RootGateCadence {
     /// Probe at most once every `n` canonical blocks, clamping `0` to `1`.
+    ///
+    /// # Cost
+    ///
+    /// Each firing issues one `eth_getProof` per tracked account — the most
+    /// expensive read this crate makes — so the request rate is
+    /// `tracked accounts / n` per canonical block. A few hundred tracked
+    /// accounts on a fast chain is a substantial standing budget. The gate is
+    /// inert until [`ReactiveRuntime::track_account`] is called, so a runtime
+    /// that never tracks accounts never pays it.
+    #[must_use]
     pub fn every_n_blocks(n: u64) -> Self {
         Self::EveryNBlocks(NonZeroU64::new(n.max(1)).expect("clamped to at least 1"))
     }
@@ -810,7 +2634,7 @@ impl Default for RootGateCadence {
 /// The gate diffs the on-chain root **across time** (never local-vs-chain, per
 /// spec §6): it persists the *observed* root as a baseline and compares
 /// `root_now` to it. This is a currency gate, not a completeness gate.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 struct TrackedRoot {
     last_root: B256,
     last_block: u64,
@@ -820,7 +2644,7 @@ struct TrackedRoot {
 }
 
 /// Request for authoritative state repair.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ResyncRequest {
     /// Resync id.
     pub id: ResyncId,
@@ -835,7 +2659,7 @@ pub struct ResyncRequest {
 }
 
 /// Resync id.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct ResyncId(String);
 
 impl ResyncId {
@@ -846,7 +2670,7 @@ impl ResyncId {
 }
 
 /// Reason for a resync request.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[non_exhaustive]
 pub enum ResyncReason {
     /// Handler requested repair.
@@ -875,10 +2699,12 @@ pub enum ResyncReason {
 }
 
 /// Block target for a resync.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum ResyncBlock {
     /// Latest block.
     Latest,
+    /// Current provider pre-confirmation state.
+    Pending,
     /// Safe head.
     Safe,
     /// Finalized head.
@@ -897,7 +2723,7 @@ pub enum ResyncBlock {
 }
 
 /// State target for a resync.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum ResyncTarget {
     /// One storage slot.
     StorageSlot {
@@ -923,7 +2749,9 @@ pub enum ResyncTarget {
 }
 
 /// Account fields requested by a resync.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub struct AccountFieldMask {
     /// Balance field.
     pub balance: bool,
@@ -934,7 +2762,19 @@ pub struct AccountFieldMask {
 }
 
 /// Resync priority.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub enum ResyncPriority {
     /// Low priority.
     Low,
@@ -1008,7 +2848,11 @@ pub struct ReactiveConfig {
     /// Set `journal_depth` to exceed the deepest reorg you intend to recover
     /// precisely. When a reorg references a block that is no longer in the journal,
     /// the runtime emits a `tracing::warn!` so the under-recovery is observable
-    /// rather than silent.
+    /// rather than silent. Checkpointed engine ingestion is stricter: explicit
+    /// reorgs, implicit parent replacements, and removed/reorged records whose
+    /// rollback proof falls outside the retained effect journal are rejected
+    /// before mutation, durable save, or acknowledgement. Align this depth with
+    /// the complete reorg horizon promised by the subscriber.
     pub journal_depth: usize,
 }
 
@@ -1041,7 +2885,7 @@ pub enum HookBackpressure {
 /// longer hold (for example a reorg that runs deeper than the journal, so some
 /// dropped effects are neither rolled back nor purged). Later waves report
 /// missed-range and coverage-gap conditions into the same state machine.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[non_exhaustive]
 pub enum CacheHealth {
     /// All recovery guarantees hold; the cache is fully self-consistent.
@@ -1068,7 +2912,7 @@ pub enum CacheHealth {
 /// increasing count over the lifetime of the runtime. Counters wired by later
 /// waves (missed-range detection, storage-hash coverage gaps, stale-verdict
 /// tracking) remain zero until those waves land.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[non_exhaustive]
 pub struct CacheMetricsSnapshot {
     /// Reorgs that ran deeper than the journal, so aged-out effects could not be
@@ -1120,6 +2964,25 @@ impl CacheMetrics {
             stale_verdicts: self.stale_verdicts.load(Ordering::Relaxed),
         }
     }
+
+    fn restore(&self, snapshot: CacheMetricsSnapshot) {
+        self.deep_reorgs
+            .store(snapshot.deep_reorgs, Ordering::Relaxed);
+        self.reorgs_recovered
+            .store(snapshot.reorgs_recovered, Ordering::Relaxed);
+        self.resync_requests
+            .store(snapshot.resync_requests, Ordering::Relaxed);
+        self.resync_failures
+            .store(snapshot.resync_failures, Ordering::Relaxed);
+        self.missed_ranges
+            .store(snapshot.missed_ranges, Ordering::Relaxed);
+        self.coverage_gaps
+            .store(snapshot.coverage_gaps, Ordering::Relaxed);
+        self.pending_contamination
+            .store(snapshot.pending_contamination, Ordering::Relaxed);
+        self.stale_verdicts
+            .store(snapshot.stale_verdicts, Ordering::Relaxed);
+    }
 }
 
 /// Runtime report.
@@ -1138,6 +3001,8 @@ pub enum ReactiveReport<N: Network = Ethereum> {
     BlockCommitted(BlockReport<N>),
     /// Reorg processing report.
     Reorg(ReorgReport<N>),
+    /// Ordered source control accepted by the runtime.
+    ChainControl(ChainControlReport),
     /// A forward gap in the canonical block sequence was detected: blocks between
     /// the last-seen head and an arriving block were never observed.
     MissedBlockRange(MissedRangeReport<N>),
@@ -1150,6 +3015,13 @@ pub enum ReactiveReport<N: Network = Ethereum> {
     Error(ReactiveErrorReport<N>),
 }
 
+/// Report emitted after an ordered source control is accepted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChainControlReport {
+    /// Control in its original delivery order.
+    pub control: ChainControl,
+}
+
 /// Input acceptance report.
 #[derive(Clone, Debug)]
 pub struct InputReport<N: Network = Ethereum> {
@@ -1157,6 +3029,8 @@ pub struct InputReport<N: Network = Ethereum> {
     pub input_ref: InputRef,
     /// Input context.
     pub context: ReactiveContext,
+    /// Provider session that originated the input, when known.
+    pub provider: Option<ProviderRef>,
     /// Network marker.
     pub _network: PhantomData<N>,
 }
@@ -1267,7 +3141,12 @@ pub struct BlockReport<N: Network = Ethereum> {
 /// deeper than [`ReactiveConfig::journal_depth`], the aged-out blocks do not
 /// appear here and their effects are neither rolled back nor purged (the runtime
 /// logs a `tracing::warn!` in that case); the freshness/validation loop is the
-/// backstop for that span.
+/// backstop for that span. Checkpointed engine ingestion rejects explicit,
+/// implicit-parent, and removed-log recovery outside the retained journal
+/// instead of producing and durably acknowledging a partial report.
+/// Non-checkpointed ingestion still emits this report when no journal entry was
+/// recoverable; in that case `dropped` identifies the signal/head when known,
+/// while `dropped_blocks` and rollback effects are empty.
 #[derive(Clone, Debug)]
 pub struct ReorgReport<N: Network = Ethereum> {
     /// First dropped block, when known.
@@ -1301,6 +3180,8 @@ pub enum ReorgReason {
     ReorgedInput,
     /// A canonical block did not connect to the journaled head.
     ParentMismatch,
+    /// A subscriber delivered an explicit canonical branch transition.
+    Explicit,
 }
 
 /// Report of a forward gap in the canonical block sequence: an arriving block
@@ -1432,6 +3313,7 @@ impl From<&str> for HandlerError {
 
 /// Runtime error.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum ReactiveError {
     /// Handler returned an error.
     #[error("handler `{handler_id}` failed: {source}")]
@@ -1467,6 +3349,30 @@ pub enum ReactiveError {
         /// Effect kind.
         effect_kind: &'static str,
     },
+    /// A subscriber supplied payload metadata that is incomplete or
+    /// contradicts the accompanying context.
+    #[error("invalid reactive input record: {message}")]
+    InvalidInputRecord {
+        /// Human-readable invariant violation.
+        message: String,
+    },
+    /// A source delivered a contradictory chain-lifecycle transition.
+    #[error("invalid chain control: {message}")]
+    InvalidChainControl {
+        /// Human-readable invariant violation.
+        message: String,
+    },
+    /// Owner-scoped catch-up would mutate a historical block for which the
+    /// runtime has no rollback journal entry.
+    #[error(
+        "owner catch-up block {number} {hash} is outside the retained canonical rollback journal"
+    )]
+    OwnerCatchupOutsideJournal {
+        /// Catch-up block number.
+        number: u64,
+        /// Catch-up block hash.
+        hash: B256,
+    },
     /// Registration error.
     #[error(transparent)]
     Register(#[from] RegisterError),
@@ -1474,6 +3380,7 @@ pub enum ReactiveError {
 
 /// Handler registration error.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum RegisterError {
     /// Duplicate handler id.
     #[error("handler id `{0}` is already registered")]
@@ -1483,6 +3390,7 @@ pub enum RegisterError {
 /// Error returned when [`ReactiveEngine`] cannot register a handler on both the
 /// runtime and subscriber sides.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum ReactiveEngineRegisterError {
     /// Runtime registry rejected the handler.
     #[error(transparent)]
@@ -1490,18 +3398,230 @@ pub enum ReactiveEngineRegisterError {
     /// Subscriber rejected the handler's interests.
     #[error(transparent)]
     Subscriber(#[from] SubscriberError),
+    /// Owner-only history was not constrained to one hash-certified block that
+    /// remains in the runtime rollback journal.
+    #[error(
+        "owner backfill {start_block}..={end_block:?} must target exactly one hash-certified block in the retained rollback journal"
+    )]
+    BackfillOutsideJournal {
+        /// First requested block.
+        start_block: u64,
+        /// Inclusive requested upper bound, if bounded.
+        end_block: Option<u64>,
+        /// Hash-certified anchor supplied by the caller, if any.
+        retained_anchor: Option<BlockRef>,
+    },
+}
+
+/// Error adopting an RPC snapshot as a runtime's canonical continuity
+/// baseline.
+#[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ReactiveBaselineError {
+    /// Runtime or engine delivery state already contains lifecycle work.
+    #[error("cannot adopt a canonical baseline after reactive processing has started")]
+    ActiveRuntime,
+    /// An exact repeat is allowed, but the requested baseline conflicts with
+    /// the previously adopted block.
+    #[error(
+        "canonical baseline conflicts with existing block {existing_number} {existing_hash} (requested {requested_number} {requested_hash})"
+    )]
+    ConflictingBaseline {
+        /// Existing baseline number.
+        existing_number: u64,
+        /// Existing baseline hash.
+        existing_hash: B256,
+        /// Requested baseline number.
+        requested_number: u64,
+        /// Requested baseline hash.
+        requested_hash: B256,
+    },
+    /// Typed baseline and cache identify different chains.
+    #[error("baseline chain id {baseline_chain_id} does not match cache chain id {cache_chain_id}")]
+    CacheChainMismatch {
+        /// Chain declared by the baseline.
+        baseline_chain_id: u64,
+        /// Chain configured on the cache.
+        cache_chain_id: u64,
+    },
+    /// The cache is not hash-pinned to the exact adopted canonical block.
+    #[error("cache block selector is not canonically hash-pinned to baseline {number} {hash}")]
+    CacheBlockMismatch {
+        /// Expected baseline number.
+        number: u64,
+        /// Expected baseline hash.
+        hash: B256,
+    },
 }
 
 /// Error returned by [`ReactiveEngine`] helpers that combine subscriber polling
 /// and runtime ingestion.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum ReactiveEngineError {
     /// Subscriber polling failed.
     #[error(transparent)]
     Subscriber(#[from] SubscriberError),
     /// Runtime ingestion failed.
     #[error(transparent)]
-    Runtime(#[from] ReactiveError),
+    Runtime(ReactiveError),
+    /// Canonical cold-start baseline adoption failed.
+    #[error(transparent)]
+    Baseline(#[from] ReactiveBaselineError),
+    /// Runtime ingestion succeeded, but its durable delivery acknowledgement
+    /// did not commit. The subscriber may replay the batch.
+    #[error("runtime ingestion succeeded but subscriber acknowledgement failed: {0}")]
+    Acknowledgement(#[source] SubscriberError),
+    /// Runtime ingestion succeeded, but the resulting cache state could not be
+    /// durably checkpointed. The engine retains the commit in memory and must
+    /// retry it before polling another batch.
+    #[error("runtime ingestion succeeded but durable checkpoint commit failed: {0}")]
+    Checkpoint(#[source] DurableCheckpointError),
+    /// A checkpointed ingest had no canonical block to bind the state to.
+    #[error("cannot durably checkpoint reactive state before observing a canonical block")]
+    MissingCheckpointBlock,
+    /// Speculative pre-confirmation state is intentionally excluded from
+    /// canonical durable checkpoints.
+    #[error("pre-confirmed Flashblock batches cannot be durably checkpointed")]
+    PreconfirmationNotCheckpointable,
+    /// Runtime rollback/finality state could not be encoded for the checkpoint.
+    #[error("failed to encode durable reactive runtime state: {0}")]
+    RuntimeCheckpoint(String),
+    /// A crash-safe checkpoint commit is pending, so the engine cannot switch
+    /// to ordinary acknowledgement ordering without first completing it.
+    #[error("cannot use ordinary ingestion while a durable checkpoint commit is pending")]
+    PendingCheckpointCommit,
+    /// An ordinary delivery acknowledgement is pending, so the engine cannot
+    /// switch to checkpointed ingestion and retroactively make it durable.
+    #[error("cannot use checkpointed ingestion while an ordinary acknowledgement is pending")]
+    PendingAcknowledgementCommit,
+    /// A caller attempted to use a raw ingestion helper with subscriber-owned
+    /// commit metadata. Only the combined polling helpers can preserve the
+    /// required ingest-before-checkpoint-before-acknowledgement ordering.
+    #[error(
+        "raw engine ingestion cannot consume delivery tokens or subscriber checkpoints; use a combined next_ingest helper"
+    )]
+    UncommittedDeliveryMetadata,
+    /// Subscriber and cache are bound to different chains.
+    #[error(
+        "subscriber chain id {subscriber_chain_id} does not match cache chain id {cache_chain_id}"
+    )]
+    SubscriberChainMismatch {
+        /// Chain reported by the subscriber.
+        subscriber_chain_id: u64,
+        /// Chain configured on the cache.
+        cache_chain_id: u64,
+    },
+    /// Crash-safe checkpoint APIs require durable replay/resume semantics.
+    #[error("subscriber does not advertise durable replay support")]
+    SubscriberNotDurable,
+    /// A restored delivery token predates or otherwise lacks the core witness
+    /// needed to prove that a replay carries the same delivery.
+    #[error(
+        "committed delivery token has no delivery witness; replay cannot be acknowledged safely"
+    )]
+    MissingReplayWitness,
+    /// A source reused a committed token for different records, routing,
+    /// controls, chain identity, or provider resume state.
+    #[error("replayed delivery token does not match its committed delivery witness")]
+    ReplayDeliveryMismatch,
+    /// The stable delivery witness could not be encoded.
+    #[error("failed to encode durable delivery witness: {0}")]
+    DeliveryWitness(String),
+    /// A tokened network-generic header/body cannot be witnessed completely
+    /// without a source-supplied canonical wire commitment.
+    #[error(
+        "tokened block-header, full-block, or hydrated-transaction delivery requires an exact payload commitment"
+    )]
+    MissingPayloadCommitment,
+    /// Cache state changed after a batch was staged for a checkpoint. Retrying
+    /// would bind those unrelated mutations to the older delivery metadata.
+    #[error(
+        "cache changed while durable checkpoint commit was pending (staged generation {staged_generation}, current generation {current_generation})"
+    )]
+    PendingCheckpointCacheChanged {
+        /// Generation immediately after the staged batch was ingested.
+        staged_generation: u64,
+        /// Generation observed when checkpoint commit was retried.
+        current_generation: u64,
+    },
+    /// Checkpointed ingestion cannot durably acknowledge a reorg when the
+    /// runtime no longer retains every potentially affected journal entry.
+    #[error(
+        "reorg after block {common_ancestor} exceeds the retained rollback journal (oldest retained block {oldest_journaled:?}, configured depth {journal_depth})"
+    )]
+    CheckpointReorgOutsideJournal {
+        /// Last block shared by the old and replacement branches.
+        common_ancestor: u64,
+        /// Oldest retained effect-bearing journal block, if any.
+        oldest_journaled: Option<u64>,
+        /// Configured maximum journal entries.
+        journal_depth: usize,
+    },
+    /// Owner-scoped catch-up would mutate a historical block for which the
+    /// runtime has no rollback journal entry.
+    #[error(
+        "owner catch-up block {number} {hash} is outside the retained canonical rollback journal"
+    )]
+    OwnerCatchupOutsideJournal {
+        /// Catch-up block number.
+        number: u64,
+        /// Catch-up block hash.
+        hash: B256,
+    },
+}
+
+impl From<ReactiveError> for ReactiveEngineError {
+    fn from(error: ReactiveError) -> Self {
+        match error {
+            ReactiveError::OwnerCatchupOutsideJournal { number, hash } => {
+                Self::OwnerCatchupOutsideJournal { number, hash }
+            }
+            error => Self::Runtime(error),
+        }
+    }
+}
+
+/// Error restoring a durable checkpoint anchor into an active runtime.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum ReactiveCheckpointRestoreError {
+    /// A runtime with canonical journal state cannot be silently rewound.
+    #[error("cannot restore a durable checkpoint into a runtime with canonical journal state")]
+    ActiveRuntime,
+    /// Stored runtime recovery bytes were malformed or unsupported.
+    #[error("invalid durable reactive runtime state: {0}")]
+    InvalidRuntimeCheckpoint(String),
+    /// Checkpoint identity or cache restoration failed before activation.
+    #[error(transparent)]
+    Checkpoint(#[from] DurableCheckpointError),
+    /// Subscriber rejected the restored durable cursor or canonical position.
+    #[error("subscriber rejected durable resume position: {0}")]
+    Subscriber(#[source] SubscriberError),
+    /// Subscriber and checkpoint identities name different chains.
+    #[error(
+        "subscriber chain id {subscriber_chain_id} does not match checkpoint chain id {checkpoint_chain_id}"
+    )]
+    SubscriberChainMismatch {
+        /// Chain reported by the subscriber.
+        subscriber_chain_id: u64,
+        /// Chain committed by the checkpoint identity.
+        checkpoint_chain_id: u64,
+    },
+    /// Restoring event continuity requires a durable replay-capable subscriber.
+    #[error("subscriber does not advertise durable replay support")]
+    SubscriberNotDurable,
+}
+
+/// Result of one crash-safe subscriber ingest cycle.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub enum CheckpointedIngest<N: Network = Ethereum> {
+    /// A new batch was ingested, durably checkpointed, and acknowledged.
+    Applied(ReactiveBatchReport<N>),
+    /// The checkpoint already contained this replayed delivery token, so the
+    /// batch was acknowledged without applying its effects twice.
+    ReplayAcknowledged,
 }
 
 /// Absolute write target used for conflict reports.
@@ -1553,8 +3673,14 @@ pub struct ReactiveRuntime<N: Network = Ethereum> {
     hooks: Vec<Arc<dyn ReactiveHook<N>>>,
     config: ReactiveConfig,
     journal: VecDeque<BlockJournal<N>>,
+    coverage_head: Option<BlockRef>,
+    /// Highest block a source has attested carries no unhealed log-notification
+    /// loss. Never inferred: absent until a source says so.
+    log_coverage_head: Option<BlockRef>,
     pending_resyncs: Vec<ResyncRequest>,
     health: CacheHealth,
+    safe_head: Option<BlockRef>,
+    finalized_head: Option<BlockRef>,
     metrics: CacheMetrics,
     /// Opt-in freshness registry the runtime stamps for canonical event writes.
     ///
@@ -1584,6 +3710,15 @@ pub struct ReactiveRuntime<N: Network = Ethereum> {
     /// decoder-covered write in a skipped block would false-positive as a
     /// [`ReactiveReport::CoverageGap`].
     touched_since_gate: HashSet<Address>,
+    /// Disposable pre-confirmation branch layered over the canonical cache.
+    /// This is deliberately omitted from durable runtime checkpoints.
+    preconfirmed_branch: Option<PreconfirmedBranch>,
+}
+
+#[derive(Clone)]
+struct PreconfirmedBranch {
+    flashblock: FlashblockRef,
+    canonical_cache: EvmCacheStateSnapshot,
 }
 
 #[derive(Clone, Debug)]
@@ -1591,7 +3726,124 @@ struct BlockJournal<N: Network = Ethereum> {
     block: BlockRef,
     inputs: Vec<InputRef>,
     applied: Vec<AppliedReport<N>>,
+    handler_ids: Vec<HandlerId>,
     resynced: Vec<ResyncReport>,
+    rollback_diffs: Vec<StateDiff>,
+}
+
+// 4: adds `log_coverage_head`, the attested log-completeness watermark.
+const DURABLE_RUNTIME_CHECKPOINT_VERSION: u32 = 4;
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct DurableRuntimeCheckpoint {
+    version: u32,
+    safe_head: Option<BlockRef>,
+    finalized_head: Option<BlockRef>,
+    health: CacheHealth,
+    pending_resyncs: Vec<ResyncRequest>,
+    coverage_head: Option<BlockRef>,
+    log_coverage_head: Option<BlockRef>,
+    journal: Vec<DurableBlockJournal>,
+    freshness: Option<FreshnessRegistry>,
+    tracking: HashMap<Address, TrackingPolicy>,
+    tracked_roots: HashMap<Address, TrackedRoot>,
+    root_gate_cadence: RootGateCadence,
+    last_gate_block: Option<u64>,
+    touched_since_gate: HashSet<Address>,
+    metrics: CacheMetricsSnapshot,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct DurableBlockJournal {
+    block: BlockRef,
+    handler_ids: Vec<HandlerId>,
+    rollback_diffs: Vec<StateDiff>,
+}
+
+struct DurableRuntimeRestorePlan {
+    checkpoint: Option<DurableRuntimeCheckpoint>,
+    fallback_history: Vec<BlockRef>,
+}
+
+impl DurableRuntimeRestorePlan {
+    fn canonical_history(&self) -> Vec<BlockRef> {
+        self.checkpoint.as_ref().map_or_else(
+            || self.fallback_history.clone(),
+            |checkpoint| checkpoint.journal.iter().map(|entry| entry.block).collect(),
+        )
+    }
+}
+
+#[derive(Clone)]
+struct ReactiveRuntimeState<N: Network> {
+    journal: VecDeque<BlockJournal<N>>,
+    coverage_head: Option<BlockRef>,
+    log_coverage_head: Option<BlockRef>,
+    pending_resyncs: Vec<ResyncRequest>,
+    health: CacheHealth,
+    safe_head: Option<BlockRef>,
+    finalized_head: Option<BlockRef>,
+    freshness: Option<FreshnessRegistry>,
+    tracking: HashMap<Address, TrackingPolicy>,
+    tracked_roots: HashMap<Address, TrackedRoot>,
+    root_gate_cadence: RootGateCadence,
+    last_gate_block: Option<u64>,
+    touched_since_gate: HashSet<Address>,
+    metrics: CacheMetricsSnapshot,
+}
+
+#[derive(Clone)]
+struct ChainControlState {
+    journal_invalidated_from: Option<u64>,
+    resolved_canonical_blocks: HashMap<(u64, B256), BlockRef>,
+}
+
+/// Canonical branch fragments already rolled back by the current atomic batch.
+///
+/// Providers commonly emit one removed notification per log after one signal
+/// has already drained the complete dropped block (and every retained
+/// descendant). Explicit reorg controls can be followed by the same redundant
+/// lifecycle records. Exact identities decide whether removal recovery is
+/// redundant; numeric spans are retained only as same-batch proof for a
+/// parentless replacement after those exact journal entries were drained.
+#[derive(Default)]
+struct BatchDroppedCanonical {
+    identities: HashSet<(u64, B256)>,
+    implicit_spans: Vec<(u64, u64)>,
+}
+
+impl BatchDroppedCanonical {
+    fn covers_implicit_number(&self, number: u64) -> bool {
+        self.implicit_spans
+            .iter()
+            .any(|(from, through)| number >= *from && number <= *through)
+    }
+
+    fn contains(&self, block: &BlockRef) -> bool {
+        self.identities.contains(&(block.number, block.hash))
+    }
+
+    fn record_identity(&mut self, block: &BlockRef) {
+        self.identities.insert((block.number, block.hash));
+    }
+
+    fn record_explicit(&mut self, _common_ancestor: &BlockRef, old_tip: &BlockRef) {
+        self.identities.insert((old_tip.number, old_tip.hash));
+    }
+
+    fn record_drained(&mut self, blocks: &[BlockRef]) {
+        let Some(from) = blocks.iter().map(|block| block.number).min() else {
+            return;
+        };
+        let through = blocks
+            .iter()
+            .map(|block| block.number)
+            .max()
+            .expect("a non-empty drained set has a maximum");
+        self.implicit_spans.push((from, through));
+        self.identities
+            .extend(blocks.iter().map(|block| (block.number, block.hash)));
+    }
 }
 
 /// Registry and router for provider-neutral reactive handlers.
@@ -1641,6 +3893,11 @@ impl<N: Network> ReactiveRegistry<N> {
     ///
     /// Duplicate handler ids are rejected with
     /// [`RegisterError::DuplicateHandler`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RegisterError::DuplicateHandler`] when the id is already
+    /// registered.
     pub fn register_handler(
         &mut self,
         handler: Arc<dyn ReactiveHandler<N>>,
@@ -1650,6 +3907,17 @@ impl<N: Network> ReactiveRegistry<N> {
             return Err(RegisterError::DuplicateHandler(id));
         }
         let interests = handler.interests();
+        self.insert_handler_prepared(id, handler, interests);
+        Ok(())
+    }
+
+    fn insert_handler_prepared(
+        &mut self,
+        id: HandlerId,
+        handler: Arc<dyn ReactiveHandler<N>>,
+        interests: Vec<ReactiveInterest<N>>,
+    ) {
+        debug_assert!(!self.handler_positions.contains_key(&id));
         let has_log_interests = interests
             .iter()
             .any(|interest| matches!(interest, ReactiveInterest::Logs(_)));
@@ -1686,7 +3954,6 @@ impl<N: Network> ReactiveRegistry<N> {
                 log_route_index,
             },
         );
-        Ok(())
     }
 
     /// Remove one handler by id, leaving all other handlers and interests intact.
@@ -1896,8 +4163,12 @@ impl<N: Network> ReactiveRuntime<N> {
             hooks: Vec::new(),
             config,
             journal: VecDeque::new(),
+            coverage_head: None,
+            log_coverage_head: None,
             pending_resyncs: Vec::new(),
             health: CacheHealth::Healthy,
+            safe_head: None,
+            finalized_head: None,
             metrics: CacheMetrics::default(),
             freshness: None,
             tracking: HashMap::new(),
@@ -1905,7 +4176,374 @@ impl<N: Network> ReactiveRuntime<N> {
             root_gate_cadence: RootGateCadence::default(),
             last_gate_block: None,
             touched_since_gate: HashSet::new(),
+            preconfirmed_branch: None,
         }
+    }
+
+    fn checkpoint_state(&self) -> ReactiveRuntimeState<N> {
+        ReactiveRuntimeState {
+            journal: self.journal.clone(),
+            coverage_head: self.coverage_head,
+            log_coverage_head: self.log_coverage_head,
+            pending_resyncs: self.pending_resyncs.clone(),
+            health: self.health,
+            safe_head: self.safe_head,
+            finalized_head: self.finalized_head,
+            freshness: self.freshness.clone(),
+            tracking: self.tracking.clone(),
+            tracked_roots: self.tracked_roots.clone(),
+            root_gate_cadence: self.root_gate_cadence,
+            last_gate_block: self.last_gate_block,
+            touched_since_gate: self.touched_since_gate.clone(),
+            metrics: self.metrics.snapshot(),
+        }
+    }
+
+    fn is_pristine_for_checkpoint_restore(&self) -> bool {
+        self.preconfirmed_branch.is_none()
+            && self.journal.is_empty()
+            && self.coverage_head.is_none()
+            && self.pending_resyncs.is_empty()
+            && self.health == CacheHealth::Healthy
+            && self.safe_head.is_none()
+            && self.finalized_head.is_none()
+            && self.tracked_roots.is_empty()
+            && self.last_gate_block.is_none()
+            && self.touched_since_gate.is_empty()
+            && self.metrics.snapshot() == CacheMetricsSnapshot::default()
+    }
+
+    fn adopted_baseline_only(&self) -> Option<BlockRef> {
+        let baseline = self.coverage_head?;
+        let journal_is_baseline_only = if self.config.journal_depth == 0 {
+            self.journal.is_empty()
+        } else {
+            self.journal.len() == 1
+                && self.journal.front().is_some_and(|entry| {
+                    entry.block == baseline
+                        && entry.inputs.is_empty()
+                        && entry.applied.is_empty()
+                        && entry.handler_ids.is_empty()
+                        && entry.resynced.is_empty()
+                        && entry.rollback_diffs.is_empty()
+                })
+        };
+        (self.preconfirmed_branch.is_none()
+            && journal_is_baseline_only
+            && self.pending_resyncs.is_empty()
+            && self.health == CacheHealth::Healthy
+            && self.safe_head.is_none()
+            && self.finalized_head.is_none()
+            && self.tracked_roots.is_empty()
+            && self.last_gate_block.is_none()
+            && self.touched_since_gate.is_empty()
+            && self.metrics.snapshot() == CacheMetricsSnapshot::default())
+        .then_some(baseline)
+    }
+
+    fn restore_state(&mut self, state: ReactiveRuntimeState<N>) {
+        self.journal = state.journal;
+        self.coverage_head = state.coverage_head;
+        self.log_coverage_head = state.log_coverage_head;
+        self.pending_resyncs = state.pending_resyncs;
+        self.health = state.health;
+        self.safe_head = state.safe_head;
+        self.finalized_head = state.finalized_head;
+        self.freshness = state.freshness;
+        self.tracking = state.tracking;
+        self.tracked_roots = state.tracked_roots;
+        self.root_gate_cadence = state.root_gate_cadence;
+        self.last_gate_block = state.last_gate_block;
+        self.touched_since_gate = state.touched_since_gate;
+        self.metrics.restore(state.metrics);
+    }
+
+    fn restore_transaction_state(&mut self, state: ReactiveRuntimeState<N>) {
+        // Metrics describe lifetime observations, including rejected attempts,
+        // and are documented as monotonic. Roll back canonical/runtime state
+        // without erasing the failure signal that caused the transaction to
+        // abort.
+        let metrics = self.metrics.snapshot();
+        self.restore_state(state);
+        self.metrics.restore(metrics);
+    }
+
+    fn durable_checkpoint_bytes(&self) -> Result<Vec<u8>, ReactiveEngineError> {
+        let checkpoint = DurableRuntimeCheckpoint {
+            version: DURABLE_RUNTIME_CHECKPOINT_VERSION,
+            safe_head: self.safe_head,
+            finalized_head: self.finalized_head,
+            health: self.health,
+            pending_resyncs: self.pending_resyncs.clone(),
+            coverage_head: self.coverage_head,
+            log_coverage_head: self.log_coverage_head,
+            journal: self
+                .journal
+                .iter()
+                .map(|entry| DurableBlockJournal {
+                    block: entry.block,
+                    handler_ids: entry.handler_ids.clone(),
+                    rollback_diffs: entry.rollback_diffs.clone(),
+                })
+                .collect(),
+            freshness: self.freshness.clone(),
+            tracking: self.tracking.clone(),
+            tracked_roots: self.tracked_roots.clone(),
+            root_gate_cadence: self.root_gate_cadence,
+            last_gate_block: self.last_gate_block,
+            touched_since_gate: self.touched_since_gate.clone(),
+            metrics: self.metrics.snapshot(),
+        };
+        bincode::serialize(&checkpoint)
+            .map_err(|error| ReactiveEngineError::RuntimeCheckpoint(error.to_string()))
+    }
+
+    fn plan_durable_checkpoint_restore(
+        &self,
+        bytes: &[u8],
+        expected_coverage: &BlockRef,
+    ) -> Result<DurableRuntimeRestorePlan, ReactiveCheckpointRestoreError> {
+        let mut cursor = std::io::Cursor::new(bytes);
+        let mut checkpoint: DurableRuntimeCheckpoint = bincode::DefaultOptions::new()
+            .with_fixint_encoding()
+            .with_limit(bytes.len() as u64)
+            .deserialize_from(&mut cursor)
+            .map_err(|error| {
+                ReactiveCheckpointRestoreError::InvalidRuntimeCheckpoint(error.to_string())
+            })?;
+        if cursor.position() != bytes.len() as u64 {
+            return Err(ReactiveCheckpointRestoreError::InvalidRuntimeCheckpoint(
+                "runtime checkpoint has trailing bytes".to_owned(),
+            ));
+        }
+        if checkpoint.version != DURABLE_RUNTIME_CHECKPOINT_VERSION {
+            return Err(ReactiveCheckpointRestoreError::InvalidRuntimeCheckpoint(
+                format!(
+                    "unsupported runtime checkpoint version {}",
+                    checkpoint.version
+                ),
+            ));
+        }
+        self.validate_durable_runtime_checkpoint(&checkpoint, expected_coverage)?;
+
+        let retained = self.config.journal_depth.min(checkpoint.journal.len());
+        let discard = checkpoint.journal.len() - retained;
+        checkpoint.journal.drain(..discard);
+        Ok(DurableRuntimeRestorePlan {
+            checkpoint: Some(checkpoint),
+            fallback_history: Vec::new(),
+        })
+    }
+
+    fn apply_durable_checkpoint_restore(&mut self, plan: DurableRuntimeRestorePlan) {
+        let Some(checkpoint) = plan.checkpoint else {
+            self.journal = plan
+                .fallback_history
+                .into_iter()
+                .map(|block| BlockJournal {
+                    block,
+                    inputs: Vec::new(),
+                    applied: Vec::new(),
+                    handler_ids: Vec::new(),
+                    resynced: Vec::new(),
+                    rollback_diffs: Vec::new(),
+                })
+                .collect();
+            return;
+        };
+        self.safe_head = checkpoint.safe_head;
+        self.finalized_head = checkpoint.finalized_head;
+        self.health = checkpoint.health;
+        self.pending_resyncs = checkpoint.pending_resyncs;
+        self.coverage_head = checkpoint.coverage_head;
+        self.log_coverage_head = checkpoint.log_coverage_head;
+        self.journal = checkpoint
+            .journal
+            .into_iter()
+            .map(|entry| BlockJournal {
+                block: entry.block,
+                inputs: Vec::new(),
+                applied: Vec::new(),
+                handler_ids: entry.handler_ids,
+                resynced: Vec::new(),
+                rollback_diffs: entry.rollback_diffs,
+            })
+            .collect();
+        self.freshness = checkpoint.freshness;
+        self.tracking = checkpoint.tracking;
+        self.tracked_roots = checkpoint.tracked_roots;
+        self.root_gate_cadence = checkpoint.root_gate_cadence;
+        self.last_gate_block = checkpoint.last_gate_block;
+        self.touched_since_gate = checkpoint.touched_since_gate;
+        self.metrics.restore(checkpoint.metrics);
+    }
+
+    fn validate_durable_runtime_checkpoint(
+        &self,
+        checkpoint: &DurableRuntimeCheckpoint,
+        expected_coverage: &BlockRef,
+    ) -> Result<(), ReactiveCheckpointRestoreError> {
+        let invalid =
+            |message: String| ReactiveCheckpointRestoreError::InvalidRuntimeCheckpoint(message);
+        let Some(coverage) = checkpoint.coverage_head.as_ref() else {
+            return Err(invalid(
+                "runtime checkpoint is missing its canonical coverage head".into(),
+            ));
+        };
+        if !optional_block_refs_are_compatible(Some(coverage), Some(expected_coverage)) {
+            return Err(invalid(format!(
+                "runtime coverage {}:{:?} conflicts with checkpoint metadata {}:{:?}",
+                coverage.number, coverage.hash, expected_coverage.number, expected_coverage.hash
+            )));
+        }
+        for (label, head) in [
+            ("safe", checkpoint.safe_head.as_ref()),
+            ("finalized", checkpoint.finalized_head.as_ref()),
+        ] {
+            let Some(head) = head else { continue };
+            if head.number > coverage.number
+                || (head.number == coverage.number && head.hash != coverage.hash)
+            {
+                return Err(invalid(format!(
+                    "{label} head {}:{:?} lies beyond or conflicts with canonical coverage {}:{:?}",
+                    head.number, head.hash, coverage.number, coverage.hash
+                )));
+            }
+            if head.number.checked_add(1) == Some(coverage.number)
+                && coverage
+                    .parent_hash
+                    .is_some_and(|parent| parent != head.hash)
+            {
+                return Err(invalid(format!(
+                    "canonical coverage does not descend from adjacent {label} head"
+                )));
+            }
+        }
+        if let (Some(finalized), Some(safe)) = (
+            checkpoint.finalized_head.as_ref(),
+            checkpoint.safe_head.as_ref(),
+        ) {
+            if finalized.number > safe.number
+                || (finalized.number == safe.number && finalized.hash != safe.hash)
+            {
+                return Err(invalid(
+                    "finalized head is above or conflicts with the safe head".into(),
+                ));
+            }
+            if finalized.number.checked_add(1) == Some(safe.number)
+                && safe.parent_hash != Some(finalized.hash)
+            {
+                return Err(invalid(
+                    "adjacent safe head does not descend from finalized head".into(),
+                ));
+            }
+        }
+
+        let mut previous: Option<&DurableBlockJournal> = None;
+        for entry in &checkpoint.journal {
+            if entry.block.number > coverage.number
+                || (entry.block.number == coverage.number && entry.block.hash != coverage.hash)
+            {
+                return Err(invalid(format!(
+                    "journal block {}:{:?} lies beyond or conflicts with canonical coverage",
+                    entry.block.number, entry.block.hash
+                )));
+            }
+            if let Some(previous) = previous {
+                if entry.block.number <= previous.block.number {
+                    return Err(invalid(
+                        "runtime journal block numbers are not strictly increasing".into(),
+                    ));
+                }
+                if previous.block.number.checked_add(1) == Some(entry.block.number)
+                    && entry.block.parent_hash.is_some()
+                    && entry.block.parent_hash != Some(previous.block.hash)
+                {
+                    return Err(invalid(
+                        "adjacent runtime journal blocks are not parent-linked".into(),
+                    ));
+                }
+            }
+            for (label, head) in [
+                ("safe", checkpoint.safe_head.as_ref()),
+                ("finalized", checkpoint.finalized_head.as_ref()),
+            ] {
+                if let Some(head) = head
+                    && head.number == entry.block.number
+                    && !optional_block_refs_are_compatible(Some(head), Some(&entry.block))
+                {
+                    return Err(invalid(format!(
+                        "{label} head conflicts with the retained journal at block {}",
+                        head.number
+                    )));
+                }
+            }
+            let mut handler_ids = HashSet::new();
+            if entry
+                .handler_ids
+                .iter()
+                .any(|handler_id| !handler_ids.insert(handler_id))
+            {
+                return Err(invalid(
+                    "runtime journal contains duplicate handler generation ids".into(),
+                ));
+            }
+            previous = Some(entry);
+        }
+        if let Some(tail) = checkpoint.journal.last()
+            && tail.block.number == coverage.number
+            && !optional_block_refs_are_compatible(Some(&tail.block), Some(coverage))
+        {
+            return Err(invalid(format!(
+                "runtime journal tail conflicts with canonical coverage at block {}",
+                coverage.number
+            )));
+        }
+        if let Some(tail) = checkpoint.journal.last()
+            && tail.block.number.checked_add(1) == Some(coverage.number)
+            && coverage
+                .parent_hash
+                .is_some_and(|parent_hash| parent_hash != tail.block.hash)
+        {
+            return Err(invalid(format!(
+                "canonical coverage does not descend from adjacent runtime journal tail at block {}",
+                tail.block.number
+            )));
+        }
+
+        if let Some(last_gate_block) = checkpoint.last_gate_block {
+            if last_gate_block > coverage.number {
+                return Err(invalid(
+                    "root-gate cursor lies beyond canonical coverage".into(),
+                ));
+            }
+        } else if !checkpoint.tracked_roots.is_empty() {
+            return Err(invalid(
+                "root-gate baselines exist without a completed gate cursor".into(),
+            ));
+        }
+        for (address, baseline) in &checkpoint.tracked_roots {
+            let Some(policy) = checkpoint.tracking.get(address) else {
+                return Err(invalid(
+                    "root-gate baseline has no corresponding tracking policy".into(),
+                ));
+            };
+            if matches!(policy, TrackingPolicy::Slots { .. }) {
+                return Err(invalid(
+                    "slot-only tracking cannot carry an account root baseline".into(),
+                ));
+            }
+            if baseline.last_block > coverage.number
+                || checkpoint
+                    .last_gate_block
+                    .is_some_and(|last_gate| baseline.last_block > last_gate)
+            {
+                return Err(invalid(
+                    "root-gate baseline lies beyond the committed gate window".into(),
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Track `address` under `policy` for the per-block root gate (Phase-8 step 4).
@@ -1921,6 +4559,13 @@ impl<N: Network> ReactiveRuntime<N> {
     /// [`ReactiveReport::CoverageGap`] and schedules a
     /// [`ResyncReason::RootMoved`] repair. [`Slots`](TrackingPolicy::Slots)
     /// accounts are never root-gated (spec Decision 3).
+    /// # Cost
+    ///
+    /// Tracking an account with a root-gated policy enrols it in the root gate,
+    /// which issues one `eth_getProof` per tracked account every
+    /// [`RootGateCadence`] window. That is the most expensive read this crate
+    /// makes, and it is standing traffic for as long as the account is tracked;
+    /// [`TrackingPolicy::Slots`] opts out of the gate entirely.
     pub fn track_account(&mut self, address: Address, policy: TrackingPolicy) {
         self.tracking.insert(address, policy);
         self.tracked_roots.remove(&address);
@@ -1945,6 +4590,17 @@ impl<N: Network> ReactiveRuntime<N> {
         self.root_gate_cadence = cadence;
         self.last_gate_block = None;
         self.touched_since_gate.clear();
+    }
+
+    /// Highest block a source has attested carries no unhealed log-notification
+    /// loss, when any source has attested.
+    ///
+    /// `None` means unknown, not complete. A consumer deciding whether it may
+    /// treat a buffered log set as authoritative must require a watermark at or
+    /// above the block in question — never infer completeness from silence. See
+    /// [`ChainControl::LogCoverage`].
+    pub const fn log_coverage_head(&self) -> Option<&BlockRef> {
+        self.log_coverage_head.as_ref()
     }
 
     /// The configured [`RootGateCadence`].
@@ -2056,6 +4712,11 @@ impl<N: Network> ReactiveRuntime<N> {
     }
 
     /// Register a handler.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RegisterError::DuplicateHandler`] when the id is already
+    /// registered.
     pub fn register_handler(
         &mut self,
         handler: Arc<dyn ReactiveHandler<N>>,
@@ -2095,11 +4756,82 @@ impl<N: Network> ReactiveRuntime<N> {
     /// recently recorded by ingestion. Reorged blocks are dropped from the
     /// journal during recovery, so a rolled-back head does not linger here.
     /// [`ReactiveEngine::register_handler`] uses it as the default backfill
-    /// anchor for handlers registered mid-lifecycle. `None` until the first
-    /// canonical input is journaled, and always `None` when
-    /// [`ReactiveConfig::journal_depth`] is 0 (journaling disabled).
+    /// anchor for handlers registered mid-lifecycle. An ordered barrier may
+    /// advance this coverage position across an empty event range. `None` until
+    /// the first canonical input or barrier is accepted.
     pub fn last_canonical_block(&self) -> Option<BlockRef> {
-        self.journal.back().map(|entry| entry.block.clone())
+        self.coverage_head
+    }
+
+    /// Adopt an exact RPC snapshot block as this runtime's canonical starting
+    /// position without applying effects or dispatching reports.
+    ///
+    /// Handlers, hooks, tracking policy, and freshness configuration may be
+    /// installed before adoption, but no chain input, finality, resync,
+    /// root-gate observation, or health transition may have occurred. An exact
+    /// repeat is idempotent; a different repeat and any active runtime fail
+    /// closed. Prefer [`ReactiveEngine::adopt_canonical_baseline`] when a cache
+    /// and subscriber are available so chain identity and the cache's exact
+    /// hash pin are validated too.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReactiveBaselineError::ActiveRuntime`] after any runtime
+    /// activity, or [`ReactiveBaselineError::ConflictingBaseline`] when a
+    /// different baseline has already been adopted.
+    pub fn adopt_canonical_baseline(
+        &mut self,
+        baseline: BlockRef,
+    ) -> Result<(), ReactiveBaselineError> {
+        self.validate_canonical_baseline_adoption(baseline)?;
+        if self.adopted_baseline_only().is_some() {
+            return Ok(());
+        }
+
+        self.coverage_head = Some(baseline);
+        if self.config.journal_depth > 0 {
+            self.journal.push_back(BlockJournal {
+                block: baseline,
+                inputs: Vec::new(),
+                applied: Vec::new(),
+                handler_ids: Vec::new(),
+                resynced: Vec::new(),
+                rollback_diffs: Vec::new(),
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_canonical_baseline_adoption(
+        &self,
+        baseline: BlockRef,
+    ) -> Result<(), ReactiveBaselineError> {
+        if let Some(existing) = self.adopted_baseline_only() {
+            return if existing == baseline {
+                Ok(())
+            } else {
+                Err(ReactiveBaselineError::ConflictingBaseline {
+                    existing_number: existing.number,
+                    existing_hash: existing.hash,
+                    requested_number: baseline.number,
+                    requested_hash: baseline.hash,
+                })
+            };
+        }
+        if !self.is_pristine_for_checkpoint_restore() {
+            return Err(ReactiveBaselineError::ActiveRuntime);
+        }
+        Ok(())
+    }
+
+    /// Most recent safe head explicitly reported by the event source.
+    pub const fn safe_head(&self) -> Option<&BlockRef> {
+        self.safe_head.as_ref()
+    }
+
+    /// Most recent finalized head explicitly reported by the event source.
+    pub const fn finalized_head(&self) -> Option<&BlockRef> {
+        self.finalized_head.as_ref()
     }
 
     /// Return whether the retained reorg journal still contains an applied
@@ -2110,12 +4842,9 @@ impl<N: Network> ReactiveRuntime<N> {
     /// as long as a later rollback could restore effects from that handler
     /// generation. This query is bounded by [`ReactiveConfig::journal_depth`].
     pub fn has_journaled_handler_effects(&self, handler_id: &HandlerId) -> bool {
-        self.journal.iter().any(|entry| {
-            entry
-                .applied
-                .iter()
-                .any(|applied| &applied.handler_id == handler_id)
-        })
+        self.journal
+            .iter()
+            .any(|entry| entry.handler_ids.contains(handler_id))
     }
 
     /// Return the distinct handler generations represented in the retained
@@ -2127,8 +4856,7 @@ impl<N: Network> ReactiveRuntime<N> {
     pub fn journaled_handler_ids(&self) -> HashSet<HandlerId> {
         self.journal
             .iter()
-            .flat_map(|entry| entry.applied.iter())
-            .map(|applied| applied.handler_id.clone())
+            .flat_map(|entry| entry.handler_ids.iter().cloned())
             .collect()
     }
 
@@ -2218,6 +4946,11 @@ impl<N: Network> ReactiveRuntime<N> {
     }
 
     /// Register a hook.
+    ///
+    /// # Errors
+    ///
+    /// This implementation is currently infallible; the `Result` preserves the
+    /// registration contract for future hook validation.
     pub fn register_hook(&mut self, hook: Arc<dyn ReactiveHook<N>>) -> Result<(), RegisterError> {
         self.hooks.push(hook);
         Ok(())
@@ -2229,12 +4962,49 @@ impl<N: Network> ReactiveRuntime<N> {
     }
 
     /// Ingest a batch, apply valid direct state effects, and dispatch reports.
+    ///
+    /// The commit is atomic on `Err`: cache state and canonical runtime state are
+    /// restored before the error returns, and hooks see no reports. Monotonic
+    /// observability counters still retain rejected-attempt signals.
+    /// The current rollback guard snapshots complete mutable cache state once per
+    /// batch, so callers should preserve transport batching rather than splitting
+    /// one delivery into many one-record calls.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReactiveError`] when records or controls are invalid, canonical
+    /// continuity cannot be proven, a handler rejects input, or an effect cannot
+    /// be applied. A pre-confirmed batch additionally requires an adopted
+    /// canonical coverage head and must identify its exact child by number and
+    /// parent hash. Cache and canonical runtime state are restored before
+    /// return; a lineage failure revokes any active speculative branch.
     pub fn ingest_batch(
         &mut self,
         cache: &mut EvmCache,
         batch: ReactiveInputBatch<N>,
     ) -> Result<ReactiveBatchReport<N>, ReactiveError> {
-        let batch_report = self.ingest_batch_direct(cache, batch)?;
+        let preconfirmation = batch_preconfirmation(&batch)?;
+        if let Some(flashblock) = preconfirmation.as_ref() {
+            self.prepare_preconfirmed_branch(cache, flashblock)?;
+        } else {
+            self.discard_preconfirmed_branch(cache);
+        }
+        let cache_state = EvmCacheStateSnapshot::capture(cache);
+        let runtime_state = self.checkpoint_state();
+        let batch_report = match self.ingest_batch_direct(cache, batch) {
+            Ok(report) => report,
+            Err(error) => {
+                cache_state.restore(cache);
+                self.restore_transaction_state(runtime_state);
+                return Err(error);
+            }
+        };
+        if let Some(flashblock) = preconfirmation {
+            self.restore_transaction_state(runtime_state);
+            if let Some(branch) = self.preconfirmed_branch.as_mut() {
+                branch.flashblock = flashblock;
+            }
+        }
         self.dispatch_reports(&batch_report.reports);
         let _ = &self.config;
         Ok(batch_report)
@@ -2250,13 +5020,135 @@ impl<N: Network> ReactiveRuntime<N> {
     /// [`EvmCache::apply_updates`], and unsupported or failed targets are reported
     /// in [`ResyncReport::failed`]. It does not start subscribers, background
     /// workers, or network transport.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReactiveError`] for the same validation, continuity, handler,
+    /// or direct-effect failures as [`ingest_batch`](Self::ingest_batch). Failed
+    /// resync targets are reported in the successful batch report instead.
     pub fn ingest_batch_with_resync(
         &mut self,
         cache: &mut EvmCache,
         batch: ReactiveInputBatch<N>,
     ) -> Result<ReactiveBatchReport<N>, ReactiveError> {
-        let mut batch_report = self.ingest_batch_direct(cache, batch)?;
+        let preconfirmation = batch_preconfirmation(&batch)?;
+        if let Some(flashblock) = preconfirmation.as_ref() {
+            self.prepare_preconfirmed_branch(cache, flashblock)?;
+        } else {
+            self.discard_preconfirmed_branch(cache);
+        }
+        let cache_state = EvmCacheStateSnapshot::capture(cache);
+        let runtime_state = self.checkpoint_state();
+        let batch_report = match self.ingest_batch_with_resync_direct(cache, batch) {
+            Ok(report) => report,
+            Err(error) => {
+                cache_state.restore(cache);
+                self.restore_transaction_state(runtime_state);
+                return Err(error);
+            }
+        };
 
+        if let Some(flashblock) = preconfirmation {
+            self.restore_transaction_state(runtime_state);
+            if let Some(branch) = self.preconfirmed_branch.as_mut() {
+                branch.flashblock = flashblock;
+            }
+        }
+
+        self.dispatch_reports(&batch_report.reports);
+        let _ = &self.config;
+        Ok(batch_report)
+    }
+
+    /// Active speculative Flashblock snapshot, when the cache currently
+    /// includes pre-confirmed effects.
+    pub fn active_preconfirmation(&self) -> Option<&FlashblockRef> {
+        self.preconfirmed_branch
+            .as_ref()
+            .map(|branch| &branch.flashblock)
+    }
+
+    /// Restore the cache to its canonical state and discard any speculative
+    /// Flashblock effects.
+    pub fn discard_preconfirmation(&mut self, cache: &mut EvmCache) {
+        self.discard_preconfirmed_branch(cache);
+    }
+
+    fn discard_preconfirmed_branch(&mut self, cache: &mut EvmCache) {
+        if let Some(branch) = self.preconfirmed_branch.take() {
+            branch.canonical_cache.restore(cache);
+        }
+    }
+
+    fn prepare_preconfirmed_branch(
+        &mut self,
+        cache: &mut EvmCache,
+        incoming: &FlashblockRef,
+    ) -> Result<(), ReactiveError> {
+        let Some(canonical) = self.coverage_head else {
+            self.discard_preconfirmed_branch(cache);
+            return Err(ReactiveError::InvalidInputRecord {
+                message: "pre-confirmed state requires an exact canonical coverage baseline".into(),
+            });
+        };
+        if canonical.number.checked_add(1) != Some(incoming.block_number) {
+            self.discard_preconfirmed_branch(cache);
+            return Err(ReactiveError::InvalidInputRecord {
+                message: format!(
+                    "pre-confirmed block {} is not the exact successor of canonical block {}",
+                    incoming.block_number, canonical.number
+                ),
+            });
+        }
+        if incoming.parent_hash != Some(canonical.hash) {
+            self.discard_preconfirmed_branch(cache);
+            return Err(ReactiveError::InvalidInputRecord {
+                message: "pre-confirmed block parent does not match the canonical coverage hash"
+                    .into(),
+            });
+        }
+        if let Some(active) = self.preconfirmed_branch.as_ref()
+            && active.flashblock.same_payload(incoming)
+        {
+            if let (Some(active_index), Some(incoming_index)) =
+                (active.flashblock.index, incoming.index)
+                && incoming_index < active_index
+            {
+                return Err(ReactiveError::InvalidInputRecord {
+                    message: format!(
+                        "Flashblock index regressed from {active_index} to {incoming_index}"
+                    ),
+                });
+            }
+            if active.flashblock.index.is_some()
+                && active.flashblock.index == incoming.index
+                && active.flashblock.content_hash != incoming.content_hash
+            {
+                self.discard_preconfirmed_branch(cache);
+                return Err(ReactiveError::InvalidInputRecord {
+                    message: "same Flashblock payload/index carried conflicting cumulative content"
+                        .into(),
+                });
+            }
+            install_preconfirmed_cache_context(cache, incoming);
+            return Ok(());
+        }
+
+        self.discard_preconfirmed_branch(cache);
+        self.preconfirmed_branch = Some(PreconfirmedBranch {
+            flashblock: incoming.clone(),
+            canonical_cache: EvmCacheStateSnapshot::capture(cache),
+        });
+        install_preconfirmed_cache_context(cache, incoming);
+        Ok(())
+    }
+
+    fn ingest_batch_with_resync_direct(
+        &mut self,
+        cache: &mut EvmCache,
+        batch: ReactiveInputBatch<N>,
+    ) -> Result<ReactiveBatchReport<N>, ReactiveError> {
+        let mut batch_report = self.ingest_batch_direct(cache, batch)?;
         if !batch_report.resyncs.is_empty() {
             let resync_report = execute_resync_requests(cache, &batch_report.resyncs);
             // Count unique logical requests: several handlers may emit the same
@@ -2280,9 +5172,6 @@ impl<N: Network> ReactiveRuntime<N> {
                 .reports
                 .push(Arc::new(ReactiveReport::Resynced(resync_report)));
         }
-
-        self.dispatch_reports(&batch_report.reports);
-        let _ = &self.config;
         Ok(batch_report)
     }
 
@@ -2291,10 +5180,70 @@ impl<N: Network> ReactiveRuntime<N> {
         cache: &mut EvmCache,
         batch: ReactiveInputBatch<N>,
     ) -> Result<ReactiveBatchReport<N>, ReactiveError> {
-        let records = sort_records(dedupe_records(batch.into_records()));
+        let (records, chain_controls, batch_chain_id) = batch.into_runtime_parts();
+        if let Some(chain_id) = batch_chain_id
+            && chain_id != cache.chain_id()
+        {
+            return Err(ReactiveError::InvalidInputRecord {
+                message: format!(
+                    "batch chain id {chain_id} does not match cache chain id {}",
+                    cache.chain_id()
+                ),
+            });
+        }
+        if !chain_controls.is_empty() && batch_chain_id.is_none() {
+            return Err(ReactiveError::InvalidChainControl {
+                message: "chain-control batches require an authoritative batch chain id".into(),
+            });
+        }
+        for (record, _, _) in &records {
+            record.validated_identity()?;
+            if let Some(chain_id) = record.context.chain_id
+                && chain_id != cache.chain_id()
+            {
+                return Err(ReactiveError::InvalidInputRecord {
+                    message: format!(
+                        "input chain id {chain_id} does not match cache chain id {}",
+                        cache.chain_id()
+                    ),
+                });
+            }
+        }
+        let records = sort_scoped_records(dedupe_scoped_records(records)?);
 
         let mut batch_report = ReactiveBatchReport::default();
         let mut reports_to_dispatch = Vec::new();
+        let control_split = validate_control_phase_order(&chain_controls)?;
+        let (pre_record_controls, post_record_controls) = chain_controls.split_at(control_split);
+        let pre_record_state =
+            self.validate_ingest_sequence(pre_record_controls, post_record_controls, &records)?;
+        self.validate_owner_catchup_against_journal(&pre_record_state, &records)?;
+        let mut batch_dropped = BatchDroppedCanonical::default();
+        for control in pre_record_controls {
+            if let ChainControl::Reorg {
+                common_ancestor,
+                old_tip,
+                ..
+            } = control
+            {
+                batch_dropped.record_explicit(common_ancestor, old_tip);
+                let drained = self
+                    .journal
+                    .iter()
+                    .filter(|entry| entry.block.number > common_ancestor.number)
+                    .map(|entry| entry.block)
+                    .collect::<Vec<_>>();
+                batch_dropped.record_drained(&drained);
+            }
+        }
+        let certified_progress_through = post_record_controls
+            .iter()
+            .filter_map(canonical_coverage_control_block)
+            .map(|block| block.number)
+            .max();
+        for control in pre_record_controls.iter().cloned() {
+            self.apply_chain_control(cache, control, &mut batch_report, &mut reports_to_dispatch);
+        }
         // Phase-8 step 4: accumulate the addresses a decoder actually wrote this
         // batch (union of applied `StateDiff` addresses) and the batch's canonical
         // block number, so the per-block root gate can run once after the record
@@ -2302,17 +5251,47 @@ impl<N: Network> ReactiveRuntime<N> {
         let mut touched_addrs: HashSet<Address> = HashSet::new();
         let mut canonical_batch_block: Option<u64> = None;
 
-        for record in records {
+        for (record, audience, delivery_scope) in records {
+            let raw_canonical_block = canonical_record_block(&record).copied();
+            let canonical_block = raw_canonical_block.map(|block| {
+                pre_record_state
+                    .resolved_canonical_blocks
+                    .get(&(block.number, block.hash))
+                    .copied()
+                    .unwrap_or(block)
+            });
             let input_ref = record.input_ref();
             reports_to_dispatch.push(Arc::new(ReactiveReport::Input(InputReport {
                 input_ref,
                 context: record.context.clone(),
+                provider: record.provider.clone(),
                 _network: PhantomData,
             })));
 
-            if let Some(reorg_report) =
-                self.recover_for_canonical_input(cache, &record, &mut reports_to_dispatch)
-            {
+            let recovered_reorg = if delivery_scope.advances_canonical_state() {
+                if let Some(block) = canonical_block.as_ref() {
+                    let gap_is_certified = delivery_scope == DeliveryScope::CanonicalProgress
+                        && certified_progress_through
+                            .is_some_and(|through| block.number <= through);
+                    let parentless_replacement_is_proven = raw_canonical_block.is_some_and(|raw| {
+                        raw.parent_hash.is_none()
+                            && batch_dropped.covers_implicit_number(raw.number)
+                    });
+                    self.recover_for_canonical_input(
+                        cache,
+                        block,
+                        gap_is_certified,
+                        parentless_replacement_is_proven,
+                        &mut reports_to_dispatch,
+                    )
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            let recovered_reorg_for_input = recovered_reorg.is_some();
+            if let Some(reorg_report) = recovered_reorg {
                 self.metrics
                     .reorgs_recovered
                     .fetch_add(1, Ordering::Relaxed);
@@ -2323,39 +5302,88 @@ impl<N: Network> ReactiveRuntime<N> {
                 reports_to_dispatch.push(Arc::new(ReactiveReport::Reorg(reorg_report)));
             }
 
-            if let Some(reorg_report) =
-                self.recover_for_reorged_input(cache, &record, &mut reports_to_dispatch)
-            {
-                self.metrics
-                    .reorgs_recovered
-                    .fetch_add(1, Ordering::Relaxed);
-                remove_canceled_resyncs_from_batch(
-                    &mut batch_report.resyncs,
-                    &reorg_report.canceled_resyncs,
-                );
-                reports_to_dispatch.push(Arc::new(ReactiveReport::Reorg(reorg_report)));
+            // Removed/reorged records are lifecycle signals, never handler
+            // data. Canonical scopes may roll back state; owner-only catch-up
+            // scopes deliberately cannot, but both must suppress ordinary
+            // decoding even when the referenced block is unknown, aged out of
+            // the journal, or has already been removed once.
+            if reorg_signal_block(&record).is_some() {
+                if delivery_scope.advances_canonical_state()
+                    && let Some(reorg_report) = self.recover_for_reorged_input(
+                        cache,
+                        &record,
+                        &mut batch_dropped,
+                        &mut reports_to_dispatch,
+                    )
+                {
+                    self.metrics
+                        .reorgs_recovered
+                        .fetch_add(1, Ordering::Relaxed);
+                    remove_canceled_resyncs_from_batch(
+                        &mut batch_report.resyncs,
+                        &reorg_report.canceled_resyncs,
+                    );
+                    reports_to_dispatch.push(Arc::new(ReactiveReport::Reorg(reorg_report)));
+                }
                 continue;
             }
 
-            if let Some(block) = canonical_record_block(&record) {
+            // Preflight validates owner history against the journal state at
+            // batch entry. A canonical record earlier in this same transaction
+            // may legitimately replace and drain that block, so close the
+            // resulting TOCTOU window immediately before any owner handler can
+            // mutate the cache. The outer transaction guard restores every
+            // earlier record in the batch on failure.
+            if delivery_scope == DeliveryScope::OwnerCatchup {
+                self.validate_owner_catchup_record_against_current_journal(&record)?;
+            }
+
+            if delivery_scope.advances_canonical_state()
+                && let Some(block) = canonical_block.as_ref()
+            {
                 // Phase-8 step 4: remember the batch's canonical block (the last
                 // canonical record wins) so the root gate probes at that height.
                 canonical_batch_block = Some(block.number);
                 self.record_journal_input(block, input_ref);
             }
 
-            // Phase-8 step 2: drive a per-block env refresh from canonical
-            // headers. Best-effort — a strict validation failure is surfaced as
-            // a non-fatal error report and does not abort the batch.
-            if let Some(Err(err)) = advance_block_for_canonical_record(cache, &record) {
-                reports_to_dispatch.push(Arc::new(ReactiveReport::Error(ReactiveErrorReport {
-                    input_ref: Some(input_ref),
-                    message: err.to_string(),
-                    _network: PhantomData,
-                })));
+            // Keep every lazy provider read pinned to the exact event block
+            // before handlers run. A full header installs the complete EVM env;
+            // compact log-only progress installs NUMBER/timestamp and clears
+            // unknown header-only fields. A later record for the same retained
+            // canonical block can preserve an already-installed full env.
+            if delivery_scope.advances_canonical_state()
+                && let Some(block) = canonical_block.as_ref()
+            {
+                match advance_block_for_canonical_record(cache, &record) {
+                    Some(Ok(())) => {
+                        cache.advance_compact_block(block.number, block.hash, block.timestamp, true)
+                    }
+                    Some(Err(err)) => {
+                        cache.advance_compact_block(
+                            block.number,
+                            block.hash,
+                            block.timestamp,
+                            false,
+                        );
+                        reports_to_dispatch.push(Arc::new(ReactiveReport::Error(
+                            ReactiveErrorReport {
+                                input_ref: Some(input_ref),
+                                message: err.to_string(),
+                                _network: PhantomData,
+                            },
+                        )));
+                    }
+                    None => cache.advance_compact_block(
+                        block.number,
+                        block.hash,
+                        block.timestamp,
+                        !recovered_reorg_for_input,
+                    ),
+                }
             }
 
-            let executions = self.execute_handlers(cache, &record, input_ref)?;
+            let executions = self.execute_handlers(cache, &record, input_ref, &audience)?;
             if executions.is_empty() {
                 continue;
             }
@@ -2376,7 +5404,11 @@ impl<N: Network> ReactiveRuntime<N> {
             // can be used while `self.freshness_mut()` mutably borrows `self`
             // inside the execution loop. `None` for pending/removed/reorged
             // records — those never stamp canonical freshness.
-            let canonical_block_number = canonical_record_block(&record).map(|block| block.number);
+            let canonical_block_number = delivery_scope
+                .advances_canonical_state()
+                .then_some(canonical_block)
+                .flatten()
+                .map(|block| block.number);
 
             for execution in executions {
                 let diff = if execution.state_updates.is_empty() {
@@ -2430,15 +5462,34 @@ impl<N: Network> ReactiveRuntime<N> {
                 // (`slots`/`accounts`/`purged`) and cold-skipped attempts alike, so
                 // a decoder that tried to write a cold slot still counts as
                 // covering the account.
-                collect_diff_addresses(&applied.diff, &mut touched_addrs);
+                if delivery_scope.advances_canonical_state() {
+                    collect_diff_addresses(&applied.diff, &mut touched_addrs);
+                }
 
                 let report = Arc::new(ReactiveReport::Applied(applied.clone()));
                 reports_to_dispatch.push(report);
-                if let Some(block) = canonical_record_block(&record) {
-                    self.record_journal_applied(block, applied.clone());
+                if let Some(block) = canonical_block.as_ref() {
+                    if delivery_scope.advances_canonical_state() {
+                        self.record_journal_applied(block, applied.clone());
+                    } else {
+                        self.record_journal_applied_if_present(block, applied.clone());
+                    }
                 }
                 batch_report.applied.push(applied);
             }
+        }
+
+        // Coverage/finality controls certify the records that precede them.
+        // Applying them here also leaves the live cache pinned to a certified
+        // zero-event tail rather than the last block that happened to emit a
+        // matching log. Reorg controls were applied before the record loop.
+        for control in post_record_controls.iter().cloned() {
+            if let Some(block) = canonical_coverage_control_block(&control) {
+                canonical_batch_block = Some(
+                    canonical_batch_block.map_or(block.number, |current| current.max(block.number)),
+                );
+            }
+            self.apply_chain_control(cache, control, &mut batch_report, &mut reports_to_dispatch);
         }
 
         // Phase-8 step 4 + §6.2 cadence: accumulate this batch's touched
@@ -2476,6 +5527,80 @@ impl<N: Network> ReactiveRuntime<N> {
 
         batch_report.reports = reports_to_dispatch;
         Ok(batch_report)
+    }
+
+    /// Prove that every owner-only historical effect can be attached to an
+    /// compatible retained canonical journal entry before any chain control or
+    /// handler mutation is applied. Number/hash are exact. Parent/timestamp are
+    /// optional enrichment, but two present values must agree; this matches the
+    /// [`BlockRef`] compatibility rule used for cross-source deduplication.
+    ///
+    /// Owner catch-up deliberately does not advance canonical coverage. Its
+    /// effects are appended to the already-existing journal entry so a later
+    /// reorg can roll them back with the rest of that block. Accepting a block
+    /// outside the journal would make the cache mutation irreversible. A reorg
+    /// control in the same batch also invalidates entries above its ancestor,
+    /// so those entries are rejected even though they still exist at this
+    /// preflight point.
+    fn validate_owner_catchup_against_journal(
+        &self,
+        control_state: &ChainControlState,
+        records: &[(ReactiveInputRecord<N>, DeliveryAudience, DeliveryScope)],
+    ) -> Result<(), ReactiveError> {
+        for (record, _, delivery_scope) in records {
+            if *delivery_scope != DeliveryScope::OwnerCatchup {
+                continue;
+            }
+            // Removed/reorged inputs are lifecycle signals only. Owner catch-up
+            // cannot make them canonical and the record loop deliberately skips
+            // handler execution, so there is no effect that needs attaching to
+            // a rollback journal entry.
+            if reorg_signal_block(record).is_some() {
+                continue;
+            }
+            let context_block = canonical_record_block(record).ok_or_else(|| {
+                ReactiveError::InvalidChainControl {
+                    message: "owner catch-up input has no canonical block identity".into(),
+                }
+            })?;
+            let block = resolve_record_block_payload_metadata(record, *context_block)?;
+            let invalidated_by_control = control_state
+                .journal_invalidated_from
+                .is_some_and(|from| block.number >= from);
+            let rollbackable = !invalidated_by_control
+                && self.journal.iter().any(|entry| {
+                    optional_block_refs_are_compatible(Some(&entry.block), Some(&block))
+                });
+            if !rollbackable {
+                return Err(ReactiveError::OwnerCatchupOutsideJournal {
+                    number: block.number,
+                    hash: block.hash,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_owner_catchup_record_against_current_journal(
+        &self,
+        record: &ReactiveInputRecord<N>,
+    ) -> Result<(), ReactiveError> {
+        let context_block =
+            canonical_record_block(record).ok_or_else(|| ReactiveError::InvalidChainControl {
+                message: "owner catch-up input has no canonical block identity".into(),
+            })?;
+        let block = resolve_record_block_payload_metadata(record, *context_block)?;
+        if self
+            .journal
+            .iter()
+            .any(|entry| optional_block_refs_are_compatible(Some(&entry.block), Some(&block)))
+        {
+            return Ok(());
+        }
+        Err(ReactiveError::OwnerCatchupOutsideJournal {
+            number: block.number,
+            hash: block.hash,
+        })
     }
 
     /// Whether the root gate could produce any signal at all: some tracked
@@ -2671,6 +5796,7 @@ impl<N: Network> ReactiveRuntime<N> {
         cache: &EvmCache,
         record: &ReactiveInputRecord<N>,
         input_ref: InputRef,
+        audience: &DeliveryAudience,
     ) -> Result<Vec<HandlerExecution>, ReactiveError> {
         let mut executions = Vec::new();
         let candidates: Vec<_> = match &record.input {
@@ -2681,6 +5807,15 @@ impl<N: Network> ReactiveRuntime<N> {
             | ReactiveInput::PendingTx(_) => self.registry.handlers().collect(),
         };
         for registered in candidates {
+            match audience {
+                DeliveryAudience::Owners(owners) if !owners.contains(&registered.id) => continue,
+                DeliveryAudience::AllExcept(excluded) if excluded.contains(&registered.id) => {
+                    continue;
+                }
+                DeliveryAudience::All
+                | DeliveryAudience::Owners(_)
+                | DeliveryAudience::AllExcept(_) => {}
+            }
             if !registered.matches(&record.input) {
                 continue;
             }
@@ -2707,6 +5842,10 @@ impl<N: Network> ReactiveRuntime<N> {
                 registered.id.clone(),
                 input_ref,
                 outcome,
+                matches!(
+                    record.context.chain_status,
+                    ChainStatus::Preconfirmed { .. }
+                ),
             ));
         }
         Ok(executions)
@@ -2720,14 +5859,205 @@ impl<N: Network> ReactiveRuntime<N> {
         }
     }
 
+    fn apply_chain_control(
+        &mut self,
+        cache: &mut EvmCache,
+        control: ChainControl,
+        batch_report: &mut ReactiveBatchReport<N>,
+        reports: &mut Vec<Arc<ReactiveReport<N>>>,
+    ) {
+        match &control {
+            ChainControl::Safe(block) => set_or_enrich_block_ref(&mut self.safe_head, block),
+            ChainControl::Finalized(block) => {
+                set_or_enrich_block_ref(&mut self.finalized_head, block);
+            }
+            ChainControl::CanonicalProgress(block)
+            | ChainControl::Barrier {
+                block: Some(block), ..
+            } => {
+                let preserve_env = self.coverage_head.as_ref().is_some_and(|current| {
+                    optional_block_refs_are_compatible(Some(current), Some(block))
+                });
+                cache.advance_compact_block(
+                    block.number,
+                    block.hash,
+                    block.timestamp,
+                    preserve_env,
+                );
+                advance_or_enrich_coverage(&mut self.coverage_head, block);
+                let enriched = self.journal_entry_mut(block).block;
+                advance_or_enrich_coverage(&mut self.coverage_head, &enriched);
+                self.trim_journal();
+            }
+            ChainControl::LogCoverage(block) => {
+                // An attestation, not progress: never advances the pinned block
+                // or the canonical coverage head.
+                set_or_enrich_block_ref(&mut self.log_coverage_head, block);
+            }
+            ChainControl::Barrier { block: None, .. } => {}
+            ChainControl::Reorg {
+                common_ancestor,
+                old_tip,
+                ..
+            } => {
+                cache.invalidate_cached_block_hashes_from(common_ancestor.number.saturating_add(1));
+                self.rebase_validation_state_from(common_ancestor.number.saturating_add(1));
+                let dropped = if let Some(ancestor_index) = self.journal.iter().rposition(|entry| {
+                    entry.block.number == common_ancestor.number
+                        && entry.block.hash == common_ancestor.hash
+                }) {
+                    self.drain_journal_after(ancestor_index)
+                } else {
+                    // Sparse journals are expected for blocks with no matching
+                    // events. If the oldest retained entry is at or below the
+                    // ancestor, every effect above it is still present and the
+                    // rollback is complete even without an exact anchor.
+                    if self
+                        .journal
+                        .front()
+                        .is_none_or(|entry| entry.block.number > common_ancestor.number)
+                    {
+                        reports.extend(
+                            self.warn_under_recovery(common_ancestor.number.saturating_add(1)),
+                        );
+                    }
+                    self.drain_journal_from_number(common_ancestor.number.saturating_add(1))
+                };
+
+                let reorg_report = self
+                    .recover_dropped_journals(cache, dropped, ReorgReason::Explicit)
+                    .unwrap_or_else(|| ReorgReport {
+                        dropped: Some(*old_tip),
+                        dropped_blocks: Vec::new(),
+                        dropped_inputs: Vec::new(),
+                        rollback_updates: Vec::new(),
+                        rollback_diff: StateDiff::default(),
+                        purge_updates: Vec::new(),
+                        purge_diff: StateDiff::default(),
+                        canceled_resyncs: self
+                            .cancel_resyncs_for_dropped_blocks(std::slice::from_ref(old_tip)),
+                        reason: ReorgReason::Explicit,
+                        _network: PhantomData,
+                    });
+                remove_canceled_resyncs_from_batch(
+                    &mut batch_report.resyncs,
+                    &reorg_report.canceled_resyncs,
+                );
+                self.metrics
+                    .reorgs_recovered
+                    .fetch_add(1, Ordering::Relaxed);
+                reports.push(Arc::new(ReactiveReport::Reorg(reorg_report)));
+
+                if self.safe_head.as_ref().is_some_and(|head| {
+                    head.number > common_ancestor.number
+                        || (head.number == common_ancestor.number
+                            && head.hash != common_ancestor.hash)
+                }) {
+                    self.safe_head = None;
+                }
+                if self.finalized_head.as_ref().is_some_and(|head| {
+                    head.number > common_ancestor.number
+                        || (head.number == common_ancestor.number
+                            && head.hash != common_ancestor.hash)
+                }) {
+                    self.finalized_head = None;
+                }
+                let mut enriched_ancestor = *common_ancestor;
+                if let Some(entry) = self.journal.iter().find(|entry| {
+                    entry.block.number == common_ancestor.number
+                        && entry.block.hash == common_ancestor.hash
+                }) {
+                    enrich_block_ref(&mut enriched_ancestor, &entry.block);
+                }
+                if let Some(current) = self.coverage_head.as_ref()
+                    && current.number == common_ancestor.number
+                    && current.hash == common_ancestor.hash
+                {
+                    enrich_block_ref(&mut enriched_ancestor, current);
+                }
+                self.coverage_head = Some(enriched_ancestor);
+                cache.advance_compact_block(
+                    enriched_ancestor.number,
+                    enriched_ancestor.hash,
+                    enriched_ancestor.timestamp,
+                    false,
+                );
+                let enriched_ancestor = self.journal_entry_mut(&enriched_ancestor).block;
+                self.coverage_head = Some(enriched_ancestor);
+                self.trim_journal();
+            }
+        }
+        reports.push(Arc::new(ReactiveReport::ChainControl(ChainControlReport {
+            control,
+        })));
+    }
+
+    fn validate_ingest_sequence(
+        &self,
+        pre_record_controls: &[ChainControl],
+        post_record_controls: &[ChainControl],
+        records: &[(ReactiveInputRecord<N>, DeliveryAudience, DeliveryScope)],
+    ) -> Result<ChainControlState, ReactiveError> {
+        let mut controls =
+            Vec::with_capacity(pre_record_controls.len() + post_record_controls.len());
+        controls.extend_from_slice(pre_record_controls);
+        controls.extend_from_slice(post_record_controls);
+        let state = CanonicalSequenceState::new(
+            self.journal.iter().map(|entry| entry.block).collect(),
+            self.coverage_head,
+            self.safe_head,
+            self.finalized_head,
+        )
+        .with_log_coverage_head(self.log_coverage_head);
+        let record_metadata = records
+            .iter()
+            .map(|(record, _, scope)| (record, *scope))
+            .collect::<Vec<_>>();
+        let validation = validate_canonical_sequence_parts(
+            &state,
+            &controls,
+            &record_metadata,
+            CanonicalSequenceValidationPolicy::ObserveIncompleteRollback,
+        )
+        .map_err(CanonicalSequenceError::into_reactive_error)?;
+        let mut resolved_canonical_blocks = HashMap::new();
+        for mutation in validation.mutations() {
+            if let CanonicalSequenceMutation::Canonical(block) = mutation {
+                resolved_canonical_blocks
+                    .entry((block.number, block.hash))
+                    .and_modify(|known| enrich_block_ref(known, block))
+                    .or_insert(*block);
+            }
+        }
+        Ok(ChainControlState {
+            journal_invalidated_from: pre_record_controls
+                .iter()
+                .filter_map(|control| match control {
+                    ChainControl::Reorg {
+                        common_ancestor, ..
+                    } => Some(common_ancestor.number.saturating_add(1)),
+                    _ => None,
+                })
+                .min(),
+            resolved_canonical_blocks,
+        })
+    }
+
     fn recover_for_canonical_input(
         &mut self,
         cache: &mut EvmCache,
-        record: &ReactiveInputRecord<N>,
+        block: &BlockRef,
+        gap_is_certified: bool,
+        parentless_replacement_is_proven: bool,
         health_reports: &mut Vec<Arc<ReactiveReport<N>>>,
     ) -> Option<ReorgReport<N>> {
-        let block = canonical_record_block(record)?;
-        let latest = self.journal.back()?.block.clone();
+        let latest = self
+            .coverage_head
+            .or_else(|| self.journal.back().map(|entry| entry.block))?;
+
+        if latest.number == block.number && latest.hash == block.hash {
+            return None;
+        }
 
         if self
             .journal
@@ -2737,74 +6067,175 @@ impl<N: Network> ReactiveRuntime<N> {
             return None;
         }
 
-        if block.number == latest.number.saturating_add(1) && block.parent_hash == Some(latest.hash)
+        if latest.number.checked_add(1) == Some(block.number)
+            && (block.parent_hash == Some(latest.hash)
+                || (parentless_replacement_is_proven && block.parent_hash.is_none()))
         {
             return None;
         }
 
-        if block.number > latest.number.saturating_add(1) {
+        if latest
+            .number
+            .checked_add(1)
+            .is_some_and(|next| block.number > next)
+        {
             // A forward gap: blocks between the journaled head and the arriving
-            // block were never observed (e.g. a disconnect). Make it observable
-            // and escalate health, but still accept the arriving block so it
-            // journals/applies normally (the chain extends).
-            self.metrics.missed_ranges.fetch_add(1, Ordering::Relaxed);
-            health_reports.extend(self.escalate_trust(block.number));
-            health_reports.push(Arc::new(ReactiveReport::MissedBlockRange(
-                MissedRangeReport {
-                    from: latest.number + 1,
-                    to: block.number - 1,
-                    block: block.number,
-                    _network: PhantomData,
-                },
-            )));
+            // block were never observed (e.g. a disconnect). A historical
+            // canonical-progress delivery can instead be covered by a
+            // compatible post-record progress/barrier certificate proving the
+            // sparse interval contained no matching events. Live canonical
+            // gaps remain observable and escalate health.
+            if !gap_is_certified {
+                self.metrics.missed_ranges.fetch_add(1, Ordering::Relaxed);
+                health_reports.extend(self.escalate_trust(block.number));
+                health_reports.push(Arc::new(ReactiveReport::MissedBlockRange(
+                    MissedRangeReport {
+                        from: latest.number + 1,
+                        to: block.number - 1,
+                        block: block.number,
+                        _network: PhantomData,
+                    },
+                )));
+            }
             return None;
         }
 
-        let dropped = if let Some(parent_hash) = block.parent_hash {
-            if let Some(parent_index) = self
-                .journal
-                .iter()
-                .rposition(|entry| entry.block.hash == parent_hash)
-            {
-                self.drain_journal_after(parent_index)
+        let (dropped, authenticated_anchor) = if let Some(parent_hash) = block.parent_hash {
+            if let Some(parent_index) = self.journal.iter().rposition(|entry| {
+                entry.block.number.checked_add(1) == Some(block.number)
+                    && entry.block.hash == parent_hash
+            }) {
+                let parent = self.journal[parent_index].block;
+                cache.invalidate_cached_block_hashes_from(parent.number.saturating_add(1));
+                (self.drain_journal_after(parent_index), Some(parent))
             } else {
+                // An unknown immediate parent proves exactly N-1 and nothing
+                // earlier. Preserve a prefix only when the accepted path is an
+                // immediate child of the runtime's exact finalized anchor;
+                // otherwise every cached BLOCKHASH may belong to the displaced
+                // branch and must be cleared fail-closed.
+                let proven_finalized_anchor = self.finalized_head.filter(|finalized| {
+                    finalized.number.checked_add(1) == Some(block.number)
+                        && parent_hash == finalized.hash
+                });
+                let invalidated_from = proven_finalized_anchor
+                    .map_or(0, |finalized| finalized.number.saturating_add(1));
+                cache.invalidate_cached_block_hashes_from(invalidated_from);
+                if block.number > 0 {
+                    // Even when the parent falls outside the retained journal,
+                    // the arriving child authenticates its exact hash. Restore
+                    // that one known value after clearing the displaced branch.
+                    cache.set_cached_block_hash(block.number.saturating_sub(1), parent_hash);
+                }
                 health_reports.extend(self.warn_under_recovery(block.number));
-                self.drain_journal_from_number(block.number)
+                let dropped = if let Some(finalized) = proven_finalized_anchor {
+                    self.drain_journal_from_number(finalized.number.saturating_add(1))
+                } else {
+                    self.drain_journal_from_number(0)
+                };
+                (dropped, proven_finalized_anchor)
             }
         } else {
+            // No parent identity authenticates any prefix of the arriving path.
+            cache.invalidate_cached_block_hashes_from(0);
             health_reports.extend(self.warn_under_recovery(block.number));
-            self.drain_journal_from_number(block.number)
+            (self.drain_journal_from_number(0), None)
         };
 
-        self.recover_dropped_journals(cache, dropped, ReorgReason::ParentMismatch)
+        self.rebase_validation_state_from(
+            authenticated_anchor.map_or(0, |anchor| anchor.number.saturating_add(1)),
+        );
+        let report = self
+            .recover_dropped_journals(cache, dropped, ReorgReason::ParentMismatch)
+            .or_else(|| {
+                Some(ReorgReport {
+                    dropped: Some(latest),
+                    dropped_blocks: Vec::new(),
+                    dropped_inputs: Vec::new(),
+                    rollback_updates: Vec::new(),
+                    rollback_diff: StateDiff::default(),
+                    purge_updates: Vec::new(),
+                    purge_diff: StateDiff::default(),
+                    canceled_resyncs: self
+                        .cancel_resyncs_for_dropped_blocks(std::slice::from_ref(&latest)),
+                    reason: ReorgReason::ParentMismatch,
+                    _network: PhantomData,
+                })
+            });
+        self.coverage_head = authenticated_anchor;
+        for head in [&mut self.safe_head, &mut self.finalized_head] {
+            if head.is_some_and(|head| {
+                authenticated_anchor.is_none_or(|anchor| {
+                    head.number > anchor.number
+                        || (head.number == anchor.number && head.hash != anchor.hash)
+                })
+            }) {
+                *head = None;
+            }
+        }
+        if let Some(anchor) = authenticated_anchor {
+            cache.advance_compact_block(anchor.number, anchor.hash, anchor.timestamp, false);
+        }
+        report
     }
 
     fn recover_for_reorged_input(
         &mut self,
         cache: &mut EvmCache,
         record: &ReactiveInputRecord<N>,
+        batch_dropped: &mut BatchDroppedCanonical,
         health_reports: &mut Vec<Arc<ReactiveReport<N>>>,
     ) -> Option<ReorgReport<N>> {
-        let (dropped_block, reason) = reorg_signal_block(record)?;
-        let dropped = if let Some(index) = self
-            .journal
-            .iter()
-            .position(|entry| entry.block.hash == dropped_block.hash)
-        {
-            self.drain_journal_from(index)
-        } else {
-            health_reports.extend(self.warn_under_recovery(dropped_block.number));
-            self.drain_journal_from_number(dropped_block.number)
-        };
+        let (incoming_dropped_block, reason) = reorg_signal_block(record)?;
+        if batch_dropped.contains(&incoming_dropped_block) {
+            // A previous signal in this atomic batch already drained this
+            // block/span. Preserve the lifecycle input report, but do not
+            // repeat rollback or classify the provider's per-log removals as a
+            // deep reorg. Exact hash-pinned repairs still need cancellation.
+            let canceled_resyncs = self
+                .cancel_resyncs_for_dropped_blocks(std::slice::from_ref(&incoming_dropped_block));
+            return (!canceled_resyncs.is_empty()).then(|| ReorgReport {
+                dropped: Some(incoming_dropped_block),
+                dropped_blocks: vec![incoming_dropped_block],
+                dropped_inputs: Vec::new(),
+                rollback_updates: Vec::new(),
+                rollback_diff: StateDiff::default(),
+                purge_updates: Vec::new(),
+                purge_diff: StateDiff::default(),
+                canceled_resyncs,
+                reason,
+                _network: PhantomData,
+            });
+        }
+        let exact_index = self.journal.iter().position(|entry| {
+            entry.block.number == incoming_dropped_block.number
+                && entry.block.hash == incoming_dropped_block.hash
+        });
+        let mut dropped_block = exact_index
+            .map(|index| self.journal[index].block)
+            .or_else(|| {
+                self.coverage_head.filter(|known| {
+                    known.number == incoming_dropped_block.number
+                        && known.hash == incoming_dropped_block.hash
+                })
+            })
+            .unwrap_or(incoming_dropped_block);
+        enrich_block_ref(&mut dropped_block, &incoming_dropped_block);
+        let replacement_is_known = exact_index.is_none()
+            && (self.journal.iter().any(|entry| {
+                entry.block.number == dropped_block.number && entry.block.hash != dropped_block.hash
+            }) || self.coverage_head.is_some_and(|head| {
+                head.number == dropped_block.number && head.hash != dropped_block.hash
+            }));
 
-        if dropped.is_empty() {
+        if replacement_is_known {
+            // A delayed/duplicate removed log for the displaced hash is
+            // idempotent. Draining by number here would destroy the already
+            // installed replacement branch at the same height.
             let canceled_resyncs =
                 self.cancel_resyncs_for_dropped_blocks(std::slice::from_ref(&dropped_block));
-            if canceled_resyncs.is_empty() {
-                return None;
-            }
-            return Some(ReorgReport {
-                dropped: Some(dropped_block.clone()),
+            return (!canceled_resyncs.is_empty()).then(|| ReorgReport {
+                dropped: Some(dropped_block),
                 dropped_blocks: vec![dropped_block],
                 dropped_inputs: Vec::new(),
                 rollback_updates: Vec::new(),
@@ -2817,7 +6248,92 @@ impl<N: Network> ReactiveRuntime<N> {
             });
         }
 
-        self.recover_dropped_journals(cache, dropped, reason)
+        let authenticated_anchor = exact_index.and_then(|index| {
+            let ancestor_number = dropped_block.number.checked_sub(1)?;
+            let retained = self
+                .journal
+                .iter()
+                .take(index)
+                .rev()
+                .find(|entry| entry.block.number == ancestor_number)
+                .map(|entry| entry.block);
+            let synthetic_parent = dropped_block.parent_hash.map(|hash| BlockRef {
+                number: ancestor_number,
+                hash,
+                parent_hash: None,
+                timestamp: None,
+            });
+            let finalized_fallback = self
+                .finalized_head
+                .filter(|head| head.number == ancestor_number);
+            let mut anchor = retained.or(synthetic_parent).or(finalized_fallback)?;
+            for head in [self.safe_head.as_ref(), self.finalized_head.as_ref()]
+                .into_iter()
+                .flatten()
+            {
+                if head.number == anchor.number && head.hash == anchor.hash {
+                    enrich_block_ref(&mut anchor, head);
+                }
+            }
+            Some(anchor)
+        });
+
+        cache.invalidate_cached_block_hashes_from(dropped_block.number);
+        let dropped = if let Some(index) = exact_index {
+            self.drain_journal_from(index)
+        } else {
+            health_reports.extend(self.warn_under_recovery(dropped_block.number));
+            self.drain_journal_from_number(dropped_block.number)
+        };
+        let drained_blocks = dropped.iter().map(|entry| entry.block).collect::<Vec<_>>();
+        batch_dropped.record_drained(&drained_blocks);
+        batch_dropped.record_identity(&dropped_block);
+        self.rebase_validation_state_from(dropped_block.number);
+
+        let recovered_journal = !dropped.is_empty();
+        let report = if !recovered_journal {
+            let canceled_resyncs =
+                self.cancel_resyncs_for_dropped_blocks(std::slice::from_ref(&dropped_block));
+            Some(ReorgReport {
+                dropped: Some(dropped_block),
+                dropped_blocks: Vec::new(),
+                dropped_inputs: Vec::new(),
+                rollback_updates: Vec::new(),
+                rollback_diff: StateDiff::default(),
+                purge_updates: Vec::new(),
+                purge_diff: StateDiff::default(),
+                canceled_resyncs,
+                reason,
+                _network: PhantomData,
+            })
+        } else {
+            self.recover_dropped_journals(cache, dropped, reason)
+        };
+
+        if recovered_journal {
+            if let Some(anchor) = authenticated_anchor {
+                self.coverage_head = Some(anchor);
+            }
+            let coverage = self.coverage_head;
+            for head in [&mut self.safe_head, &mut self.finalized_head] {
+                if head.is_some_and(|head| {
+                    coverage.is_none_or(|coverage| {
+                        head.number > coverage.number
+                            || (head.number == coverage.number && head.hash != coverage.hash)
+                    })
+                }) {
+                    *head = None;
+                }
+            }
+        }
+
+        if recovered_journal
+            && report.is_some()
+            && let Some(head) = self.coverage_head
+        {
+            cache.advance_compact_block(head.number, head.hash, head.timestamp, false);
+        }
+        report
     }
 
     /// Warn that a reorg references a block no longer resident in the journal, so
@@ -2850,16 +6366,39 @@ impl<N: Network> ReactiveRuntime<N> {
     }
 
     fn record_journal_input(&mut self, block: &BlockRef, input_ref: InputRef) {
+        advance_or_enrich_coverage(&mut self.coverage_head, block);
         let entry = self.journal_entry_mut(block);
+        let enriched = entry.block;
         if !entry.inputs.contains(&input_ref) {
             entry.inputs.push(input_ref);
         }
+        advance_or_enrich_coverage(&mut self.coverage_head, &enriched);
         self.trim_journal();
     }
 
     fn record_journal_applied(&mut self, block: &BlockRef, applied: AppliedReport<N>) {
-        self.journal_entry_mut(block).applied.push(applied);
+        let entry = self.journal_entry_mut(block);
+        if !entry.handler_ids.contains(&applied.handler_id) {
+            entry.handler_ids.push(applied.handler_id.clone());
+        }
+        entry.rollback_diffs.push(applied.diff.clone());
+        entry.applied.push(applied);
         self.trim_journal();
+    }
+
+    fn record_journal_applied_if_present(&mut self, block: &BlockRef, applied: AppliedReport<N>) {
+        let Some(entry) = self
+            .journal
+            .iter_mut()
+            .find(|entry| entry.block.number == block.number && entry.block.hash == block.hash)
+        else {
+            return;
+        };
+        if !entry.handler_ids.contains(&applied.handler_id) {
+            entry.handler_ids.push(applied.handler_id.clone());
+        }
+        entry.rollback_diffs.push(applied.diff.clone());
+        entry.applied.push(applied);
     }
 
     fn record_journal_resync(&mut self, report: &ResyncReport) {
@@ -2869,7 +6408,9 @@ impl<N: Network> ReactiveRuntime<N> {
         let Some(block) = single_hash_pinned_resync_block(report) else {
             return;
         };
-        self.journal_entry_mut(&block).resynced.push(report.clone());
+        let entry = self.journal_entry_mut(&block);
+        entry.rollback_diffs.push(report.diff.clone());
+        entry.resynced.push(report.clone());
         self.trim_journal();
     }
 
@@ -2879,14 +6420,17 @@ impl<N: Network> ReactiveRuntime<N> {
             .iter()
             .position(|entry| entry.block.hash == block.hash && entry.block.number == block.number)
         {
+            enrich_block_ref(&mut self.journal[index].block, block);
             return &mut self.journal[index];
         }
 
         self.journal.push_back(BlockJournal {
-            block: block.clone(),
+            block: *block,
             inputs: Vec::new(),
             applied: Vec::new(),
+            handler_ids: Vec::new(),
             resynced: Vec::new(),
+            rollback_diffs: Vec::new(),
         });
         let index = self.journal.len() - 1;
         &mut self.journal[index]
@@ -2931,7 +6475,20 @@ impl<N: Network> ReactiveRuntime<N> {
             return None;
         }
 
-        let dropped_blocks: Vec<_> = dropped.iter().map(|entry| entry.block.clone()).collect();
+        let first_dropped_block = dropped
+            .iter()
+            .map(|entry| entry.block.number)
+            .min()
+            .expect("non-empty dropped journal set");
+        self.rebase_validation_state_from(first_dropped_block);
+        if self
+            .safe_head
+            .is_some_and(|head| head.number >= first_dropped_block)
+        {
+            self.safe_head = None;
+        }
+
+        let dropped_blocks: Vec<_> = dropped.iter().map(|entry| entry.block).collect();
         let dropped_inputs: Vec<_> = dropped
             .iter()
             .flat_map(|entry| entry.inputs.iter().copied())
@@ -2954,6 +6511,7 @@ impl<N: Network> ReactiveRuntime<N> {
         } else {
             cache.apply_updates(&purge_updates)
         };
+        self.coverage_head = self.journal.back().map(|entry| entry.block);
 
         Some(ReorgReport {
             dropped: dropped_blocks.first().cloned(),
@@ -2967,6 +6525,28 @@ impl<N: Network> ReactiveRuntime<N> {
             reason,
             _network: PhantomData,
         })
+    }
+
+    fn rebase_validation_state_from(&mut self, first_dropped_block: u64) {
+        if let Some(freshness) = self.freshness.as_mut() {
+            freshness.invalidate_valid_through_from(first_dropped_block);
+        }
+        self.tracked_roots
+            .retain(|_, baseline| baseline.last_block < first_dropped_block);
+        if self
+            .last_gate_block
+            .is_some_and(|block| block >= first_dropped_block)
+        {
+            self.last_gate_block = self
+                .tracked_roots
+                .values()
+                .map(|baseline| baseline.last_block)
+                .max();
+        }
+        // Touch provenance is window-relative. Once any block in that window
+        // is dropped, retaining the union could incorrectly mark a replacement
+        // branch root move as decoder-covered.
+        self.touched_since_gate.clear();
     }
 
     fn cancel_resyncs_for_dropped_blocks(
@@ -2989,6 +6569,1825 @@ impl<N: Network> ReactiveRuntime<N> {
         self.pending_resyncs
             .retain(|request| !ids.contains(&request.id));
     }
+}
+
+fn install_preconfirmed_cache_context(cache: &mut EvmCache, flashblock: &FlashblockRef) {
+    cache.set_block(BlockId::pending());
+    cache.set_block_context(Some(flashblock.block_number), flashblock.base_fee_per_gas);
+    cache.set_coinbase(flashblock.beneficiary);
+    cache.set_prevrandao(flashblock.prevrandao);
+    cache.set_block_gas_limit(flashblock.gas_limit);
+    cache.set_timestamp(flashblock.timestamp);
+}
+
+/// Validate one provider-neutral delivery envelope without mutating runtime or
+/// cache state.
+///
+/// This is the canonical metadata contract shared by [`ReactiveRuntime`] and
+/// composite/remote subscribers. It validates explicit reorg controls before
+/// records, canonical record identity and implicit-reorg finality, then
+/// progress/barrier/safe/finalized controls. All identity assertions in the
+/// envelope must agree at each height. Retained history may be sparse; an
+/// explicit common ancestor need not itself be retained when the oldest
+/// retained entry is at or below it. Ancestors and removed blocks outside that
+/// rollback horizon are rejected, so a durable caller cannot persist a partial
+/// rollback. The runtime uses this same implementation with an internal
+/// observable-deep-reorg policy for its deliberately non-durable ingest path.
+///
+/// The returned state and mutations are cache-free. Callers that durably stage
+/// delivery should publish/persist them only at their own acknowledgement
+/// boundary.
+///
+/// This validator is deliberately chain-agnostic and does not compare
+/// [`ReactiveInputBatch::chain_id`] because [`CanonicalSequenceState`] carries
+/// no chain id. Cross-service/composite callers must bind one authoritative
+/// chain identity outside this state before sharing or advancing it; runtime
+/// ingestion separately checks the batch id against [`EvmCache`].
+///
+/// # Errors
+///
+/// Returns [`ReactiveError::InvalidInputRecord`] when record identity/payload
+/// metadata is malformed or conflicting, and
+/// [`ReactiveError::InvalidChainControl`] when the snapshot or envelope has an
+/// invalid canonical transition, incomplete rollback proof, contradictory
+/// identity, or invalid coverage/finality relationship.
+pub fn validate_canonical_sequence<N: Network>(
+    state: &CanonicalSequenceState,
+    batch: &ReactiveInputBatch<N>,
+) -> Result<CanonicalSequenceValidation, ReactiveError> {
+    validate_canonical_sequence_diagnostic(state, batch)
+        .map_err(CanonicalSequenceError::into_reactive_error)
+}
+
+/// Validate one provider-neutral delivery envelope and retain structured
+/// rollback diagnostics.
+///
+/// This is the diagnostic counterpart to [`validate_canonical_sequence`]. Use
+/// it at durable/composite source boundaries that need to distinguish malformed
+/// input from an otherwise valid transition whose rollback ancestor has aged
+/// out of the retained history. Callers should branch on
+/// [`CanonicalSequenceError`] rather than parsing error text.
+///
+/// # Errors
+///
+/// Returns [`CanonicalSequenceError::Invalid`] for malformed or contradictory
+/// state/input and [`CanonicalSequenceError::IncompleteRollback`] when more
+/// retained canonical history is required to prove the transition.
+pub fn validate_canonical_sequence_diagnostic<N: Network>(
+    state: &CanonicalSequenceState,
+    batch: &ReactiveInputBatch<N>,
+) -> Result<CanonicalSequenceValidation, CanonicalSequenceError> {
+    validate_canonical_sequence_internal(
+        state,
+        batch,
+        CanonicalSequenceValidationPolicy::RequireCompleteRollback,
+    )
+}
+
+/// Validate a composite-source envelope and normalize harmless coverage
+/// overlap.
+///
+/// This has the same fail-closed rollback/finality/identity contract as
+/// [`validate_canonical_sequence`]. In addition, an equal or older
+/// [`ChainControl::CanonicalProgress`] whose exact compatible identity is
+/// retained is omitted from [`CanonicalSequenceValidation::normalized_chain_controls`].
+/// A compatible stale blockful [`ChainControl::Barrier`] is retained with the
+/// same opaque id and `block: None`, preserving the synchronization event
+/// without forwarding regressive coverage. An equal-height control that fills
+/// absent parent/timestamp metadata is retained and applied. Older compatible
+/// metadata enrichment is deliberately dropped together with its non-forwarded
+/// control so the returned state remains identical to what the runtime will
+/// observe. Unknown or conflicting stale identities remain errors.
+///
+/// # Errors
+///
+/// Returns [`ReactiveError::InvalidInputRecord`] for malformed or conflicting
+/// record identity/payload metadata, and
+/// [`ReactiveError::InvalidChainControl`] when canonical overlap cannot be
+/// proven redundant or when rollback, adjacency, identity, coverage, or
+/// finality validation fails.
+pub fn normalize_and_validate_canonical_sequence<N: Network>(
+    state: &CanonicalSequenceState,
+    batch: &ReactiveInputBatch<N>,
+) -> Result<CanonicalSequenceValidation, ReactiveError> {
+    normalize_and_validate_canonical_sequence_diagnostic(state, batch)
+        .map_err(CanonicalSequenceError::into_reactive_error)
+}
+
+/// Validate and normalize one composite-source envelope while retaining
+/// structured rollback diagnostics.
+///
+/// This is the diagnostic counterpart to
+/// [`normalize_and_validate_canonical_sequence`]. It has identical transition
+/// and normalization semantics, but reports history exhaustion as
+/// [`CanonicalSequenceError::IncompleteRollback`] instead of folding it into a
+/// prose [`ReactiveError::InvalidChainControl`].
+///
+/// # Errors
+///
+/// Returns [`CanonicalSequenceError::Invalid`] for malformed, contradictory, or
+/// non-normalizable input and [`CanonicalSequenceError::IncompleteRollback`]
+/// when the retained history cannot prove a complete rollback.
+pub fn normalize_and_validate_canonical_sequence_diagnostic<N: Network>(
+    state: &CanonicalSequenceState,
+    batch: &ReactiveInputBatch<N>,
+) -> Result<CanonicalSequenceValidation, CanonicalSequenceError> {
+    validate_canonical_sequence_internal(
+        state,
+        batch,
+        CanonicalSequenceValidationPolicy::RequireCompleteRollbackNormalizeCoverage,
+    )
+}
+
+fn validate_canonical_sequence_internal<N: Network>(
+    state: &CanonicalSequenceState,
+    batch: &ReactiveInputBatch<N>,
+    policy: CanonicalSequenceValidationPolicy,
+) -> Result<CanonicalSequenceValidation, CanonicalSequenceError> {
+    let records = batch
+        .records()
+        .iter()
+        .enumerate()
+        .map(|(index, record)| {
+            (
+                record.clone(),
+                DeliveryAudience::All,
+                batch
+                    .record_delivery_scope(index)
+                    .expect("enumerated record always has a delivery scope"),
+            )
+        })
+        .collect::<Vec<_>>();
+    let records = sort_scoped_records(dedupe_scoped_records(records)?);
+    let records = records
+        .iter()
+        .map(|(record, _, scope)| (record, *scope))
+        .collect::<Vec<_>>();
+    validate_canonical_sequence_parts(state, batch.chain_controls(), &records, policy)
+}
+
+#[derive(Clone, Copy)]
+enum CanonicalSequenceValidationPolicy {
+    RequireCompleteRollback,
+    RequireCompleteRollbackNormalizeCoverage,
+    ObserveIncompleteRollback,
+}
+
+/// Stable category for a canonical transition that needs older retained
+/// history before it can be durably accepted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CanonicalRollbackKind {
+    /// An explicit reorg control names an ancestor outside retained history.
+    Explicit,
+    /// A removed/reorged record names a block outside retained history.
+    Removed,
+    /// An implicit canonical replacement has no retained parent proof.
+    ImplicitParent,
+    /// A removed block is not followed by a provable replacement/anchor.
+    MissingReplacement,
+}
+
+/// Structured failure returned by canonical-sequence diagnostic validation.
+///
+/// This type is intentionally independent of diagnostic prose so remote and
+/// composite subscribers can select recovery behavior without string matching.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum CanonicalSequenceError {
+    /// The snapshot or envelope is intrinsically malformed or contradictory.
+    #[error(transparent)]
+    Invalid(#[from] ReactiveError),
+    /// The transition may be valid, but its rollback proof lies outside the
+    /// supplied retained canonical history.
+    #[error(
+        "{kind:?} rollback after block {common_ancestor} exceeds retained canonical history starting at {oldest_retained:?}"
+    )]
+    IncompleteRollback {
+        /// Last ancestor height required to prove the rollback.
+        common_ancestor: u64,
+        /// Oldest retained canonical height supplied by the caller.
+        oldest_retained: Option<u64>,
+        /// Stable reason the history window is insufficient.
+        kind: CanonicalRollbackKind,
+    },
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RequiredReorgAnchor {
+    number: u64,
+    block: Option<BlockRef>,
+    permits_missing_child_parent: bool,
+    must_be_consumed: bool,
+}
+
+#[derive(Debug)]
+struct SequenceRewind {
+    common_ancestor: Option<BlockRef>,
+    dropped: Vec<BlockRef>,
+}
+
+impl RequiredReorgAnchor {
+    const fn hash(self) -> Option<B256> {
+        match self.block {
+            Some(block) => Some(block.hash),
+            None => None,
+        }
+    }
+}
+
+impl CanonicalSequenceError {
+    /// Whether retrying with an older retained history window may prove this
+    /// same transition.
+    pub const fn requires_history(&self) -> bool {
+        matches!(self, Self::IncompleteRollback { .. })
+    }
+
+    /// Fold this structured diagnostic into the legacy ergonomic runtime error.
+    pub fn into_reactive_error(self) -> ReactiveError {
+        match self {
+            Self::Invalid(error) => error,
+            Self::IncompleteRollback {
+                common_ancestor,
+                oldest_retained,
+                kind,
+            } => ReactiveError::InvalidChainControl {
+                message: format!(
+                    "{kind:?} rollback after block {common_ancestor} exceeds retained canonical history starting at {oldest_retained:?}"
+                ),
+            },
+        }
+    }
+}
+
+impl CanonicalSequenceValidationPolicy {
+    const fn requires_complete_rollback(self) -> bool {
+        matches!(
+            self,
+            Self::RequireCompleteRollback | Self::RequireCompleteRollbackNormalizeCoverage
+        )
+    }
+
+    const fn normalizes_coverage(self) -> bool {
+        matches!(self, Self::RequireCompleteRollbackNormalizeCoverage)
+    }
+}
+
+fn validate_canonical_sequence_parts<N: Network>(
+    initial: &CanonicalSequenceState,
+    controls: &[ChainControl],
+    records: &[(&ReactiveInputRecord<N>, DeliveryScope)],
+    policy: CanonicalSequenceValidationPolicy,
+) -> Result<CanonicalSequenceValidation, CanonicalSequenceError> {
+    validate_canonical_sequence_snapshot(initial)?;
+    let control_split = validate_control_phase_order(controls)?;
+    let (pre_record_controls, post_record_controls) = controls.split_at(control_split);
+    let mut state = initial.clone();
+    let mut asserted_blocks = HashMap::<u64, BlockRef>::new();
+    let mut mutations = Vec::new();
+    let mut normalized_chain_controls = Vec::with_capacity(controls.len());
+    let mut batch_dropped = BatchDroppedCanonical::default();
+    let mut removed_assertions = HashMap::<(u64, B256), BlockRef>::new();
+    let mut removed_heights_by_hash = HashMap::<B256, u64>::new();
+    let mut record_proof_control_identities = HashSet::<(u64, B256)>::new();
+    let rollback_oldest = initial
+        .retained_canonical_history
+        .first()
+        .map(|block| block.number);
+
+    for control in pre_record_controls {
+        normalized_chain_controls.push(control.clone());
+        validate_sequence_control(&state, control)?;
+        assert_chain_control_identities(&mut asserted_blocks, control)?;
+        let ChainControl::Reorg {
+            common_ancestor,
+            old_tip,
+            ..
+        } = control
+        else {
+            unreachable!("phase validation leaves only reorg controls before records")
+        };
+        let exact_ancestor = state.retained_canonical_history.iter().any(|block| {
+            block.number == common_ancestor.number && block.hash == common_ancestor.hash
+        });
+        let rollback_horizon_covers_ancestor = state
+            .retained_canonical_history
+            .first()
+            .is_some_and(|oldest| oldest.number <= common_ancestor.number);
+        if policy.requires_complete_rollback()
+            && !exact_ancestor
+            && !rollback_horizon_covers_ancestor
+        {
+            return Err(CanonicalSequenceError::IncompleteRollback {
+                common_ancestor: common_ancestor.number,
+                oldest_retained: rollback_oldest,
+                kind: CanonicalRollbackKind::Explicit,
+            });
+        }
+        let dropped = state
+            .retained_canonical_history
+            .iter()
+            .copied()
+            .filter(|block| block.number > common_ancestor.number)
+            .collect::<Vec<_>>();
+        state
+            .retained_canonical_history
+            .retain(|block| block.number <= common_ancestor.number);
+        upsert_sequence_history(&mut state.retained_canonical_history, common_ancestor)?;
+        let mut enriched_ancestor = *common_ancestor;
+        if let Some(retained) = state.retained_canonical_history.iter().find(|block| {
+            block.number == common_ancestor.number && block.hash == common_ancestor.hash
+        }) {
+            enrich_block_ref(&mut enriched_ancestor, retained);
+        }
+        if let Some(coverage) = state.coverage_head.as_ref()
+            && coverage.number == common_ancestor.number
+            && coverage.hash == common_ancestor.hash
+        {
+            enrich_block_ref(&mut enriched_ancestor, coverage);
+        }
+        upsert_sequence_history(&mut state.retained_canonical_history, &enriched_ancestor)?;
+        state.coverage_head = Some(enriched_ancestor);
+        clear_sequence_heads_above(&mut state, &enriched_ancestor);
+        batch_dropped.record_explicit(common_ancestor, old_tip);
+        batch_dropped.record_drained(&dropped);
+        mutations.push(CanonicalSequenceMutation::Rewind {
+            common_ancestor: Some(enriched_ancestor),
+            dropped,
+        });
+    }
+    let pre_record_state = state.clone();
+    let mut required_reorg_anchor = None::<RequiredReorgAnchor>;
+
+    for (record, scope) in records {
+        if !scope.advances_canonical_state() {
+            continue;
+        }
+        if let Some((incoming_dropped_block, _)) = reorg_signal_block(record) {
+            let incoming_dropped_block =
+                resolve_record_block_payload_metadata(record, incoming_dropped_block)?;
+            validate_sequence_matching_metadata(&state, &incoming_dropped_block, "removed record")?;
+            validate_sequence_adjacent_parent_identity(
+                &state,
+                &incoming_dropped_block,
+                "removed record",
+            )?;
+            let mut dropped_block = state
+                .retained_canonical_history
+                .iter()
+                .find(|known| {
+                    known.number == incoming_dropped_block.number
+                        && known.hash == incoming_dropped_block.hash
+                })
+                .copied()
+                .or_else(|| {
+                    state.coverage_head.filter(|known| {
+                        known.number == incoming_dropped_block.number
+                            && known.hash == incoming_dropped_block.hash
+                    })
+                })
+                .unwrap_or(incoming_dropped_block);
+            enrich_block_ref(&mut dropped_block, &incoming_dropped_block);
+            validate_sequence_implicit_finality(&state, record, None)?;
+            if dropped_block.number == 0 {
+                return Err(ReactiveError::InvalidChainControl {
+                    message: "a removed/reorged genesis block has no canonical parent anchor"
+                        .into(),
+                }
+                .into());
+            }
+            let removed_identity = (dropped_block.number, dropped_block.hash);
+            if let Some(previous_number) =
+                removed_heights_by_hash.insert(dropped_block.hash, dropped_block.number)
+                && previous_number != dropped_block.number
+            {
+                return Err(ReactiveError::InvalidChainControl {
+                    message: format!(
+                        "removed hash {:?} is reused at heights {} and {}",
+                        dropped_block.hash, previous_number, dropped_block.number
+                    ),
+                }
+                .into());
+            }
+            if let Some(previous) = removed_assertions.get_mut(&removed_identity) {
+                if !optional_block_refs_are_compatible(Some(previous), Some(&dropped_block)) {
+                    return Err(ReactiveError::InvalidChainControl {
+                        message: format!(
+                            "duplicate removed block {}:{:?} carries conflicting metadata",
+                            dropped_block.number, dropped_block.hash
+                        ),
+                    }
+                    .into());
+                }
+                enrich_block_ref(previous, &dropped_block);
+            } else {
+                removed_assertions.insert(removed_identity, dropped_block);
+            }
+            if asserted_blocks
+                .get(&dropped_block.number)
+                .is_some_and(|asserted| asserted.hash == dropped_block.hash)
+            {
+                return Err(ReactiveError::InvalidChainControl {
+                    message: format!(
+                        "removed block {}:{:?} is asserted canonical by the same envelope",
+                        dropped_block.number, dropped_block.hash
+                    ),
+                }
+                .into());
+            }
+            if batch_dropped.contains(&dropped_block) {
+                continue;
+            }
+            if let Some(index) = state.retained_canonical_history.iter().position(|block| {
+                block.number == dropped_block.number && block.hash == dropped_block.hash
+            }) {
+                let dropped = state.retained_canonical_history.split_off(index);
+                batch_dropped.record_drained(&dropped);
+                let ancestor_number = dropped_block
+                    .number
+                    .checked_sub(1)
+                    .expect("genesis removal was rejected above");
+                let retained_anchor = state
+                    .retained_canonical_history
+                    .iter()
+                    .rev()
+                    .find(|head| head.number == ancestor_number)
+                    .copied();
+                let authenticated_anchor = retained_anchor
+                    .or_else(|| {
+                        dropped_block.parent_hash.map(|hash| BlockRef {
+                            number: ancestor_number,
+                            hash,
+                            parent_hash: None,
+                            timestamp: None,
+                        })
+                    })
+                    .or_else(|| {
+                        state
+                            .finalized_head
+                            .filter(|head| head.number == ancestor_number)
+                    });
+                let authenticated_anchor = authenticated_anchor.map(|mut anchor| {
+                    for head in [state.safe_head.as_ref(), state.finalized_head.as_ref()]
+                        .into_iter()
+                        .flatten()
+                    {
+                        if head.number == anchor.number && head.hash == anchor.hash {
+                            enrich_block_ref(&mut anchor, head);
+                        }
+                    }
+                    anchor
+                });
+                required_reorg_anchor = Some(RequiredReorgAnchor {
+                    number: ancestor_number,
+                    block: authenticated_anchor,
+                    permits_missing_child_parent: retained_anchor.is_some(),
+                    must_be_consumed: authenticated_anchor.is_none()
+                        && state.retained_canonical_history.is_empty(),
+                });
+                state.coverage_head = authenticated_anchor
+                    .or_else(|| state.retained_canonical_history.last().copied());
+                if let Some(head) = state.coverage_head {
+                    clear_sequence_heads_above(&mut state, &head);
+                } else {
+                    state.safe_head = None;
+                    state.finalized_head = None;
+                }
+                mutations.push(CanonicalSequenceMutation::Rewind {
+                    common_ancestor: state.coverage_head,
+                    dropped,
+                });
+            } else {
+                let replacement_is_known = state.retained_canonical_history.iter().any(|block| {
+                    block.number == dropped_block.number && block.hash != dropped_block.hash
+                }) || state.coverage_head.is_some_and(|head| {
+                    head.number == dropped_block.number && head.hash != dropped_block.hash
+                });
+                if !replacement_is_known {
+                    // Ordinary runtime ingestion deliberately keeps an unknown
+                    // deep removal observable and lets the recovery path
+                    // degrade health. With no exact retained rollback proof,
+                    // this validator must not fabricate a new canonical head.
+                    if policy.requires_complete_rollback() {
+                        return Err(CanonicalSequenceError::IncompleteRollback {
+                            common_ancestor: dropped_block
+                                .number
+                                .checked_sub(1)
+                                .expect("genesis removal was rejected above"),
+                            oldest_retained: rollback_oldest,
+                            kind: CanonicalRollbackKind::Removed,
+                        });
+                    }
+                    continue;
+                }
+            }
+            continue;
+        }
+
+        let Some(context_block) = canonical_record_block(record) else {
+            continue;
+        };
+        let incoming_block = resolve_record_block_payload_metadata(record, *context_block)?;
+        if post_record_controls
+            .iter()
+            .filter_map(canonical_coverage_control_block)
+            .any(|asserted| {
+                asserted.number == incoming_block.number
+                    && asserted.hash == incoming_block.hash
+                    && optional_block_refs_are_compatible(Some(asserted), Some(&incoming_block))
+                    && ((incoming_block.parent_hash.is_none() && asserted.parent_hash.is_some())
+                        || (incoming_block.timestamp.is_none() && asserted.timestamp.is_some()))
+            })
+        {
+            record_proof_control_identities.insert((incoming_block.number, incoming_block.hash));
+        }
+        let mut resolved_block = incoming_block;
+        if let Some(asserted) = asserted_blocks
+            .get(&incoming_block.number)
+            .filter(|asserted| asserted.hash == incoming_block.hash)
+        {
+            if !optional_block_refs_are_compatible(Some(asserted), Some(&incoming_block)) {
+                return Err(ReactiveError::InvalidChainControl {
+                    message: format!(
+                        "canonical record {}:{:?} conflicts with the same envelope's asserted metadata",
+                        incoming_block.number, incoming_block.hash
+                    ),
+                }
+                .into());
+            }
+            enrich_block_ref(&mut resolved_block, asserted);
+        }
+        for asserted in post_record_controls
+            .iter()
+            .filter_map(chain_control_canonical_assertion)
+            .filter(|asserted| {
+                asserted.number == incoming_block.number && asserted.hash == incoming_block.hash
+            })
+        {
+            if !optional_block_refs_are_compatible(Some(&resolved_block), Some(asserted)) {
+                return Err(ReactiveError::InvalidChainControl {
+                    message: format!(
+                        "canonical record {}:{:?} conflicts with the same envelope's asserted metadata",
+                        incoming_block.number, incoming_block.hash
+                    ),
+                }
+                .into());
+            }
+            enrich_block_ref(&mut resolved_block, asserted);
+        }
+        let replacement_anchor =
+            required_reorg_anchor.filter(|required| resolved_block.number > required.number);
+        if resolved_block.parent_hash.is_none()
+            && replacement_anchor.is_some_and(|anchor| {
+                anchor.permits_missing_child_parent
+                    && anchor.number.checked_add(1) == Some(resolved_block.number)
+            })
+        {
+            resolved_block.parent_hash = replacement_anchor.and_then(RequiredReorgAnchor::hash);
+        }
+        let block = &resolved_block;
+        if removed_assertions.contains_key(&(block.number, block.hash)) {
+            return Err(ReactiveError::InvalidChainControl {
+                message: format!(
+                    "canonical block {}:{:?} is also removed by the same envelope",
+                    block.number, block.hash
+                ),
+            }
+            .into());
+        }
+        if let Some(removed_number) = removed_heights_by_hash.get(&block.hash)
+            && *removed_number != block.number
+        {
+            return Err(ReactiveError::InvalidChainControl {
+                message: format!(
+                    "canonical hash {:?} at height {} is removed at height {} by the same envelope",
+                    block.hash, block.number, removed_number
+                ),
+            }
+            .into());
+        }
+        let replacement_proven_by_removal =
+            validate_replacement_reorg_anchor(replacement_anchor, block, policy, rollback_oldest)?;
+        if replacement_anchor.is_some() {
+            required_reorg_anchor = None;
+        }
+        validate_sequence_matching_metadata(&state, block, "canonical record")?;
+        validate_sequence_implicit_finality(&state, record, Some(block))?;
+        let implicit_replacement_requires_history = if replacement_proven_by_removal {
+            false
+        } else {
+            sequence_implicit_replacement_requires_history(&state, block, policy)?
+        };
+        if implicit_replacement_requires_history && policy.requires_complete_rollback() {
+            return Err(CanonicalSequenceError::IncompleteRollback {
+                common_ancestor: block.number.saturating_sub(1),
+                oldest_retained: rollback_oldest,
+                kind: CanonicalRollbackKind::ImplicitParent,
+            });
+        }
+        assert_canonical_block_identity(&mut asserted_blocks, block, "canonical record")?;
+        let allow_parentless_extension = replacement_anchor.is_some_and(|anchor| {
+            anchor.permits_missing_child_parent
+                && anchor.number.checked_add(1) == Some(block.number)
+        });
+        if let Some(rewind) =
+            apply_sequence_canonical_block(&mut state, block, allow_parentless_extension)?
+        {
+            mutations.push(CanonicalSequenceMutation::Rewind {
+                common_ancestor: rewind.common_ancestor,
+                dropped: rewind.dropped,
+            });
+        }
+        mutations.push(CanonicalSequenceMutation::Canonical(*block));
+    }
+
+    for control in post_record_controls {
+        if let Some(block) = chain_control_canonical_assertion(control)
+            && removed_assertions.contains_key(&(block.number, block.hash))
+        {
+            return Err(ReactiveError::InvalidChainControl {
+                message: format!(
+                    "canonical block {}:{:?} is also removed by the same envelope",
+                    block.number, block.hash
+                ),
+            }
+            .into());
+        }
+        if let Some(block) = chain_control_canonical_assertion(control)
+            && let Some(removed_number) = removed_heights_by_hash.get(&block.hash)
+            && *removed_number != block.number
+        {
+            return Err(ReactiveError::InvalidChainControl {
+                message: format!(
+                    "canonical hash {:?} at height {} is removed at height {} by the same envelope",
+                    block.hash, block.number, removed_number
+                ),
+            }
+            .into());
+        }
+        let replacement_anchor = canonical_coverage_control_block(control).and_then(|block| {
+            required_reorg_anchor.filter(|required| block.number > required.number)
+        });
+        if let Some(block) = canonical_coverage_control_block(control) {
+            validate_replacement_reorg_anchor(replacement_anchor, block, policy, rollback_oldest)?;
+            if replacement_anchor.is_some() {
+                required_reorg_anchor = None;
+            }
+        }
+        assert_chain_control_identities(&mut asserted_blocks, control)?;
+        let preserves_record_proof =
+            canonical_coverage_control_block(control).is_some_and(|block| {
+                record_proof_control_identities.contains(&(block.number, block.hash))
+            });
+        if policy.normalizes_coverage()
+            && !preserves_record_proof
+            && let Some(block) = canonical_coverage_control_block(control)
+            && state
+                .coverage_head
+                .is_some_and(|head| block.number <= head.number)
+        {
+            let is_equal_coverage = state
+                .coverage_head
+                .is_some_and(|head| block.number == head.number);
+            let known = state
+                .coverage_head
+                .as_ref()
+                .filter(|head| head.number == block.number && head.hash == block.hash)
+                .or_else(|| {
+                    state
+                        .retained_canonical_history
+                        .iter()
+                        .find(|entry| entry.number == block.number && entry.hash == block.hash)
+                });
+            if let Some(known) = known
+                && optional_block_refs_are_compatible(Some(known), Some(block))
+                && (!is_equal_coverage || !sequence_block_adds_metadata(&state, block))
+            {
+                if let ChainControl::Barrier { id, .. } = control {
+                    normalized_chain_controls.push(ChainControl::Barrier {
+                        id: id.clone(),
+                        block: None,
+                    });
+                }
+                continue;
+            }
+        }
+        validate_sequence_control(&state, control)?;
+        normalized_chain_controls.push(control.clone());
+        match control {
+            ChainControl::Safe(block) => {
+                set_or_enrich_block_ref(&mut state.safe_head, block);
+                mutations.push(CanonicalSequenceMutation::Safe(
+                    state.safe_head.expect("safe head was just installed"),
+                ));
+            }
+            ChainControl::Finalized(block) => {
+                set_or_enrich_block_ref(&mut state.finalized_head, block);
+                mutations.push(CanonicalSequenceMutation::Finalized(
+                    state
+                        .finalized_head
+                        .expect("finalized head was just installed"),
+                ));
+            }
+            ChainControl::CanonicalProgress(block)
+            | ChainControl::Barrier {
+                block: Some(block), ..
+            } => {
+                let allow_parentless_extension = replacement_anchor.is_some_and(|anchor| {
+                    anchor.permits_missing_child_parent
+                        && anchor.number.checked_add(1) == Some(block.number)
+                }) || (replacement_anchor.is_none()
+                    && block.parent_hash.is_none()
+                    && state
+                        .coverage_head
+                        .is_some_and(|head| head.number.checked_add(1) == Some(block.number)));
+                if let Some(rewind) =
+                    apply_sequence_canonical_block(&mut state, block, allow_parentless_extension)?
+                {
+                    mutations.push(CanonicalSequenceMutation::Rewind {
+                        common_ancestor: rewind.common_ancestor,
+                        dropped: rewind.dropped,
+                    });
+                }
+                mutations.push(CanonicalSequenceMutation::Canonical(*block));
+            }
+            ChainControl::LogCoverage(block) => {
+                set_or_enrich_block_ref(&mut state.log_coverage_head, block);
+                mutations.push(CanonicalSequenceMutation::LogCoverage(
+                    state
+                        .log_coverage_head
+                        .expect("log coverage head was just installed"),
+                ));
+            }
+            ChainControl::Barrier { block: None, .. } => {}
+            ChainControl::Reorg { .. } => {
+                unreachable!("phase validation excludes post-record reorg controls")
+            }
+        }
+    }
+
+    if let Some(required) = required_reorg_anchor
+        && required.must_be_consumed
+        && policy.requires_complete_rollback()
+    {
+        return Err(CanonicalSequenceError::IncompleteRollback {
+            common_ancestor: required.number,
+            oldest_retained: rollback_oldest,
+            kind: CanonicalRollbackKind::MissingReplacement,
+        });
+    }
+
+    validate_canonical_sequence_snapshot(&state)?;
+    Ok(CanonicalSequenceValidation {
+        pre_record_state,
+        next_state: state,
+        mutations,
+        normalized_chain_controls,
+    })
+}
+
+fn validate_canonical_sequence_snapshot(
+    state: &CanonicalSequenceState,
+) -> Result<(), ReactiveError> {
+    let invalid = |message: String| ReactiveError::InvalidChainControl { message };
+    let supplied_blocks = state
+        .retained_canonical_history
+        .iter()
+        .chain(state.coverage_head.iter())
+        .chain(state.safe_head.iter())
+        .chain(state.finalized_head.iter())
+        .collect::<Vec<_>>();
+    validate_known_parent_hash_heights(&supplied_blocks)?;
+    let mut prior = None::<BlockRef>;
+    for block in &state.retained_canonical_history {
+        if let Some(previous) = prior {
+            if block.number < previous.number {
+                return Err(invalid(
+                    "retained canonical history is not ordered by block number".into(),
+                ));
+            }
+            if block.number == previous.number {
+                let qualifier = if optional_block_refs_are_compatible(Some(&previous), Some(block))
+                {
+                    "duplicate"
+                } else {
+                    "conflicting"
+                };
+                return Err(invalid(format!(
+                    "retained canonical history contains {qualifier} identities at block {}",
+                    block.number
+                )));
+            }
+            if previous.number.checked_add(1) == Some(block.number)
+                && block.parent_hash.is_some()
+                && block.parent_hash != Some(previous.hash)
+            {
+                return Err(invalid(format!(
+                    "adjacent retained block {}:{:?} does not descend from {}:{:?}",
+                    block.number, block.hash, previous.number, previous.hash
+                )));
+            }
+        }
+        prior = Some(*block);
+    }
+    if state.coverage_head.is_none() && !state.retained_canonical_history.is_empty() {
+        return Err(invalid(
+            "retained canonical history requires an authoritative coverage head".into(),
+        ));
+    }
+    if let Some(head) = state.coverage_head.as_ref() {
+        if let Some(retained) = state
+            .retained_canonical_history
+            .iter()
+            .find(|entry| entry.number == head.number)
+            && !optional_block_refs_are_compatible(Some(retained), Some(head))
+        {
+            return Err(invalid(format!(
+                "coverage head {}:{:?} conflicts with retained identity {:?}",
+                head.number, head.hash, retained
+            )));
+        }
+        if state
+            .retained_canonical_history
+            .last()
+            .is_some_and(|retained| retained.number > head.number)
+        {
+            return Err(invalid(
+                "retained canonical history advances beyond the coverage head".into(),
+            ));
+        }
+        if let Some(retained) = state.retained_canonical_history.last()
+            && retained.number.checked_add(1) == Some(head.number)
+            && head.parent_hash.is_some()
+            && head.parent_hash != Some(retained.hash)
+        {
+            return Err(invalid(format!(
+                "coverage head {}:{:?} does not descend from adjacent retained block {}:{:?}",
+                head.number, head.hash, retained.number, retained.hash
+            )));
+        }
+    }
+    if let Some(safe) = state.safe_head.as_ref() {
+        validate_sequence_known_identity(state, safe, "safe")?;
+        validate_sequence_head_within_coverage(state, safe, "safe")?;
+        validate_coverage_descends_from_adjacent_head(state.coverage_head.as_ref(), safe, "safe")?;
+    }
+    if let Some(finalized) = state.finalized_head.as_ref() {
+        validate_sequence_known_identity(state, finalized, "finalized")?;
+        validate_sequence_head_within_coverage(state, finalized, "finalized")?;
+        validate_coverage_descends_from_adjacent_head(
+            state.coverage_head.as_ref(),
+            finalized,
+            "finalized",
+        )?;
+    }
+    validate_adjacent_finality(state.finalized_head.as_ref(), state.safe_head.as_ref())?;
+    if let (Some(finalized), Some(safe)) = (state.finalized_head, state.safe_head)
+        && (finalized.number > safe.number
+            || (finalized.number == safe.number && finalized.hash != safe.hash))
+    {
+        return Err(invalid(
+            "finalized head cannot advance beyond or conflict with safe head".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_known_parent_hash_heights(blocks: &[&BlockRef]) -> Result<(), ReactiveError> {
+    let mut heights_by_hash = HashMap::<B256, u64>::with_capacity(blocks.len());
+    let mut resolved_by_height = HashMap::<u64, BlockRef>::with_capacity(blocks.len());
+    for block in blocks.iter().copied() {
+        if let Some(previous_height) = heights_by_hash.insert(block.hash, block.number)
+            && previous_height != block.number
+        {
+            return Err(ReactiveError::InvalidChainControl {
+                message: format!(
+                    "canonical hash {:?} is reused at heights {} and {}",
+                    block.hash, previous_height, block.number
+                ),
+            });
+        }
+        if let Some(resolved) = resolved_by_height.get_mut(&block.number) {
+            if !optional_block_refs_are_compatible(Some(resolved), Some(block)) {
+                return Err(ReactiveError::InvalidChainControl {
+                    message: format!(
+                        "canonical aliases at height {} carry conflicting identities or metadata",
+                        block.number
+                    ),
+                });
+            }
+            enrich_block_ref(resolved, block);
+        } else {
+            resolved_by_height.insert(block.number, *block);
+        }
+    }
+    for child in resolved_by_height.values() {
+        let Some(parent_hash) = child.parent_hash else {
+            continue;
+        };
+        if let Some(parent_number) = heights_by_hash.get(&parent_hash)
+            && parent_number.checked_add(1) != Some(child.number)
+        {
+            return Err(ReactiveError::InvalidChainControl {
+                message: format!(
+                    "block {}:{:?} names hash {:?} from known height {} as a non-adjacent parent",
+                    child.number, child.hash, parent_hash, parent_number
+                ),
+            });
+        }
+        if let Some(parent_number) = child.number.checked_sub(1)
+            && let Some(parent) = resolved_by_height.get(&parent_number)
+            && parent.hash != parent_hash
+        {
+            return Err(ReactiveError::InvalidChainControl {
+                message: format!(
+                    "block {}:{:?} does not descend from supplied adjacent identity {}:{:?}",
+                    child.number, child.hash, parent.number, parent.hash
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_coverage_descends_from_adjacent_head(
+    coverage: Option<&BlockRef>,
+    head: &BlockRef,
+    label: &str,
+) -> Result<(), ReactiveError> {
+    let Some(coverage) = coverage else {
+        return Ok(());
+    };
+    if head.number.checked_add(1) == Some(coverage.number)
+        && coverage
+            .parent_hash
+            .is_some_and(|parent| parent != head.hash)
+    {
+        return Err(ReactiveError::InvalidChainControl {
+            message: format!(
+                "canonical coverage {}:{:?} does not descend from adjacent {label} head {}:{:?}",
+                coverage.number, coverage.hash, head.number, head.hash
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn validate_sequence_control(
+    state: &CanonicalSequenceState,
+    control: &ChainControl,
+) -> Result<(), ReactiveError> {
+    let invalid = |message: String| ReactiveError::InvalidChainControl { message };
+    match control {
+        ChainControl::Safe(block) => {
+            validate_sequence_known_identity(state, block, "safe")?;
+            validate_sequence_head_within_coverage(state, block, "safe")?;
+            if let Some(current) = state.safe_head.as_ref()
+                && (block.number < current.number
+                    || (block.number == current.number
+                        && (block.hash != current.hash
+                            || !optional_block_refs_are_compatible(Some(block), Some(current)))))
+            {
+                return Err(invalid(format!(
+                    "safe head {}:{:?} conflicts with current {}:{:?}",
+                    block.number, block.hash, current.number, current.hash
+                )));
+            }
+            if let Some(finalized) = state.finalized_head.as_ref()
+                && (block.number < finalized.number
+                    || (block.number == finalized.number && block.hash != finalized.hash))
+            {
+                return Err(invalid(
+                    "safe head cannot precede or conflict with finalized head".into(),
+                ));
+            }
+            validate_adjacent_finality(state.finalized_head.as_ref(), Some(block))?;
+        }
+        ChainControl::Finalized(block) => {
+            validate_sequence_known_identity(state, block, "finalized")?;
+            validate_sequence_head_within_coverage(state, block, "finalized")?;
+            if let Some(current) = state.finalized_head.as_ref()
+                && (block.number < current.number
+                    || (block.number == current.number
+                        && (block.hash != current.hash
+                            || !optional_block_refs_are_compatible(Some(block), Some(current)))))
+            {
+                return Err(invalid(format!(
+                    "finalized head {}:{:?} conflicts with current {}:{:?}",
+                    block.number, block.hash, current.number, current.hash
+                )));
+            }
+            if let Some(safe) = state.safe_head.as_ref()
+                && (block.number > safe.number
+                    || (block.number == safe.number && block.hash != safe.hash))
+            {
+                return Err(invalid(
+                    "finalized head cannot advance beyond or conflict with safe head".into(),
+                ));
+            }
+            validate_adjacent_finality(Some(block), state.safe_head.as_ref())?;
+        }
+        ChainControl::CanonicalProgress(block)
+        | ChainControl::Barrier {
+            block: Some(block), ..
+        } => {
+            validate_sequence_known_identity(state, block, "canonical coverage")?;
+            if let Some(current) = state.coverage_head.as_ref()
+                && (block.number < current.number
+                    || (block.number == current.number && block.hash != current.hash))
+            {
+                return Err(invalid(format!(
+                    "canonical coverage {}:{:?} conflicts with current {}:{:?}",
+                    block.number, block.hash, current.number, current.hash
+                )));
+            }
+            if let Some(current) = state.coverage_head.as_ref()
+                && current.number.checked_add(1) == Some(block.number)
+                && block.parent_hash.is_some()
+                && block.parent_hash != Some(current.hash)
+            {
+                return Err(invalid(format!(
+                    "canonical coverage {}:{:?} does not descend from current {}:{:?}",
+                    block.number, block.hash, current.number, current.hash
+                )));
+            }
+        }
+        ChainControl::LogCoverage(block) => {
+            validate_sequence_known_identity(state, block, "log coverage")?;
+            // Monotonic: an attestation may be re-sent for the same block but
+            // must never retreat, or a consumer could widen a window it had
+            // already narrowed.
+            if let Some(current) = state.log_coverage_head.as_ref()
+                && (block.number < current.number
+                    || (block.number == current.number && block.hash != current.hash))
+            {
+                return Err(invalid(format!(
+                    "log coverage {}:{:?} conflicts with current {}:{:?}",
+                    block.number, block.hash, current.number, current.hash
+                )));
+            }
+            // Logs cannot be attested complete for a block the source has not
+            // established canonical coverage for.
+            if let Some(coverage) = state.coverage_head.as_ref()
+                && block.number > coverage.number
+            {
+                return Err(invalid(format!(
+                    "log coverage {}:{:?} is ahead of canonical coverage {}:{:?}",
+                    block.number, block.hash, coverage.number, coverage.hash
+                )));
+            }
+        }
+        ChainControl::Barrier { block: None, .. } => {}
+        ChainControl::Reorg {
+            common_ancestor,
+            old_tip,
+            new_tip,
+        } => {
+            validate_sequence_known_identity(state, common_ancestor, "reorg common ancestor")?;
+            validate_reorg_ancestor_against_retained_branch(state, common_ancestor)?;
+            validate_sequence_known_hash_height(state, old_tip, "reorg old tip")?;
+            validate_sequence_known_hash_height(state, new_tip, "reorg new tip")?;
+            validate_sequence_known_parent_height(state, old_tip, "reorg old tip")?;
+            validate_sequence_known_parent_height(state, new_tip, "reorg new tip")?;
+            validate_sequence_adjacent_parent_identity(state, old_tip, "reorg old tip")?;
+            if let Some(current) = state.coverage_head.as_ref()
+                && (old_tip.number != current.number
+                    || old_tip.hash != current.hash
+                    || !optional_block_refs_are_compatible(Some(old_tip), Some(current)))
+            {
+                return Err(invalid(format!(
+                    "reorg old tip {}:{:?} does not exactly match current metadata {}:{:?}",
+                    old_tip.number, old_tip.hash, current.number, current.hash
+                )));
+            }
+            if common_ancestor.number > old_tip.number || common_ancestor.number > new_tip.number {
+                return Err(invalid(
+                    "reorg common ancestor cannot be above either branch tip".into(),
+                ));
+            }
+            if common_ancestor.number == old_tip.number || common_ancestor.number == new_tip.number
+            {
+                return Err(invalid(
+                    "reorg must replace non-empty old and new branches above the common ancestor"
+                        .into(),
+                ));
+            }
+            if old_tip.number == new_tip.number && old_tip.hash == new_tip.hash {
+                return Err(invalid(
+                    "reorg old and new tips cannot have the same canonical identity".into(),
+                ));
+            }
+            for (label, tip) in [("old", old_tip), ("new", new_tip)] {
+                if common_ancestor.number.checked_add(1) == Some(tip.number)
+                    && tip.parent_hash != Some(common_ancestor.hash)
+                {
+                    return Err(invalid(format!(
+                        "reorg {label} tip does not descend from the common ancestor"
+                    )));
+                }
+            }
+            if let Some(finalized) = state.finalized_head.as_ref()
+                && (common_ancestor.number < finalized.number
+                    || (common_ancestor.number == finalized.number
+                        && common_ancestor.hash != finalized.hash))
+            {
+                return Err(invalid(
+                    "reorg would cross or conflict with the finalized head".into(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_sequence_known_identity(
+    state: &CanonicalSequenceState,
+    block: &BlockRef,
+    label: &str,
+) -> Result<(), ReactiveError> {
+    validate_sequence_known_hash_height(state, block, label)?;
+    validate_sequence_known_parent_height(state, block, label)?;
+    let known = state
+        .coverage_head
+        .as_ref()
+        .filter(|head| head.number == block.number)
+        .or_else(|| {
+            state
+                .retained_canonical_history
+                .iter()
+                .find(|entry| entry.number == block.number)
+        });
+    if let Some(known) = known
+        && !optional_block_refs_are_compatible(Some(known), Some(block))
+    {
+        return Err(ReactiveError::InvalidChainControl {
+            message: format!(
+                "{label} block {}:{:?} conflicts with known canonical block {:?}",
+                block.number, block.hash, known
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn validate_sequence_known_parent_height(
+    state: &CanonicalSequenceState,
+    block: &BlockRef,
+    label: &str,
+) -> Result<(), ReactiveError> {
+    let Some(parent_hash) = block.parent_hash else {
+        return Ok(());
+    };
+    let known_parent = state
+        .retained_canonical_history
+        .iter()
+        .chain(state.coverage_head.iter())
+        .chain(state.safe_head.iter())
+        .chain(state.finalized_head.iter())
+        .find(|known| known.hash == parent_hash);
+    if let Some(parent) = known_parent
+        && parent.number.checked_add(1) != Some(block.number)
+    {
+        return Err(ReactiveError::InvalidChainControl {
+            message: format!(
+                "{label} block {}:{:?} names hash {:?} from known height {} as a non-adjacent parent",
+                block.number, block.hash, parent.hash, parent.number
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn validate_sequence_head_within_coverage(
+    state: &CanonicalSequenceState,
+    block: &BlockRef,
+    label: &str,
+) -> Result<(), ReactiveError> {
+    let Some(coverage) = state.coverage_head.as_ref() else {
+        return Err(ReactiveError::InvalidChainControl {
+            message: format!("{label} head requires an authoritative coverage head"),
+        });
+    };
+    if block.number > coverage.number
+        || (block.number == coverage.number
+            && !optional_block_refs_are_compatible(Some(block), Some(coverage)))
+    {
+        return Err(ReactiveError::InvalidChainControl {
+            message: format!(
+                "{label} head {}:{:?} advances beyond or conflicts with coverage {}:{:?}",
+                block.number, block.hash, coverage.number, coverage.hash
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn validate_sequence_matching_metadata(
+    state: &CanonicalSequenceState,
+    block: &BlockRef,
+    label: &str,
+) -> Result<(), ReactiveError> {
+    validate_sequence_known_hash_height(state, block, label)?;
+    validate_sequence_known_parent_height(state, block, label)?;
+    let known = state
+        .coverage_head
+        .as_ref()
+        .filter(|head| head.number == block.number && head.hash == block.hash)
+        .or_else(|| {
+            state
+                .retained_canonical_history
+                .iter()
+                .find(|entry| entry.number == block.number && entry.hash == block.hash)
+        });
+    if let Some(known) = known
+        && !optional_block_refs_are_compatible(Some(known), Some(block))
+    {
+        return Err(ReactiveError::InvalidChainControl {
+            message: format!(
+                "{label} block {}:{:?} carries metadata conflicting with known canonical block {:?}",
+                block.number, block.hash, known
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn validate_sequence_known_hash_height(
+    state: &CanonicalSequenceState,
+    block: &BlockRef,
+    label: &str,
+) -> Result<(), ReactiveError> {
+    let known = state
+        .retained_canonical_history
+        .iter()
+        .chain(state.coverage_head.iter())
+        .chain(state.safe_head.iter())
+        .chain(state.finalized_head.iter())
+        .find(|known| known.hash == block.hash);
+    if let Some(known) = known
+        && known.number != block.number
+    {
+        return Err(ReactiveError::InvalidChainControl {
+            message: format!(
+                "{label} block {}:{:?} reuses a canonical hash already known at height {}",
+                block.number, block.hash, known.number
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn validate_reorg_ancestor_against_retained_branch(
+    state: &CanonicalSequenceState,
+    ancestor: &BlockRef,
+) -> Result<(), ReactiveError> {
+    let adjacent_number = ancestor.number.checked_add(1);
+    for retained in state
+        .retained_canonical_history
+        .iter()
+        .chain(state.coverage_head.iter())
+        .chain(state.safe_head.iter())
+        .chain(state.finalized_head.iter())
+    {
+        if Some(retained.number) == adjacent_number
+            && retained
+                .parent_hash
+                .is_some_and(|parent| parent != ancestor.hash)
+        {
+            return Err(ReactiveError::InvalidChainControl {
+                message: format!(
+                    "reorg common ancestor {}:{:?} conflicts with retained child {}:{:?} parent {:?}",
+                    ancestor.number,
+                    ancestor.hash,
+                    retained.number,
+                    retained.hash,
+                    retained.parent_hash
+                ),
+            });
+        }
+        if retained.parent_hash == Some(ancestor.hash) && Some(retained.number) != adjacent_number {
+            return Err(ReactiveError::InvalidChainControl {
+                message: format!(
+                    "reorg common ancestor {}:{:?} is named as the non-adjacent parent of retained block {}:{:?}",
+                    ancestor.number, ancestor.hash, retained.number, retained.hash
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_sequence_adjacent_parent_identity(
+    state: &CanonicalSequenceState,
+    block: &BlockRef,
+    label: &str,
+) -> Result<(), ReactiveError> {
+    let Some(parent_hash) = block.parent_hash else {
+        return Ok(());
+    };
+    let Some(parent_number) = block.number.checked_sub(1) else {
+        return Ok(());
+    };
+    let known_parent = state
+        .retained_canonical_history
+        .iter()
+        .chain(state.coverage_head.iter())
+        .chain(state.safe_head.iter())
+        .chain(state.finalized_head.iter())
+        .find(|known| known.number == parent_number);
+    if let Some(known_parent) = known_parent
+        && known_parent.hash != parent_hash
+    {
+        return Err(ReactiveError::InvalidChainControl {
+            message: format!(
+                "{label} block {}:{:?} names parent {:?}, which conflicts with known adjacent block {}:{:?}",
+                block.number, block.hash, parent_hash, known_parent.number, known_parent.hash
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn sequence_block_adds_metadata(state: &CanonicalSequenceState, incoming: &BlockRef) -> bool {
+    state
+        .coverage_head
+        .iter()
+        .chain(state.retained_canonical_history.iter())
+        .filter(|known| known.number == incoming.number && known.hash == incoming.hash)
+        .any(|known| {
+            (known.parent_hash.is_none() && incoming.parent_hash.is_some())
+                || (known.timestamp.is_none() && incoming.timestamp.is_some())
+        })
+}
+
+fn validate_sequence_implicit_finality<N: Network>(
+    state: &CanonicalSequenceState,
+    record: &ReactiveInputRecord<N>,
+    resolved_canonical_block: Option<&BlockRef>,
+) -> Result<(), ReactiveError> {
+    let Some(finalized) = state.finalized_head.as_ref() else {
+        return Ok(());
+    };
+    if let Some((dropped, _)) = reorg_signal_block(record) {
+        if dropped.number <= finalized.number {
+            return Err(ReactiveError::InvalidChainControl {
+                message: format!(
+                    "implicit reorg at {}:{:?} would cross finalized head {}:{:?}",
+                    dropped.number, dropped.hash, finalized.number, finalized.hash
+                ),
+            });
+        }
+        return Ok(());
+    }
+    let Some(block) = resolved_canonical_block.or_else(|| canonical_record_block(record)) else {
+        return Ok(());
+    };
+    let Some(latest) = state.coverage_head.as_ref() else {
+        return Ok(());
+    };
+    if (block.number == latest.number && block.hash == latest.hash)
+        || state
+            .retained_canonical_history
+            .iter()
+            .any(|entry| entry.number == block.number && entry.hash == block.hash)
+        || (latest.number.checked_add(1) == Some(block.number)
+            && block.parent_hash == Some(latest.hash))
+        || latest
+            .number
+            .checked_add(1)
+            .is_some_and(|next| block.number > next)
+    {
+        return Ok(());
+    }
+    let crosses_finalized = if block.number <= finalized.number {
+        true
+    } else if let Some(parent_hash) = block.parent_hash {
+        if finalized.number.checked_add(1) == Some(block.number) && parent_hash == finalized.hash {
+            false
+        } else if let Some(parent_index) =
+            state.retained_canonical_history.iter().rposition(|entry| {
+                entry.number.checked_add(1) == Some(block.number) && entry.hash == parent_hash
+            })
+        {
+            state
+                .retained_canonical_history
+                .iter()
+                .skip(parent_index + 1)
+                .any(|entry| entry.number <= finalized.number)
+        } else {
+            true
+        }
+    } else {
+        true
+    };
+    if crosses_finalized {
+        return Err(ReactiveError::InvalidChainControl {
+            message: format!(
+                "canonical input {}:{:?} would replace finalized head {}:{:?}",
+                block.number, block.hash, finalized.number, finalized.hash
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn validate_required_reorg_anchor(
+    required: Option<RequiredReorgAnchor>,
+    block: &BlockRef,
+) -> Result<(), ReactiveError> {
+    let Some(required) = required else {
+        return Ok(());
+    };
+    let ancestor_hash = required.hash();
+    let restores_ancestor =
+        block.number == required.number && ancestor_hash.is_some_and(|hash| block.hash == hash);
+    let replaces_removed_child = required.number.checked_add(1) == Some(block.number)
+        && ancestor_hash.is_some()
+        && (block.parent_hash == ancestor_hash
+            || (block.parent_hash.is_none() && required.permits_missing_child_parent));
+    if restores_ancestor || replaces_removed_child {
+        return Ok(());
+    }
+    Err(ReactiveError::InvalidChainControl {
+        message: format!(
+            "canonical replacement {}:{:?} does not prove the removed tip's parent at block {}",
+            block.number, block.hash, required.number
+        ),
+    })
+}
+
+fn validate_replacement_reorg_anchor(
+    required: Option<RequiredReorgAnchor>,
+    block: &BlockRef,
+    policy: CanonicalSequenceValidationPolicy,
+    oldest_retained: Option<u64>,
+) -> Result<bool, CanonicalSequenceError> {
+    let Some(required) = required else {
+        return Ok(false);
+    };
+    match validate_required_reorg_anchor(Some(required), block) {
+        Ok(()) => Ok(true),
+        Err(error) if required.block.is_some() => Err(error.into()),
+        Err(_) if policy.requires_complete_rollback() => {
+            Err(CanonicalSequenceError::IncompleteRollback {
+                common_ancestor: required.number,
+                oldest_retained,
+                kind: CanonicalRollbackKind::MissingReplacement,
+            })
+        }
+        Err(_) => Ok(false),
+    }
+}
+
+fn apply_sequence_canonical_block(
+    state: &mut CanonicalSequenceState,
+    block: &BlockRef,
+    allow_parentless_adjacent_extension: bool,
+) -> Result<Option<SequenceRewind>, ReactiveError> {
+    let latest = state.coverage_head;
+    let already_known = state
+        .retained_canonical_history
+        .iter()
+        .any(|entry| entry.number == block.number && entry.hash == block.hash);
+    let repeats_tip =
+        latest.is_some_and(|head| head.number == block.number && head.hash == block.hash);
+    let extends_tip = latest.is_some_and(|head| {
+        head.number.checked_add(1) == Some(block.number)
+            && (block.parent_hash == Some(head.hash)
+                || (allow_parentless_adjacent_extension && block.parent_hash.is_none()))
+    });
+    let forward_gap = latest.is_some_and(|head| {
+        head.number
+            .checked_add(1)
+            .is_some_and(|next| block.number > next)
+    });
+    let mut rewind = None;
+
+    if latest.is_some() && !already_known && !repeats_tip && !extends_tip && !forward_gap {
+        let retained_parent = block.parent_hash.and_then(|parent_hash| {
+            state
+                .retained_canonical_history
+                .iter()
+                .rposition(|entry| {
+                    entry.number.checked_add(1) == Some(block.number) && entry.hash == parent_hash
+                })
+                .map(|index| (index, state.retained_canonical_history[index]))
+        });
+        let finalized_parent = block.parent_hash.and_then(|parent_hash| {
+            state.finalized_head.filter(|finalized| {
+                finalized.number.checked_add(1) == Some(block.number)
+                    && finalized.hash == parent_hash
+            })
+        });
+        let (common_ancestor, dropped) = if let Some((parent_index, parent)) = retained_parent {
+            let dropped = state.retained_canonical_history.split_off(parent_index + 1);
+            (Some(parent), dropped)
+        } else if let Some(finalized) = finalized_parent {
+            let dropped = state
+                .retained_canonical_history
+                .iter()
+                .position(|entry| entry.number > finalized.number)
+                .map_or_else(Vec::new, |index| {
+                    state.retained_canonical_history.split_off(index)
+                });
+            (Some(finalized), dropped)
+        } else {
+            // The observable runtime policy may continue after an incomplete
+            // rollback proof so it can degrade health and repair. The metadata
+            // validator must nevertheless avoid claiming any old prefix is an
+            // ancestor of the arriving branch: without the exact N-1 parent,
+            // no retained identity is authenticated.
+            (None, std::mem::take(&mut state.retained_canonical_history))
+        };
+        state.coverage_head = common_ancestor;
+        if let Some(common_ancestor) = common_ancestor {
+            clear_sequence_heads_above(state, &common_ancestor);
+        } else {
+            state.safe_head = None;
+            state.finalized_head = None;
+        }
+        rewind = Some(SequenceRewind {
+            common_ancestor,
+            dropped,
+        });
+    }
+    upsert_sequence_history(&mut state.retained_canonical_history, block)?;
+    advance_or_enrich_coverage(&mut state.coverage_head, block);
+    Ok(rewind)
+}
+
+fn sequence_implicit_replacement_requires_history(
+    state: &CanonicalSequenceState,
+    block: &BlockRef,
+    policy: CanonicalSequenceValidationPolicy,
+) -> Result<bool, ReactiveError> {
+    let Some(latest) = state.coverage_head else {
+        return Ok(false);
+    };
+    let already_known = state
+        .retained_canonical_history
+        .iter()
+        .any(|entry| entry.number == block.number && entry.hash == block.hash);
+    let repeats_tip = block.number == latest.number && block.hash == latest.hash;
+    let extends_tip = latest.number.checked_add(1) == Some(block.number)
+        && block.parent_hash == Some(latest.hash);
+    let forward_gap = latest
+        .number
+        .checked_add(1)
+        .is_some_and(|next| block.number > next);
+    if already_known || repeats_tip || extends_tip || forward_gap {
+        return Ok(false);
+    }
+    let Some(parent_hash) = block.parent_hash else {
+        if policy.requires_complete_rollback() {
+            return Err(ReactiveError::InvalidChainControl {
+                message: format!(
+                    "implicit canonical replacement {}:{:?} must identify its parent",
+                    block.number, block.hash
+                ),
+            });
+        }
+        return Ok(true);
+    };
+    let known_adjacent_parent = block.number.checked_sub(1).and_then(|parent_number| {
+        state
+            .retained_canonical_history
+            .iter()
+            .chain(state.coverage_head.iter())
+            .chain(state.safe_head.iter())
+            .chain(state.finalized_head.iter())
+            .find(|known| known.number == parent_number)
+    });
+    if let Some(known_parent) = known_adjacent_parent
+        && known_parent.hash != parent_hash
+        && policy.requires_complete_rollback()
+    {
+        return Err(ReactiveError::InvalidChainControl {
+            message: format!(
+                "implicit canonical replacement {}:{:?} names parent {:?}, which conflicts with known adjacent block {}:{:?}",
+                block.number, block.hash, parent_hash, known_parent.number, known_parent.hash
+            ),
+        });
+    }
+    let retained_parent = state.retained_canonical_history.iter().any(|entry| {
+        entry.number.checked_add(1) == Some(block.number) && entry.hash == parent_hash
+    });
+    let finalized_parent = state.finalized_head.is_some_and(|finalized| {
+        finalized.number.checked_add(1) == Some(block.number) && parent_hash == finalized.hash
+    });
+    Ok(!retained_parent && !finalized_parent)
+}
+
+fn upsert_sequence_history(
+    history: &mut Vec<BlockRef>,
+    block: &BlockRef,
+) -> Result<(), ReactiveError> {
+    if let Some(existing) = history
+        .iter_mut()
+        .find(|entry| entry.number == block.number)
+    {
+        if existing.hash != block.hash {
+            return Err(ReactiveError::InvalidChainControl {
+                message: format!(
+                    "canonical block {}:{:?} conflicts with retained identity {:?}",
+                    block.number, block.hash, existing
+                ),
+            });
+        }
+        if !optional_block_refs_are_compatible(Some(existing), Some(block)) {
+            return Err(ReactiveError::InvalidChainControl {
+                message: format!(
+                    "canonical block {}:{:?} carries conflicting retained metadata",
+                    block.number, block.hash
+                ),
+            });
+        }
+        enrich_block_ref(existing, block);
+    } else {
+        history.push(*block);
+        history.sort_by_key(|entry| entry.number);
+    }
+    Ok(())
+}
+
+fn clear_sequence_heads_above(state: &mut CanonicalSequenceState, ancestor: &BlockRef) {
+    if state.safe_head.as_ref().is_some_and(|head| {
+        head.number > ancestor.number
+            || (head.number == ancestor.number && head.hash != ancestor.hash)
+    }) {
+        state.safe_head = None;
+    }
+    if state.finalized_head.as_ref().is_some_and(|head| {
+        head.number > ancestor.number
+            || (head.number == ancestor.number && head.hash != ancestor.hash)
+    }) {
+        state.finalized_head = None;
+    }
+}
+
+fn validate_control_phase_order(controls: &[ChainControl]) -> Result<usize, ReactiveError> {
+    let split = controls
+        .iter()
+        .position(|control| !matches!(control, ChainControl::Reorg { .. }))
+        .unwrap_or(controls.len());
+    if controls[split..]
+        .iter()
+        .any(|control| matches!(control, ChainControl::Reorg { .. }))
+    {
+        return Err(ReactiveError::InvalidChainControl {
+            message: "reorg controls must precede records and all post-record controls in a batch"
+                .into(),
+        });
+    }
+    Ok(split)
+}
+
+fn canonical_coverage_control_block(control: &ChainControl) -> Option<&BlockRef> {
+    match control {
+        ChainControl::CanonicalProgress(block)
+        | ChainControl::Barrier {
+            block: Some(block), ..
+        } => Some(block),
+        // An attestation names a canonical block but claims no progress to it.
+        ChainControl::Reorg { .. }
+        | ChainControl::Safe(_)
+        | ChainControl::Finalized(_)
+        | ChainControl::LogCoverage(_)
+        | ChainControl::Barrier { block: None, .. } => None,
+    }
+}
+
+fn chain_control_canonical_assertion(control: &ChainControl) -> Option<&BlockRef> {
+    match control {
+        ChainControl::Safe(block)
+        | ChainControl::Finalized(block)
+        | ChainControl::CanonicalProgress(block)
+        | ChainControl::LogCoverage(block)
+        | ChainControl::Barrier {
+            block: Some(block), ..
+        } => Some(block),
+        ChainControl::Reorg { .. } | ChainControl::Barrier { block: None, .. } => None,
+    }
+}
+
+fn assert_chain_control_identities(
+    asserted_blocks: &mut HashMap<u64, BlockRef>,
+    control: &ChainControl,
+) -> Result<(), ReactiveError> {
+    match control {
+        ChainControl::Safe(block)
+        | ChainControl::Finalized(block)
+        | ChainControl::CanonicalProgress(block)
+        | ChainControl::LogCoverage(block)
+        | ChainControl::Barrier {
+            block: Some(block), ..
+        } => assert_canonical_block_identity(asserted_blocks, block, "chain control"),
+        ChainControl::Barrier { block: None, .. } => Ok(()),
+        ChainControl::Reorg {
+            common_ancestor,
+            new_tip,
+            ..
+        } => {
+            asserted_blocks.retain(|number, _| *number <= common_ancestor.number);
+            assert_canonical_block_identity(
+                asserted_blocks,
+                common_ancestor,
+                "reorg common ancestor",
+            )?;
+            assert_canonical_block_identity(asserted_blocks, new_tip, "reorg new tip")
+        }
+    }
+}
+
+fn assert_canonical_block_identity(
+    asserted_blocks: &mut HashMap<u64, BlockRef>,
+    block: &BlockRef,
+    label: &str,
+) -> Result<(), ReactiveError> {
+    for asserted in asserted_blocks.values() {
+        if asserted.hash == block.hash && asserted.number != block.number {
+            return Err(ReactiveError::InvalidChainControl {
+                message: format!(
+                    "{label} hash {:?} is already asserted at height {}, not {}",
+                    block.hash, asserted.number, block.number
+                ),
+            });
+        }
+        if block
+            .parent_hash
+            .is_some_and(|parent| parent == asserted.hash)
+            && asserted.number.checked_add(1) != Some(block.number)
+        {
+            return Err(ReactiveError::InvalidChainControl {
+                message: format!(
+                    "{label} block {}:{:?} names hash {:?} from known height {} as a non-adjacent parent",
+                    block.number, block.hash, asserted.hash, asserted.number
+                ),
+            });
+        }
+        if asserted
+            .parent_hash
+            .is_some_and(|parent| parent == block.hash)
+            && block.number.checked_add(1) != Some(asserted.number)
+        {
+            return Err(ReactiveError::InvalidChainControl {
+                message: format!(
+                    "block {}:{:?} asserted earlier names {label} hash {:?} from non-adjacent height {} as its parent",
+                    asserted.number, asserted.hash, block.hash, block.number
+                ),
+            });
+        }
+    }
+    if let Some(known) = asserted_blocks.get_mut(&block.number) {
+        if !optional_block_refs_are_compatible(Some(known), Some(block)) {
+            return Err(ReactiveError::InvalidChainControl {
+                message: format!(
+                    "{label} block {}:{:?} conflicts with block identity {:?} asserted earlier in the batch",
+                    block.number, block.hash, known
+                ),
+            });
+        }
+        enrich_block_ref(known, block);
+    } else {
+        asserted_blocks.insert(block.number, *block);
+    }
+    Ok(())
+}
+
+fn set_or_enrich_block_ref(current: &mut Option<BlockRef>, incoming: &BlockRef) {
+    match current {
+        Some(current) if current.number == incoming.number && current.hash == incoming.hash => {
+            enrich_block_ref(current, incoming);
+        }
+        _ => *current = Some(*incoming),
+    }
+}
+
+fn advance_or_enrich_coverage(current: &mut Option<BlockRef>, incoming: &BlockRef) {
+    match current {
+        Some(current) if current.number == incoming.number && current.hash == incoming.hash => {
+            enrich_block_ref(current, incoming);
+        }
+        Some(current) if current.number >= incoming.number => {}
+        _ => *current = Some(*incoming),
+    }
+}
+
+fn validate_adjacent_finality(
+    finalized: Option<&BlockRef>,
+    safe: Option<&BlockRef>,
+) -> Result<(), ReactiveError> {
+    let Some((finalized, safe)) = finalized.zip(safe) else {
+        return Ok(());
+    };
+    if finalized.number.checked_add(1) == Some(safe.number)
+        && safe.parent_hash != Some(finalized.hash)
+    {
+        return Err(ReactiveError::InvalidChainControl {
+            message: "adjacent safe head does not descend from finalized head".into(),
+        });
+    }
+    Ok(())
 }
 
 /// Fold every address a [`StateDiff`] references — genuine changes
@@ -3024,6 +8423,42 @@ fn root_moved_account_resync(
     }
 }
 
+fn batch_preconfirmation<N: Network>(
+    batch: &ReactiveInputBatch<N>,
+) -> Result<Option<FlashblockRef>, ReactiveError> {
+    let mut flashblock: Option<FlashblockRef> = None;
+    let mut has_non_preconfirmed = false;
+    for (index, record) in batch.records().iter().enumerate() {
+        match &record.context.chain_status {
+            ChainStatus::Preconfirmed {
+                flashblock: current,
+            } => {
+                if batch.record_delivery_scope(index) != Some(DeliveryScope::Preconfirmed) {
+                    return Err(ReactiveError::InvalidInputRecord {
+                        message: "pre-confirmed input requires pre-confirmed delivery scope".into(),
+                    });
+                }
+                if flashblock
+                    .as_ref()
+                    .is_some_and(|known| known != current.as_ref())
+                {
+                    return Err(ReactiveError::InvalidInputRecord {
+                        message: "one batch cannot mix distinct Flashblock snapshots".into(),
+                    });
+                }
+                flashblock.get_or_insert_with(|| current.as_ref().clone());
+            }
+            _ => has_non_preconfirmed = true,
+        }
+    }
+    if flashblock.is_some() && (has_non_preconfirmed || !batch.chain_controls().is_empty()) {
+        return Err(ReactiveError::InvalidInputRecord {
+            message: "pre-confirmed delivery cannot mix canonical inputs or chain controls".into(),
+        });
+    }
+    Ok(flashblock)
+}
+
 fn canonical_record_block<N: Network>(record: &ReactiveInputRecord<N>) -> Option<&BlockRef> {
     if matches!(&record.input, ReactiveInput::Log(log) if log.removed) {
         return None;
@@ -3032,6 +8467,227 @@ fn canonical_record_block<N: Network>(record: &ReactiveInputRecord<N>) -> Option
         return context_block_ref(&record.context);
     }
     None
+}
+
+fn resolve_record_block_payload_metadata<N: Network>(
+    record: &ReactiveInputRecord<N>,
+    mut block: BlockRef,
+) -> Result<BlockRef, ReactiveError> {
+    let ReactiveInput::Log(log) = &record.input else {
+        return Ok(block);
+    };
+    if log.block_number != Some(block.number) || log.block_hash != Some(block.hash) {
+        return Err(ReactiveError::InvalidInputRecord {
+            message: "log payload and canonical context carry different block identities".into(),
+        });
+    }
+    if let Some(timestamp) = log.block_timestamp {
+        if block.timestamp.is_some_and(|known| known != timestamp) {
+            return Err(ReactiveError::InvalidInputRecord {
+                message: "log payload and canonical context carry different block timestamps"
+                    .into(),
+            });
+        }
+        block.timestamp = Some(timestamp);
+    }
+    Ok(block)
+}
+
+fn validate_input_record<N: Network>(record: &ReactiveInputRecord<N>) -> Result<(), ReactiveError> {
+    let invalid = |message: String| ReactiveError::InvalidInputRecord { message };
+    if let ChainStatus::Preconfirmed { flashblock } = &record.context.chain_status
+        && record.context.block != Some(flashblock.block_ref())
+    {
+        return Err(invalid(
+            "pre-confirmed status and context carry different partial block identities".into(),
+        ));
+    }
+    let status_block = match &record.context.chain_status {
+        ChainStatus::Included { block, .. }
+        | ChainStatus::Safe { block }
+        | ChainStatus::Finalized { block }
+        | ChainStatus::Reorged {
+            dropped_from: block,
+        } => Some(block),
+        ChainStatus::Preconfirmed { .. } => record.context.block.as_ref(),
+        ChainStatus::Pending => None,
+    };
+    match (status_block, record.context.block.as_ref()) {
+        (Some(status), Some(context)) if status == context => {}
+        (Some(_), Some(_)) => {
+            return Err(invalid(
+                "chain status and context carry different block identities".into(),
+            ));
+        }
+        (Some(_), None) => {
+            return Err(invalid(
+                "included or reorged input is missing its context block".into(),
+            ));
+        }
+        (None, Some(_)) => {
+            return Err(invalid(
+                "pending input cannot carry a canonical context block".into(),
+            ));
+        }
+        (None, None) => {}
+    }
+
+    match &record.input {
+        ReactiveInput::Log(log) => {
+            let Some(block) = status_block else {
+                return Err(invalid(
+                    "log input must carry an included or reorged block identity".into(),
+                ));
+            };
+            if log.removed && !matches!(record.context.chain_status, ChainStatus::Reorged { .. }) {
+                return Err(invalid(
+                    "removed log must carry reorged chain status".into(),
+                ));
+            }
+            let block_number = log
+                .block_number
+                .ok_or_else(|| invalid("log is missing its block number".into()))?;
+            let block_hash = log
+                .block_hash
+                .ok_or_else(|| invalid("log is missing its block hash".into()))?;
+            log.transaction_hash
+                .ok_or_else(|| invalid("log is missing its transaction hash".into()))?;
+            let transaction_index = log
+                .transaction_index
+                .ok_or_else(|| invalid("log is missing its transaction index".into()))?;
+            let log_index = log
+                .log_index
+                .ok_or_else(|| invalid("log is missing its log index".into()))?;
+            if block_number != block.number
+                || block_hash != block.hash
+                || !optional_metadata_compatible(
+                    log.block_timestamp.as_ref(),
+                    block.timestamp.as_ref(),
+                )
+            {
+                return Err(invalid(
+                    "log payload and context carry different block identities".into(),
+                ));
+            }
+            if record.context.transaction_index != Some(transaction_index)
+                || record.context.log_index != Some(log_index)
+            {
+                return Err(invalid(
+                    "log payload and context carry different transaction/log positions".into(),
+                ));
+            }
+        }
+        ReactiveInput::BlockHeader(header) => {
+            if let Some(block) = status_block {
+                if header.number() != block.number
+                    || header.hash() != block.hash
+                    || Some(header.parent_hash()) != block.parent_hash
+                    || Some(header.timestamp()) != block.timestamp
+                {
+                    return Err(invalid(
+                        "block header payload and context carry different block identities".into(),
+                    ));
+                }
+            } else if !matches!(record.context.chain_status, ChainStatus::Pending) {
+                return Err(invalid("block header has an unsupported lifecycle".into()));
+            }
+            if record.context.transaction_index.is_some() || record.context.log_index.is_some() {
+                return Err(invalid(
+                    "block header context cannot carry transaction/log positions".into(),
+                ));
+            }
+        }
+        ReactiveInput::FullBlock(block_response) => {
+            let header = block_response.header();
+            if let Some(block) = status_block {
+                if header.number() != block.number
+                    || header.hash() != block.hash
+                    || Some(header.parent_hash()) != block.parent_hash
+                    || Some(header.timestamp()) != block.timestamp
+                {
+                    return Err(invalid(
+                        "full-block payload and context carry different block identities".into(),
+                    ));
+                }
+            } else if !matches!(record.context.chain_status, ChainStatus::Pending) {
+                return Err(invalid("full block has an unsupported lifecycle".into()));
+            }
+            if record.context.transaction_index.is_some() || record.context.log_index.is_some() {
+                return Err(invalid(
+                    "full-block context cannot carry transaction/log positions".into(),
+                ));
+            }
+            if let Some(transactions) = block_response.transactions().as_transactions() {
+                for (index, transaction) in transactions.iter().enumerate() {
+                    if transaction
+                        .block_hash()
+                        .is_some_and(|hash| hash != header.hash())
+                        || transaction
+                            .block_number()
+                            .is_some_and(|number| number != header.number())
+                        || transaction
+                            .transaction_index()
+                            .is_some_and(|position| position != index as u64)
+                    {
+                        return Err(invalid(format!(
+                            "full-block transaction {index} carries contradictory inclusion metadata"
+                        )));
+                    }
+                    if transaction
+                        .chain_id()
+                        .zip(record.context.chain_id)
+                        .is_some_and(|(transaction, context)| transaction != context)
+                    {
+                        return Err(invalid(format!(
+                            "full-block transaction {index} carries a chain id conflicting with its context"
+                        )));
+                    }
+                }
+            }
+        }
+        ReactiveInput::PendingTxHash(_) => {
+            if !matches!(record.context.chain_status, ChainStatus::Pending) {
+                return Err(invalid(
+                    "pending transaction input must carry pending chain status".into(),
+                ));
+            }
+            if record.context.transaction_index.is_some() || record.context.log_index.is_some() {
+                return Err(invalid(
+                    "pending transaction context cannot carry canonical positions".into(),
+                ));
+            }
+        }
+        ReactiveInput::PendingTx(transaction) => {
+            if !matches!(record.context.chain_status, ChainStatus::Pending) {
+                return Err(invalid(
+                    "pending transaction input must carry pending chain status".into(),
+                ));
+            }
+            if record.context.transaction_index.is_some() || record.context.log_index.is_some() {
+                return Err(invalid(
+                    "pending transaction context cannot carry canonical positions".into(),
+                ));
+            }
+            if transaction.block_hash().is_some()
+                || transaction.block_number().is_some()
+                || transaction.transaction_index().is_some()
+            {
+                return Err(invalid(
+                    "hydrated pending transaction cannot carry inclusion metadata".into(),
+                ));
+            }
+            if transaction
+                .chain_id()
+                .zip(record.context.chain_id)
+                .is_some_and(|(transaction, context)| transaction != context)
+            {
+                return Err(invalid(
+                    "pending transaction carries a chain id conflicting with its context".into(),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Best-effort per-block env refresh (Phase-8 step 2).
@@ -3062,6 +8718,7 @@ fn context_block_ref(ctx: &ReactiveContext) -> Option<&BlockRef> {
         | ChainStatus::Safe { block }
         | ChainStatus::Finalized { block } => Some(block),
         ChainStatus::Reorged { dropped_from } => Some(dropped_from),
+        ChainStatus::Preconfirmed { .. } => ctx.block.as_ref(),
         ChainStatus::Pending => ctx.block.as_ref(),
     }
 }
@@ -3074,7 +8731,7 @@ fn reorg_signal_block<N: Network>(
     }
 
     if let ChainStatus::Reorged { dropped_from } = &record.context.chain_status {
-        return Some((dropped_from.clone(), ReorgReason::ReorgedInput));
+        return Some((*dropped_from, ReorgReason::ReorgedInput));
     }
 
     None
@@ -3167,11 +8824,8 @@ fn purge_scopes_for_dropped_journals<N: Network>(
 ) -> Vec<(Address, PurgeScope)> {
     let mut scopes: Vec<(Address, PurgeScope)> = Vec::new();
     for entry in dropped.iter().rev() {
-        for resynced in entry.resynced.iter().rev() {
-            merge_purge_scopes_for_diff(&mut scopes, &resynced.diff);
-        }
-        for applied in entry.applied.iter().rev() {
-            merge_purge_scopes_for_diff(&mut scopes, &applied.diff);
+        for diff in entry.rollback_diffs.iter().rev() {
+            merge_purge_scopes_for_diff(&mut scopes, diff);
         }
     }
     scopes
@@ -3187,11 +8841,8 @@ fn rollback_updates_for_dropped_journals<N: Network>(
         .collect();
     let mut updates = Vec::new();
     for entry in dropped.iter().rev() {
-        for resynced in entry.resynced.iter().rev() {
-            push_rollback_updates_for_diff(&mut updates, &resynced.diff, &purge_addresses);
-        }
-        for applied in entry.applied.iter().rev() {
-            push_rollback_updates_for_diff(&mut updates, &applied.diff, &purge_addresses);
+        for diff in entry.rollback_diffs.iter().rev() {
+            push_rollback_updates_for_diff(&mut updates, diff, &purge_addresses);
         }
     }
     updates
@@ -3687,6 +9338,7 @@ fn push_storage_resync_slot(
 fn resync_block_to_block_id(block: &ResyncBlock) -> BlockId {
     match block {
         ResyncBlock::Latest => BlockId::latest(),
+        ResyncBlock::Pending => BlockId::pending(),
         ResyncBlock::Safe => BlockId::safe(),
         ResyncBlock::Finalized => BlockId::finalized(),
         ResyncBlock::Number(number) => BlockId::number(*number),
@@ -3719,17 +9371,73 @@ impl<N: Network> RegisteredHandler<N> {
 }
 
 fn merge_log_subscription_filter(filters: &mut Vec<Filter>, next: &Filter) {
-    if let Some(existing) = filters
-        .iter_mut()
-        .find(|existing| existing.block_option == next.block_option)
-    {
-        merge_filter_set(&mut existing.address, &next.address);
-        for (existing_topic, next_topic) in existing.topics.iter_mut().zip(next.topics.iter()) {
-            merge_filter_set(existing_topic, next_topic);
+    let mut candidate = next.clone();
+    let mut insertion_index = filters.len();
+    let mut index = 0;
+    while index < filters.len() {
+        if filters[index].block_option != candidate.block_option {
+            index += 1;
+            continue;
         }
-    } else {
-        filters.push(next.clone());
+        if let Some(merged) = exact_filter_union(&candidate, &filters[index]) {
+            candidate = merged;
+            insertion_index = insertion_index.min(index);
+            filters.remove(index);
+            index = 0;
+        } else {
+            index += 1;
+        }
     }
+    filters.insert(insertion_index.min(filters.len()), candidate);
+}
+
+fn exact_filter_union(left: &Filter, right: &Filter) -> Option<Filter> {
+    if filter_subsumes(left, right) {
+        return Some(left.clone());
+    }
+    if filter_subsumes(right, left) {
+        return Some(right.clone());
+    }
+    let differing_dimensions = usize::from(left.address != right.address)
+        + left
+            .topics
+            .iter()
+            .zip(right.topics.iter())
+            .filter(|(left, right)| left != right)
+            .count();
+    if differing_dimensions != 1 {
+        return None;
+    }
+
+    let mut merged = left.clone();
+    if merged.address != right.address {
+        merge_filter_set(&mut merged.address, &right.address);
+    } else {
+        for (merged_topic, right_topic) in merged.topics.iter_mut().zip(right.topics.iter()) {
+            if merged_topic != right_topic {
+                merge_filter_set(merged_topic, right_topic);
+                break;
+            }
+        }
+    }
+    Some(merged)
+}
+
+fn filter_subsumes(left: &Filter, right: &Filter) -> bool {
+    filter_set_subsumes(&left.address, &right.address)
+        && left
+            .topics
+            .iter()
+            .zip(right.topics.iter())
+            .all(|(left, right)| filter_set_subsumes(left, right))
+}
+
+fn filter_set_subsumes<T: Eq + Hash>(left: &FilterSet<T>, right: &FilterSet<T>) -> bool {
+    left.is_empty()
+        || (!right.is_empty()
+            && right
+                .iter()
+                .all(|value| left.iter().any(|known| known == value)))
 }
 
 fn merge_filter_set<T: Clone + Eq + Hash>(target: &mut FilterSet<T>, source: &FilterSet<T>) {
@@ -3758,7 +9466,12 @@ struct HandlerExecution {
 }
 
 impl HandlerExecution {
-    fn from_outcome(handler_id: HandlerId, input_ref: InputRef, outcome: HandlerOutcome) -> Self {
+    fn from_outcome(
+        handler_id: HandlerId,
+        input_ref: InputRef,
+        outcome: HandlerOutcome,
+        preconfirmed: bool,
+    ) -> Self {
         let mut state_updates = Vec::new();
         let mut invalidations = Vec::new();
         let mut resyncs = Vec::new();
@@ -3775,7 +9488,12 @@ impl HandlerExecution {
                     ));
                     invalidations.push(invalidation);
                 }
-                ReactiveEffect::Resync(request) => resyncs.push(request),
+                ReactiveEffect::Resync(mut request) => {
+                    if preconfirmed {
+                        request.block = ResyncBlock::Pending;
+                    }
+                    resyncs.push(request);
+                }
                 ReactiveEffect::Hook(signal) => hook_signals.push(signal),
                 ReactiveEffect::Speculative(mut request) => {
                     request.input_ref = input_ref;
@@ -3797,15 +9515,91 @@ impl HandlerExecution {
     }
 }
 
-fn dedupe_records<N: Network>(records: Vec<ReactiveInputRecord<N>>) -> Vec<ReactiveInputRecord<N>> {
-    let mut seen = HashSet::new();
+fn dedupe_records<N: Network>(
+    records: Vec<ReactiveInputRecord<N>>,
+) -> Result<Vec<ReactiveInputRecord<N>>, ReactiveError> {
+    let mut positions = HashMap::<ReactiveInputIdentity, usize>::new();
     let mut deduped = Vec::with_capacity(records.len());
     for record in records {
-        if seen.insert(record.input_ref()) {
+        let identity = record.validated_identity()?;
+        if !record.is_payload_deduplicable() {
+            deduped.push(record);
+            continue;
+        }
+        if let Some(index) = positions.get(&identity).copied() {
+            let merged = deduped[index].merge_compatible_duplicate(&record)?;
+            debug_assert!(merged, "same indexed identity is deduplicable");
+        } else {
+            positions.insert(identity, deduped.len());
             deduped.push(record);
         }
     }
-    deduped
+    Ok(deduped)
+}
+
+fn dedupe_scoped_records<N: Network>(
+    records: Vec<(ReactiveInputRecord<N>, DeliveryAudience, DeliveryScope)>,
+) -> Result<Vec<(ReactiveInputRecord<N>, DeliveryAudience, DeliveryScope)>, ReactiveError> {
+    let mut positions: HashMap<ReactiveInputIdentity, usize> = HashMap::new();
+    let mut deduped: Vec<(ReactiveInputRecord<N>, DeliveryAudience, DeliveryScope)> =
+        Vec::with_capacity(records.len());
+    for (record, audience, delivery_scope) in records {
+        let identity = record.validated_identity()?;
+        if !record.is_payload_deduplicable() {
+            deduped.push((record, audience, delivery_scope));
+            continue;
+        }
+        if let Some(index) = positions.get(&identity).copied() {
+            let merged = deduped[index].0.merge_compatible_duplicate(&record)?;
+            debug_assert!(merged, "same indexed identity is deduplicable");
+            merge_delivery_audience(&mut deduped[index].1, audience);
+            merge_delivery_scope(&mut deduped[index].2, delivery_scope);
+        } else {
+            positions.insert(identity, deduped.len());
+            deduped.push((record, audience, delivery_scope));
+        }
+    }
+    Ok(deduped)
+}
+
+fn merge_delivery_scope(into: &mut DeliveryScope, incoming: DeliveryScope) {
+    *into = match (*into, incoming) {
+        (DeliveryScope::Canonical, _) | (_, DeliveryScope::Canonical) => DeliveryScope::Canonical,
+        (DeliveryScope::CanonicalProgress, _) | (_, DeliveryScope::CanonicalProgress) => {
+            DeliveryScope::CanonicalProgress
+        }
+        (DeliveryScope::Preconfirmed, DeliveryScope::Preconfirmed)
+        | (DeliveryScope::Preconfirmed, DeliveryScope::OwnerCatchup)
+        | (DeliveryScope::OwnerCatchup, DeliveryScope::Preconfirmed) => DeliveryScope::Preconfirmed,
+        (DeliveryScope::OwnerCatchup, DeliveryScope::OwnerCatchup) => DeliveryScope::OwnerCatchup,
+    };
+}
+
+fn merge_delivery_audience(into: &mut DeliveryAudience, incoming: DeliveryAudience) {
+    match (&mut *into, incoming) {
+        (DeliveryAudience::All, _) => {}
+        (current, DeliveryAudience::All) => *current = DeliveryAudience::All,
+        (DeliveryAudience::Owners(current), DeliveryAudience::Owners(incoming)) => {
+            for owner in incoming {
+                if !current.contains(&owner) {
+                    current.push(owner);
+                }
+            }
+        }
+        (DeliveryAudience::AllExcept(current), DeliveryAudience::AllExcept(incoming)) => {
+            current.retain(|owner| incoming.contains(owner));
+        }
+        (DeliveryAudience::AllExcept(excluded), DeliveryAudience::Owners(included)) => {
+            excluded.retain(|owner| !included.contains(owner));
+        }
+        (current @ DeliveryAudience::Owners(_), DeliveryAudience::AllExcept(mut excluded)) => {
+            let DeliveryAudience::Owners(included) = current else {
+                unreachable!("match arm restricts the audience variant")
+            };
+            excluded.retain(|owner| !included.contains(owner));
+            *current = DeliveryAudience::AllExcept(excluded);
+        }
+    }
 }
 
 fn sort_records<N: Network>(records: Vec<ReactiveInputRecord<N>>) -> Vec<ReactiveInputRecord<N>> {
@@ -3815,32 +9609,60 @@ fn sort_records<N: Network>(records: Vec<ReactiveInputRecord<N>>) -> Vec<Reactiv
     indexed.into_iter().map(|(_, record)| record).collect()
 }
 
+fn sort_scoped_records<N: Network>(
+    records: Vec<(ReactiveInputRecord<N>, DeliveryAudience, DeliveryScope)>,
+) -> Vec<(ReactiveInputRecord<N>, DeliveryAudience, DeliveryScope)> {
+    let mut indexed: Vec<_> = records.into_iter().enumerate().collect();
+    indexed.sort_by_key(|(index, (record, _, _))| record_sort_key(*index, record));
+    indexed
+        .into_iter()
+        .map(|(_, scoped_record)| scoped_record)
+        .collect()
+}
+
 fn record_sort_key<N: Network>(index: usize, record: &ReactiveInputRecord<N>) -> RecordSortKey {
-    if let ReactiveInput::Log(log) = &record.input
-        && is_canonical_status(&record.context.chain_status)
-        && !log.removed
-    {
+    if let Some((block, _)) = reorg_signal_block(record) {
         return RecordSortKey {
             class: 0,
-            block_number: log
-                .block_number
-                .or(record.context.block.as_ref().map(|block| block.number))
-                .unwrap_or(u64::MAX),
-            transaction_index: log
-                .transaction_index
-                .or(record.context.transaction_index)
-                .unwrap_or(u64::MAX),
-            log_index: log
-                .log_index
-                .or(record.context.log_index)
-                .unwrap_or(u64::MAX),
+            block_number: block.number,
+            record_class: 0,
+            transaction_index: record.context.transaction_index.unwrap_or(u64::MAX),
+            log_index: record.context.log_index.unwrap_or(u64::MAX),
+            original_index: index,
+        };
+    }
+    if is_canonical_status(&record.context.chain_status)
+        && let Some(block) = record.context.block.as_ref()
+    {
+        let (record_class, transaction_index, log_index) = match &record.input {
+            ReactiveInput::BlockHeader(_) | ReactiveInput::FullBlock(_) => (0, 0, 0),
+            ReactiveInput::Log(log) if !log.removed => (
+                1,
+                log.transaction_index
+                    .or(record.context.transaction_index)
+                    .unwrap_or(u64::MAX),
+                log.log_index
+                    .or(record.context.log_index)
+                    .unwrap_or(u64::MAX),
+            ),
+            ReactiveInput::Log(_)
+            | ReactiveInput::PendingTxHash(_)
+            | ReactiveInput::PendingTx(_) => (2, u64::MAX, u64::MAX),
+        };
+        return RecordSortKey {
+            class: 1,
+            block_number: block.number,
+            record_class,
+            transaction_index,
+            log_index,
             original_index: index,
         };
     }
 
     RecordSortKey {
-        class: 1,
+        class: 2,
         block_number: 0,
+        record_class: 0,
         transaction_index: 0,
         log_index: 0,
         original_index: index,
@@ -3851,6 +9673,7 @@ fn record_sort_key<N: Network>(index: usize, record: &ReactiveInputRecord<N>) ->
 struct RecordSortKey {
     class: u8,
     block_number: u64,
+    record_class: u8,
     transaction_index: u64,
     log_index: u64,
     original_index: usize,
@@ -4090,21 +9913,219 @@ impl<N: Network> ReactiveHandler<N> for EventDecoderHandler {
     }
 }
 
+/// One independently negotiable event-subscriber behavior.
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+#[non_exhaustive]
+pub enum SubscriberCapability {
+    /// Emit EVM logs.
+    Logs,
+    /// Emit block headers.
+    BlockHeaders,
+    /// Emit full blocks with transaction bodies.
+    FullBlocks,
+    /// Emit pending transaction hashes.
+    PendingTransactionHashes,
+    /// Emit hydrated pending transactions.
+    PendingTransactions,
+    /// Fetch historical data from a caller-selected anchor.
+    HistoricalBackfill,
+    /// Follow live chain data.
+    Live,
+    /// Attest, via [`ChainControl::LogCoverage`], that no log-notification loss
+    /// went unhealed at or below a stated block.
+    ///
+    /// Advertise this only when loss is actually detectable: a source that can
+    /// silently drop a notification must not claim it, because a consumer treats
+    /// the capability as licence to trust a delivered log set instead of
+    /// re-fetching it. Absence of the capability and absence of an attestation
+    /// mean the same thing — unknown — and neither may be read as complete.
+    LogCoverageAttestation,
+    /// Recover the complete committed consumer position after reconnect or
+    /// restart, including any unacknowledged delivery.
+    ///
+    /// An implementation may satisfy this with native stream replay or with a
+    /// durable cursor plus deterministic historical reconciliation of an
+    /// ephemeral live child. The end-to-end subscriber must still prove there
+    /// is no gap between the restored position and resumed live delivery. If an
+    /// old delivery token is emitted again, that token must identify the same
+    /// immutable delivery and pass the engine's witness check.
+    DurableReplay,
+    /// Preserve logical handler ownership on delivered batches.
+    OwnerScopedDelivery,
+    /// Add and remove interests without replacing the complete session.
+    DynamicInterests,
+    /// Emit explicit canonical branch transitions.
+    ExplicitReorgs,
+    /// Emit safe and finalized head updates.
+    FinalityUpdates,
+    /// Emit ordered synchronization or source-cutover barriers.
+    Barriers,
+    /// Emit sequencer pre-confirmations into a disposable state overlay.
+    Preconfirmations,
+}
+
+/// Capability set advertised by an [`EventSubscriber`].
+///
+/// The default is deliberately empty: callers can safely reject a topology
+/// when an older or minimal implementation has not opted into a required
+/// behavior.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SubscriberCapabilities {
+    supported: BTreeSet<SubscriberCapability>,
+}
+
+impl SubscriberCapabilities {
+    /// Construct a capability set from supported behaviors.
+    pub fn new(capabilities: impl IntoIterator<Item = SubscriberCapability>) -> Self {
+        Self {
+            supported: capabilities.into_iter().collect(),
+        }
+    }
+
+    /// Test one independently negotiable behavior.
+    pub fn supports(&self, capability: SubscriberCapability) -> bool {
+        self.supported.contains(&capability)
+    }
+
+    /// Iterate supported behaviors in stable order.
+    pub fn iter(&self) -> impl Iterator<Item = SubscriberCapability> + '_ {
+        self.supported.iter().copied()
+    }
+
+    /// Whether the subscriber follows live chain data.
+    pub fn supports_live(&self) -> bool {
+        self.supports(SubscriberCapability::Live)
+    }
+
+    /// Whether the subscriber can durably recover its committed position and
+    /// any unacknowledged delivery without an event gap.
+    pub fn supports_durable_replay(&self) -> bool {
+        self.supports(SubscriberCapability::DurableReplay)
+    }
+
+    /// Whether the subscriber emits explicit branch transitions.
+    pub fn supports_explicit_reorgs(&self) -> bool {
+        self.supports(SubscriberCapability::ExplicitReorgs)
+    }
+}
+
+impl FromIterator<SubscriberCapability> for SubscriberCapabilities {
+    fn from_iter<T: IntoIterator<Item = SubscriberCapability>>(iter: T) -> Self {
+        Self::new(iter)
+    }
+}
+
 /// Provider-agnostic subscriber interface.
 pub trait EventSubscriber<N: Network = Ethereum>: Send {
+    /// Chain identity attached to emitted records, when it has been resolved.
+    ///
+    /// Remote and provider-backed subscribers should cache one authoritative
+    /// identity before exposing input. Returning `None` is reserved for
+    /// synthetic or genuinely chain-agnostic subscribers; composite sources
+    /// can use this hook to reject accidentally mixed networks.
+    fn chain_id(&self) -> Option<u64> {
+        None
+    }
+
+    /// Behaviors this subscriber can uphold for topology validation.
+    fn capabilities(&self) -> SubscriberCapabilities {
+        SubscriberCapabilities::default()
+    }
+
     /// Replace all interests registered with the subscriber.
     ///
     /// Implementations may use this as a full setup/reset operation. The
     /// in-crate [`AlloySubscriber`] clears owner-scoped interest state and
     /// delivery/dedupe bookkeeping when this method is called.
+    ///
+    /// The returned operation must complete only after the replacement has
+    /// committed to the subscriber's desired state. Remote implementations can
+    /// use this asynchronous boundary to wait for an authoritative service-side
+    /// acknowledgement before returning `Ok(())`. On error, or when the future
+    /// is dropped before completion, the previously committed desired state
+    /// must remain authoritative (or be reconciled before later delivery can
+    /// expose the uncommitted change) so callers can safely retry.
+    ///
+    /// # Errors
+    ///
+    /// The returned operation reports [`SubscriberError`] when the replacement
+    /// cannot be validated or committed by the underlying source.
     fn register_interests(
         &mut self,
         interests: &[ReactiveInterest<N>],
-    ) -> Result<(), SubscriberError>;
+    ) -> SubscriberOperation<'_, ()>;
 
     /// Return the next input batch, or `Ok(None)` when the stream is exhausted.
+    ///
+    /// The returned future must be cancellation-safe: dropping it while pending
+    /// must not discard a complete input that a later call could otherwise
+    /// deliver. Composite subscribers use this property to race historical and
+    /// live sources without dedicating a task to each transport.
+    ///
+    /// # Errors
+    ///
+    /// The returned future reports [`SubscriberError`] for transport,
+    /// continuity, decoding, or source-resource failures.
     fn next_batch(&mut self) -> SubscriberNextBatch<'_, N>;
+
+    /// Restore the subscriber's committed position before polling resumes.
+    ///
+    /// The engine invokes this synchronously from
+    /// [`ReactiveEngine::resume_from_durable_checkpoint`] after decoding runtime
+    /// recovery state and before publishing that state as resumed. Implementations
+    /// should validate that provider/service cursors cannot regress and seed any
+    /// source epoch or overlap history required for safe replay. A composite may
+    /// rebuild an ephemeral live child from `coverage_head` plus historical
+    /// reconciliation rather than require that child to replay bytes itself, but
+    /// it may advertise [`SubscriberCapability::DurableReplay`] only when the
+    /// complete restore closes that cutover gap before exposing live input. On
+    /// error, either
+    /// the prior position must remain authoritative, or the subscriber may retain
+    /// this *exact* restore as pending intent; in the latter case it must block
+    /// delivery and reject conflicting restores until retry/reconciliation commits
+    /// the same position. This permits synchronous adapters over durable remote
+    /// state without exposing a half-restored stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SubscriberError`] when the position is invalid, regresses or
+    /// conflicts with committed source state, or cannot be restored durably.
+    fn restore_position(
+        &mut self,
+        _position: &SubscriberResumePosition,
+    ) -> Result<(), SubscriberError> {
+        Ok(())
+    }
+
+    /// Commit a subscriber-owned delivery token after runtime ingestion.
+    ///
+    /// Ephemeral subscribers can rely on this no-op default. Durable remote
+    /// subscribers should make acknowledgement idempotent because cancellation
+    /// or transport failure can cause a successfully ingested batch to replay.
+    /// Re-emitting a token must reproduce the same immutable records, routing,
+    /// chain controls, chain identity, and provider checkpoint; the checkpointed
+    /// engine verifies its persisted delivery witness before skipping ingestion.
+    ///
+    /// # Errors
+    ///
+    /// The returned operation reports [`SubscriberError`] when the delivery
+    /// token cannot be committed idempotently by the source.
+    fn acknowledge_delivery(
+        &mut self,
+        _token: SubscriberDeliveryToken,
+    ) -> SubscriberOperation<'_, ()> {
+        Box::pin(async { Ok(()) })
+    }
 }
+
+/// Boxed, sendable future returned by subscriber lifecycle operations.
+///
+/// The output is generic so the same type can represent registration, removal,
+/// and future acknowledgement values without requiring an async-trait helper.
+pub type SubscriberOperation<'a, T> =
+    Pin<Box<dyn Future<Output = Result<T, SubscriberError>> + Send + 'a>>;
 
 /// Boxed future returned by [`EventSubscriber::next_batch`].
 pub type SubscriberNextBatch<'a, N> = Pin<
@@ -4132,17 +10153,138 @@ pub enum SubscriberMode {
     Polling,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FlashblocksAdapter {
+    NativeSubscriptions,
+    PendingStatePolling,
+}
+
+fn flashblocks_adapter(chain_id: u64) -> Option<FlashblocksAdapter> {
+    match chain_id {
+        8_453 | 84_532 => Some(FlashblocksAdapter::NativeSubscriptions),
+        10 | 11_155_420 => Some(FlashblocksAdapter::PendingStatePolling),
+        _ => None,
+    }
+}
+
 /// Subscriber configuration.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SubscriberConfig {
+    /// Flashblocks delivery policy. Provider support itself is configured by
+    /// the transport's single `flashblocks` endpoint flag.
+    pub preconfirmations: PreconfirmationMode,
+    /// Cadence for certifying sealed canonical heads while connected to a
+    /// Flashblocks endpoint whose `newHeads` stream may contain partial heads.
+    pub canonical_head_poll_interval: Duration,
+    /// Maximum time allowed for one provider request that certifies a
+    /// canonical head while Flashblocks are active.
+    pub canonical_head_request_timeout: Duration,
+    /// Optimism pending-state sampling cadence.
+    ///
+    /// Base uses native `newFlashblocks` plus `pendingLogs`. Optimism providers
+    /// currently expose the interoperable Flashblocks surface through
+    /// `pending` RPC reads, so one generation-pinned sampler reads the
+    /// cumulative pending block, its exact hash-addressed parent, filtered
+    /// pending-block logs, and bounded exact transaction receipts.
+    ///
+    /// # Cost
+    ///
+    /// This is the most request-hungry setting in the crate, and unlike the
+    /// canonical paths it cannot be made event-driven: the pending surface is
+    /// only observable by asking. Every tick issues one pending-block read, one
+    /// `eth_getLogs` **per provider-facing log filter**, and up to
+    /// [`Self::max_pending_transaction_receipts_per_tick`] receipt calls. At the
+    /// 250 ms default that is four ticks a second, bounded overall by
+    /// [`Self::max_flashblock_rpc_requests_per_second`] — a ceiling of 40
+    /// requests per second, or roughly 3.4 M per day on one chain.
+    ///
+    /// It is reached only by enabling pre-confirmations on a chain whose adapter
+    /// samples pending state (Optimism and its testnet), which in a transport
+    /// configuration means marking one of that chain's endpoints
+    /// `flashblocks = true`. Raise this interval, lower
+    /// `max_flashblock_rpc_requests_per_second`, or leave
+    /// [`Self::preconfirmations`] disabled if that budget is not intended;
+    /// [`AlloySubscriber::rpc_stats`] attributes the traffic to
+    /// [`SubscriberRpcCause::PendingStateSample`] so it is visible before it
+    /// arrives on an invoice.
+    pub flashblock_poll_interval: Duration,
+    /// Consecutive pending-state request failure allowance.
+    ///
+    /// A successful sampling tick resets this counter. Semantic integrity
+    /// failures, such as non-monotonic transaction membership or malformed
+    /// logs, are never retried through this allowance.
+    pub max_consecutive_flashblock_poll_failures: usize,
+    /// Maximum pending receipts per sampling tick.
+    ///
+    /// Receipts are requested by exact transaction hash in one JSON-RPC batch,
+    /// because separate `eth_getBlockReceipts("pending")` responses can refer
+    /// to a different cumulative Flashblock. The rolling total-method budget
+    /// may impose a lower effective per-tick limit; with the defaults and one
+    /// log filter, at most seven receipts are requested per tick.
+    pub max_pending_transaction_receipts_per_tick: usize,
+    /// Pending-state RPC method budget per rolling one-second window.
+    ///
+    /// The sampler reserves capacity for the pending-block, exact-parent, and
+    /// filtered-log methods implied by its cadence and filter plan, plus the
+    /// exact-parent canonical-head poll when block interests require it. Exact
+    /// receipt hydration uses only an evenly apportioned remainder. Request
+    /// timestamps enforce the ceiling across actual ticks, including delayed
+    /// ticks. The default leaves headroom below common paid-provider limits of
+    /// 50 requests per second.
+    pub max_flashblock_rpc_requests_per_second: usize,
+    /// Bounded notification capacity for pubsub log streams.
+    ///
+    /// `None` reuses [`Self::max_batch_size`]. Size this independently when a
+    /// high-volume log filter shares a subscriber with small delivery batches:
+    /// the transport drops notifications once the channel is full, and while
+    /// that loss is now detected and healed by an exact-window refetch, each
+    /// occurrence costs an `eth_getLogs`. Watch
+    /// [`SubscriberStreamGapStats::lagged_notifications`] to tell whether this
+    /// is too small.
+    pub log_channel_size: Option<usize>,
     /// Hydrate pending transaction hashes into full bodies when possible.
     pub hydrate_pending_transactions: bool,
+    /// Verify each canonical log's block identity through RPC and enrich its
+    /// context with the exact parent hash before delivery.
+    ///
+    /// # This is not the way to trust a log stream
+    ///
+    /// Enabling this to decide whether delivered logs can be trusted is the
+    /// expensive wrong answer: it costs a request per distinct canonical block
+    /// and proves strictly less than [`ChainControl::LogCoverage`], which is
+    /// free. Verification confirms that each log it *received* names a real
+    /// block; it says nothing about logs that never arrived, which is the
+    /// failure that matters. Use the attestation for completeness, and reserve
+    /// this for a strict coordinator that needs exact parent-hash enrichment on
+    /// log-only pubsub events.
+    ///
+    /// Enable this when a strict coordinator (such as a hybrid historical/live
+    /// source) must prove canonical ancestry from log-only pubsub events.
+    /// Verification is cached per block, so the provider is queried at most
+    /// once for each distinct canonical block retained in the dedupe window.
+    /// For high-volume pubsub filters, configure
+    /// [`AlloySubscriber::with_log_verification_provider`] with a separate HTTP
+    /// provider so verification responses cannot be starved by notifications.
+    pub verify_log_block_context: bool,
     /// Maximum records to emit per batch.
     pub max_batch_size: usize,
     /// Maximum distinct contract addresses placed in one provider-side log
     /// subscription. Compatible logical owner filters are fanned into address
     /// supersets up to this limit; exact owner routing still happens locally.
     pub max_log_addresses_per_subscription: usize,
+    /// Maximum records retained across the delivery queue and hidden
+    /// transaction-aware reconcile buffer. Exceeding it fails the subscriber
+    /// closed until a full interest reset, because dropping an event would
+    /// create an unknowable continuity gap.
+    pub max_pending_records: usize,
+    /// Maximum lazy owner-backfill requests retained at once.
+    pub max_pending_backfills: usize,
+    /// Maximum approximate encoded bytes accepted from one historical log
+    /// response (fixed log identity fields, topics, and data).
+    pub max_backfill_log_bytes: usize,
+    /// Maximum provider log requests concurrently in flight during bulk owner
+    /// reconciliation.
+    pub max_reconcile_requests_in_flight: usize,
     /// Reconnect policy for WebSocket/pubsub streams.
     pub reconnect: SubscriberReconnectConfig,
 }
@@ -4150,11 +10292,681 @@ pub struct SubscriberConfig {
 impl Default for SubscriberConfig {
     fn default() -> Self {
         Self {
+            log_channel_size: None,
+            preconfirmations: PreconfirmationMode::Disabled,
+            canonical_head_poll_interval: Duration::from_millis(500),
+            canonical_head_request_timeout: Duration::from_secs(3),
+            flashblock_poll_interval: Duration::from_millis(250),
+            max_consecutive_flashblock_poll_failures: 10,
+            max_pending_transaction_receipts_per_tick: 32,
+            max_flashblock_rpc_requests_per_second: 40,
             hydrate_pending_transactions: false,
+            verify_log_block_context: false,
             max_batch_size: 1024,
             max_log_addresses_per_subscription: 1024,
+            max_pending_records: 16_384,
+            max_pending_backfills: 4_096,
+            max_backfill_log_bytes: 64 * 1024 * 1024,
+            max_reconcile_requests_in_flight: 8,
             reconnect: SubscriberReconnectConfig::default(),
         }
+    }
+}
+
+/// Provider surface established for one Flashblocks generation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum FlashblocksDelivery {
+    /// Native `newFlashblocks` plus filtered `pendingLogs` WebSocket streams.
+    NativeSubscriptions,
+    /// Generation-pinned `pending` block and log sampling.
+    PendingStatePolling,
+    /// Standardized updates supplied by an application-managed transport.
+    #[cfg(feature = "raw-flashblocks-json")]
+    ExternalUpdates,
+}
+
+/// Request/response traffic issued by one Flashblocks subscriber generation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FlashblocksRpcMetrics {
+    capability_requests: u64,
+    provider_pair_chain_requests: u64,
+    canonical_head_requests: u64,
+    pending_block_requests: u64,
+    pending_log_requests: u64,
+    pending_receipt_requests: u64,
+    pending_receipts_completed: u64,
+    pending_receipts_unavailable: u64,
+    failed_requests: u64,
+    raced_samples: u64,
+    suppressed_canonical_head_polls: u64,
+}
+
+impl FlashblocksRpcMetrics {
+    /// Opportunistic `op_supportedCapabilities` probes attempted.
+    pub const fn capability_requests(self) -> u64 {
+        self.capability_requests
+    }
+
+    /// Chain-identity requests used to verify an explicitly paired
+    /// pending-state provider against the subscriber's stream provider.
+    pub const fn provider_pair_chain_requests(self) -> u64 {
+        self.provider_pair_chain_requests
+    }
+
+    /// Exact parent-block requests used to fence pending and canonical state.
+    pub const fn canonical_head_requests(self) -> u64 {
+        self.canonical_head_requests
+    }
+
+    /// Cumulative pending-block requests.
+    pub const fn pending_block_requests(self) -> u64 {
+        self.pending_block_requests
+    }
+
+    /// Pending log-filter requests.
+    pub const fn pending_log_requests(self) -> u64 {
+        self.pending_log_requests
+    }
+
+    /// Pending-state `eth_getTransactionReceipt` methods issued by exact hash.
+    /// Several methods may share one JSON-RPC batch transport request.
+    pub const fn pending_receipt_requests(self) -> u64 {
+        self.pending_receipt_requests
+    }
+
+    /// Exact pending transaction receipts returned successfully.
+    pub const fn pending_receipts_completed(self) -> u64 {
+        self.pending_receipts_completed
+    }
+
+    /// Exact pending transaction receipts that were not materialized yet and remain
+    /// eligible for retry on the next cumulative sample.
+    pub const fn pending_receipts_unavailable(self) -> u64 {
+        self.pending_receipts_unavailable
+    }
+
+    /// Provider request failures observed by a pending-state sampler.
+    pub const fn failed_requests(self) -> u64 {
+        self.failed_requests
+    }
+
+    /// Timer-driven canonical head polls that issued no request because the
+    /// flashblock stream had already certified the head inside the poll window.
+    ///
+    /// On a chain whose flashblock cadence is faster than the poll interval,
+    /// most ticks land here: the certification is event-driven and the timer is
+    /// only a liveness fallback.
+    pub const fn suppressed_canonical_head_polls(self) -> u64 {
+        self.suppressed_canonical_head_polls
+    }
+
+    /// Samples discarded because the pending-log response advanced beyond
+    /// the separately fetched cumulative block. The next tick retries from a
+    /// fresh block/log pair; no partial speculative view is published.
+    pub const fn raced_samples(self) -> u64 {
+        self.raced_samples
+    }
+
+    /// Total request/response calls attributable to Flashblocks qualification
+    /// and sampling.
+    pub const fn total_requests(self) -> u64 {
+        self.capability_requests
+            .saturating_add(self.provider_pair_chain_requests)
+            .saturating_add(self.canonical_head_requests)
+            .saturating_add(self.pending_block_requests)
+            .saturating_add(self.pending_log_requests)
+            .saturating_add(self.pending_receipt_requests)
+    }
+}
+
+/// JSON-RPC method issued by the reactive stack on a consumer's behalf.
+///
+/// `EthSubscribe` covers every `eth_subscribe`/`eth_newFilter` handshake the
+/// subscriber performs when it installs a stream source, including the OP Stack
+/// `newFlashblocks` and `pendingLogs` channels. Notifications delivered over an
+/// established subscription are not requests and are not counted here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
+pub enum SubscriberRpcMethod {
+    /// `eth_chainId`.
+    EthChainId,
+    /// `eth_blockNumber`.
+    EthBlockNumber,
+    /// `eth_getBlockByNumber`.
+    EthGetBlockByNumber,
+    /// `eth_getBlockByHash`.
+    EthGetBlockByHash,
+    /// `eth_getLogs`.
+    EthGetLogs,
+    /// `eth_getTransactionReceipt`.
+    EthGetTransactionReceipt,
+    /// Stream installation: `eth_subscribe`, or the polling transport's
+    /// `eth_newFilter` handshake.
+    EthSubscribe,
+    /// `op_supportedCapabilities`.
+    OpSupportedCapabilities,
+}
+
+impl SubscriberRpcMethod {
+    /// Every method the reactive stack can issue, in reporting order.
+    pub const ALL: [Self; 8] = [
+        Self::EthChainId,
+        Self::EthBlockNumber,
+        Self::EthGetBlockByNumber,
+        Self::EthGetBlockByHash,
+        Self::EthGetLogs,
+        Self::EthGetTransactionReceipt,
+        Self::EthSubscribe,
+        Self::OpSupportedCapabilities,
+    ];
+
+    /// Number of distinct methods.
+    pub const COUNT: usize = Self::ALL.len();
+
+    /// Wire name, suitable for a metrics label.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::EthChainId => "eth_chainId",
+            Self::EthBlockNumber => "eth_blockNumber",
+            Self::EthGetBlockByNumber => "eth_getBlockByNumber",
+            Self::EthGetBlockByHash => "eth_getBlockByHash",
+            Self::EthGetLogs => "eth_getLogs",
+            Self::EthGetTransactionReceipt => "eth_getTransactionReceipt",
+            Self::EthSubscribe => "eth_subscribe",
+            Self::OpSupportedCapabilities => "op_supportedCapabilities",
+        }
+    }
+
+    const fn index(self) -> usize {
+        match self {
+            Self::EthChainId => 0,
+            Self::EthBlockNumber => 1,
+            Self::EthGetBlockByNumber => 2,
+            Self::EthGetBlockByHash => 3,
+            Self::EthGetLogs => 4,
+            Self::EthGetTransactionReceipt => 5,
+            Self::EthSubscribe => 6,
+            Self::OpSupportedCapabilities => 7,
+        }
+    }
+}
+
+impl fmt::Display for SubscriberRpcMethod {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Mechanism that caused the subscriber to issue a provider request.
+///
+/// This is the dimension that matters for an RPC budget: a consumer asks for
+/// interests and reads batches, and every request below is a consequence the
+/// consumer never named. Attributing by cause is what makes an unexpected bill
+/// diagnosable from inside the process.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
+pub enum SubscriberRpcCause {
+    /// Resolving the provider's chain identity once, before any record escapes.
+    ChainIdentity,
+    /// Installing a live stream source.
+    StreamSubscription,
+    /// Qualifying a Flashblocks endpoint: capability probe and paired
+    /// pending-state provider verification.
+    FlashblocksSetup,
+    /// Certifying a sealed canonical head while Flashblocks are active, because
+    /// a Flashblocks endpoint's `newHeads` may carry partial heads.
+    CanonicalHeadCertification,
+    /// Sampling OP Stack pending state on the bounded pre-confirmation cadence.
+    PendingStateSample,
+    /// Proving a canonical log's block identity when
+    /// [`SubscriberConfig::verify_log_block_context`] is set.
+    LogBlockVerification,
+    /// Bulk owner catch-up requested through
+    /// [`AlloySubscriber::reconcile_interest_owners`].
+    OwnerReconcile,
+    /// Draining a queued adoption or continuity backfill.
+    LazyBackfill,
+    /// Closing the window missed while a terminated stream was reconnecting.
+    ReconnectBackfill,
+    /// Closing the window a live stream dropped: the subscription stayed
+    /// connected but notifications were lost, so only the missed range is
+    /// refetched.
+    GapBackfill,
+}
+
+impl SubscriberRpcCause {
+    /// Every cause the reactive stack can attribute a request to, in reporting
+    /// order.
+    pub const ALL: [Self; 10] = [
+        Self::ChainIdentity,
+        Self::StreamSubscription,
+        Self::FlashblocksSetup,
+        Self::CanonicalHeadCertification,
+        Self::PendingStateSample,
+        Self::LogBlockVerification,
+        Self::OwnerReconcile,
+        Self::LazyBackfill,
+        Self::ReconnectBackfill,
+        Self::GapBackfill,
+    ];
+
+    /// Number of distinct causes.
+    pub const COUNT: usize = Self::ALL.len();
+
+    /// Stable snake_case name, suitable for a metrics label.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ChainIdentity => "chain_identity",
+            Self::StreamSubscription => "stream_subscription",
+            Self::FlashblocksSetup => "flashblocks_setup",
+            Self::CanonicalHeadCertification => "canonical_head_certification",
+            Self::PendingStateSample => "pending_state_sample",
+            Self::LogBlockVerification => "log_block_verification",
+            Self::OwnerReconcile => "owner_reconcile",
+            Self::LazyBackfill => "lazy_backfill",
+            Self::ReconnectBackfill => "reconnect_backfill",
+            Self::GapBackfill => "gap_backfill",
+        }
+    }
+
+    const fn index(self) -> usize {
+        match self {
+            Self::ChainIdentity => 0,
+            Self::StreamSubscription => 1,
+            Self::FlashblocksSetup => 2,
+            Self::CanonicalHeadCertification => 3,
+            Self::PendingStateSample => 4,
+            Self::LogBlockVerification => 5,
+            Self::OwnerReconcile => 6,
+            Self::LazyBackfill => 7,
+            Self::ReconnectBackfill => 8,
+            Self::GapBackfill => 9,
+        }
+    }
+}
+
+impl fmt::Display for SubscriberRpcCause {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Every provider request the reactive stack has issued, by method and by the
+/// mechanism responsible for it.
+///
+/// Counts are **cumulative for the subscriber's lifetime**. They deliberately
+/// survive reconnects, stream-topology changes, and delivery-state resets, so a
+/// long-running process can report total RPC consumption; call
+/// [`AlloySubscriber::reset_rpc_stats`] to measure a bounded window instead.
+/// This is the difference from [`FlashblocksRpcMetrics`], which is scoped to one
+/// Flashblocks subscriber generation and resets with it.
+///
+/// Every request the subscriber makes is counted here, including the ones also
+/// tallied by `FlashblocksRpcMetrics` — reading both never requires adding them
+/// together. `FlashblocksRpcMetrics` remains the place for outcomes that are not
+/// request counts, such as receipts that were unavailable or samples discarded
+/// for racing the pending block.
+///
+/// ```no_run
+/// # use evm_fork_cache::reactive::{AlloySubscriber, SubscriberRpcCause, SubscriberRpcMethod};
+/// # fn report<P, N: alloy_network::Network>(subscriber: &AlloySubscriber<P, N>) {
+/// let stats = subscriber.rpc_stats();
+/// println!("total provider requests: {}", stats.total());
+/// println!("eth_getLogs: {}", stats.by_method(SubscriberRpcMethod::EthGetLogs));
+/// for (cause, method, requests) in stats.nonzero() {
+///     println!("{cause} / {method}: {requests}");
+/// }
+/// # }
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SubscriberRpcStats {
+    counts: [[u64; SubscriberRpcMethod::COUNT]; SubscriberRpcCause::COUNT],
+}
+
+impl Default for SubscriberRpcStats {
+    fn default() -> Self {
+        Self {
+            counts: [[0; SubscriberRpcMethod::COUNT]; SubscriberRpcCause::COUNT],
+        }
+    }
+}
+
+impl SubscriberRpcStats {
+    /// Requests issued for one exact cause/method pair.
+    pub const fn get(&self, cause: SubscriberRpcCause, method: SubscriberRpcMethod) -> u64 {
+        self.counts[cause.index()][method.index()]
+    }
+
+    /// Requests issued for one cause, across every method.
+    pub fn by_cause(&self, cause: SubscriberRpcCause) -> u64 {
+        self.counts[cause.index()]
+            .iter()
+            .fold(0u64, |total, count| total.saturating_add(*count))
+    }
+
+    /// Requests issued for one method, across every cause.
+    pub fn by_method(&self, method: SubscriberRpcMethod) -> u64 {
+        self.counts
+            .iter()
+            .fold(0u64, |total, row| total.saturating_add(row[method.index()]))
+    }
+
+    /// Every provider request the subscriber has issued.
+    pub fn total(&self) -> u64 {
+        SubscriberRpcCause::ALL
+            .into_iter()
+            .fold(0u64, |total, cause| {
+                total.saturating_add(self.by_cause(cause))
+            })
+    }
+
+    /// Every cause/method pair in reporting order, including zeroes.
+    pub fn entries(
+        &self,
+    ) -> impl Iterator<Item = (SubscriberRpcCause, SubscriberRpcMethod, u64)> + '_ {
+        SubscriberRpcCause::ALL.into_iter().flat_map(move |cause| {
+            SubscriberRpcMethod::ALL
+                .into_iter()
+                .map(move |method| (cause, method, self.get(cause, method)))
+        })
+    }
+
+    /// Only the cause/method pairs that actually issued a request — the useful
+    /// shape for logging or a metrics export.
+    pub fn nonzero(
+        &self,
+    ) -> impl Iterator<Item = (SubscriberRpcCause, SubscriberRpcMethod, u64)> + '_ {
+        self.entries().filter(|(_, _, requests)| *requests > 0)
+    }
+}
+
+/// Interior-mutable counter set behind [`SubscriberRpcStats`].
+///
+/// Shared through an `Arc` because provider work runs off the subscriber's
+/// `&mut self`: bulk owner catch-up is driven as an independent future while
+/// live events continue to drain, and the free functions it calls record without
+/// any subscriber borrow. `Relaxed` ordering is correct for counters whose only
+/// consumer is a diagnostic snapshot.
+#[derive(Debug)]
+pub(crate) struct SubscriberRpcCounters {
+    counts: [[AtomicU64; SubscriberRpcMethod::COUNT]; SubscriberRpcCause::COUNT],
+}
+
+impl Default for SubscriberRpcCounters {
+    fn default() -> Self {
+        Self {
+            counts: std::array::from_fn(|_| std::array::from_fn(|_| AtomicU64::new(0))),
+        }
+    }
+}
+
+/// Why a live subscription lost data without disconnecting.
+///
+/// Both cases were previously invisible: `alloy-pubsub`'s typed subscription
+/// stream logs a lagged receiver at `debug` and continues, and discards an
+/// undecodable notification the same way. A consumer whose contract is
+/// *completeness* cannot build on a stream that loses records silently, so these
+/// are surfaced and healed instead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SubscriberStreamGap {
+    /// The bounded notification channel overflowed and the transport dropped
+    /// `skipped` notifications before this receiver observed them.
+    ///
+    /// This is backpressure, not a transport fault: the subscriber was not
+    /// draining as fast as the endpoint pushed. Raising
+    /// [`SubscriberConfig::log_channel_size`] is the direct remedy.
+    Lagged {
+        /// Notifications the transport dropped.
+        skipped: u64,
+    },
+    /// A notification arrived but did not decode into the expected type.
+    ///
+    /// Treated as lost data rather than skipped, because a filter's matched set
+    /// cannot be proven complete while one of its notifications is unreadable.
+    Undecodable,
+}
+
+impl SubscriberStreamGap {
+    /// Notifications known to be missing, when the transport reported a count.
+    pub const fn skipped(self) -> Option<u64> {
+        match self {
+            Self::Lagged { skipped } => Some(skipped),
+            Self::Undecodable => None,
+        }
+    }
+
+    /// Stable snake_case name, suitable for a metrics label.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Lagged { .. } => "lagged",
+            Self::Undecodable => "undecodable",
+        }
+    }
+}
+
+impl fmt::Display for SubscriberStreamGap {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Lagged { skipped } => write!(f, "lagged({skipped})"),
+            Self::Undecodable => f.write_str("undecodable"),
+        }
+    }
+}
+
+/// Notification loss observed on live subscriptions, and what it cost to heal.
+///
+/// A non-zero `lagged_notifications` means the subscriber could not keep up with
+/// its endpoint. That is recoverable — the missed window is refetched — but each
+/// occurrence buys an `eth_getLogs`, so a steadily climbing count is a signal to
+/// raise [`SubscriberConfig::log_channel_size`] rather than to keep paying.
+///
+/// Counts are cumulative for the subscriber's lifetime, matching
+/// [`SubscriberRpcStats`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SubscriberStreamGapStats {
+    lagged_notifications: u64,
+    undecodable_notifications: u64,
+    log_gaps_healed: u64,
+    header_gaps: u64,
+    preconfirmation_gaps: u64,
+}
+
+impl SubscriberStreamGapStats {
+    /// Notifications dropped by the transport because a bounded channel filled.
+    pub const fn lagged_notifications(self) -> u64 {
+        self.lagged_notifications
+    }
+
+    /// Notifications that arrived but could not be decoded.
+    pub const fn undecodable_notifications(self) -> u64 {
+        self.undecodable_notifications
+    }
+
+    /// Canonical log gaps closed by refetching the exact missed range.
+    ///
+    /// Each of these issued provider requests attributed to
+    /// [`SubscriberRpcCause::GapBackfill`].
+    pub const fn log_gaps_healed(self) -> u64 {
+        self.log_gaps_healed
+    }
+
+    /// Gaps observed on the canonical block-header stream.
+    ///
+    /// These are not refetched here: a consumer that walks a replacement
+    /// header's parent lineage back to retained canonical history recovers the
+    /// skipped blocks on the next header it receives. The count exists so that
+    /// self-healing is visible rather than assumed.
+    pub const fn header_gaps(self) -> u64 {
+        self.header_gaps
+    }
+
+    /// Gaps observed on a pre-confirmation log stream, each of which discarded
+    /// the speculative snapshot rather than publishing an incomplete one.
+    pub const fn preconfirmation_gaps(self) -> u64 {
+        self.preconfirmation_gaps
+    }
+
+    /// Every observed notification loss, across all stream kinds.
+    pub const fn total_gaps(self) -> u64 {
+        self.lagged_notifications
+            .saturating_add(self.undecodable_notifications)
+    }
+}
+
+/// Interior-mutable counters behind [`SubscriberStreamGapStats`].
+#[derive(Debug, Default)]
+pub(crate) struct SubscriberStreamGapCounters {
+    lagged_notifications: AtomicU64,
+    undecodable_notifications: AtomicU64,
+    log_gaps_healed: AtomicU64,
+    header_gaps: AtomicU64,
+    preconfirmation_gaps: AtomicU64,
+}
+
+impl SubscriberStreamGapCounters {
+    fn bump(counter: &AtomicU64, amount: u64) {
+        counter.fetch_add(amount, Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "reactive-ws")]
+    pub(crate) fn record_gap(&self, gap: SubscriberStreamGap) {
+        match gap {
+            SubscriberStreamGap::Lagged { skipped } => {
+                Self::bump(&self.lagged_notifications, skipped.max(1));
+            }
+            SubscriberStreamGap::Undecodable => {
+                Self::bump(&self.undecodable_notifications, 1);
+            }
+        }
+    }
+
+    pub(crate) fn record_log_gap_healed(&self) {
+        Self::bump(&self.log_gaps_healed, 1);
+    }
+
+    pub(crate) fn record_header_gap(&self) {
+        Self::bump(&self.header_gaps, 1);
+    }
+
+    pub(crate) fn record_preconfirmation_gap(&self) {
+        Self::bump(&self.preconfirmation_gaps, 1);
+    }
+
+    pub(crate) fn snapshot(&self) -> SubscriberStreamGapStats {
+        let load = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
+        SubscriberStreamGapStats {
+            lagged_notifications: load(&self.lagged_notifications),
+            undecodable_notifications: load(&self.undecodable_notifications),
+            log_gaps_healed: load(&self.log_gaps_healed),
+            header_gaps: load(&self.header_gaps),
+            preconfirmation_gaps: load(&self.preconfirmation_gaps),
+        }
+    }
+
+    pub(crate) fn reset(&self) {
+        for counter in [
+            &self.lagged_notifications,
+            &self.undecodable_notifications,
+            &self.log_gaps_healed,
+            &self.header_gaps,
+            &self.preconfirmation_gaps,
+        ] {
+            counter.store(0, Ordering::Relaxed);
+        }
+    }
+}
+
+impl SubscriberRpcCounters {
+    /// Record one issued request.
+    pub(crate) fn record(&self, cause: SubscriberRpcCause, method: SubscriberRpcMethod) {
+        self.record_many(cause, method, 1);
+    }
+
+    /// Record `requests` issued requests, for a batch that ships several calls
+    /// of one method in a single round trip.
+    pub(crate) fn record_many(
+        &self,
+        cause: SubscriberRpcCause,
+        method: SubscriberRpcMethod,
+        requests: u64,
+    ) {
+        self.counts[cause.index()][method.index()].fetch_add(requests, Ordering::Relaxed);
+    }
+
+    /// Snapshot every counter.
+    pub(crate) fn snapshot(&self) -> SubscriberRpcStats {
+        SubscriberRpcStats {
+            counts: std::array::from_fn(|cause| {
+                std::array::from_fn(|method| self.counts[cause][method].load(Ordering::Relaxed))
+            }),
+        }
+    }
+
+    /// Zero every counter.
+    pub(crate) fn reset(&self) {
+        for row in &self.counts {
+            for counter in row {
+                counter.store(0, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+/// Successful initial Flashblocks endpoint preflight.
+///
+/// This proves chain identity and either subscription acknowledgement for
+/// Base's `newFlashblocks` plus every pool-filtered `pendingLogs` stream, method
+/// support for OP's bounded pending block/log sampler, or the canonical stream
+/// topology paired with an application-managed standardized source.
+/// Notification liveness and active-interest coverage remain acceptance-window
+/// checks: a successful preflight alone must not qualify a source for live use.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FlashblocksPreflight {
+    chain_id: u64,
+    provider: ProviderRef,
+    delivery: FlashblocksDelivery,
+    pending_log_subscriptions: usize,
+    pending_log_filters: usize,
+    advertised_capabilities: Option<serde_json::Value>,
+}
+
+impl FlashblocksPreflight {
+    /// Chain identity read from the pinned provider lease.
+    pub const fn chain_id(&self) -> u64 {
+        self.chain_id
+    }
+
+    /// Provider generation selected for speculative updates.
+    ///
+    /// Built-in profiles preflight this provider's coupled request/subscription
+    /// surfaces. External profiles retain caller-supplied provenance while the
+    /// application qualifies the supplemental socket separately.
+    pub const fn provider(&self) -> &ProviderRef {
+        &self.provider
+    }
+
+    /// Provider surface selected for this chain.
+    pub const fn delivery(&self) -> FlashblocksDelivery {
+        self.delivery
+    }
+
+    /// Number of acknowledged pool-filtered `pendingLogs` subscriptions.
+    ///
+    /// This is zero for sampled and externally managed delivery profiles.
+    pub const fn pending_log_subscriptions(&self) -> usize {
+        self.pending_log_subscriptions
+    }
+
+    /// Number of provider-facing log filters whose interests must be covered by
+    /// the selected native, sampled, or external delivery surface.
+    pub const fn pending_log_filters(&self) -> usize {
+        self.pending_log_filters
+    }
+
+    /// Opaque response from `op_supportedCapabilities`, when the provider
+    /// implements that optional RPC method.
+    pub const fn advertised_capabilities(&self) -> Option<&serde_json::Value> {
+        self.advertised_capabilities.as_ref()
     }
 }
 
@@ -4198,15 +11010,18 @@ impl Default for SubscriberReconnectConfig {
 ///
 /// Backfill applies only to [`ReactiveInterest::Logs`] entries. Block and
 /// pending-transaction interests are live-only. `AlloySubscriber` emits records
-/// fetched through this policy as [`InputSource::Backfill`] before attempting
-/// live stream initialization, and a drained backfill seeds the filter's
-/// delivery anchor at its resolved upper bound (even when the window held no
-/// logs), so the newly added filter gets the same reconnect/catch-up protection
-/// an established one has.
+/// fetched through this policy as [`InputSource::Backfill`]. Continuity-safe
+/// owner registration adopts/subscribes the desired live filter first, then
+/// reconciles history behind that live fence; startup/global replacement commits
+/// topology and historical work as one desired-state transaction. A drained
+/// backfill seeds the filter's delivery anchor at its resolved upper bound (even
+/// when the window held no logs), so the newly added filter gets the same
+/// reconnect/catch-up protection an established one has.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SubscriberBackfill {
     from_block: u64,
     to_block: Option<u64>,
+    retained_anchor: Option<BlockRef>,
 }
 
 impl SubscriberBackfill {
@@ -4215,6 +11030,7 @@ impl SubscriberBackfill {
         Self {
             from_block,
             to_block: Some(to_block),
+            retained_anchor: None,
         }
     }
 
@@ -4223,7 +11039,104 @@ impl SubscriberBackfill {
         Self {
             from_block,
             to_block: None,
+            retained_anchor: None,
         }
+    }
+
+    /// Backfill inclusively from an exact retained canonical block.
+    ///
+    /// The Alloy subscriber verifies this number/hash against its provider
+    /// before accepting any lazy catch-up response. Engine-managed mid-stream
+    /// registration uses this form so owner replay cannot silently cross a
+    /// reorged discovery boundary.
+    pub fn from_canonical_block(block: BlockRef) -> Self {
+        Self {
+            from_block: block.number,
+            to_block: None,
+            retained_anchor: Some(block),
+        }
+    }
+
+    /// Backfill inclusively from an exact canonical block through an inclusive
+    /// upper bound.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SubscriberError::InvalidConfig`] when `to_block` precedes the
+    /// retained anchor.
+    pub fn from_canonical_block_through(
+        block: BlockRef,
+        to_block: u64,
+    ) -> Result<Self, SubscriberError> {
+        if to_block < block.number {
+            return Err(SubscriberError::InvalidConfig(
+                "inclusive backfill upper bound precedes its retained anchor",
+            ));
+        }
+        Ok(Self {
+            from_block: block.number,
+            to_block: Some(to_block),
+            retained_anchor: Some(block),
+        })
+    }
+
+    /// Backfill strictly after an exact canonical state baseline.
+    ///
+    /// This is distinct from [`from_canonical_block`](Self::from_canonical_block):
+    /// a restored cache already embodies every effect through `block`, so
+    /// replaying that block would apply it twice. The retained block is still
+    /// carried so the subscriber can prove that its provider is on the same
+    /// canonical branch before accepting any post-baseline history.
+    ///
+    /// Returns an error at `u64::MAX`; silently saturating would turn an empty
+    /// exclusive range into an inclusive replay of the baseline block.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SubscriberError::InvalidConfig`] when the baseline number is
+    /// `u64::MAX` and therefore has no following block.
+    pub fn after_canonical_block(block: BlockRef) -> Result<Self, SubscriberError> {
+        Self::after_canonical_block_inner(block, None)
+    }
+
+    /// Backfill strictly after an exact canonical baseline through an
+    /// inclusive upper bound.
+    ///
+    /// `to_block == block.number` represents a deliberately empty certified
+    /// interval. Bounds before the retained baseline are rejected.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SubscriberError::InvalidConfig`] when `to_block` precedes the
+    /// baseline, or when a non-empty exclusive range would have to begin after
+    /// block `u64::MAX`.
+    pub fn after_canonical_block_through(
+        block: BlockRef,
+        to_block: u64,
+    ) -> Result<Self, SubscriberError> {
+        if to_block < block.number {
+            return Err(SubscriberError::InvalidConfig(
+                "exclusive backfill upper bound precedes its retained baseline",
+            ));
+        }
+        Self::after_canonical_block_inner(block, Some(to_block))
+    }
+
+    fn after_canonical_block_inner(
+        block: BlockRef,
+        to_block: Option<u64>,
+    ) -> Result<Self, SubscriberError> {
+        let from_block = block
+            .number
+            .checked_add(1)
+            .ok_or(SubscriberError::InvalidConfig(
+                "cannot construct an exclusive backfill after block u64::MAX",
+            ))?;
+        Ok(Self {
+            from_block,
+            to_block,
+            retained_anchor: Some(block),
+        })
     }
 
     /// First block included in the backfill.
@@ -4234,6 +11147,11 @@ impl SubscriberBackfill {
     /// Last block included in the backfill, or `None` for provider latest.
     pub fn end_block(&self) -> Option<u64> {
         self.to_block
+    }
+
+    /// Exact retained start-block identity, when supplied.
+    pub fn retained_anchor(&self) -> Option<&BlockRef> {
+        self.retained_anchor.as_ref()
     }
 }
 
@@ -4263,24 +11181,52 @@ pub enum SubscriberInputScope {
         /// Staged owner epochs that require a buffered copy.
         owners: Vec<SubscriberOwnerEpoch>,
     },
+    /// Canonical input whose owner catch-up already delivered selected handler
+    /// owners. The residual canonical copy must exclude those handlers while
+    /// remaining authoritative for global chain progress.
+    CanonicalResidual {
+        /// Staged epoch owners that still require a buffered copy.
+        owners: Vec<SubscriberOwnerEpoch>,
+        /// Active compatibility owners already served by owner catch-up.
+        excluded: Vec<HandlerId>,
+    },
     /// Input delivered only to the listed staged owners.
     OwnerOnly {
         /// Exact staged owner epochs receiving the input.
         owners: Vec<SubscriberOwnerEpoch>,
     },
+    /// Compatibility owner-only delivery keyed by stable handler id.
+    OwnerOnlyHandlers {
+        /// Exact active handlers receiving the catch-up input.
+        owners: Vec<HandlerId>,
+    },
+    /// Flashblock input routed through ordinary matching handlers but applied
+    /// only to the speculative overlay.
+    Preconfirmed,
 }
 
 impl SubscriberInputScope {
     /// Exact staged owner epochs attached to this input.
     pub fn owners(&self) -> &[SubscriberOwnerEpoch] {
         match self {
-            Self::Canonical { owners } | Self::OwnerOnly { owners } => owners,
+            Self::Canonical { owners }
+            | Self::CanonicalResidual { owners, .. }
+            | Self::OwnerOnly { owners } => owners,
+            Self::OwnerOnlyHandlers { .. } | Self::Preconfirmed => &[],
         }
     }
 
     /// Whether this input must be forwarded once through canonical routing.
     pub const fn is_canonical(&self) -> bool {
-        matches!(self, Self::Canonical { .. })
+        matches!(
+            self,
+            Self::Canonical { .. } | Self::CanonicalResidual { .. }
+        )
+    }
+
+    /// Whether this input belongs only to the disposable preconfirmed overlay.
+    pub const fn is_preconfirmed(&self) -> bool {
+        matches!(self, Self::Preconfirmed)
     }
 }
 
@@ -4289,6 +11235,7 @@ impl SubscriberInputScope {
 pub struct SubscriberInputRecord<N: Network = Ethereum> {
     record: ReactiveInputRecord<N>,
     scope: SubscriberInputScope,
+    preconfirmation_timing: Option<FlashblockIngressTiming>,
 }
 
 impl<N: Network> SubscriberInputRecord<N> {
@@ -4300,6 +11247,11 @@ impl<N: Network> SubscriberInputRecord<N> {
     /// Delivery audience captured when the record was enqueued.
     pub const fn scope(&self) -> &SubscriberInputScope {
         &self.scope
+    }
+
+    /// Original typed source ingress when this is a preconfirmed record.
+    pub const fn preconfirmation_timing(&self) -> Option<FlashblockIngressTiming> {
+        self.preconfirmation_timing
     }
 
     /// Consume the scoped value into its reactive input record.
@@ -4320,6 +11272,10 @@ impl<N: Network> std::ops::Deref for SubscriberInputRecord<N> {
 #[derive(Clone, Debug)]
 pub struct SubscriberInputBatch<N: Network = Ethereum> {
     records: Vec<SubscriberInputRecord<N>>,
+    chain_id: Option<u64>,
+    chain_controls: Vec<ChainControl>,
+    preconfirmation_invalidated: bool,
+    preconfirmation_timing: Option<FlashblockIngressTiming>,
 }
 
 /// Result of polling a scoped subscriber batch against one driver control
@@ -4344,13 +11300,82 @@ impl<N: Network> SubscriberInputBatch<N> {
         self.records
     }
 
-    fn into_reactive_batch(self) -> ReactiveInputBatch<N> {
-        ReactiveInputBatch::new(
-            self.records
-                .into_iter()
-                .map(SubscriberInputRecord::into_record)
-                .collect(),
+    /// Ordered chain controls committed after the preceding records.
+    pub fn chain_controls(&self) -> &[ChainControl] {
+        &self.chain_controls
+    }
+
+    /// Whether the announcing Flashblocks generation lost continuity before
+    /// this batch was returned.
+    pub const fn preconfirmation_invalidated(&self) -> bool {
+        self.preconfirmation_invalidated
+    }
+
+    /// Earliest typed source ingress contributing to a preconfirmed batch.
+    pub const fn preconfirmation_timing(&self) -> Option<FlashblockIngressTiming> {
+        self.preconfirmation_timing
+    }
+
+    /// Consume the scoped subscriber delivery into a runtime-ready batch.
+    ///
+    /// Delivery audiences and the preconfirmed/canonical boundary are retained,
+    /// allowing downstream owner actors to forward a batch without rebuilding
+    /// subscriber-internal scope metadata.
+    pub fn into_reactive_batch(self) -> ReactiveInputBatch<N> {
+        let chain_id = self.chain_id;
+        let chain_controls = self.chain_controls;
+        let preconfirmation_timing = self.preconfirmation_timing;
+        let mut batch = ReactiveInputBatch::from_scoped_records_with_delivery_scope(
+            self.records.into_iter().map(|scoped| {
+                let source = scoped.record.context.source;
+                let (audience, delivery_scope) = match scoped.scope {
+                    SubscriberInputScope::Canonical { .. } => (
+                        DeliveryAudience::All,
+                        if source == InputSource::Backfill {
+                            DeliveryScope::CanonicalProgress
+                        } else {
+                            DeliveryScope::Canonical
+                        },
+                    ),
+                    SubscriberInputScope::CanonicalResidual { excluded, .. } => (
+                        DeliveryAudience::AllExcept(excluded),
+                        if source == InputSource::Backfill {
+                            DeliveryScope::CanonicalProgress
+                        } else {
+                            DeliveryScope::Canonical
+                        },
+                    ),
+                    SubscriberInputScope::OwnerOnly { owners } => {
+                        let mut handler_ids = Vec::with_capacity(owners.len());
+                        for epoch in owners {
+                            if !handler_ids.contains(epoch.owner()) {
+                                handler_ids.push(epoch.owner().clone());
+                            }
+                        }
+                        (
+                            DeliveryAudience::Owners(handler_ids),
+                            DeliveryScope::OwnerCatchup,
+                        )
+                    }
+                    SubscriberInputScope::OwnerOnlyHandlers { owners } => (
+                        DeliveryAudience::Owners(owners),
+                        DeliveryScope::OwnerCatchup,
+                    ),
+                    SubscriberInputScope::Preconfirmed => {
+                        (DeliveryAudience::All, DeliveryScope::Preconfirmed)
+                    }
+                };
+                (scoped.record, audience, delivery_scope)
+            }),
         )
+        .with_chain_controls(chain_controls);
+        if let Some(chain_id) = chain_id {
+            batch = batch.with_chain_id(chain_id);
+        }
+        if let Some(timing) = preconfirmation_timing {
+            batch = batch.with_preconfirmation_timing(timing);
+        }
+        batch
     }
 }
 
@@ -4495,25 +11520,167 @@ pub enum SubscriberOwnerError {
 /// updating an owner's interests must not silently discard delivery progress
 /// the previous interests had already established (the in-crate
 /// [`AlloySubscriber`] carries the owner's prior delivery anchor over to
-/// changed filter shapes and automatically backfills the gap).
+/// changed filter shapes and automatically backfills the gap). Every mutating
+/// operation is also a commit boundary: returning `Ok` means the new desired
+/// state is authoritative, while errors or cancellation must preserve the
+/// previous state or reconcile before exposing the uncommitted change.
 pub trait InterestOwnerSubscriber<N: Network = Ethereum>: EventSubscriber<N> {
-    /// Add or replace the interests owned by `owner`.
+    /// Atomically add or replace several owners in one desired-state revision.
+    ///
+    /// Unrelated owners remain installed. Returning `Ok(())` is one commit
+    /// boundary for the complete set; an error or cancellation must leave the
+    /// previously committed owner topology authoritative. Durable remote
+    /// subscribers should override this method so bootstrap creates one service
+    /// revision and one activation barrier rather than one barrier per owner.
+    ///
+    /// # Errors
+    ///
+    /// The returned operation reports [`SubscriberError::Unsupported`] by
+    /// default, or an implementation-specific validation or commit failure.
+    fn upsert_interest_owners(
+        &mut self,
+        _owners: Vec<(HandlerId, Vec<ReactiveInterest<N>>)>,
+    ) -> SubscriberOperation<'_, ()> {
+        Box::pin(async {
+            Err(SubscriberError::Unsupported(
+                "subscriber does not implement atomic bulk owner upsert",
+            ))
+        })
+    }
+
+    /// Atomically replace the complete engine-managed owner topology without
+    /// requesting history.
+    ///
+    /// This is the fresh-runtime bootstrap operation. Base/unowned interests,
+    /// stale owners, queued delivery, and dedupe/source state from the prior
+    /// topology must not survive a successful replacement. Errors and dropped
+    /// futures leave the prior committed topology authoritative.
+    ///
+    /// # Errors
+    ///
+    /// The returned operation reports [`SubscriberError::Unsupported`] by
+    /// default, or an implementation-specific validation or commit failure.
+    fn replace_interest_owners(
+        &mut self,
+        _owners: Vec<(HandlerId, Vec<ReactiveInterest<N>>)>,
+    ) -> SubscriberOperation<'_, ()> {
+        Box::pin(async {
+            Err(SubscriberError::Unsupported(
+                "subscriber does not implement atomic exact owner replacement",
+            ))
+        })
+    }
+
+    /// Atomically replace the complete owner set and schedule one global
+    /// historical log backfill in the same desired-state revision.
+    ///
+    /// This is the continuity-safe bootstrap operation for a runtime that has
+    /// already processed canonical state while the subscriber's owner state is
+    /// new or may have been lost. Implementations must commit the complete
+    /// owner topology and all required historical work together: returning an
+    /// error or dropping the future must leave the previously committed state
+    /// authoritative. The default is deliberately unsupported rather than a
+    /// sequence of partially committed single-owner updates.
+    /// Historical records must be delivered through canonical global routing
+    /// (`DeliveryAudience::All` / `DeliveryScope::CanonicalProgress`), not as
+    /// owner catch-up, so their effects participate in the normal rollback
+    /// journal before the source certifies the cutover. Base/unowned interests
+    /// are replaced by this complete engine-managed topology. Any owner absent
+    /// from `owners` must be removed together with its queued owner-only work, which closes
+    /// the crash window where a subscriber committed registration but the
+    /// runtime process died before installing the corresponding handler.
+    ///
+    /// # Errors
+    ///
+    /// The returned operation reports [`SubscriberError::Unsupported`] by
+    /// default, or a backfill, validation, transport, or atomic-commit failure.
+    fn replace_interest_owners_with_global_backfill(
+        &mut self,
+        _owners: Vec<(HandlerId, Vec<ReactiveInterest<N>>)>,
+        _backfill: SubscriberBackfill,
+    ) -> SubscriberOperation<'_, ()> {
+        Box::pin(async {
+            Err(SubscriberError::Unsupported(
+                "subscriber does not implement atomic owner replacement with global backfill",
+            ))
+        })
+    }
+
+    /// Add or replace the interests owned by `owner`, awaiting the subscriber's
+    /// commit boundary.
+    ///
+    /// Implementations must leave the previously committed owner state
+    /// authoritative when the operation returns an error or is cancelled before
+    /// completion.
+    ///
+    /// # Errors
+    ///
+    /// The returned operation reports [`SubscriberError`] when the owner update
+    /// cannot be validated or committed.
     fn add_interest_owner(
         &mut self,
         owner: HandlerId,
         interests: &[ReactiveInterest<N>],
-    ) -> Result<(), SubscriberError>;
+    ) -> SubscriberOperation<'_, ()>;
 
-    /// Add or replace owner interests and schedule log backfill for that owner.
+    /// Add or replace owner interests and schedule log backfill for that owner,
+    /// awaiting the subscriber's commit boundary.
+    ///
+    /// # Errors
+    ///
+    /// The returned operation reports [`SubscriberError`] when the owner update
+    /// or requested backfill cannot be validated or committed.
     fn add_interest_owner_with_backfill(
         &mut self,
         owner: HandlerId,
         interests: &[ReactiveInterest<N>],
         backfill: SubscriberBackfill,
-    ) -> Result<(), SubscriberError>;
+    ) -> SubscriberOperation<'_, ()>;
 
-    /// Remove one owner's interests, preserving unrelated interests.
-    fn remove_interest_owner(&mut self, owner: &HandlerId) -> Option<Vec<ReactiveInterest<N>>>;
+    /// Add a handler discovered at retained canonical block `C` without
+    /// opening a gap while registration commits.
+    ///
+    /// The subscriber must subscribe/adopt the new desired state first, then
+    /// expose the new owner's matching records from `C` as owner catch-up and
+    /// expose `C + 1` through the activation head as one globally ordered
+    /// canonical catch-up over the complete active interest union. This split
+    /// is deliberate: the runtime already has a rollback entry for `C`, while
+    /// later blocks must run every handler and create normal canonical journal
+    /// entries. Errors/cancellation preserve the prior committed topology.
+    /// Implementations that cannot uphold this coordinated transaction must
+    /// return `Unsupported`; emitting owner-only records past `C` is invalid.
+    ///
+    /// # Errors
+    ///
+    /// The returned operation reports [`SubscriberError::Unsupported`] by
+    /// default, or a canonical-anchor, transport, or atomic-commit failure.
+    fn add_interest_owner_with_canonical_catchup(
+        &mut self,
+        _owner: HandlerId,
+        _interests: &[ReactiveInterest<N>],
+        _retained: BlockRef,
+    ) -> SubscriberOperation<'_, ()> {
+        Box::pin(async {
+            Err(SubscriberError::Unsupported(
+                "subscriber does not implement coordinated canonical owner catch-up",
+            ))
+        })
+    }
+
+    /// Remove one owner's interests, preserving unrelated interests, and await
+    /// acknowledgement that the removal committed.
+    ///
+    /// On error the owner must remain authoritative, so the runtime handler is
+    /// not removed while subscriber delivery may still target it.
+    ///
+    /// # Errors
+    ///
+    /// The returned operation reports [`SubscriberError`] when the removal
+    /// cannot be committed while preserving unrelated owners.
+    fn remove_interest_owner(
+        &mut self,
+        owner: &HandlerId,
+    ) -> SubscriberOperation<'_, Option<Vec<ReactiveInterest<N>>>>;
 
     /// Borrow the interests currently owned by `owner`.
     fn owner_interests(&self, owner: &HandlerId) -> Option<&[ReactiveInterest<N>]>;
@@ -4527,18 +11694,20 @@ pub trait InterestOwnerSubscriber<N: Network = Ethereum>: EventSubscriber<N> {
 /// [`unregister_handler`](Self::unregister_handler) update runtime routing and
 /// subscriber interests as one operation, keyed by the handler's stable
 /// [`HandlerId`]. Registration is continuity-safe by default — once the runtime
-/// has journaled a canonical block, a newly registered handler is backfilled
-/// from that block, so a pool discovered in block *N* (say via a factory
-/// `PoolCreated` event) misses none of its own logs from *N* onward even though
-/// its live subscription starts later. Overlap between backfill and live
-/// delivery is absorbed by subscriber and runtime dedup.
+/// has journaled canonical block *N*, a newly registered handler is live-adopted,
+/// replayed owner-only at *N*, and then caught up globally with every handler
+/// from *N + 1* through activation. A factory-discovered pool therefore misses
+/// none of its own logs without making later history owner-local and
+/// unrollbackable. The subscriber must absorb overlap that crosses batch
+/// boundaries; the runtime validates and merges duplicate representations only
+/// within one [`ReactiveInputBatch`].
 ///
 /// Registration methods by intent:
 ///
 /// | Method | Backfill |
 /// |---|---|
-/// | [`register_handler`](Self::register_handler) | from the runtime's last canonical block (live-only on a fresh runtime) |
-/// | [`register_handler_with_backfill`](Self::register_handler_with_backfill) | explicit range or anchor (deep history) |
+/// | [`register_handler`](Self::register_handler) | coordinated owner replay at the last retained block plus global catch-up above it (live-only on a fresh runtime) |
+/// | [`register_handler_with_backfill`](Self::register_handler_with_backfill) | exactly one hash-certified block still retained by the rollback journal |
 /// | [`register_handler_live_only`](Self::register_handler_live_only) | none — future logs only |
 ///
 /// Unregistering a handler stops future subscription routing and runtime
@@ -4560,6 +11729,171 @@ pub trait InterestOwnerSubscriber<N: Network = Ethereum>: EventSubscriber<N> {
 pub struct ReactiveEngine<S, N: Network = Ethereum> {
     runtime: ReactiveRuntime<N>,
     subscriber: S,
+    pending_acknowledgement: Option<PendingAcknowledgement<N>>,
+    pending_checkpoint: Option<PendingCheckpoint<N>>,
+    last_checkpoint_block: Option<DurableCheckpointBlock>,
+    last_checkpoint_delivery_token: Option<SubscriberDeliveryToken>,
+    last_checkpoint_delivery_witness: Option<B256>,
+    last_subscriber_checkpoint: Option<SubscriberCheckpoint>,
+    checkpoint_identity: Option<DurableCheckpointIdentity>,
+}
+
+struct PendingAcknowledgement<N: Network> {
+    token: SubscriberDeliveryToken,
+    report: ReactiveBatchReport<N>,
+}
+
+struct PendingCheckpoint<N: Network> {
+    metadata: DurableCheckpointMetadata,
+    delivery_token: Option<SubscriberDeliveryToken>,
+    report: ReactiveBatchReport<N>,
+    saved_to: Option<PathBuf>,
+    staged_generation: u64,
+}
+
+struct CheckpointStage<N: Network> {
+    incoming_block: Option<DurableCheckpointBlock>,
+    delivery_token: Option<SubscriberDeliveryToken>,
+    delivery_witness: Option<B256>,
+    subscriber_checkpoint: Option<SubscriberCheckpoint>,
+    staged_generation: u64,
+    report: ReactiveBatchReport<N>,
+}
+
+struct DurableResumePlan {
+    runtime: DurableRuntimeRestorePlan,
+    position: SubscriberResumePosition,
+    delivery_witness: Option<B256>,
+}
+
+enum HandlerRegistrationCatchup {
+    LiveOnly,
+    OwnerBackfill(SubscriberBackfill),
+    CoordinatedCanonical(BlockRef),
+}
+
+// 2: `ChainControl` gained `LogCoverage`, so a witness can encode a control
+// shape version 1 readers cannot interpret. Bumping keeps a replayed token from
+// an older process from being matched against a newer encoding.
+const DELIVERY_WITNESS_VERSION: u32 = 2;
+const DELIVERY_WITNESS_DOMAIN: &[u8] = b"evm-fork-cache/reactive-delivery-witness";
+
+#[derive(serde::Serialize)]
+struct DeliveryWitnessEnvelope<'a> {
+    version: u32,
+    chain_id: Option<u64>,
+    records: Vec<DeliveryRecordWitness<'a>>,
+    chain_controls: &'a [ChainControl],
+    subscriber_checkpoint: Option<&'a [u8]>,
+    payload_commitment: Option<B256>,
+}
+
+#[derive(serde::Serialize)]
+struct DeliveryRecordWitness<'a> {
+    identity: ReactiveInputIdentity,
+    context: &'a ReactiveContext,
+    audience: &'a DeliveryAudience,
+    scope: DeliveryScope,
+    payload: DeliveryPayloadWitness<'a>,
+}
+
+#[derive(serde::Serialize)]
+enum DeliveryPayloadWitness<'a> {
+    /// Logs are the primary state-bearing event representation, so retain every
+    /// RPC payload field in addition to the validated identity/context.
+    Log {
+        address: Address,
+        topics: &'a [B256],
+        data: &'a Bytes,
+        block_hash: Option<B256>,
+        block_number: Option<u64>,
+        block_timestamp: Option<u64>,
+        transaction_hash: Option<B256>,
+        transaction_index: Option<u64>,
+        log_index: Option<u64>,
+        removed: bool,
+    },
+    /// Network-generic response bodies do not expose one stable complete serde
+    /// contract. Their validated identity/context are witnessed here; batches
+    /// containing headers, full blocks, or hydrated transactions additionally
+    /// require the source's exact canonical wire-payload commitment. A generic
+    /// header response can expose a supplied hash without proving that every
+    /// handler-visible inner field recomputes to it.
+    IdentityCommitted,
+}
+
+fn durable_delivery_witness<N: Network>(
+    batch: &ReactiveInputBatch<N>,
+) -> Result<B256, ReactiveEngineError> {
+    let requires_payload_commitment = batch.records.iter().any(|record| {
+        matches!(
+            &record.input,
+            ReactiveInput::BlockHeader(_)
+                | ReactiveInput::FullBlock(_)
+                | ReactiveInput::PendingTx(_)
+        )
+    });
+    if requires_payload_commitment && batch.payload_commitment.is_none() {
+        return Err(ReactiveEngineError::MissingPayloadCommitment);
+    }
+    let records = batch
+        .records
+        .iter()
+        .enumerate()
+        .map(|(index, record)| {
+            let payload = match &record.input {
+                ReactiveInput::Log(log) => DeliveryPayloadWitness::Log {
+                    address: log.address(),
+                    topics: log.topics(),
+                    data: &log.inner.data.data,
+                    block_hash: log.block_hash,
+                    block_number: log.block_number,
+                    block_timestamp: log.block_timestamp,
+                    transaction_hash: log.transaction_hash,
+                    transaction_index: log.transaction_index,
+                    log_index: log.log_index,
+                    removed: log.removed,
+                },
+                ReactiveInput::BlockHeader(_)
+                | ReactiveInput::FullBlock(_)
+                | ReactiveInput::PendingTxHash(_)
+                | ReactiveInput::PendingTx(_) => DeliveryPayloadWitness::IdentityCommitted,
+            };
+            Ok(DeliveryRecordWitness {
+                identity: record.validated_identity()?,
+                context: &record.context,
+                audience: batch
+                    .record_audience(index)
+                    .expect("enumerated record always has an audience"),
+                scope: batch
+                    .record_delivery_scope(index)
+                    .expect("enumerated record always has a delivery scope"),
+                payload,
+            })
+        })
+        .collect::<Result<Vec<_>, ReactiveError>>()?;
+    let envelope = DeliveryWitnessEnvelope {
+        version: DELIVERY_WITNESS_VERSION,
+        chain_id: batch.chain_id,
+        records,
+        chain_controls: &batch.chain_controls,
+        subscriber_checkpoint: batch
+            .subscriber_checkpoint
+            .as_ref()
+            .map(SubscriberCheckpoint::as_bytes),
+        payload_commitment: batch
+            .payload_commitment
+            .as_ref()
+            .map(SubscriberPayloadCommitment::digest),
+    };
+    let encoded = bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .serialize(&envelope)
+        .map_err(|error| ReactiveEngineError::DeliveryWitness(error.to_string()))?;
+    let mut witness = Keccak256::new();
+    witness.update(DELIVERY_WITNESS_DOMAIN);
+    witness.update(encoded);
+    Ok(witness.finalize())
 }
 
 impl<S, N> ReactiveEngine<S, N>
@@ -4572,12 +11906,226 @@ where
         Self {
             runtime,
             subscriber,
+            pending_acknowledgement: None,
+            pending_checkpoint: None,
+            last_checkpoint_block: None,
+            last_checkpoint_delivery_token: None,
+            last_checkpoint_delivery_witness: None,
+            last_subscriber_checkpoint: None,
+            checkpoint_identity: None,
         }
     }
 
-    /// Split the engine into its runtime and subscriber parts.
-    pub fn into_parts(self) -> (ReactiveRuntime<N>, S) {
-        (self.runtime, self.subscriber)
+    /// Split the engine into its runtime and subscriber parts when no commit is
+    /// pending.
+    ///
+    /// A failed delivery acknowledgement or durable checkpoint commit remains
+    /// live protocol state: dropping it would allow the caller to lose the
+    /// already-applied report/token pair and poll past an uncommitted batch.
+    /// In that case this returns the intact engine so the caller can repair the
+    /// dependency and retry through the normal ingestion method.
+    ///
+    /// # Errors
+    ///
+    /// Returns the intact boxed engine when an acknowledgement or checkpoint
+    /// commit is pending.
+    pub fn into_parts(self) -> Result<(ReactiveRuntime<N>, S), Box<Self>> {
+        if self.pending_acknowledgement.is_some() || self.pending_checkpoint.is_some() {
+            return Err(Box::new(self));
+        }
+        Ok((self.runtime, self.subscriber))
+    }
+
+    fn durable_resume_plan(
+        &self,
+        metadata: &DurableCheckpointMetadata,
+    ) -> Result<DurableResumePlan, ReactiveCheckpointRestoreError> {
+        if !self.subscriber.capabilities().supports_durable_replay() {
+            return Err(ReactiveCheckpointRestoreError::SubscriberNotDurable);
+        }
+        self.ensure_subscriber_restore_chain(metadata.identity.chain_id)?;
+        if !self.runtime.is_pristine_for_checkpoint_restore()
+            || self.pending_acknowledgement.is_some()
+            || self.pending_checkpoint.is_some()
+            || self.last_checkpoint_block.is_some()
+            || self.last_checkpoint_delivery_token.is_some()
+            || self.last_checkpoint_delivery_witness.is_some()
+            || self.last_subscriber_checkpoint.is_some()
+            || self.checkpoint_identity.is_some()
+        {
+            return Err(ReactiveCheckpointRestoreError::ActiveRuntime);
+        }
+
+        let block = BlockRef {
+            number: metadata.block.number,
+            hash: metadata.block.hash,
+            parent_hash: metadata.block.parent_hash,
+            timestamp: metadata.block.timestamp,
+        };
+        let runtime = match metadata.runtime_checkpoint.as_deref() {
+            Some(bytes) => self
+                .runtime
+                .plan_durable_checkpoint_restore(bytes, &block)?,
+            None => DurableRuntimeRestorePlan {
+                checkpoint: None,
+                fallback_history: (self.runtime.config.journal_depth > 0)
+                    .then_some(block)
+                    .into_iter()
+                    .collect(),
+            },
+        };
+        let delivery_token = metadata
+            .delivery_token
+            .clone()
+            .map(SubscriberDeliveryToken::new);
+        let subscriber_checkpoint = metadata
+            .subscriber_checkpoint
+            .clone()
+            .map(SubscriberCheckpoint::new);
+        let position = SubscriberResumePosition::new(
+            metadata.identity.chain_id,
+            block,
+            runtime.canonical_history(),
+            delivery_token,
+            subscriber_checkpoint,
+        );
+        Ok(DurableResumePlan {
+            runtime,
+            position,
+            delivery_witness: metadata.delivery_witness,
+        })
+    }
+
+    /// Preview the exact subscriber position a durable restore will install.
+    ///
+    /// This read-only step exists for durable subscribers that must complete
+    /// asynchronous source or transport preparation before the engine invokes
+    /// the synchronous [`EventSubscriber::restore_position`] hook. It decodes
+    /// and validates the core runtime checkpoint, applies this runtime's
+    /// configured journal retention to the preview, and returns the same
+    /// [`SubscriberResumePosition`] that
+    /// [`resume_from_durable_checkpoint`](Self::resume_from_durable_checkpoint)
+    /// will later pass to the subscriber.
+    ///
+    /// Call this on the same fresh engine that will perform the restore. After
+    /// subscriber preparation completes, pass the identical `metadata` to
+    /// `resume_from_durable_checkpoint` (or restore the same loaded checkpoint
+    /// through [`restore_durable_checkpoint`](Self::restore_durable_checkpoint))
+    /// without mutating engine runtime or checkpoint state in between. The
+    /// checkpoint identity and, for non-finalized state, its canonical block
+    /// must still be validated by the caller before external preparation.
+    ///
+    /// This method does not mutate the runtime, subscriber, or checkpoint
+    /// bookkeeping.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReactiveCheckpointRestoreError`] when the subscriber is not
+    /// durable, its chain identity conflicts with the checkpoint, the engine is
+    /// not fresh, or the stored runtime checkpoint is malformed, unsupported,
+    /// or internally inconsistent.
+    pub fn preview_durable_resume_position(
+        &self,
+        metadata: &DurableCheckpointMetadata,
+    ) -> Result<SubscriberResumePosition, ReactiveCheckpointRestoreError> {
+        Ok(self.durable_resume_plan(metadata)?.position)
+    }
+
+    /// Resume delivery bookkeeping and canonical continuity from a cache
+    /// checkpoint that has already been identity- and hash-validated and
+    /// restored into [`EvmCache`].
+    ///
+    /// Call this on a fresh engine. The anchor has no rollback effects of its
+    /// own: it represents the state baseline embodied by the checkpoint, while
+    /// newly ingested blocks are journaled normally above it.
+    /// The subscriber must advertise [`SubscriberCapability::DurableReplay`];
+    /// restoring an ephemeral stream would claim a restart guarantee it cannot
+    /// uphold and is rejected before cache or runtime mutation.
+    ///
+    /// Prefer [`restore_durable_checkpoint`](Self::restore_durable_checkpoint)
+    /// when the cache has not yet been restored: that helper rolls the cache
+    /// back as well if runtime or subscriber activation fails.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReactiveCheckpointRestoreError`] when the subscriber is not
+    /// durable, chain identity conflicts, the runtime is not pristine, stored
+    /// runtime state is invalid, or the subscriber rejects the restored
+    /// position. Runtime state is restored on subscriber failure.
+    pub fn resume_from_durable_checkpoint(
+        &mut self,
+        metadata: &DurableCheckpointMetadata,
+    ) -> Result<(), ReactiveCheckpointRestoreError> {
+        let plan = self.durable_resume_plan(metadata)?;
+        let prior_runtime = self.runtime.checkpoint_state();
+
+        let DurableResumePlan {
+            runtime,
+            position,
+            delivery_witness,
+        } = plan;
+        self.runtime.apply_durable_checkpoint_restore(runtime);
+        self.runtime.coverage_head = Some(position.coverage_head);
+        if let Err(error) = self.subscriber.restore_position(&position) {
+            self.runtime.restore_state(prior_runtime);
+            return Err(ReactiveCheckpointRestoreError::Subscriber(error));
+        }
+        if let Err(error) = self.ensure_subscriber_restore_chain(metadata.identity.chain_id) {
+            self.runtime.restore_state(prior_runtime);
+            return Err(error);
+        }
+        self.last_checkpoint_block = Some(metadata.block.clone());
+        self.last_checkpoint_delivery_token = position.delivery_token;
+        self.last_checkpoint_delivery_witness = delivery_witness;
+        self.last_subscriber_checkpoint = position.subscriber_checkpoint;
+        self.checkpoint_identity = Some(metadata.identity.clone());
+        Ok(())
+    }
+
+    /// Atomically restore cache, runtime, and subscriber position from one
+    /// validated durable checkpoint.
+    ///
+    /// Inspect [`LoadedDurableCheckpoint::metadata`] and validate its canonical
+    /// block against an authoritative RPC source before calling this method when
+    /// the block is not finalized. Identity, cache-chain, runtime-state, and
+    /// subscriber failures leave the cache and engine runtime unchanged. The
+    /// subscriber follows [`EventSubscriber::restore_position`]'s retry contract.
+    /// It must advertise [`SubscriberCapability::DurableReplay`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReactiveCheckpointRestoreError`] for checkpoint identity,
+    /// cache-chain, runtime-state, subscriber-capability, subscriber-chain, or
+    /// position-restore failures. Cache and runtime state remain unchanged.
+    pub fn restore_durable_checkpoint(
+        &mut self,
+        cache: &mut EvmCache,
+        loaded: LoadedDurableCheckpoint,
+        expected: &DurableCheckpointIdentity,
+    ) -> Result<DurableCheckpointMetadata, ReactiveCheckpointRestoreError> {
+        if !self.subscriber.capabilities().supports_durable_replay() {
+            return Err(ReactiveCheckpointRestoreError::SubscriberNotDurable);
+        }
+        self.ensure_subscriber_restore_chain(expected.chain_id)?;
+        if !self.runtime.is_pristine_for_checkpoint_restore()
+            || self.pending_acknowledgement.is_some()
+            || self.pending_checkpoint.is_some()
+            || self.last_checkpoint_block.is_some()
+            || self.last_checkpoint_delivery_token.is_some()
+            || self.last_checkpoint_delivery_witness.is_some()
+            || self.last_subscriber_checkpoint.is_some()
+            || self.checkpoint_identity.is_some()
+        {
+            return Err(ReactiveCheckpointRestoreError::ActiveRuntime);
+        }
+
+        let prior_cache = EvmCacheStateSnapshot::capture(cache);
+        let metadata = loaded.restore_into(cache, expected)?;
+        if let Err(error) = self.resume_from_durable_checkpoint(&metadata) {
+            prior_cache.restore(cache);
+            return Err(error);
+        }
+        Ok(metadata)
     }
 
     /// Borrow the runtime.
@@ -4600,56 +12148,695 @@ where
         &mut self.subscriber
     }
 
-    /// Poll the subscriber for the next batch.
-    pub fn next_batch(&mut self) -> SubscriberNextBatch<'_, N> {
-        self.subscriber.next_batch()
+    /// Adopt a hash-pinned RPC cache snapshot as the runtime's canonical
+    /// cold-start baseline.
+    ///
+    /// The cache must use the exact canonical hash selector and block-number
+    /// context named by `baseline`; when the baseline includes a timestamp, the
+    /// cache timestamp must match too. Cache, baseline, and any already-resolved
+    /// subscriber identity must name the same chain. No delivery or checkpoint
+    /// commit may be pending. After this succeeds, call
+    /// [`sync_handler_interests_with_backfill`](Self::sync_handler_interests_with_backfill)
+    /// before polling: it exact-replaces subscriber owners and begins event
+    /// catch-up at `C + 1`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReactiveEngineError`] when commit state is pending, the runtime
+    /// is active or already has a conflicting baseline, cache/subscriber chain
+    /// identity differs, or the cache is not pinned to the exact baseline.
+    pub fn adopt_canonical_baseline(
+        &mut self,
+        cache: &EvmCache,
+        baseline: ReactiveCanonicalBaseline,
+    ) -> Result<(), ReactiveEngineError> {
+        if self.pending_acknowledgement.is_some()
+            || self.pending_checkpoint.is_some()
+            || self.last_checkpoint_block.is_some()
+            || self.last_checkpoint_delivery_token.is_some()
+            || self.last_checkpoint_delivery_witness.is_some()
+            || self.last_subscriber_checkpoint.is_some()
+            || self.checkpoint_identity.is_some()
+        {
+            return Err(ReactiveBaselineError::ActiveRuntime.into());
+        }
+        // Establish deterministic lifecycle/idempotency semantics before
+        // consulting mutable cache context. A conflicting repeat is a runtime
+        // baseline conflict even if the caller also repointed the cache.
+        self.runtime
+            .validate_canonical_baseline_adoption(baseline.block)?;
+        if baseline.chain_id != cache.chain_id() {
+            return Err(ReactiveBaselineError::CacheChainMismatch {
+                baseline_chain_id: baseline.chain_id,
+                cache_chain_id: cache.chain_id(),
+            }
+            .into());
+        }
+        self.ensure_subscriber_chain(cache)?;
+        let exact_selector = BlockId::from((baseline.block.hash, Some(true)));
+        let context_matches = cache.block_number() == Some(baseline.block.number)
+            && baseline
+                .block
+                .timestamp
+                .is_none_or(|timestamp| cache.timestamp() == Some(timestamp));
+        if cache.block() != exact_selector || !context_matches {
+            return Err(ReactiveBaselineError::CacheBlockMismatch {
+                number: baseline.block.number,
+                hash: baseline.block.hash,
+            }
+            .into());
+        }
+        self.runtime.adopt_canonical_baseline(baseline.block)?;
+        Ok(())
+    }
+
+    /// Poll the subscriber for the next batch without ingesting it.
+    ///
+    /// This low-level escape hatch is unavailable while the engine owes an
+    /// acknowledgement or checkpoint commit. Callers that use it must return
+    /// any subscriber-owned delivery metadata through a combined
+    /// [`next_ingest`](Self::next_ingest) helper; raw ingestion deliberately
+    /// rejects that metadata so it cannot be discarded accidentally.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReactiveEngineError`] when an acknowledgement/checkpoint commit
+    /// is pending or subscriber and cache chain identities conflict.
+    pub fn next_batch(
+        &mut self,
+        cache: &EvmCache,
+    ) -> Result<SubscriberNextBatch<'_, N>, ReactiveEngineError> {
+        if self.pending_checkpoint.is_some() {
+            return Err(ReactiveEngineError::PendingCheckpointCommit);
+        }
+        if self.pending_acknowledgement.is_some() {
+            return Err(ReactiveEngineError::PendingAcknowledgementCommit);
+        }
+        self.ensure_subscriber_chain(cache)?;
+        Ok(self.subscriber.next_batch())
     }
 
     /// Ingest one already-polled batch through the runtime (direct effects
     /// only; surfaced resync requests are reported, not executed).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReactiveEngineError`] when commit state is pending, the batch
+    /// carries subscriber-owned commit metadata, chain identity conflicts, or
+    /// runtime ingestion fails.
     pub fn ingest_batch(
         &mut self,
         cache: &mut EvmCache,
         batch: ReactiveInputBatch<N>,
-    ) -> Result<ReactiveBatchReport<N>, ReactiveError> {
-        self.runtime.ingest_batch(cache, batch)
+    ) -> Result<ReactiveBatchReport<N>, ReactiveEngineError> {
+        self.ensure_raw_ingest_is_safe(cache, &batch)?;
+        Ok(self.runtime.ingest_batch(cache, batch)?)
     }
 
     /// Ingest one already-polled batch and execute the storage/account resyncs
     /// it surfaces, exactly like
     /// [`ReactiveRuntime::ingest_batch_with_resync`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReactiveEngineError`] when commit state is pending, the batch
+    /// carries subscriber-owned commit metadata, chain identity conflicts, or
+    /// runtime ingestion fails.
     pub fn ingest_batch_with_resync(
         &mut self,
         cache: &mut EvmCache,
         batch: ReactiveInputBatch<N>,
-    ) -> Result<ReactiveBatchReport<N>, ReactiveError> {
-        self.runtime.ingest_batch_with_resync(cache, batch)
+    ) -> Result<ReactiveBatchReport<N>, ReactiveEngineError> {
+        self.ensure_raw_ingest_is_safe(cache, &batch)?;
+        Ok(self.runtime.ingest_batch_with_resync(cache, batch)?)
+    }
+
+    fn ensure_raw_ingest_is_safe(
+        &self,
+        cache: &EvmCache,
+        batch: &ReactiveInputBatch<N>,
+    ) -> Result<(), ReactiveEngineError> {
+        if self.pending_checkpoint.is_some() {
+            return Err(ReactiveEngineError::PendingCheckpointCommit);
+        }
+        if self.pending_acknowledgement.is_some() {
+            return Err(ReactiveEngineError::PendingAcknowledgementCommit);
+        }
+        if batch.delivery_token().is_some() || batch.subscriber_checkpoint().is_some() {
+            return Err(ReactiveEngineError::UncommittedDeliveryMetadata);
+        }
+        self.ensure_subscriber_chain(cache)?;
+        Ok(())
+    }
+
+    fn ensure_subscriber_chain(&self, cache: &EvmCache) -> Result<(), ReactiveEngineError> {
+        if let Some(subscriber_chain_id) = self.subscriber.chain_id()
+            && subscriber_chain_id != cache.chain_id()
+        {
+            return Err(ReactiveEngineError::SubscriberChainMismatch {
+                subscriber_chain_id,
+                cache_chain_id: cache.chain_id(),
+            });
+        }
+        Ok(())
+    }
+
+    fn ensure_subscriber_restore_chain(
+        &self,
+        checkpoint_chain_id: u64,
+    ) -> Result<(), ReactiveCheckpointRestoreError> {
+        if let Some(subscriber_chain_id) = self.subscriber.chain_id()
+            && subscriber_chain_id != checkpoint_chain_id
+        {
+            return Err(ReactiveCheckpointRestoreError::SubscriberChainMismatch {
+                subscriber_chain_id,
+                checkpoint_chain_id,
+            });
+        }
+        Ok(())
     }
 
     /// Poll the subscriber once and ingest the returned batch when present
     /// (direct effects only).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReactiveEngineError`] for subscriber/cache chain mismatch,
+    /// pending checkpoint state, subscriber polling, runtime ingestion, or
+    /// delivery-acknowledgement failure. A failed acknowledgement remains
+    /// pending and is retried before polling again.
     pub async fn next_ingest(
         &mut self,
         cache: &mut EvmCache,
     ) -> Result<Option<ReactiveBatchReport<N>>, ReactiveEngineError> {
-        let Some(batch) = self.subscriber.next_batch().await? else {
+        self.ensure_subscriber_chain(cache)?;
+        if self.pending_checkpoint.is_some() {
+            return Err(ReactiveEngineError::PendingCheckpointCommit);
+        }
+        if self.pending_acknowledgement.is_some() {
+            return self.commit_pending_acknowledgement().await.map(Some);
+        }
+        let batch = self.subscriber.next_batch().await?;
+        self.ensure_subscriber_chain(cache)?;
+        let Some(mut batch) = batch else {
             return Ok(None);
         };
-        Ok(Some(self.runtime.ingest_batch(cache, batch)?))
+        let delivery_token = batch.take_delivery_token();
+        let report = self.runtime.ingest_batch(cache, batch)?;
+        self.stage_or_return_acknowledgement(delivery_token, report)
+            .await
     }
 
     /// Poll the subscriber once and ingest the returned batch with resync
     /// execution — the loop shape for consumers that rely on coverage-gap
     /// repair (root-gate resyncs, handler-requested re-reads).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReactiveEngineError`] for subscriber/cache chain mismatch,
+    /// pending checkpoint state, subscriber polling, runtime ingestion, or
+    /// delivery-acknowledgement failure. A failed acknowledgement remains
+    /// pending and is retried before polling again.
     pub async fn next_ingest_with_resync(
         &mut self,
         cache: &mut EvmCache,
     ) -> Result<Option<ReactiveBatchReport<N>>, ReactiveEngineError> {
-        let Some(batch) = self.subscriber.next_batch().await? else {
+        self.ensure_subscriber_chain(cache)?;
+        if self.pending_checkpoint.is_some() {
+            return Err(ReactiveEngineError::PendingCheckpointCommit);
+        }
+        if self.pending_acknowledgement.is_some() {
+            return self.commit_pending_acknowledgement().await.map(Some);
+        }
+        let batch = self.subscriber.next_batch().await?;
+        self.ensure_subscriber_chain(cache)?;
+        let Some(mut batch) = batch else {
             return Ok(None);
         };
-        Ok(Some(self.runtime.ingest_batch_with_resync(cache, batch)?))
+        let delivery_token = batch.take_delivery_token();
+        let report = self.runtime.ingest_batch_with_resync(cache, batch)?;
+        self.stage_or_return_acknowledgement(delivery_token, report)
+            .await
     }
+
+    /// Poll, ingest, atomically checkpoint, then acknowledge one batch.
+    ///
+    /// The ordering is strict: subscriber acknowledgement is never attempted
+    /// until the complete cache checkpoint is synced. If checkpointing or
+    /// acknowledgement fails, the in-memory pending commit is retried before
+    /// any later batch is polled, so a transient disk failure cannot cause the
+    /// already-applied batch to execute twice in the same process. Across a
+    /// process restart, [`resume_from_durable_checkpoint`](Self::resume_from_durable_checkpoint)
+    /// uses the stored delivery token and delivery witness to recognize and
+    /// acknowledge an identical replay without re-ingestion. Reusing a token
+    /// for different input or cursor state fails closed. Mutating the cache while
+    /// a commit is pending also fails closed rather than binding newer state to
+    /// older delivery metadata. Any explicit, implicit, or removed-log reorg
+    /// that cannot be proven from the retained effect journal is rejected before
+    /// mutation/save/ACK; configure
+    /// [`ReactiveConfig::journal_depth`] to cover the subscriber's reorg horizon.
+    /// Hooks are dispatched only after checkpoint staging
+    /// succeeds, but remain in-process observers rather than a durable outbox;
+    /// see [`ReactiveHook`]. The subscriber must advertise
+    /// [`SubscriberCapability::DurableReplay`]; ephemeral subscribers are
+    /// rejected before polling.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReactiveEngineError`] when the subscriber lacks durable replay,
+    /// identities or replay witnesses conflict, a checkpoint/ACK is already in
+    /// an incompatible state, polling or ingestion fails, complete rollback
+    /// proof is unavailable, the cache changes after staging, persistence
+    /// fails, or delivery acknowledgement fails. Pending checkpoint/ACK work is
+    /// retained for retry before another poll.
+    pub async fn next_ingest_checkpointed(
+        &mut self,
+        cache: &mut EvmCache,
+        store: &DurableCheckpointStore,
+        identity: &DurableCheckpointIdentity,
+    ) -> Result<Option<CheckpointedIngest<N>>, ReactiveEngineError> {
+        if !self.subscriber.capabilities().supports_durable_replay() {
+            return Err(ReactiveEngineError::SubscriberNotDurable);
+        }
+        self.ensure_subscriber_chain(cache)?;
+        if self.pending_acknowledgement.is_some() {
+            return Err(ReactiveEngineError::PendingAcknowledgementCommit);
+        }
+        self.ensure_checkpoint_identity(cache, identity)?;
+        if self.pending_checkpoint.is_some() {
+            return self.commit_pending_checkpoint(cache, store).await.map(Some);
+        }
+
+        let batch = self.subscriber.next_batch().await?;
+        self.ensure_subscriber_chain(cache)?;
+        let Some(mut batch) = batch else {
+            return Ok(None);
+        };
+        if batch_preconfirmation(&batch)?.is_some() {
+            return Err(ReactiveEngineError::PreconfirmationNotCheckpointable);
+        }
+        self.runtime.discard_preconfirmed_branch(cache);
+        let delivery_witness = batch
+            .delivery_token()
+            .map(|_| durable_delivery_witness(&batch))
+            .transpose()?;
+        let delivery_token = batch.take_delivery_token();
+        let subscriber_checkpoint = batch.take_subscriber_checkpoint();
+        if let (Some(replay_token), Some(committed_token)) = (
+            delivery_token.as_ref(),
+            self.last_checkpoint_delivery_token.as_ref(),
+        ) && replay_token == committed_token
+        {
+            let committed_witness = self
+                .last_checkpoint_delivery_witness
+                .ok_or(ReactiveEngineError::MissingReplayWitness)?;
+            if delivery_witness != Some(committed_witness) {
+                return Err(ReactiveEngineError::ReplayDeliveryMismatch);
+            }
+            self.subscriber
+                .acknowledge_delivery(replay_token.clone())
+                .await
+                .map_err(ReactiveEngineError::Acknowledgement)?;
+            return Ok(Some(CheckpointedIngest::ReplayAcknowledged));
+        }
+
+        self.ensure_checkpointable_reorgs(&batch)?;
+
+        let incoming_block = latest_canonical_batch_block(&batch);
+        let cache_state = EvmCacheStateSnapshot::capture(cache);
+        let runtime_state = self.runtime.checkpoint_state();
+        let report = match self.runtime.ingest_batch_direct(cache, batch) {
+            Ok(report) => report,
+            Err(error) => {
+                cache_state.restore(cache);
+                self.runtime.restore_transaction_state(runtime_state);
+                return Err(error.into());
+            }
+        };
+        let reports = report.reports.clone();
+        let stage = CheckpointStage {
+            incoming_block,
+            delivery_token,
+            delivery_witness,
+            subscriber_checkpoint,
+            staged_generation: cache.snapshot_generation(),
+            report,
+        };
+        if let Err(error) = self.stage_checkpoint(identity, stage) {
+            cache_state.restore(cache);
+            self.runtime.restore_transaction_state(runtime_state);
+            return Err(error);
+        }
+        self.runtime.dispatch_reports(&reports);
+        self.commit_pending_checkpoint(cache, store).await.map(Some)
+    }
+
+    /// Checkpointed counterpart to [`next_ingest_with_resync`](Self::next_ingest_with_resync).
+    /// Requires [`SubscriberCapability::DurableReplay`] and rejects an
+    /// ephemeral subscriber before polling.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReactiveEngineError`] for the same durability, identity,
+    /// rollback-proof, replay-witness, polling, ingestion, persistence,
+    /// mutation-fence, and acknowledgement failures as
+    /// [`next_ingest_checkpointed`](Self::next_ingest_checkpointed).
+    pub async fn next_ingest_with_resync_checkpointed(
+        &mut self,
+        cache: &mut EvmCache,
+        store: &DurableCheckpointStore,
+        identity: &DurableCheckpointIdentity,
+    ) -> Result<Option<CheckpointedIngest<N>>, ReactiveEngineError> {
+        if !self.subscriber.capabilities().supports_durable_replay() {
+            return Err(ReactiveEngineError::SubscriberNotDurable);
+        }
+        self.ensure_subscriber_chain(cache)?;
+        if self.pending_acknowledgement.is_some() {
+            return Err(ReactiveEngineError::PendingAcknowledgementCommit);
+        }
+        self.ensure_checkpoint_identity(cache, identity)?;
+        if self.pending_checkpoint.is_some() {
+            return self.commit_pending_checkpoint(cache, store).await.map(Some);
+        }
+
+        let batch = self.subscriber.next_batch().await?;
+        self.ensure_subscriber_chain(cache)?;
+        let Some(mut batch) = batch else {
+            return Ok(None);
+        };
+        if batch_preconfirmation(&batch)?.is_some() {
+            return Err(ReactiveEngineError::PreconfirmationNotCheckpointable);
+        }
+        self.runtime.discard_preconfirmed_branch(cache);
+        let delivery_witness = batch
+            .delivery_token()
+            .map(|_| durable_delivery_witness(&batch))
+            .transpose()?;
+        let delivery_token = batch.take_delivery_token();
+        let subscriber_checkpoint = batch.take_subscriber_checkpoint();
+        if let (Some(replay_token), Some(committed_token)) = (
+            delivery_token.as_ref(),
+            self.last_checkpoint_delivery_token.as_ref(),
+        ) && replay_token == committed_token
+        {
+            let committed_witness = self
+                .last_checkpoint_delivery_witness
+                .ok_or(ReactiveEngineError::MissingReplayWitness)?;
+            if delivery_witness != Some(committed_witness) {
+                return Err(ReactiveEngineError::ReplayDeliveryMismatch);
+            }
+            self.subscriber
+                .acknowledge_delivery(replay_token.clone())
+                .await
+                .map_err(ReactiveEngineError::Acknowledgement)?;
+            return Ok(Some(CheckpointedIngest::ReplayAcknowledged));
+        }
+
+        self.ensure_checkpointable_reorgs(&batch)?;
+
+        let incoming_block = latest_canonical_batch_block(&batch);
+        let cache_state = EvmCacheStateSnapshot::capture(cache);
+        let runtime_state = self.runtime.checkpoint_state();
+        let report = match self.runtime.ingest_batch_with_resync_direct(cache, batch) {
+            Ok(report) => report,
+            Err(error) => {
+                cache_state.restore(cache);
+                self.runtime.restore_transaction_state(runtime_state);
+                return Err(error.into());
+            }
+        };
+        let reports = report.reports.clone();
+        let stage = CheckpointStage {
+            incoming_block,
+            delivery_token,
+            delivery_witness,
+            subscriber_checkpoint,
+            staged_generation: cache.snapshot_generation(),
+            report,
+        };
+        if let Err(error) = self.stage_checkpoint(identity, stage) {
+            cache_state.restore(cache);
+            self.runtime.restore_transaction_state(runtime_state);
+            return Err(error);
+        }
+        self.runtime.dispatch_reports(&reports);
+        self.commit_pending_checkpoint(cache, store).await.map(Some)
+    }
+
+    fn stage_checkpoint(
+        &mut self,
+        identity: &DurableCheckpointIdentity,
+        stage: CheckpointStage<N>,
+    ) -> Result<(), ReactiveEngineError> {
+        let CheckpointStage {
+            incoming_block,
+            delivery_token,
+            delivery_witness,
+            subscriber_checkpoint,
+            staged_generation,
+            report,
+        } = stage;
+        if delivery_token.is_some() != delivery_witness.is_some() {
+            return Err(ReactiveEngineError::DeliveryWitness(
+                "delivery token and witness must be staged together".into(),
+            ));
+        }
+        let runtime_checkpoint = self.runtime.durable_checkpoint_bytes()?;
+        let block = self
+            .runtime
+            .last_canonical_block()
+            .map(|block| DurableCheckpointBlock {
+                number: block.number,
+                hash: block.hash,
+                parent_hash: block.parent_hash,
+                timestamp: block.timestamp,
+            })
+            .or(incoming_block)
+            .or_else(|| self.last_checkpoint_block.clone())
+            .ok_or(ReactiveEngineError::MissingCheckpointBlock)?;
+        let metadata = DurableCheckpointMetadata {
+            identity: identity.clone(),
+            block,
+            delivery_token: delivery_token
+                .as_ref()
+                .or(self.last_checkpoint_delivery_token.as_ref())
+                .map(|token| token.as_bytes().to_vec()),
+            delivery_witness: if delivery_token.is_some() {
+                delivery_witness
+            } else {
+                self.last_checkpoint_delivery_witness
+            },
+            subscriber_checkpoint: subscriber_checkpoint
+                .as_ref()
+                .or(self.last_subscriber_checkpoint.as_ref())
+                .map(|checkpoint| checkpoint.as_bytes().to_vec()),
+            runtime_checkpoint: Some(runtime_checkpoint),
+        };
+        self.pending_checkpoint = Some(PendingCheckpoint {
+            metadata,
+            delivery_token,
+            report,
+            saved_to: None,
+            staged_generation,
+        });
+        Ok(())
+    }
+
+    fn ensure_checkpointable_reorgs(
+        &self,
+        batch: &ReactiveInputBatch<N>,
+    ) -> Result<(), ReactiveEngineError> {
+        let state = CanonicalSequenceState::new(
+            self.runtime
+                .journal
+                .iter()
+                .map(|entry| entry.block)
+                .collect(),
+            self.runtime.coverage_head,
+            self.runtime.safe_head,
+            self.runtime.finalized_head,
+        )
+        .with_log_coverage_head(self.runtime.log_coverage_head);
+        match validate_canonical_sequence_internal(
+            &state,
+            batch,
+            CanonicalSequenceValidationPolicy::RequireCompleteRollback,
+        ) {
+            Ok(_) => Ok(()),
+            Err(CanonicalSequenceError::Invalid(error)) => Err(error.into()),
+            Err(CanonicalSequenceError::IncompleteRollback {
+                common_ancestor,
+                oldest_retained,
+                ..
+            }) => Err(ReactiveEngineError::CheckpointReorgOutsideJournal {
+                common_ancestor,
+                oldest_journaled: oldest_retained,
+                journal_depth: self.runtime.config.journal_depth,
+            }),
+        }
+    }
+
+    async fn stage_or_return_acknowledgement(
+        &mut self,
+        delivery_token: Option<SubscriberDeliveryToken>,
+        report: ReactiveBatchReport<N>,
+    ) -> Result<Option<ReactiveBatchReport<N>>, ReactiveEngineError> {
+        let Some(token) = delivery_token else {
+            return Ok(Some(report));
+        };
+        self.pending_acknowledgement = Some(PendingAcknowledgement { token, report });
+        self.commit_pending_acknowledgement().await.map(Some)
+    }
+
+    async fn commit_pending_acknowledgement(
+        &mut self,
+    ) -> Result<ReactiveBatchReport<N>, ReactiveEngineError> {
+        let token = self
+            .pending_acknowledgement
+            .as_ref()
+            .expect("caller checked pending acknowledgement")
+            .token
+            .clone();
+        self.subscriber
+            .acknowledge_delivery(token)
+            .await
+            .map_err(ReactiveEngineError::Acknowledgement)?;
+        Ok(self
+            .pending_acknowledgement
+            .take()
+            .expect("pending acknowledgement remains until commit")
+            .report)
+    }
+
+    async fn commit_pending_checkpoint(
+        &mut self,
+        cache: &EvmCache,
+        store: &DurableCheckpointStore,
+    ) -> Result<CheckpointedIngest<N>, ReactiveEngineError> {
+        let pending = self
+            .pending_checkpoint
+            .as_mut()
+            .expect("caller checked pending checkpoint");
+        let cache_generation = cache.snapshot_generation();
+        if cache_generation != pending.staged_generation {
+            return Err(ReactiveEngineError::PendingCheckpointCacheChanged {
+                staged_generation: pending.staged_generation,
+                current_generation: cache_generation,
+            });
+        }
+        if pending.saved_to.as_deref() != Some(store.path()) {
+            store
+                .save_async(cache, pending.metadata.clone())
+                .await
+                .map_err(ReactiveEngineError::Checkpoint)?;
+            pending.saved_to = Some(store.path().to_path_buf());
+        }
+        if let Some(token) = pending.delivery_token.clone() {
+            self.subscriber
+                .acknowledge_delivery(token)
+                .await
+                .map_err(ReactiveEngineError::Acknowledgement)?;
+        }
+
+        let pending = self
+            .pending_checkpoint
+            .take()
+            .expect("pending checkpoint remains until commit");
+        self.last_checkpoint_block = Some(pending.metadata.block);
+        self.checkpoint_identity = Some(pending.metadata.identity);
+        self.last_checkpoint_delivery_token = pending
+            .metadata
+            .delivery_token
+            .map(SubscriberDeliveryToken::new);
+        self.last_checkpoint_delivery_witness = pending.metadata.delivery_witness;
+        self.last_subscriber_checkpoint = pending
+            .metadata
+            .subscriber_checkpoint
+            .map(SubscriberCheckpoint::new);
+        Ok(CheckpointedIngest::Applied(pending.report))
+    }
+
+    fn ensure_checkpoint_identity(
+        &self,
+        cache: &EvmCache,
+        identity: &DurableCheckpointIdentity,
+    ) -> Result<(), ReactiveEngineError> {
+        if identity.chain_id != cache.chain_id() {
+            return Err(ReactiveEngineError::Checkpoint(
+                DurableCheckpointError::CacheChainMismatch {
+                    cache_chain_id: cache.chain_id(),
+                    checkpoint_chain_id: identity.chain_id,
+                },
+            ));
+        }
+        if let Some(actual) = self.checkpoint_identity.as_ref()
+            && actual != identity
+        {
+            return Err(ReactiveEngineError::Checkpoint(
+                DurableCheckpointError::IdentityMismatch {
+                    expected: identity.clone(),
+                    actual: actual.clone(),
+                },
+            ));
+        }
+        if let Some(pending) = self.pending_checkpoint.as_ref()
+            && &pending.metadata.identity != identity
+        {
+            return Err(ReactiveEngineError::Checkpoint(
+                DurableCheckpointError::IdentityMismatch {
+                    expected: identity.clone(),
+                    actual: pending.metadata.identity.clone(),
+                },
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn latest_canonical_batch_block<N: Network>(
+    batch: &ReactiveInputBatch<N>,
+) -> Option<DurableCheckpointBlock> {
+    let record_block = batch
+        .records()
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| {
+            batch
+                .record_delivery_scope(*index)
+                .is_some_and(DeliveryScope::advances_canonical_state)
+        })
+        .filter_map(|(_, record)| canonical_record_block(record))
+        .max_by_key(|block| block.number)
+        .cloned();
+    let control_block = batch
+        .chain_controls()
+        .iter()
+        .filter_map(|control| match control {
+            ChainControl::Reorg {
+                common_ancestor, ..
+            } => Some(common_ancestor),
+            ChainControl::Barrier {
+                block: Some(block), ..
+            }
+            | ChainControl::CanonicalProgress(block) => Some(block),
+            ChainControl::Safe(_)
+            | ChainControl::Finalized(_)
+            | ChainControl::LogCoverage(_)
+            | ChainControl::Barrier { block: None, .. } => None,
+        })
+        .max_by_key(|block| block.number)
+        .cloned();
+
+    record_block
+        .into_iter()
+        .chain(control_block)
+        .max_by_key(|block| block.number)
+        .map(|block| DurableCheckpointBlock {
+            number: block.number,
+            hash: block.hash,
+            parent_hash: block.parent_hash,
+            timestamp: block.timestamp,
+        })
 }
 
 impl<S, N> ReactiveEngine<S, N>
@@ -4660,123 +12847,257 @@ where
     /// Register a handler with both the runtime and subscriber, backfilling its
     /// log interests from the runtime's last canonical block.
     ///
-    /// This is the continuity-safe default for mid-lifecycle registration: the
-    /// runtime already knows how far it has processed the chain, so the new
-    /// handler's logs are fetched from that block forward and no discovery gap
-    /// opens between "we decided to track this pool" and "its live subscription
-    /// started". On a runtime that has not journaled any canonical block yet
+    /// This is the continuity-safe default for mid-lifecycle registration. The
+    /// subscriber adopts the live desired state first, delivers the new owner's
+    /// matching records at retained block `C` as owner catch-up, then delivers
+    /// `C + 1` through activation as global canonical catch-up over the complete
+    /// handler union. No discovery gap opens, and every effect after `C` enters
+    /// the ordinary global rollback journal. On a runtime that has not journaled any canonical block yet
     /// (fresh start, or `journal_depth` 0) registration is live-only, matching
     /// pre-ingestion bootstrap. Use
     /// [`register_handler_with_backfill`](Self::register_handler_with_backfill)
-    /// for deeper history or
+    /// for an explicit replay of one retained block or
     /// [`register_handler_live_only`](Self::register_handler_live_only) to opt
     /// out of backfill entirely.
     ///
-    /// If subscriber registration fails, the runtime registration is rolled back
-    /// before the error is returned.
-    pub fn register_handler(
+    /// Subscriber registration commits before runtime routing is installed. If
+    /// the subscriber operation fails or is cancelled, the runtime remains
+    /// unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReactiveEngineRegisterError`] when the handler id is already
+    /// registered or the subscriber rejects/does not support the required
+    /// owner update or coordinated catch-up.
+    pub async fn register_handler(
         &mut self,
         handler: Arc<dyn ReactiveHandler<N>>,
     ) -> Result<(), ReactiveEngineRegisterError> {
         let backfill = self
             .runtime
             .last_canonical_block()
-            .map(|block| SubscriberBackfill::from_block(block.number));
-        self.register_handler_inner(handler, backfill)
+            .filter(|retained| {
+                self.runtime.journal.iter().any(|entry| {
+                    optional_block_refs_are_compatible(Some(&entry.block), Some(retained))
+                })
+            })
+            .map(HandlerRegistrationCatchup::CoordinatedCanonical)
+            .unwrap_or(HandlerRegistrationCatchup::LiveOnly);
+        self.register_handler_inner(handler, backfill).await
     }
 
-    /// Register a handler and request an explicit owner-scoped log backfill for
-    /// its interests (deep history / custom anchors).
+    /// Register a handler and replay its matching logs at one exact retained
+    /// canonical block.
     ///
-    /// If subscriber registration fails, the runtime registration is rolled back
-    /// before the error is returned.
-    pub fn register_handler_with_backfill(
+    /// Owner-only effects are appended to that block's existing rollback
+    /// journal entry. Consequently this method accepts only a bounded
+    /// [`SubscriberBackfill`] whose start, end, and hash-certified retained
+    /// anchor all identify the same journaled block. Wider/deeper recovery must
+    /// use ordinary global canonical ingestion (for example startup catch-up),
+    /// where every handler sees the records and the runtime advances coverage.
+    ///
+    /// If subscriber registration fails or is cancelled, the runtime remains
+    /// unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReactiveEngineRegisterError`] when the handler id is already
+    /// registered, the requested backfill is not exactly one hash-certified
+    /// retained journal block, or the subscriber update fails.
+    pub async fn register_handler_with_backfill(
         &mut self,
         handler: Arc<dyn ReactiveHandler<N>>,
         backfill: SubscriberBackfill,
     ) -> Result<(), ReactiveEngineRegisterError> {
-        self.register_handler_inner(handler, Some(backfill))
+        self.register_handler_inner(handler, HandlerRegistrationCatchup::OwnerBackfill(backfill))
+            .await
     }
 
     /// Register a handler without any log backfill — only logs delivered after
     /// its live subscription starts are routed to it.
     ///
-    /// If subscriber registration fails, the runtime registration is rolled back
-    /// before the error is returned.
-    pub fn register_handler_live_only(
+    /// If subscriber registration fails or is cancelled, the runtime remains
+    /// unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReactiveEngineRegisterError`] when the handler id is already
+    /// registered or the subscriber cannot commit the owner update.
+    pub async fn register_handler_live_only(
         &mut self,
         handler: Arc<dyn ReactiveHandler<N>>,
     ) -> Result<(), ReactiveEngineRegisterError> {
-        self.register_handler_inner(handler, None)
+        self.register_handler_inner(handler, HandlerRegistrationCatchup::LiveOnly)
+            .await
     }
 
-    fn register_handler_inner(
+    async fn register_handler_inner(
         &mut self,
         handler: Arc<dyn ReactiveHandler<N>>,
-        backfill: Option<SubscriberBackfill>,
+        catchup: HandlerRegistrationCatchup,
     ) -> Result<(), ReactiveEngineRegisterError> {
         let id = handler.id();
-        self.runtime.register_handler(handler)?;
-        let interests = self
-            .runtime
-            .handler_interests(&id)
-            .expect("handler was just registered")
-            .to_vec();
+        if self.runtime.contains_handler(&id) {
+            return Err(RegisterError::DuplicateHandler(id).into());
+        }
+        let interests = handler.interests();
 
-        let subscribed = match backfill {
-            Some(backfill) => {
+        if let HandlerRegistrationCatchup::OwnerBackfill(backfill) = &catchup {
+            let retained_anchor = backfill.retained_anchor().copied();
+            let is_exact_retained_block = retained_anchor.is_some_and(|anchor| {
+                backfill.start_block() == anchor.number
+                    && backfill.end_block() == Some(anchor.number)
+                    && self.runtime.journal.iter().any(|entry| {
+                        optional_block_refs_are_compatible(Some(&entry.block), Some(&anchor))
+                    })
+            });
+            if !is_exact_retained_block {
+                return Err(ReactiveEngineRegisterError::BackfillOutsideJournal {
+                    start_block: backfill.start_block(),
+                    end_block: backfill.end_block(),
+                    retained_anchor,
+                });
+            }
+        }
+
+        let subscribed = match catchup {
+            HandlerRegistrationCatchup::OwnerBackfill(backfill) => {
                 self.subscriber
                     .add_interest_owner_with_backfill(id.clone(), &interests, backfill)
+                    .await
             }
-            None => self.subscriber.add_interest_owner(id.clone(), &interests),
+            HandlerRegistrationCatchup::CoordinatedCanonical(retained) => {
+                self.subscriber
+                    .add_interest_owner_with_canonical_catchup(id.clone(), &interests, retained)
+                    .await
+            }
+            HandlerRegistrationCatchup::LiveOnly => {
+                self.subscriber
+                    .add_interest_owner(id.clone(), &interests)
+                    .await
+            }
         };
         if let Err(error) = subscribed {
-            self.runtime.unregister_handler(&id);
             return Err(error.into());
         }
 
+        // `&mut self` excludes concurrent registry mutation between the
+        // duplicate preflight and this commit. Registration is deliberately
+        // subscriber-first: cancelling the awaited operation cannot leave a
+        // runtime handler active without committed subscriber interests.
+        self.runtime
+            .registry
+            .insert_handler_prepared(id, handler, interests);
         Ok(())
     }
 
     /// Register every handler currently in the runtime registry as a subscriber
     /// interest owner.
     ///
-    /// This is the bootstrap path for an engine built around a pre-populated
-    /// runtime: each handler becomes its own owner (upsert semantics, so
-    /// rerunning is safe and already-registered owners are refreshed in place).
-    /// No backfill is requested — bootstrap happens before ingestion starts, so
-    /// there is no processed position to be continuous with; use
-    /// [`register_handler_with_backfill`](Self::register_handler_with_backfill)
-    /// for handlers that need history. Owners are not removed by this call: use
-    /// [`unregister_handler`](Self::unregister_handler) for lifecycle removal
-    /// rather than mutating the runtime registry directly.
+    /// This is the no-history bootstrap path for a fresh runtime/subscriber pair
+    /// before ingestion starts, or for reattaching an already-aligned durable
+    /// subscriber whose exact owner state was restored independently. Each
+    /// handler becomes its own owner through one exact bulk replacement;
+    /// crash-stale owners and unowned/base interests are removed.
     ///
-    /// On error, owners already synced stay registered (upserts are
-    /// independent); the call can simply be retried.
-    pub fn sync_handler_interests(&mut self) -> Result<(), SubscriberError> {
-        for id in self.runtime.handler_ids() {
-            let interests = self
-                .runtime
-                .handler_interests(&id)
-                .map(<[ReactiveInterest<N>]>::to_vec)
-                .unwrap_or_default();
-            self.subscriber.add_interest_owner(id, &interests)?;
-        }
-        Ok(())
+    /// No backfill is requested. It is therefore **not** the restart-recovery path for a new or
+    /// potentially stale subscriber after the runtime has processed canonical
+    /// state: use
+    /// [`sync_handler_interests_with_backfill`](Self::sync_handler_interests_with_backfill),
+    /// which exact-replaces the owner set and closes continuity from the
+    /// restored runtime position.
+    ///
+    /// The complete exact set commits through one subscriber operation; an
+    /// error or cancellation leaves the previously committed topology
+    /// authoritative.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SubscriberError`] when the subscriber cannot atomically
+    /// replace the complete owner topology.
+    pub async fn sync_handler_interests(&mut self) -> Result<(), SubscriberError> {
+        let owners = self
+            .runtime
+            .handler_ids()
+            .into_iter()
+            .map(|id| {
+                let interests = self
+                    .runtime
+                    .handler_interests(&id)
+                    .map(<[ReactiveInterest<N>]>::to_vec)
+                    .unwrap_or_default();
+                (id, interests)
+            })
+            .collect();
+        self.subscriber.replace_interest_owners(owners).await
+    }
+
+    /// Rebuild subscriber owner state from a runtime that already embodies a
+    /// canonical checkpoint.
+    ///
+    /// The runtime registry is authoritative: the subscriber must atomically
+    /// replace its complete owner set, removing crash-stale owners as well as
+    /// adding the current ones. Log catch-up is routed globally through normal
+    /// canonical ingestion and begins strictly at `C + 1`, where
+    /// `C` is [`ReactiveRuntime::last_canonical_block`], because the restored
+    /// cache already contains every effect through `C`. The exact number/hash
+    /// identity of `C` remains attached as a retained baseline and must be
+    /// validated by the subscriber before it exposes post-baseline records.
+    /// Global routing is essential: startup catch-up effects enter the ordinary
+    /// canonical journal and can be rolled back if the certified branch later
+    /// reorganizes; owner-only catch-up is reserved for a true mid-lifecycle
+    /// handler addition.
+    ///
+    /// A runtime without a canonical position must use
+    /// [`sync_handler_interests`](Self::sync_handler_interests) instead. Block
+    /// `u64::MAX` is rejected rather than wrapping or replaying the baseline.
+    /// The replacement is one subscriber commit boundary: errors and
+    /// cancellation leave the previous topology authoritative.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SubscriberError::InvalidConfig`] when no canonical baseline
+    /// exists or no exclusive successor can be represented, and otherwise
+    /// propagates subscriber validation, transport, or atomic-commit failures.
+    pub async fn sync_handler_interests_with_backfill(&mut self) -> Result<(), SubscriberError> {
+        let baseline =
+            self.runtime
+                .last_canonical_block()
+                .ok_or(SubscriberError::InvalidConfig(
+                    "cannot continuity-sync handlers before a canonical runtime position exists",
+                ))?;
+        let backfill = SubscriberBackfill::after_canonical_block(baseline)?;
+        let owners = self
+            .runtime
+            .handler_ids()
+            .into_iter()
+            .map(|id| {
+                let interests = self
+                    .runtime
+                    .handler_interests(&id)
+                    .map(<[ReactiveInterest<N>]>::to_vec)
+                    .unwrap_or_default();
+                (id, interests)
+            })
+            .collect();
+        self.subscriber
+            .replace_interest_owners_with_global_backfill(owners, backfill)
+            .await
     }
 
     /// Unregister a handler from both the subscriber and runtime.
     ///
     /// Subscriber interests are removed first so no new live records are routed
     /// to a handler after it has left the runtime registry. Returns the removed
-    /// handler when the id was registered.
+    /// handler when the id was registered. If subscriber removal fails or is
+    /// cancelled, runtime routing remains installed.
     ///
     /// This is the routing/transport half of dropping an adapter. State the
     /// handler accumulated is deliberately left in place; the complete teardown
     /// for a pool or adapter that will not return is:
     ///
     /// ```text
-    /// engine.unregister_handler(&id);
+    /// engine.unregister_handler(&id).await?;
     /// for request_id in handler_request_ids {
     ///     // Drop only this handler generation's queued repair work.
     ///     engine.runtime_mut().cancel_pending_resync(&request_id);
@@ -4790,11 +13111,30 @@ where
     ///
     /// Health, metrics, the reorg journal, hooks, and freshness stamps are
     /// runtime-global and are never touched by handler removal.
-    pub fn unregister_handler(&mut self, id: &HandlerId) -> Option<Arc<dyn ReactiveHandler<N>>> {
-        self.subscriber.remove_interest_owner(id);
-        self.runtime.unregister_handler(id)
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SubscriberError`] when the subscriber cannot commit owner
+    /// removal. In that case runtime routing remains installed.
+    pub async fn unregister_handler(
+        &mut self,
+        id: &HandlerId,
+    ) -> Result<Option<Arc<dyn ReactiveHandler<N>>>, SubscriberError> {
+        self.subscriber.remove_interest_owner(id).await?;
+        Ok(self.runtime.unregister_handler(id))
     }
 }
+
+type FlashblockReconnectFuture<N> = Pin<
+    Box<
+        dyn Future<
+                Output = (
+                    SubscriberStreamSource,
+                    Result<BoxStream<'static, SubscriberEvent<N>>, SubscriberError>,
+                ),
+            > + Send,
+    >,
+>;
 
 /// Alloy-backed event subscriber.
 ///
@@ -4805,10 +13145,50 @@ where
 /// subscriptions are backfilled from the last seen block. Owner-scoped log
 /// additions can request backfill from an explicit block anchor. Full pending
 /// transaction hydration and full block bodies remain explicit follow-up work.
+///
+/// Historical log fetching is deliberately a bounded live-subscriber aid, not
+/// a high-volume indexer: each filter/window is issued as one complete-range
+/// `eth_getLogs` request. [`SubscriberConfig::max_backfill_log_bytes`] rejects
+/// an oversized decoded response, but the subscriber does not adaptively split
+/// block ranges and cannot bypass an RPC provider's result cap. Keep owner
+/// registration and reconnect windows modest; use an indexing source such as
+/// HyperSync behind [`EventSubscriber`] for deep or high-density catch-up.
+///
 /// With no registered interests, [`EventSubscriber::next_batch`] returns
 /// `Ok(None)`.
 pub struct AlloySubscriber<P, N: Network = Ethereum> {
     provider: P,
+    /// Stable identity of an application-managed standardized Flashblock
+    /// update source. The application owns its transport and lifecycle.
+    #[cfg(feature = "raw-flashblocks-json")]
+    external_flashblocks_provider: Option<ProviderRef>,
+    /// Receiving half of the optional bounded application-to-subscriber queue.
+    #[cfg(feature = "raw-flashblocks-json")]
+    external_flashblock_updates:
+        Option<tokio::sync::mpsc::Receiver<raw_json_flashblocks::QueuedFlashblockUpdate>>,
+    /// Whether an external update queue was opened for this subscriber.
+    #[cfg(feature = "raw-flashblocks-json")]
+    external_flashblock_update_channel_opened: bool,
+    /// Highest external generation rejected by subscriber-level validation.
+    #[cfg(feature = "raw-flashblocks-json")]
+    rejected_external_flashblock_generation: Option<u64>,
+    /// Last accepted externally standardized snapshot, retained so callers
+    /// cannot bypass indexed-payload continuity enforced by the raw adapter.
+    #[cfg(feature = "raw-flashblocks-json")]
+    last_external_flashblock_snapshot: Option<FlashblockSnapshot>,
+    /// Optional request/response half of the same configured provider lease.
+    /// OP Flashblocks pending reads use this transport when WebSocket JSON-RPC
+    /// does not expose the provider's pending-state surface.
+    flashblocks_state_provider: Option<P>,
+    /// Stable identity for the provider session used by Flashblocks and every
+    /// follow-up pending-state read.
+    provider_ref: Option<ProviderRef>,
+    /// Optional provider dedicated to canonical log-context verification.
+    /// Keeping this separate prevents a high-volume pubsub connection from
+    /// starving its own verification requests behind log notifications.
+    log_verification_provider: Option<P>,
+    /// Provider chain identity, resolved once before any record can escape.
+    chain_id: Option<u64>,
     mode: SubscriberMode,
     config: SubscriberConfig,
     base_interests: Vec<ReactiveInterest<N>>,
@@ -4822,6 +13202,11 @@ pub struct AlloySubscriber<P, N: Network = Ethereum> {
     log_source_ids: HashMap<Filter, usize>,
     next_log_source_id: usize,
     pending_backfills: VecDeque<QueuedSubscriberBackfill>,
+    /// Successfully connected sources whose subscribe-then-backfill step has
+    /// not committed yet. Installation happens before the backfill await, so a
+    /// cancelled reconcile keeps the live stream and retries only the missing
+    /// historical window.
+    pending_source_backfills: VecDeque<SubscriberStreamSource>,
     /// Set when interest bookkeeping changed since the last successful stream
     /// reconcile, so steady-state polling skips the desired-vs-live diff.
     sources_dirty: bool,
@@ -4830,16 +13215,69 @@ pub struct AlloySubscriber<P, N: Network = Ethereum> {
     stream_revision: u64,
     state: AlloySubscriberState<N>,
     pending_records: VecDeque<SubscriberInputRecord<N>>,
+    pending_chain_controls: VecDeque<ChainControl>,
     /// Owner copies of live records consumed during an in-flight reconcile.
     /// These remain hidden from subscriber output until the owning reconcile
     /// commits and survive cancellation so subscribe-first adoption cannot
     /// lose an event at an await boundary.
     pending_reconcile_owner_records: VecDeque<BufferedSubscriberOwnerRecord<N>>,
+    /// Sticky fail-closed capacity error. Once an event could not be retained,
+    /// only a full replacement registration can establish a new baseline.
+    resource_error: Option<String>,
     last_seen_log_blocks: HashMap<usize, u64>,
+    verified_log_blocks: HashMap<(u64, B256), BlockRef>,
+    verified_log_block_order: VecDeque<(u64, B256)>,
     recent_input_refs: VecDeque<InputRef>,
     recent_input_ref_set: HashSet<InputRef>,
     recent_owner_input_refs: HashMap<SubscriberOwnerEpoch, VecDeque<InputRef>>,
     recent_owner_input_ref_sets: HashMap<SubscriberOwnerEpoch, HashSet<InputRef>>,
+    recent_compat_owner_input_refs: HashMap<HandlerId, VecDeque<InputRef>>,
+    recent_compat_owner_input_ref_sets: HashMap<HandlerId, HashSet<InputRef>>,
+    base_flashblock_header: Option<(FixedBytes<8>, BaseFlashblockBase)>,
+    base_flashblock_transactions: Option<(FixedBytes<8>, u64, Vec<B256>, Vec<B256>)>,
+    unmatched_pending_logs: VecDeque<(usize, Log, FlashblockIngressTiming)>,
+    latest_preconfirmation: Option<FlashblockRef>,
+    preconfirmed_seen_logs: HashSet<(B256, u64)>,
+    /// OP transaction receipts already proven for the active cumulative
+    /// payload. This avoids re-querying non-matching transactions while still
+    /// retrying receipts that were temporarily unavailable.
+    preconfirmed_receipted_transactions: HashSet<B256>,
+    /// OP receipt hashes that returned `null` at least once for the active
+    /// payload. Never-attempted hashes are scheduled ahead of this retry set so
+    /// a lagging provider cache cannot let a few transactions monopolize the
+    /// bounded request budget.
+    preconfirmed_unavailable_receipts: HashSet<B256>,
+    last_certified_canonical_head: Option<BlockRef>,
+    /// When the canonical head was last certified against the provider.
+    ///
+    /// A Flashblocks endpoint replaces the `newHeads` subscription with a
+    /// fixed-interval certification poll, because its `newHeads` may carry
+    /// partial heads. Recording the last certification lets the timer suppress
+    /// itself when the flashblock stream already proved a block sealed, so the
+    /// poll spends a request only when nothing else did.
+    last_canonical_head_certification: Option<Instant>,
+    /// Set when a `newFlashblocks` payload opens a block, which means the
+    /// previous block sealed and its canonical head is worth certifying.
+    sealed_block_pending_certification: bool,
+    /// Highest canonical block observed while every log source was whole, and
+    /// the last value attested to the consumer. Advances only through
+    /// `note_attestable_canonical_block`, which a live gap resets.
+    attestable_canonical_head: Option<BlockRef>,
+    attested_log_coverage: Option<BlockRef>,
+    pending_preconfirmation_invalidation: bool,
+    pending_flashblock_reconnects: FuturesUnordered<FlashblockReconnectFuture<N>>,
+    pending_flashblock_reconnect_sources: Vec<SubscriberStreamSource>,
+    flashblocks_rpc_metrics: FlashblocksRpcMetrics,
+    /// Every provider request this subscriber has issued, by method and cause.
+    /// Shared so catch-up futures and the free functions they call can record
+    /// without borrowing the subscriber; see [`SubscriberRpcCounters`].
+    rpc_counters: Arc<SubscriberRpcCounters>,
+    /// Notification loss observed on live subscriptions. Shared for the same
+    /// reason as `rpc_counters`: stream adapters record without a subscriber
+    /// borrow.
+    gap_counters: Arc<SubscriberStreamGapCounters>,
+    consecutive_flashblock_poll_failures: usize,
+    flashblock_rpc_request_times: VecDeque<Instant>,
     _network: PhantomData<N>,
 }
 
@@ -4866,6 +13304,17 @@ struct SubscriberOwnerCatchup {
     certified: BlockRef,
 }
 
+#[derive(Clone, Copy)]
+struct SubscriberOwnerCatchupOptions {
+    target_preverified: bool,
+    max_logs: usize,
+    max_log_bytes: usize,
+    max_requests_in_flight: usize,
+    /// Which mechanism asked for this catch-up, so its provider requests are
+    /// attributed to the caller rather than to the shared fetch helper.
+    cause: SubscriberRpcCause,
+}
+
 struct SubscriberOwnerReconcileFilter {
     filter: Filter,
     from_block: u64,
@@ -4879,9 +13328,12 @@ struct BufferedSubscriberOwnerRecord<N: Network = Ethereum> {
 const OWNER_RECONCILE_FILTERS_PER_CHUNK: usize = 256;
 
 struct QueuedSubscriberBackfill {
-    owner: HandlerId,
+    /// `None` means global canonical catch-up; `Some` is compatibility
+    /// owner-only catch-up for true mid-lifecycle additions.
+    owner: Option<HandlerId>,
     epoch: Option<SubscriberOwnerEpoch>,
-    filter: Filter,
+    /// Complete logical filter set for one certified, globally ordered window.
+    filters: Vec<Filter>,
     backfill: SubscriberBackfill,
 }
 
@@ -4906,6 +13358,20 @@ impl<P, N: Network> AlloySubscriber<P, N> {
         ensure_ring_crypto_provider();
         Self {
             provider,
+            #[cfg(feature = "raw-flashblocks-json")]
+            external_flashblocks_provider: None,
+            #[cfg(feature = "raw-flashblocks-json")]
+            external_flashblock_updates: None,
+            #[cfg(feature = "raw-flashblocks-json")]
+            external_flashblock_update_channel_opened: false,
+            #[cfg(feature = "raw-flashblocks-json")]
+            rejected_external_flashblock_generation: None,
+            #[cfg(feature = "raw-flashblocks-json")]
+            last_external_flashblock_snapshot: None,
+            flashblocks_state_provider: None,
+            provider_ref: None,
+            log_verification_provider: None,
+            chain_id: None,
             mode,
             config,
             base_interests: Vec::new(),
@@ -4915,16 +13381,43 @@ impl<P, N: Network> AlloySubscriber<P, N> {
             log_source_ids: HashMap::new(),
             next_log_source_id: 0,
             pending_backfills: VecDeque::new(),
+            pending_source_backfills: VecDeque::new(),
             sources_dirty: true,
             stream_revision: 0,
             state: AlloySubscriberState::Uninitialized,
             pending_records: VecDeque::new(),
+            pending_chain_controls: VecDeque::new(),
             pending_reconcile_owner_records: VecDeque::new(),
+            resource_error: None,
             last_seen_log_blocks: HashMap::new(),
+            verified_log_blocks: HashMap::new(),
+            verified_log_block_order: VecDeque::new(),
             recent_input_refs: VecDeque::new(),
             recent_input_ref_set: HashSet::new(),
             recent_owner_input_refs: HashMap::new(),
             recent_owner_input_ref_sets: HashMap::new(),
+            recent_compat_owner_input_refs: HashMap::new(),
+            recent_compat_owner_input_ref_sets: HashMap::new(),
+            base_flashblock_header: None,
+            base_flashblock_transactions: None,
+            unmatched_pending_logs: VecDeque::new(),
+            latest_preconfirmation: None,
+            preconfirmed_seen_logs: HashSet::new(),
+            preconfirmed_receipted_transactions: HashSet::new(),
+            preconfirmed_unavailable_receipts: HashSet::new(),
+            last_certified_canonical_head: None,
+            last_canonical_head_certification: None,
+            sealed_block_pending_certification: false,
+            attestable_canonical_head: None,
+            attested_log_coverage: None,
+            pending_preconfirmation_invalidation: false,
+            pending_flashblock_reconnects: FuturesUnordered::new(),
+            pending_flashblock_reconnect_sources: Vec::new(),
+            flashblocks_rpc_metrics: FlashblocksRpcMetrics::default(),
+            rpc_counters: Arc::new(SubscriberRpcCounters::default()),
+            gap_counters: Arc::new(SubscriberStreamGapCounters::default()),
+            consecutive_flashblock_poll_failures: 0,
+            flashblock_rpc_request_times: VecDeque::new(),
             _network: PhantomData,
         }
     }
@@ -4932,6 +13425,147 @@ impl<P, N: Network> AlloySubscriber<P, N> {
     /// Borrow the provider.
     pub fn provider(&self) -> &P {
         &self.provider
+    }
+
+    /// Bind this subscriber to the concrete provider lease that supplies
+    /// Flashblocks. Callers obtain the lease from a transport endpoint marked
+    /// with the single `flashblocks = true` flag.
+    #[must_use]
+    pub fn with_provider_ref(mut self, provider: ProviderRef) -> Self {
+        self.provider_ref = Some(provider);
+        self
+    }
+
+    /// Select application-managed standardized Flashblock updates before
+    /// subscriber registration begins.
+    ///
+    /// This suppresses the subscriber's chain-specific native or pending-state
+    /// Flashblocks source. Canonical logs and block headers continue through the
+    /// configured subscriber transport. The application owns the raw socket,
+    /// control frames, bounded queue, timeout, retry, backoff, and provider
+    /// rotation, and passes decoded updates to
+    /// [`Self::ingest_flashblock_update`].
+    ///
+    /// Call [`Self::ingest_flashblock_update`] directly while retaining mutable
+    /// subscriber ownership, or open a bounded handoff with
+    /// [`Self::open_external_flashblock_update_channel`] before moving the
+    /// subscriber into another runtime owner.
+    ///
+    /// This is deliberately a fallible construction-time configuration method,
+    /// not a live reconfiguration API. Replacing a source after canonical or
+    /// speculative processing begins requires a new subscriber so existing
+    /// streams and overlays cannot survive under ambiguous provider ownership.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SubscriberError::InvalidConfig`] when an external source was
+    /// already selected or subscriber registration, stream installation, or
+    /// event processing has begun.
+    #[cfg(feature = "raw-flashblocks-json")]
+    pub fn configure_external_flashblock_updates(
+        &mut self,
+        provider: ProviderRef,
+    ) -> Result<(), SubscriberError> {
+        if self.external_flashblocks_provider.is_some() {
+            return Err(SubscriberError::InvalidConfig(
+                "external Flashblock updates were already configured",
+            ));
+        }
+        if self.external_flashblock_update_channel_opened
+            || self.external_flashblock_updates.is_some()
+            || self.chain_id.is_some()
+            || !self.base_interests.is_empty()
+            || !self.owned_interests.is_empty()
+            || !self.interests.is_empty()
+            || !self.pending_records.is_empty()
+            || !self.pending_chain_controls.is_empty()
+            || !self.pending_backfills.is_empty()
+            || !matches!(self.state, AlloySubscriberState::Uninitialized)
+        {
+            return Err(SubscriberError::InvalidConfig(
+                "external Flashblock updates must be configured before subscriber registration",
+            ));
+        }
+        self.external_flashblocks_provider = Some(provider);
+        Ok(())
+    }
+
+    /// Open one bounded standardized-update queue and return its application handle.
+    ///
+    /// The queue is useful when the subscriber will be moved into a runtime
+    /// driver: the application retains the cloneable sender while the subscriber
+    /// continues to own all validation, speculative deduplication, and canonical
+    /// reconciliation. Opening a queue does not create a socket or background
+    /// task, and does not implement retry or backoff. Awaited sends complete
+    /// only after subscriber validation; non-blocking sends return an explicit
+    /// acknowledgement receipt.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SubscriberError::InvalidConfig`] if external updates were not
+    /// selected first, `capacity` is zero, or a queue was already opened.
+    #[cfg(feature = "raw-flashblocks-json")]
+    pub fn open_external_flashblock_update_channel(
+        &mut self,
+        capacity: usize,
+    ) -> Result<FlashblockUpdateSender, SubscriberError> {
+        if capacity == 0 {
+            return Err(SubscriberError::InvalidConfig(
+                "external Flashblock update channel capacity must be greater than zero",
+            ));
+        }
+        let provider = self.external_flashblocks_provider.clone().ok_or(
+            SubscriberError::InvalidConfig(
+                "external Flashblock update channel requires configure_external_flashblock_updates",
+            ),
+        )?;
+        if self.external_flashblock_update_channel_opened {
+            return Err(SubscriberError::InvalidConfig(
+                "external Flashblock update channel was already opened",
+            ));
+        }
+        let (sender, receiver) =
+            raw_json_flashblocks::flashblock_update_channel(provider, capacity);
+        self.external_flashblock_updates = Some(receiver);
+        self.external_flashblock_update_channel_opened = true;
+        self.sources_dirty = true;
+        Ok(sender)
+    }
+
+    fn uses_external_flashblock_updates(&self) -> bool {
+        #[cfg(feature = "raw-flashblocks-json")]
+        {
+            self.external_flashblocks_provider.is_some()
+        }
+        #[cfg(not(feature = "raw-flashblocks-json"))]
+        {
+            false
+        }
+    }
+
+    /// Pair the subscriber's event transport with the request/response
+    /// transport for the same configured provider ID and generation.
+    ///
+    /// Optimism pending block/log sampling uses this provider. Preflight reads
+    /// its chain ID and rejects a mismatch before pending data can be emitted.
+    /// Use type-erased Alloy providers when the WebSocket and HTTP transports
+    /// have different concrete Rust types.
+    #[must_use]
+    pub fn with_flashblocks_state_provider(mut self, provider: P) -> Self {
+        self.flashblocks_state_provider = Some(provider);
+        self
+    }
+
+    /// Use a separate provider for canonical log-context verification.
+    ///
+    /// This is recommended with
+    /// [`SubscriberConfig::verify_log_block_context`] in high-volume pubsub
+    /// deployments. The provider must target the same chain; every fetched
+    /// block is still checked against the log's number, hash, and timestamp.
+    #[must_use]
+    pub fn with_log_verification_provider(mut self, provider: P) -> Self {
+        self.log_verification_provider = Some(provider);
+        self
     }
 
     /// Subscriber mode.
@@ -4942,6 +13576,62 @@ impl<P, N: Network> AlloySubscriber<P, N> {
     /// Subscriber config.
     pub fn config(&self) -> &SubscriberConfig {
         &self.config
+    }
+
+    /// Request/response traffic issued for Flashblocks qualification and
+    /// pending-state sampling since the last full interest reset.
+    pub const fn flashblocks_rpc_metrics(&self) -> FlashblocksRpcMetrics {
+        self.flashblocks_rpc_metrics
+    }
+
+    /// Every provider request this subscriber has issued, attributed to the
+    /// method and the mechanism responsible for it.
+    ///
+    /// Cumulative for the subscriber's lifetime: unlike
+    /// [`flashblocks_rpc_metrics`](Self::flashblocks_rpc_metrics), these counts
+    /// survive reconnects and delivery-state resets so a long-running process
+    /// can report total RPC consumption. Use
+    /// [`reset_rpc_stats`](Self::reset_rpc_stats) to measure a bounded window.
+    pub fn rpc_stats(&self) -> SubscriberRpcStats {
+        self.rpc_counters.snapshot()
+    }
+
+    /// Zero every [`rpc_stats`](Self::rpc_stats) counter, starting a new
+    /// measurement window. Takes `&self` so a window can be opened while
+    /// catch-up work holds the subscriber.
+    pub fn reset_rpc_stats(&self) {
+        self.rpc_counters.reset();
+    }
+
+    /// Notification loss observed on live subscriptions, and what healing it
+    /// cost.
+    ///
+    /// A subscription that never lags reports zeroes here. That is evidence
+    /// nothing was *lost*, which is necessary before treating the stream as
+    /// authoritative — but it is not evidence that everything has *arrived*.
+    /// Deciding a particular block's set is closed needs ordering evidence from
+    /// the log stream itself; see [`ChainControl::LogCoverage`].
+    pub fn stream_gap_stats(&self) -> SubscriberStreamGapStats {
+        self.gap_counters.snapshot()
+    }
+
+    /// Zero every [`stream_gap_stats`](Self::stream_gap_stats) counter.
+    pub fn reset_stream_gap_stats(&self) {
+        self.gap_counters.reset();
+    }
+
+    /// Record one issued provider request against this subscriber's counters.
+    fn record_rpc(&self, cause: SubscriberRpcCause, method: SubscriberRpcMethod) {
+        self.rpc_counters.record(cause, method);
+    }
+
+    /// Bounded notification capacity for a pubsub log stream.
+    #[cfg(feature = "reactive-ws")]
+    fn log_channel_size(&self) -> usize {
+        self.config
+            .log_channel_size
+            .unwrap_or(self.config.max_batch_size)
+            .max(1)
     }
 
     /// Registered interests across base and owner-scoped registrations.
@@ -4959,6 +13649,12 @@ impl<P, N: Network> AlloySubscriber<P, N> {
     /// Post-block owners require hash-certified
     /// [`reconcile_interest_owner`](Self::reconcile_interest_owner) progress on
     /// the current clean stream revision before activation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SubscriberOwnerError`] for invalid subscriber configuration,
+    /// duplicate owners, unsupported post-block interests, unsupported
+    /// transport interests, block-number overflow, or epoch exhaustion.
     pub fn stage_interest_owner(
         &mut self,
         owner: HandlerId,
@@ -5032,6 +13728,13 @@ impl<P, N: Network> AlloySubscriber<P, N> {
     /// Commit both epochs atomically with
     /// [`commit_interest_owner_replacement`](Self::commit_interest_owner_replacement),
     /// or abort the staged epoch with [`abort_interest_owner`](Self::abort_interest_owner).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SubscriberOwnerError`] for invalid subscriber configuration,
+    /// missing/non-unique active owner state, unsupported post-block interests,
+    /// unsupported transport interests, block-number overflow, or epoch
+    /// exhaustion.
     pub fn stage_interest_owner_replacement(
         &mut self,
         owner: HandlerId,
@@ -5049,7 +13752,11 @@ impl<P, N: Network> AlloySubscriber<P, N> {
         let active_count = self
             .owned_interests
             .iter()
-            .filter(|entry| entry.owner == owner && entry.state == SubscriberOwnerState::Active)
+            .filter(|entry| {
+                entry.owner == owner
+                    && entry.state == SubscriberOwnerState::Active
+                    && entry.epoch.is_some()
+            })
             .count();
         if active_count != 1
             || self
@@ -5271,7 +13978,8 @@ impl<P, N: Network> AlloySubscriber<P, N> {
             .retain(|backfill| backfill.epoch.as_ref() != Some(epoch));
         self.pending_records
             .retain_mut(|pending| match &mut pending.scope {
-                SubscriberInputScope::Canonical { owners } => {
+                SubscriberInputScope::Canonical { owners }
+                | SubscriberInputScope::CanonicalResidual { owners, .. } => {
                     owners.retain(|owner| owner != epoch);
                     true
                 }
@@ -5279,6 +13987,8 @@ impl<P, N: Network> AlloySubscriber<P, N> {
                     owners.retain(|owner| owner != epoch);
                     !owners.is_empty()
                 }
+                SubscriberInputScope::OwnerOnlyHandlers { .. }
+                | SubscriberInputScope::Preconfirmed => true,
             });
         self.pending_reconcile_owner_records.retain_mut(|pending| {
             pending.owners.retain(|owner| owner != epoch);
@@ -5286,6 +13996,293 @@ impl<P, N: Network> AlloySubscriber<P, N> {
         });
         self.recent_owner_input_refs.remove(epoch);
         self.recent_owner_input_ref_sets.remove(epoch);
+    }
+
+    /// Atomically add or replace several owners while preserving unrelated ones.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SubscriberError`] for invalid configuration, duplicate owners,
+    /// mixed lifecycle APIs, unsupported interests, or backfill-capacity
+    /// exhaustion. No owner state changes on error.
+    pub fn upsert_interest_owners(
+        &mut self,
+        owners: Vec<(HandlerId, Vec<ReactiveInterest<N>>)>,
+    ) -> Result<(), SubscriberError> {
+        self.upsert_interest_owners_inner(owners, None)
+    }
+
+    /// Atomically add or replace several owners and queue one common backfill
+    /// policy for every log interest while preserving unrelated owners.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SubscriberError`] for invalid configuration, duplicate owners,
+    /// mixed lifecycle APIs, unsupported interests, or backfill-capacity
+    /// exhaustion. No owner or backfill state changes on error.
+    pub fn upsert_interest_owners_with_backfill(
+        &mut self,
+        owners: Vec<(HandlerId, Vec<ReactiveInterest<N>>)>,
+        backfill: SubscriberBackfill,
+    ) -> Result<(), SubscriberError> {
+        self.upsert_interest_owners_inner(owners, Some(backfill))
+    }
+
+    fn upsert_interest_owners_inner(
+        &mut self,
+        owners: Vec<(HandlerId, Vec<ReactiveInterest<N>>)>,
+        explicit_backfill: Option<SubscriberBackfill>,
+    ) -> Result<(), SubscriberError> {
+        validate_subscriber_config(&self.config)?;
+        let mut seen = HashSet::with_capacity(owners.len());
+        let mut next_owned = self.clone_owned_interests();
+        for (owner, interests) in &owners {
+            if !seen.insert(owner.clone()) {
+                return Err(SubscriberError::InvalidConfig(
+                    "bulk owner upsert contains a duplicate owner",
+                ));
+            }
+            if self
+                .owned_interests
+                .iter()
+                .any(|entry| &entry.owner == owner && entry.epoch.is_some())
+            {
+                return Err(SubscriberError::InvalidConfig(
+                    "cannot mix compatibility and epoch-scoped owner lifecycle APIs",
+                ));
+            }
+            if let Some(entry) = next_owned.iter_mut().find(|entry| &entry.owner == owner) {
+                entry.interests = interests.clone();
+                entry.state = SubscriberOwnerState::Active;
+                entry.baseline = None;
+                entry.progress = None;
+                entry.progress_stream_revision = None;
+            } else {
+                next_owned.push(OwnedSubscriberInterests {
+                    owner: owner.clone(),
+                    interests: interests.clone(),
+                    epoch: None,
+                    state: SubscriberOwnerState::Active,
+                    baseline: None,
+                    progress: None,
+                    progress_stream_revision: None,
+                });
+            }
+        }
+        let next_registered = aggregate_interests(&self.base_interests, &next_owned);
+        validate_supported_interests(self.mode, &self.config, &next_registered)?;
+
+        // Build every owner's replacement queue before the first mutation.
+        // Besides keeping capacity failure atomic, this preserves continuity
+        // for changed filter shapes when the caller did not provide a common
+        // open-ended backfill that already covers the old delivery anchor.
+        let mut replacement_backfills = Vec::new();
+        for (owner, interests) in &owners {
+            let previous_filters: Vec<Filter> = self
+                .owner_interests(owner)
+                .map(log_filters)
+                .unwrap_or_default();
+            let continuity_anchor = previous_filters
+                .iter()
+                .filter_map(|filter| self.log_anchor(filter))
+                .min();
+            let filters = log_filters(interests);
+            if let Some(backfill) = explicit_backfill
+                && !filters.is_empty()
+            {
+                replacement_backfills.push(QueuedSubscriberBackfill {
+                    owner: Some(owner.clone()),
+                    epoch: None,
+                    filters: filters.clone(),
+                    backfill,
+                });
+            }
+            let explicit_covers = explicit_backfill.is_some_and(|explicit| {
+                explicit.end_block().is_none()
+                    && continuity_anchor.is_some_and(|anchor| explicit.start_block() <= anchor)
+            });
+            let continuity_filters: Vec<_> = filters
+                .into_iter()
+                .filter(|filter| !previous_filters.contains(filter))
+                .collect();
+            if let Some(anchor) = continuity_anchor
+                && !continuity_filters.is_empty()
+                && !explicit_covers
+            {
+                replacement_backfills.push(QueuedSubscriberBackfill {
+                    owner: Some(owner.clone()),
+                    epoch: None,
+                    filters: continuity_filters,
+                    backfill: SubscriberBackfill::from_block(anchor),
+                });
+            }
+        }
+
+        let retained_backfills = self
+            .pending_backfills
+            .iter()
+            .filter(|queued| {
+                queued
+                    .owner
+                    .as_ref()
+                    .is_none_or(|owner| !seen.contains(owner))
+            })
+            .map(|queued| queued.filters.len())
+            .sum::<usize>();
+        let replacement_units = replacement_backfills
+            .iter()
+            .map(|queued| queued.filters.len())
+            .sum::<usize>();
+        if retained_backfills.saturating_add(replacement_units) > self.config.max_pending_backfills
+        {
+            return Err(SubscriberError::ResourceExhausted(format!(
+                "bulk owner update would queue more than {} lazy backfills",
+                self.config.max_pending_backfills
+            )));
+        }
+
+        // All validation and capacity checks are complete. The remaining
+        // assignments have no failure or cancellation point, so topology and
+        // historical work become authoritative as one local commit.
+        self.owned_interests = next_owned;
+        self.interests = next_registered;
+        for owner in &seen {
+            self.recent_compat_owner_input_refs.remove(owner);
+            self.recent_compat_owner_input_ref_sets.remove(owner);
+        }
+        self.retire_unreferenced_filters();
+        self.sources_dirty = true;
+        self.pending_backfills.retain(|queued| {
+            queued
+                .owner
+                .as_ref()
+                .is_none_or(|owner| !seen.contains(owner))
+        });
+        self.pending_backfills.extend(replacement_backfills);
+        Ok(())
+    }
+
+    /// Atomically replace every compatibility owner without requesting
+    /// historical delivery.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SubscriberError`] for invalid configuration, duplicate owners,
+    /// mixed lifecycle APIs, unsupported interests, or resource exhaustion.
+    /// The previous topology remains authoritative on error.
+    pub fn replace_interest_owners(
+        &mut self,
+        owners: Vec<(HandlerId, Vec<ReactiveInterest<N>>)>,
+    ) -> Result<(), SubscriberError> {
+        self.replace_interest_owners_inner(owners, None)
+    }
+
+    /// Atomically replace every compatibility owner and queue one global
+    /// post-baseline backfill for the resulting union of log interests.
+    ///
+    /// Base interests are replaced. Epoch-scoped lifecycle operations cannot
+    /// be mixed with this compatibility replacement because silently deleting
+    /// an in-flight epoch would violate its activation transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SubscriberError`] for invalid configuration, duplicate owners,
+    /// mixed lifecycle APIs, unsupported interests, or backfill-capacity
+    /// exhaustion. The previous topology remains authoritative on error.
+    pub fn replace_interest_owners_with_global_backfill(
+        &mut self,
+        owners: Vec<(HandlerId, Vec<ReactiveInterest<N>>)>,
+        backfill: SubscriberBackfill,
+    ) -> Result<(), SubscriberError> {
+        self.replace_interest_owners_inner(owners, Some(backfill))
+    }
+
+    fn replace_interest_owners_inner(
+        &mut self,
+        owners: Vec<(HandlerId, Vec<ReactiveInterest<N>>)>,
+        backfill: Option<SubscriberBackfill>,
+    ) -> Result<(), SubscriberError> {
+        validate_subscriber_config(&self.config)?;
+        if self
+            .owned_interests
+            .iter()
+            .any(|entry| entry.epoch.is_some())
+        {
+            return Err(SubscriberError::InvalidConfig(
+                "cannot replace compatibility owners while an epoch-scoped lifecycle exists",
+            ));
+        }
+
+        let mut seen = HashSet::with_capacity(owners.len());
+        let mut next_owned = Vec::with_capacity(owners.len());
+        for (owner, interests) in owners {
+            if !seen.insert(owner.clone()) {
+                return Err(SubscriberError::InvalidConfig(
+                    "owner replacement contains a duplicate owner",
+                ));
+            }
+            next_owned.push(OwnedSubscriberInterests {
+                owner,
+                interests,
+                epoch: None,
+                state: SubscriberOwnerState::Active,
+                baseline: None,
+                progress: None,
+                progress_stream_revision: None,
+            });
+        }
+        let next_registered = aggregate_interests(&[], &next_owned);
+        validate_supported_interests(self.mode, &self.config, &next_registered)?;
+        let mut filters = log_filters(&next_registered);
+        let mut unique_filters = Vec::with_capacity(filters.len());
+        for filter in filters.drain(..) {
+            if !unique_filters.contains(&filter) {
+                unique_filters.push(filter);
+            }
+        }
+        let replacement_backfills: VecDeque<_> = match backfill {
+            Some(backfill) if !unique_filters.is_empty() => {
+                VecDeque::from([QueuedSubscriberBackfill {
+                    owner: None,
+                    epoch: None,
+                    filters: unique_filters,
+                    backfill,
+                }])
+            }
+            Some(_) | None => VecDeque::new(),
+        };
+        let replacement_units = replacement_backfills
+            .iter()
+            .map(|queued| queued.filters.len())
+            .sum::<usize>();
+        if replacement_units > self.config.max_pending_backfills {
+            return Err(SubscriberError::ResourceExhausted(format!(
+                "owner replacement would queue more than {} lazy backfills",
+                self.config.max_pending_backfills
+            )));
+        }
+
+        // No fallible work remains. The post-baseline range reconstructs every
+        // delivery after the cache snapshot, so reset all stale delivery and
+        // dedupe state from the prior topology before publishing the exact
+        // replacement plus its global historical work.
+        let revoke_preconfirmation = self.latest_preconfirmation.is_some()
+            || self.pending_preconfirmation_invalidation
+            || self.pending_records.iter().any(|record| {
+                record.scope == SubscriberInputScope::Preconfirmed
+                    || matches!(
+                        &record.record.context.chain_status,
+                        ChainStatus::Preconfirmed { .. }
+                    )
+            });
+        self.base_interests.clear();
+        self.owned_interests = next_owned;
+        self.interests = next_registered;
+        self.reset_delivery_state();
+        self.pending_preconfirmation_invalidation = revoke_preconfirmation;
+        self.pending_backfills = replacement_backfills;
+        self.reset_stream_topology();
+        Ok(())
     }
 
     /// Add or replace the interests owned by `owner`.
@@ -5304,6 +14301,12 @@ impl<P, N: Network> AlloySubscriber<P, N> {
     /// [`add_interest_owner_with_backfill`](Self::add_interest_owner_with_backfill)
     /// anchor (or register through [`ReactiveEngine::register_handler`], which
     /// anchors to the runtime's last canonical block).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SubscriberError`] for invalid configuration, incompatible
+    /// lifecycle state, unsupported interests, or continuity-backfill capacity
+    /// exhaustion. The prior owner state remains authoritative on error.
     pub fn add_interest_owner(
         &mut self,
         owner: HandlerId,
@@ -5324,6 +14327,12 @@ impl<P, N: Network> AlloySubscriber<P, N> {
     /// [`add_interest_owner`](Self::add_interest_owner)) is queued in addition,
     /// unless this explicit backfill is open-ended and already starts at or
     /// below the owner's prior anchor.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SubscriberError`] for invalid configuration, incompatible
+    /// lifecycle state, unsupported interests, or backfill-capacity exhaustion.
+    /// The prior owner state remains authoritative on error.
     pub fn add_interest_owner_with_backfill(
         &mut self,
         owner: HandlerId,
@@ -5331,6 +14340,132 @@ impl<P, N: Network> AlloySubscriber<P, N> {
         backfill: SubscriberBackfill,
     ) -> Result<(), SubscriberError> {
         self.set_interest_owner(owner, interests, Some(backfill))
+    }
+
+    /// Add or replace one owner at retained canonical block `C`, then queue the
+    /// coordinated cutover required by [`ReactiveEngine::register_handler`].
+    ///
+    /// The new owner alone receives matching records from `C` so its effects
+    /// attach to the runtime's existing journal entry. Every matching log from
+    /// `C + 1` through the activation head is then delivered canonically over
+    /// the complete interest union. [`Self::next_scoped_batch`] installs the
+    /// desired live streams before draining either window, closing the
+    /// subscribe/backfill gap. Alloy cannot reconstruct historical block or
+    /// pending-transaction deliveries through this log backfill path, so a
+    /// mixed interest topology is rejected rather than silently underfilled.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SubscriberError`] for invalid configuration, incompatible
+    /// lifecycle state, unsupported non-log catch-up, block-number overflow, or
+    /// resource exhaustion. The prior owner state remains authoritative on
+    /// error.
+    pub fn add_interest_owner_with_canonical_catchup(
+        &mut self,
+        owner: HandlerId,
+        interests: &[ReactiveInterest<N>],
+        retained: BlockRef,
+    ) -> Result<(), SubscriberError> {
+        validate_subscriber_config(&self.config)?;
+        if self
+            .owned_interests
+            .iter()
+            .any(|entry| entry.owner == owner && entry.epoch.is_some())
+        {
+            return Err(SubscriberError::InvalidConfig(
+                "cannot mix compatibility and epoch-scoped owner lifecycle APIs",
+            ));
+        }
+
+        let mut next_owned = self.clone_owned_interests();
+        if let Some(entry) = next_owned.iter_mut().find(|entry| entry.owner == owner) {
+            entry.interests = interests.to_vec();
+            entry.state = SubscriberOwnerState::Active;
+            entry.baseline = None;
+            entry.progress = None;
+            entry.progress_stream_revision = None;
+            entry.epoch = None;
+        } else {
+            next_owned.push(OwnedSubscriberInterests {
+                owner: owner.clone(),
+                interests: interests.to_vec(),
+                epoch: None,
+                state: SubscriberOwnerState::Active,
+                baseline: None,
+                progress: None,
+                progress_stream_revision: None,
+            });
+        }
+        let next_registered = aggregate_interests(&self.base_interests, &next_owned);
+        validate_supported_interests(self.mode, &self.config, &next_registered)?;
+        if next_registered
+            .iter()
+            .any(|interest| !matches!(interest, ReactiveInterest::Logs(_)))
+        {
+            return Err(SubscriberError::Unsupported(
+                "Alloy coordinated registration supports log-only interest topologies",
+            ));
+        }
+
+        let mut owner_filters = Vec::new();
+        for filter in log_filters(interests) {
+            if !owner_filters.contains(&filter) {
+                owner_filters.push(filter);
+            }
+        }
+        let mut global_filters = Vec::new();
+        for filter in log_filters(&next_registered) {
+            if !global_filters.contains(&filter) {
+                global_filters.push(filter);
+            }
+        }
+        let owner_backfill =
+            SubscriberBackfill::from_canonical_block_through(retained, retained.number)?;
+        let global_backfill = SubscriberBackfill::after_canonical_block(retained)?;
+        let replacement_units = owner_filters.len().saturating_add(global_filters.len());
+        let retained_units = self
+            .pending_backfills
+            .iter()
+            .filter(|queued| queued.owner.as_ref() != Some(&owner))
+            .map(|queued| queued.filters.len())
+            .sum::<usize>();
+        if retained_units.saturating_add(replacement_units) > self.config.max_pending_backfills {
+            return Err(SubscriberError::ResourceExhausted(format!(
+                "coordinated owner registration would queue more than {} lazy backfills",
+                self.config.max_pending_backfills
+            )));
+        }
+
+        let mut replacement_backfills = VecDeque::new();
+        if !owner_filters.is_empty() {
+            replacement_backfills.push_back(QueuedSubscriberBackfill {
+                owner: Some(owner.clone()),
+                epoch: None,
+                filters: owner_filters,
+                backfill: owner_backfill,
+            });
+        }
+        // Keep the global certification job even for an empty filter union: it
+        // advances canonical coverage through a zero-event registration window.
+        replacement_backfills.push_back(QueuedSubscriberBackfill {
+            owner: None,
+            epoch: None,
+            filters: global_filters,
+            backfill: global_backfill,
+        });
+
+        // Every fallible preflight is complete. Publish topology and both
+        // ordered windows as one synchronous local commit.
+        self.owned_interests = next_owned;
+        self.interests = next_registered;
+        self.recent_compat_owner_input_refs.remove(&owner);
+        self.recent_compat_owner_input_ref_sets.remove(&owner);
+        self.pending_backfills
+            .retain(|queued| queued.owner.as_ref() != Some(&owner));
+        self.pending_backfills.extend(replacement_backfills);
+        self.retire_unreferenced_filters();
+        self.sources_dirty = true;
+        Ok(())
     }
 
     /// Remove one owner's interests, preserving unrelated owner/base interests.
@@ -5345,13 +14480,15 @@ impl<P, N: Network> AlloySubscriber<P, N> {
         let index = self
             .owned_interests
             .iter()
-            .position(|entry| &entry.owner == owner)?;
+            .position(|entry| &entry.owner == owner && entry.epoch.is_none())?;
         let removed = self.owned_interests.remove(index);
         if let Some(epoch) = &removed.epoch {
             self.purge_owner_epoch(epoch);
         } else {
             self.pending_backfills
-                .retain(|backfill| &backfill.owner != owner);
+                .retain(|backfill| backfill.owner.as_ref() != Some(owner));
+            self.recent_compat_owner_input_refs.remove(owner);
+            self.recent_compat_owner_input_ref_sets.remove(owner);
         }
         self.rebuild_registered_interests();
         self.retire_unreferenced_filters();
@@ -5374,6 +14511,15 @@ impl<P, N: Network> AlloySubscriber<P, N> {
         backfill: Option<SubscriberBackfill>,
     ) -> Result<(), SubscriberError> {
         validate_subscriber_config(&self.config)?;
+        if self
+            .owned_interests
+            .iter()
+            .any(|entry| entry.owner == owner && entry.epoch.is_some())
+        {
+            return Err(SubscriberError::InvalidConfig(
+                "cannot mix compatibility and epoch-scoped owner lifecycle APIs",
+            ));
+        }
 
         let mut next_owned = self.clone_owned_interests();
         let replaced_epoch = match next_owned.iter_mut().find(|entry| entry.owner == owner) {
@@ -5416,10 +14562,65 @@ impl<P, N: Network> AlloySubscriber<P, N> {
             .filter_map(|filter| self.log_anchor(filter))
             .min();
 
+        // Build the replacement queue before committing owner state. Capacity
+        // failure is therefore atomic and cannot leave desired interests ahead
+        // of the historical work required to make them continuous.
+        let mut replacement_backfills = Vec::new();
+        let filters = log_filters(interests);
+        if let Some(backfill) = backfill
+            && !filters.is_empty()
+        {
+            replacement_backfills.push(QueuedSubscriberBackfill {
+                owner: Some(owner.clone()),
+                epoch: None,
+                filters: filters.clone(),
+                backfill,
+            });
+        }
+        let explicit_covers = backfill.is_some_and(|explicit| {
+            explicit.end_block().is_none()
+                && continuity_anchor.is_some_and(|anchor| explicit.start_block() <= anchor)
+        });
+        let continuity_filters: Vec<_> = filters
+            .into_iter()
+            .filter(|filter| !previous_filters.contains(filter))
+            .collect();
+        if let Some(anchor) = continuity_anchor
+            && !continuity_filters.is_empty()
+            && !explicit_covers
+        {
+            replacement_backfills.push(QueuedSubscriberBackfill {
+                owner: Some(owner.clone()),
+                epoch: None,
+                filters: continuity_filters,
+                backfill: SubscriberBackfill::from_block(anchor),
+            });
+        }
+        let retained_backfills = self
+            .pending_backfills
+            .iter()
+            .filter(|queued| queued.owner.as_ref() != Some(&owner))
+            .map(|queued| queued.filters.len())
+            .sum::<usize>();
+        let replacement_units = replacement_backfills
+            .iter()
+            .map(|queued| queued.filters.len())
+            .sum::<usize>();
+        if retained_backfills.saturating_add(replacement_units) > self.config.max_pending_backfills
+        {
+            return Err(SubscriberError::ResourceExhausted(format!(
+                "owner update would queue more than {} lazy backfills",
+                self.config.max_pending_backfills
+            )));
+        }
+
         self.owned_interests = next_owned;
         self.interests = next_registered;
         if let Some(epoch) = replaced_epoch {
             self.purge_owner_epoch(&epoch);
+        } else {
+            self.recent_compat_owner_input_refs.remove(&owner);
+            self.recent_compat_owner_input_ref_sets.remove(&owner);
         }
         self.retire_unreferenced_filters();
         self.sources_dirty = true;
@@ -5427,38 +14628,8 @@ impl<P, N: Network> AlloySubscriber<P, N> {
         // Re-queue this owner's backfills from scratch: previously queued
         // entries may reference filter shapes that no longer exist.
         self.pending_backfills
-            .retain(|queued| queued.owner != owner);
-        for filter in log_filters(interests) {
-            if let Some(backfill) = backfill {
-                self.pending_backfills.push_back(QueuedSubscriberBackfill {
-                    owner: owner.clone(),
-                    epoch: None,
-                    filter: filter.clone(),
-                    backfill,
-                });
-            }
-
-            // Continuity backfill for changed/new shapes only: an unchanged
-            // filter kept its anchor and its live stream, and an open-ended
-            // explicit backfill starting at or below the anchor already covers
-            // the window.
-            let unchanged = previous_filters.contains(&filter);
-            let explicit_covers = backfill.is_some_and(|explicit| {
-                explicit.end_block().is_none()
-                    && continuity_anchor.is_some_and(|anchor| explicit.start_block() <= anchor)
-            });
-            if let Some(anchor) = continuity_anchor
-                && !unchanged
-                && !explicit_covers
-            {
-                self.pending_backfills.push_back(QueuedSubscriberBackfill {
-                    owner: owner.clone(),
-                    epoch: None,
-                    filter,
-                    backfill: SubscriberBackfill::from_block(anchor),
-                });
-            }
-        }
+            .retain(|queued| queued.owner.as_ref() != Some(&owner));
+        self.pending_backfills.extend(replacement_backfills);
         Ok(())
     }
 
@@ -5470,7 +14641,7 @@ impl<P, N: Network> AlloySubscriber<P, N> {
                 interests: entry.interests.clone(),
                 epoch: entry.epoch.clone(),
                 state: entry.state,
-                baseline: entry.baseline.clone(),
+                baseline: entry.baseline,
                 progress: entry.progress.clone(),
                 progress_stream_revision: entry.progress_stream_revision,
             })
@@ -5563,12 +14734,18 @@ impl<P, N: Network> AlloySubscriber<P, N> {
             for entry in &streams.entries {
                 match &entry.source {
                     SubscriberStreamSource::PubSubLog { filter, .. }
+                    | SubscriberStreamSource::BasePendingLog { filter, .. }
                     | SubscriberStreamSource::PollingLog { filter } => {
                         live.insert(filter.clone());
                     }
-                    SubscriberStreamSource::PubSubPendingHashes
+                    SubscriberStreamSource::BaseFlashblocks
+                    | SubscriberStreamSource::OpPendingFlashblocks
+                    | SubscriberStreamSource::CanonicalHeadPolling
+                    | SubscriberStreamSource::PubSubPendingHashes
                     | SubscriberStreamSource::PubSubBlockHeaders
                     | SubscriberStreamSource::PollingPendingHashes => {}
+                    #[cfg(feature = "raw-flashblocks-json")]
+                    SubscriberStreamSource::ExternalFlashblockUpdates => {}
                 }
             }
         }
@@ -5579,28 +14756,213 @@ impl<P, N: Network> AlloySubscriber<P, N> {
             .retain(|id, _| live_ids.contains(id));
     }
 
+    /// Record a canonical header observed while every log source was whole.
+    ///
+    /// Called before the header is enqueued, so a gap discovered later in the
+    /// same poll cannot retroactively attest a block whose logs it may have
+    /// dropped: `reset_log_attestation` clears the candidate, and it only
+    /// re-advances once a later header arrives after the gap was healed.
+    fn note_attestable_canonical_block(&mut self, record: &ReactiveInputRecord<N>) {
+        if !self.attests_log_coverage() {
+            return;
+        }
+        let Some(block) = record.context.block.as_ref() else {
+            return;
+        };
+        let advances = self
+            .attestable_canonical_head
+            .as_ref()
+            .is_none_or(|current| block.number > current.number);
+        if advances {
+            self.attestable_canonical_head = Some(*block);
+        }
+    }
+
+    /// Withdraw the pending attestation candidate after detected loss.
+    ///
+    /// The healed window is refetched, but the candidate is still dropped: a
+    /// consumer must not be told a block was whole on the strength of an
+    /// observation made before the loss was known.
+    fn reset_log_attestation(&mut self) {
+        self.attestable_canonical_head = None;
+    }
+
+    /// Whether this subscriber can prove the attestation it would emit.
+    ///
+    /// Mirrors [`SubscriberCapability::LogCoverageAttestation`]: only the pubsub
+    /// log streams surface a dropped notification, and only a subscriber with log
+    /// interests has anything to attest about.
+    fn attests_log_coverage(&self) -> bool {
+        matches!(
+            resolve_subscriber_transport(self.mode),
+            Ok(SubscriberTransport::PubSub)
+        ) && self
+            .interests
+            .iter()
+            .any(|interest| matches!(interest, ReactiveInterest::Logs(_)))
+    }
+
+    /// Queue a `LogCoverage` control when the attested watermark advances.
+    fn queue_log_coverage_attestation(&mut self) {
+        if !self.attests_log_coverage() {
+            return;
+        }
+        let Some(candidate) = self.attestable_canonical_head else {
+            return;
+        };
+        let advances = self
+            .attested_log_coverage
+            .as_ref()
+            .is_none_or(|attested| candidate.number > attested.number);
+        if !advances {
+            return;
+        }
+        self.attested_log_coverage = Some(candidate);
+        self.pending_chain_controls
+            .push_back(ChainControl::LogCoverage(candidate));
+    }
+
     fn drain_next_scoped_batch(&mut self) -> Option<SubscriberInputBatch<N>> {
-        if self.pending_records.is_empty() {
+        // Attest before the emptiness check: the watermark may be the only thing
+        // this batch has to say. Controls still drain only once every record
+        // ahead of them has left, so an attestation never precedes its header.
+        self.queue_log_coverage_attestation();
+        if self.pending_records.is_empty()
+            && self.pending_chain_controls.is_empty()
+            && !self.pending_preconfirmation_invalidation
+        {
             return None;
         }
 
-        let len = self.config.max_batch_size.min(self.pending_records.len());
+        let first_preconfirmation = self.pending_records.front().and_then(|record| {
+            if record.scope != SubscriberInputScope::Preconfirmed {
+                return None;
+            }
+            match &record.record.context.chain_status {
+                ChainStatus::Preconfirmed { flashblock } => Some(flashblock.clone()),
+                _ => None,
+            }
+        });
+        let len = self
+            .pending_records
+            .iter()
+            .take(self.config.max_batch_size)
+            .take_while(|record| match &first_preconfirmation {
+                Some(expected) => {
+                    record.scope == SubscriberInputScope::Preconfirmed
+                        && matches!(
+                            &record.record.context.chain_status,
+                            ChainStatus::Preconfirmed { flashblock } if flashblock == expected
+                        )
+                }
+                None => record.scope != SubscriberInputScope::Preconfirmed,
+            })
+            .count();
+        let preconfirmation_timing = self
+            .pending_records
+            .iter()
+            .take(len)
+            .filter_map(SubscriberInputRecord::preconfirmation_timing)
+            .reduce(FlashblockIngressTiming::earliest);
         let records = self.pending_records.drain(..len).collect();
-        Some(SubscriberInputBatch { records })
+        let chain_controls = if first_preconfirmation.is_none() && self.pending_records.is_empty() {
+            self.pending_chain_controls.drain(..).collect()
+        } else {
+            Vec::new()
+        };
+        Some(SubscriberInputBatch {
+            records,
+            chain_id: self.chain_id,
+            chain_controls,
+            preconfirmation_invalidated: std::mem::take(
+                &mut self.pending_preconfirmation_invalidation,
+            ),
+            preconfirmation_timing,
+        })
     }
 
     fn reset_delivery_state(&mut self) {
         self.pending_records.clear();
+        self.pending_chain_controls.clear();
         self.pending_reconcile_owner_records.clear();
+        self.resource_error = None;
         self.last_seen_log_blocks.clear();
+        self.verified_log_blocks.clear();
+        self.verified_log_block_order.clear();
         self.recent_input_refs.clear();
         self.recent_input_ref_set.clear();
         self.recent_owner_input_refs.clear();
         self.recent_owner_input_ref_sets.clear();
+        self.recent_compat_owner_input_refs.clear();
+        self.recent_compat_owner_input_ref_sets.clear();
         self.pending_backfills.clear();
+        self.pending_source_backfills.clear();
+        self.pending_preconfirmation_invalidation = false;
+        self.pending_flashblock_reconnects.clear();
+        self.pending_flashblock_reconnect_sources.clear();
+        self.flashblocks_rpc_metrics = FlashblocksRpcMetrics::default();
         self.log_source_ids.clear();
         self.next_log_source_id = 0;
         self.sources_dirty = true;
+        self.last_certified_canonical_head = None;
+        self.last_canonical_head_certification = None;
+        self.sealed_block_pending_certification = false;
+        self.attestable_canonical_head = None;
+        self.attested_log_coverage = None;
+        self.reset_flashblock_tracking();
+    }
+
+    fn reset_stream_topology(&mut self) {
+        #[cfg(feature = "raw-flashblocks-json")]
+        let external = match &mut self.state {
+            AlloySubscriberState::Active(streams) => streams
+                .entries
+                .iter()
+                .position(|entry| entry.source.is_external_flashblocks())
+                .map(|index| streams.entries.remove(index)),
+            AlloySubscriberState::Uninitialized | AlloySubscriberState::Empty => None,
+        };
+
+        #[cfg(feature = "raw-flashblocks-json")]
+        if let Some(external) = external {
+            let mut streams = SubscriberStreams::new();
+            streams.entries.push(external);
+            self.state = AlloySubscriberState::Active(streams);
+            return;
+        }
+
+        self.state = AlloySubscriberState::Uninitialized;
+    }
+
+    fn reset_flashblock_tracking(&mut self) {
+        self.base_flashblock_header = None;
+        self.base_flashblock_transactions = None;
+        self.unmatched_pending_logs.clear();
+        self.latest_preconfirmation = None;
+        self.preconfirmed_seen_logs.clear();
+        self.preconfirmed_receipted_transactions.clear();
+        self.preconfirmed_unavailable_receipts.clear();
+        #[cfg(feature = "raw-flashblocks-json")]
+        {
+            self.last_external_flashblock_snapshot = None;
+        }
+        self.consecutive_flashblock_poll_failures = 0;
+    }
+
+    /// Revoke only the active speculative snapshot while keeping the pinned
+    /// provider session and its streams alive. A sampled OP pending view can
+    /// legitimately be replaced, or a provider backend can briefly return an
+    /// older cumulative view. Either observation makes the current signing
+    /// authority unsafe, but does not prove that the transport generation is
+    /// broken and should be reconnected.
+    fn invalidate_preconfirmation_snapshot(&mut self) {
+        self.pending_records
+            .retain(|record| record.scope != SubscriberInputScope::Preconfirmed);
+        self.pending_preconfirmation_invalidation = true;
+        self.latest_preconfirmation = None;
+        self.preconfirmed_seen_logs.clear();
+        self.preconfirmed_receipted_transactions.clear();
+        self.preconfirmed_unavailable_receipts.clear();
     }
 
     fn bump_stream_revision(&mut self) {
@@ -5614,12 +14976,55 @@ where
     N: Network + 'static,
     N::HeaderResponse: Send + 'static,
 {
+    fn upsert_interest_owners(
+        &mut self,
+        owners: Vec<(HandlerId, Vec<ReactiveInterest<N>>)>,
+    ) -> SubscriberOperation<'_, ()> {
+        Box::pin(async move {
+            if !owners.is_empty() {
+                self.ensure_chain_id().await?;
+            }
+            AlloySubscriber::upsert_interest_owners(self, owners)
+        })
+    }
+
+    fn replace_interest_owners(
+        &mut self,
+        owners: Vec<(HandlerId, Vec<ReactiveInterest<N>>)>,
+    ) -> SubscriberOperation<'_, ()> {
+        Box::pin(async move {
+            if owners.iter().any(|(_, interests)| !interests.is_empty()) {
+                self.ensure_chain_id().await?;
+            }
+            AlloySubscriber::replace_interest_owners(self, owners)
+        })
+    }
+
+    fn replace_interest_owners_with_global_backfill(
+        &mut self,
+        owners: Vec<(HandlerId, Vec<ReactiveInterest<N>>)>,
+        backfill: SubscriberBackfill,
+    ) -> SubscriberOperation<'_, ()> {
+        Box::pin(async move {
+            if owners.iter().any(|(_, interests)| !interests.is_empty()) {
+                self.ensure_chain_id().await?;
+            }
+            AlloySubscriber::replace_interest_owners_with_global_backfill(self, owners, backfill)
+        })
+    }
+
     fn add_interest_owner(
         &mut self,
         owner: HandlerId,
         interests: &[ReactiveInterest<N>],
-    ) -> Result<(), SubscriberError> {
-        AlloySubscriber::add_interest_owner(self, owner, interests)
+    ) -> SubscriberOperation<'_, ()> {
+        let interests = interests.to_vec();
+        Box::pin(async move {
+            if !interests.is_empty() {
+                self.ensure_chain_id().await?;
+            }
+            AlloySubscriber::add_interest_owner(self, owner, &interests)
+        })
     }
 
     fn add_interest_owner_with_backfill(
@@ -5627,12 +15032,39 @@ where
         owner: HandlerId,
         interests: &[ReactiveInterest<N>],
         backfill: SubscriberBackfill,
-    ) -> Result<(), SubscriberError> {
-        AlloySubscriber::add_interest_owner_with_backfill(self, owner, interests, backfill)
+    ) -> SubscriberOperation<'_, ()> {
+        let interests = interests.to_vec();
+        Box::pin(async move {
+            if !interests.is_empty() {
+                self.ensure_chain_id().await?;
+            }
+            AlloySubscriber::add_interest_owner_with_backfill(self, owner, &interests, backfill)
+        })
     }
 
-    fn remove_interest_owner(&mut self, owner: &HandlerId) -> Option<Vec<ReactiveInterest<N>>> {
-        AlloySubscriber::remove_interest_owner(self, owner)
+    fn add_interest_owner_with_canonical_catchup(
+        &mut self,
+        owner: HandlerId,
+        interests: &[ReactiveInterest<N>],
+        retained: BlockRef,
+    ) -> SubscriberOperation<'_, ()> {
+        let interests = interests.to_vec();
+        Box::pin(async move {
+            // Resolve provider identity before the synchronous topology commit;
+            // cancellation or failure at this await leaves prior state intact.
+            self.ensure_chain_id().await?;
+            AlloySubscriber::add_interest_owner_with_canonical_catchup(
+                self, owner, &interests, retained,
+            )
+        })
+    }
+
+    fn remove_interest_owner(
+        &mut self,
+        owner: &HandlerId,
+    ) -> SubscriberOperation<'_, Option<Vec<ReactiveInterest<N>>>> {
+        let owner = owner.clone();
+        Box::pin(async move { Ok(AlloySubscriber::remove_interest_owner(self, &owner)) })
     }
 
     fn owner_interests(&self, owner: &HandlerId) -> Option<&[ReactiveInterest<N>]> {
@@ -5676,7 +15108,7 @@ impl<N: Network> SubscriberStreams<N> {
         self.entries.push(SubscriberStreamEntry { source, stream });
     }
 
-    #[cfg(all(test, feature = "reactive-ws"))]
+    #[cfg(all(test, any(feature = "reactive-polling", feature = "reactive-ws")))]
     fn len(&self) -> usize {
         self.entries.len()
     }
@@ -5762,54 +15194,277 @@ enum SubscriberTransport {
 
 #[derive(Clone, Debug)]
 enum SubscriberStreamSource {
-    PubSubLog { id: usize, filter: Filter },
+    PubSubLog {
+        id: usize,
+        filter: Filter,
+    },
+    BasePendingLog {
+        id: usize,
+        filter: Filter,
+    },
+    BaseFlashblocks,
+    OpPendingFlashblocks,
+    CanonicalHeadPolling,
     PubSubPendingHashes,
     PubSubBlockHeaders,
-    PollingLog { filter: Filter },
+    PollingLog {
+        filter: Filter,
+    },
     PollingPendingHashes,
+    #[cfg(feature = "raw-flashblocks-json")]
+    ExternalFlashblockUpdates,
 }
 
 impl SubscriberStreamSource {
     fn label(&self) -> &'static str {
         match self {
             Self::PubSubLog { .. } => "pubsub log",
+            Self::BasePendingLog { .. } => "OP Stack pendingLogs",
+            Self::BaseFlashblocks => "OP Stack newFlashblocks",
+            Self::OpPendingFlashblocks => "Optimism pending Flashblocks",
+            Self::CanonicalHeadPolling => "certified canonical head",
             Self::PubSubPendingHashes => "pubsub pending transaction hash",
             Self::PubSubBlockHeaders => "pubsub block header",
             Self::PollingLog { .. } => "polling log",
             Self::PollingPendingHashes => "polling pending transaction hash",
+            #[cfg(feature = "raw-flashblocks-json")]
+            Self::ExternalFlashblockUpdates => "external standardized Flashblock update",
         }
     }
 
     fn is_pubsub(&self) -> bool {
         matches!(
             self,
-            Self::PubSubLog { .. } | Self::PubSubPendingHashes | Self::PubSubBlockHeaders
+            Self::PubSubLog { .. }
+                | Self::BasePendingLog { .. }
+                | Self::BaseFlashblocks
+                | Self::OpPendingFlashblocks
+                | Self::PubSubPendingHashes
+                | Self::PubSubBlockHeaders
+        )
+    }
+
+    fn is_flashblocks(&self) -> bool {
+        matches!(
+            self,
+            Self::BasePendingLog { .. } | Self::BaseFlashblocks | Self::OpPendingFlashblocks
         )
     }
 
     fn same_key(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::PubSubLog { filter: left, .. }, Self::PubSubLog { filter: right, .. })
+            | (
+                Self::BasePendingLog { filter: left, .. },
+                Self::BasePendingLog { filter: right, .. },
+            )
             | (Self::PollingLog { filter: left }, Self::PollingLog { filter: right }) => {
                 left == right
             }
-            (Self::PubSubPendingHashes, Self::PubSubPendingHashes)
+            (Self::BaseFlashblocks, Self::BaseFlashblocks)
+            | (Self::OpPendingFlashblocks, Self::OpPendingFlashblocks)
+            | (Self::CanonicalHeadPolling, Self::CanonicalHeadPolling)
+            | (Self::PubSubPendingHashes, Self::PubSubPendingHashes)
             | (Self::PubSubBlockHeaders, Self::PubSubBlockHeaders)
             | (Self::PollingPendingHashes, Self::PollingPendingHashes) => true,
+            #[cfg(feature = "raw-flashblocks-json")]
+            (Self::ExternalFlashblockUpdates, Self::ExternalFlashblockUpdates) => true,
             _ => false,
+        }
+    }
+
+    fn is_external_flashblocks(&self) -> bool {
+        #[cfg(feature = "raw-flashblocks-json")]
+        {
+            matches!(self, Self::ExternalFlashblockUpdates)
+        }
+        #[cfg(not(feature = "raw-flashblocks-json"))]
+        {
+            false
         }
     }
 }
 
 #[allow(dead_code)]
 enum SubscriberEvent<N: Network> {
-    Log { source_id: usize, log: Log },
-    BackfilledLogs { source_id: usize, logs: Vec<Log> },
+    Log {
+        source_id: usize,
+        log: Log,
+    },
+    BackfilledLogs {
+        source_id: usize,
+        logs: Vec<Log>,
+    },
     Logs(Vec<Log>),
     BlockHeader(N::HeaderResponse),
     PendingHash(B256),
     PendingHashes(Vec<B256>),
+    BasePendingLog {
+        source_id: usize,
+        log: Log,
+    },
+    BasePendingLogTimed {
+        source_id: usize,
+        log: Log,
+        timing: FlashblockIngressTiming,
+    },
+    BaseFlashblock(BaseFlashblockWirePayload),
+    BaseFlashblockTimed {
+        payload: BaseFlashblockWirePayload,
+        timing: FlashblockIngressTiming,
+    },
+    OpFlashblockTick,
+    OpFlashblockTickTimed(FlashblockIngressTiming),
+    CanonicalHeadTick,
+    PreconfirmedLogs {
+        flashblock: FlashblockRef,
+        logs: Vec<Log>,
+        timing: FlashblockIngressTiming,
+    },
+    FlashblockInvalidated,
+    FlashblockObserved,
+    #[cfg(feature = "raw-flashblocks-json")]
+    ExternalFlashblockUpdate(raw_json_flashblocks::QueuedFlashblockUpdate),
     StreamTerminated(SubscriberStreamSource),
+    /// A live stream lost notifications without disconnecting. The subscription
+    /// is still installed, so only the missed window is recovered rather than
+    /// the source being reconnected.
+    StreamGap {
+        source: SubscriberStreamSource,
+        gap: SubscriberStreamGap,
+    },
+}
+
+enum SubscriberReady<N: Network> {
+    Event(Option<SubscriberEvent<N>>),
+    FlashblockReconnect(
+        SubscriberStreamSource,
+        Result<BoxStream<'static, SubscriberEvent<N>>, SubscriberError>,
+    ),
+}
+
+#[derive(Debug)]
+enum PendingFlashblockPollError {
+    Request(SubscriberError),
+    Integrity(SubscriberError),
+}
+
+impl PendingFlashblockPollError {
+    fn into_subscriber(self) -> SubscriberError {
+        match self {
+            Self::Request(error) | Self::Integrity(error) => error,
+        }
+    }
+}
+
+fn pending_flashblock_request_error(error: impl fmt::Display) -> PendingFlashblockPollError {
+    PendingFlashblockPollError::Request(provider_error(error))
+}
+
+fn normalize_op_pending_block<N: Network>(
+    mut value: serde_json::Value,
+) -> Result<N::BlockResponse, SubscriberError> {
+    let object = value.as_object_mut().ok_or_else(|| {
+        SubscriberError::Provider("OP pending block response is not an object".into())
+    })?;
+    let transactions = object
+        .get_mut("transactions")
+        .and_then(serde_json::Value::as_array_mut)
+        .ok_or_else(|| {
+            SubscriberError::Provider(
+                "OP pending block response is missing its transaction array".into(),
+            )
+        })?;
+    for transaction in transactions {
+        if transaction.is_string() {
+            continue;
+        }
+        let hash = transaction
+            .as_object()
+            .and_then(|object| object.get("hash"))
+            .filter(|hash| hash.is_string())
+            .cloned()
+            .ok_or_else(|| {
+                SubscriberError::Provider("OP pending block transaction is missing its hash".into())
+            })?;
+        *transaction = hash;
+    }
+    if object.get("hash").is_none_or(serde_json::Value::is_null) {
+        object.insert(
+            "hash".into(),
+            serde_json::Value::String(B256::ZERO.to_string()),
+        );
+    }
+    if object.get("nonce").is_none_or(serde_json::Value::is_null) {
+        object.insert(
+            "nonce".into(),
+            serde_json::Value::String("0x0000000000000000".into()),
+        );
+    }
+    if object.get("miner").is_none_or(serde_json::Value::is_null)
+        || object
+            .get("beneficiary")
+            .is_none_or(serde_json::Value::is_null)
+    {
+        object.insert(
+            "miner".into(),
+            serde_json::Value::String(Address::ZERO.to_string()),
+        );
+    }
+    serde_json::from_value(value).map_err(|error| {
+        SubscriberError::Provider(format!(
+            "failed to decode normalized OP pending block: {error}"
+        ))
+    })
+}
+
+fn normalize_pending_transaction_receipt(
+    expected_transaction_hash: B256,
+    value: serde_json::Value,
+) -> Result<Option<Vec<Log>>, SubscriberError> {
+    if value.is_null() {
+        return Ok(None);
+    }
+    let receipt = value.as_object().ok_or_else(|| {
+        SubscriberError::Provider("pending transaction receipt response is not an object".into())
+    })?;
+    let transaction_hash: B256 =
+        serde_json::from_value(receipt.get("transactionHash").cloned().ok_or_else(|| {
+            SubscriberError::Provider(
+                "pending transaction receipt is missing its transaction hash".into(),
+            )
+        })?)
+        .map_err(|error| {
+            SubscriberError::Provider(format!(
+                "failed to decode pending transaction receipt hash: {error}"
+            ))
+        })?;
+    if transaction_hash != expected_transaction_hash {
+        return Err(SubscriberError::Provider(
+            "pending transaction receipt hash disagrees with its request".into(),
+        ));
+    }
+    let receipt_logs = receipt
+        .get("logs")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| {
+            SubscriberError::Provider("pending transaction receipt is missing its log array".into())
+        })?;
+    let mut logs = Vec::new();
+    for log in receipt_logs {
+        let log: Log = serde_json::from_value(log.clone()).map_err(|error| {
+            SubscriberError::Provider(format!(
+                "failed to decode pending transaction receipt log: {error}"
+            ))
+        })?;
+        if log.transaction_hash != Some(expected_transaction_hash) {
+            return Err(SubscriberError::Provider(
+                "pending transaction receipt log hash disagrees with its receipt".into(),
+            ));
+        }
+        logs.push(log);
+    }
+    Ok(Some(logs))
 }
 
 impl<P, N> EventSubscriber<N> for AlloySubscriber<P, N>
@@ -5818,19 +15473,60 @@ where
     N: Network + 'static,
     N::HeaderResponse: Send + 'static,
 {
+    fn chain_id(&self) -> Option<u64> {
+        self.chain_id
+    }
+
+    fn capabilities(&self) -> SubscriberCapabilities {
+        let Ok(transport) = resolve_subscriber_transport(self.mode) else {
+            return SubscriberCapabilities::default();
+        };
+        let mut capabilities = vec![
+            SubscriberCapability::Logs,
+            SubscriberCapability::PendingTransactionHashes,
+            SubscriberCapability::HistoricalBackfill,
+            SubscriberCapability::Live,
+            SubscriberCapability::OwnerScopedDelivery,
+            SubscriberCapability::DynamicInterests,
+        ];
+        if transport == SubscriberTransport::PubSub {
+            capabilities.push(SubscriberCapability::BlockHeaders);
+            // Only the pubsub log streams are consumed through
+            // `gap_observing_stream`, so only they can prove no loss went
+            // unhealed. The polling transport's watcher cannot, and must not
+            // claim it.
+            capabilities.push(SubscriberCapability::LogCoverageAttestation);
+        }
+        if self.config.preconfirmations != PreconfirmationMode::Disabled
+            && (self.uses_external_flashblock_updates()
+                || (self.provider_ref.is_some()
+                    && self.chain_id.and_then(flashblocks_adapter).is_some()))
+        {
+            capabilities.push(SubscriberCapability::Preconfirmations);
+        }
+        SubscriberCapabilities::new(capabilities)
+    }
+
     fn register_interests(
         &mut self,
         interests: &[ReactiveInterest<N>],
-    ) -> Result<(), SubscriberError> {
-        validate_subscriber_config(&self.config)?;
-        validate_supported_interests(self.mode, &self.config, interests)?;
+    ) -> SubscriberOperation<'_, ()> {
+        let interests = interests.to_vec();
+        Box::pin(async move {
+            validate_subscriber_config(&self.config)?;
+            validate_supported_interests(self.mode, &self.config, &interests)?;
+            if !interests.is_empty() {
+                self.ensure_chain_id().await?;
+            }
+            self.validate_flashblocks_setup()?;
 
-        self.base_interests = interests.to_vec();
-        self.owned_interests.clear();
-        self.rebuild_registered_interests();
-        self.reset_delivery_state();
-        self.state = AlloySubscriberState::Uninitialized;
-        Ok(())
+            self.base_interests = interests;
+            self.owned_interests.clear();
+            self.rebuild_registered_interests();
+            self.reset_delivery_state();
+            self.reset_stream_topology();
+            Ok(())
+        })
     }
 
     fn next_batch(&mut self) -> SubscriberNextBatch<'_, N> {
@@ -5849,6 +15545,568 @@ where
     N: Network + 'static,
     N::HeaderResponse: Send + 'static,
 {
+    /// Validate one configured provider generation and establish its selected
+    /// Flashblocks delivery surface.
+    ///
+    /// The caller must register at least one active log interest first. The
+    /// built-in profiles require a matching chain id and stable [`ProviderRef`].
+    /// Base additionally requires pubsub, `newFlashblocks`, and one
+    /// `pendingLogs` acknowledgement per planned provider filter. Optimism
+    /// probes the bounded pending block/log/receipt surface.
+    /// `op_supportedCapabilities` is queried opportunistically and retained as
+    /// opaque evidence because provider implementations do not expose a uniform
+    /// capability vocabulary.
+    ///
+    /// With `raw-flashblocks-json` and
+    /// [`Self::configure_external_flashblock_updates`], preflight instead verifies
+    /// the canonical subscriber chain and installed canonical stream topology.
+    /// The application owns supplemental-source qualification, and this method
+    /// performs no Flashblocks request/response calls for that profile.
+    ///
+    /// A successful return is deliberately not a liveness qualification. The
+    /// acceptance window must still observe a Flashblock whose pending state
+    /// advances and a correlated log for an active pool.
+    pub async fn establish_flashblocks_preflight(
+        &mut self,
+        expected_chain_id: u64,
+    ) -> Result<FlashblocksPreflight, SubscriberError> {
+        validate_subscriber_config(&self.config)?;
+        if self.config.preconfirmations == PreconfirmationMode::Disabled {
+            return Err(SubscriberError::InvalidConfig(
+                "Flashblocks preflight requires preconfirmations",
+            ));
+        }
+        if !self
+            .interests
+            .iter()
+            .any(|interest| matches!(interest, ReactiveInterest::Logs(_)))
+        {
+            return Err(SubscriberError::InvalidConfig(
+                "Flashblocks preflight requires at least one active log interest",
+            ));
+        }
+        let chain_id = self.ensure_chain_id().await?;
+        if chain_id != expected_chain_id {
+            return Err(SubscriberError::ChainMismatch {
+                expected: expected_chain_id,
+                actual: chain_id,
+            });
+        }
+        self.validate_flashblocks_setup()?;
+        #[cfg(feature = "raw-flashblocks-json")]
+        if let Some(provider) = self.external_flashblocks_provider.clone() {
+            self.ensure_streams().await?;
+            return Ok(FlashblocksPreflight {
+                chain_id,
+                provider,
+                delivery: FlashblocksDelivery::ExternalUpdates,
+                pending_log_subscriptions: 0,
+                pending_log_filters: self.log_stream_filters().len(),
+                advertised_capabilities: None,
+            });
+        }
+        let adapter = flashblocks_adapter(chain_id).ok_or(SubscriberError::Unsupported(
+            "Flashblocks are currently implemented for Base and OP chains",
+        ))?;
+        let provider = self
+            .provider_ref
+            .clone()
+            .ok_or(SubscriberError::InvalidConfig(
+                "Flashblocks preflight requires a stable provider ref",
+            ))?;
+        self.record_rpc(
+            SubscriberRpcCause::FlashblocksSetup,
+            SubscriberRpcMethod::OpSupportedCapabilities,
+        );
+        self.flashblocks_rpc_metrics.capability_requests = self
+            .flashblocks_rpc_metrics
+            .capability_requests
+            .saturating_add(1);
+        let capability_provider = if adapter == FlashblocksAdapter::PendingStatePolling {
+            self.flashblocks_state_provider
+                .as_ref()
+                .unwrap_or(&self.provider)
+        } else {
+            &self.provider
+        };
+        let advertised_capabilities = capability_provider
+            .client()
+            .request::<_, serde_json::Value>("op_supportedCapabilities", ())
+            .await
+            .ok();
+
+        self.ensure_streams().await?;
+        let pending_log_filters = self.log_stream_filters();
+        if adapter == FlashblocksAdapter::PendingStatePolling
+            && self.pending_receipt_requests_per_tick_capacity() == 0
+        {
+            return Err(SubscriberError::InvalidConfig(
+                "Flashblocks RPC budget leaves no capacity for OP transaction receipts",
+            ));
+        }
+        let (delivery, pending_log_subscriptions) = match adapter {
+            FlashblocksAdapter::NativeSubscriptions => {
+                if resolve_subscriber_transport(self.mode)? != SubscriberTransport::PubSub {
+                    return Err(SubscriberError::Unsupported(
+                        "Base Flashblocks preflight requires pubsub",
+                    ));
+                }
+                let pending_sources = self
+                    .pubsub_stream_sources()
+                    .into_iter()
+                    .filter(|source| {
+                        matches!(source, SubscriberStreamSource::BasePendingLog { .. })
+                    })
+                    .collect::<Vec<_>>();
+                let AlloySubscriberState::Active(streams) = &self.state else {
+                    return Err(SubscriberError::Provider(
+                        "Flashblocks preflight subscriptions did not become active".to_owned(),
+                    ));
+                };
+                if !streams.contains_source(&SubscriberStreamSource::BaseFlashblocks)
+                    || pending_sources
+                        .iter()
+                        .any(|source| !streams.contains_source(source))
+                {
+                    return Err(SubscriberError::Provider(
+                        "Base Flashblocks preflight did not retain both subscription lanes"
+                            .to_owned(),
+                    ));
+                }
+                (
+                    FlashblocksDelivery::NativeSubscriptions,
+                    pending_sources.len(),
+                )
+            }
+            FlashblocksAdapter::PendingStatePolling => {
+                if let Some(state_provider) = self.flashblocks_state_provider.as_ref() {
+                    self.record_rpc(
+                        SubscriberRpcCause::FlashblocksSetup,
+                        SubscriberRpcMethod::EthChainId,
+                    );
+                    self.flashblocks_rpc_metrics.provider_pair_chain_requests = self
+                        .flashblocks_rpc_metrics
+                        .provider_pair_chain_requests
+                        .saturating_add(1);
+                    let actual = state_provider
+                        .get_chain_id()
+                        .await
+                        .map_err(provider_error)?;
+                    if actual != expected_chain_id {
+                        return Err(SubscriberError::ChainMismatch {
+                            expected: expected_chain_id,
+                            actual,
+                        });
+                    }
+                }
+                let AlloySubscriberState::Active(streams) = &self.state else {
+                    return Err(SubscriberError::Provider(
+                        "Flashblocks preflight streams did not become active".to_owned(),
+                    ));
+                };
+                if !streams.contains_source(&SubscriberStreamSource::OpPendingFlashblocks) {
+                    return Err(SubscriberError::Provider(
+                        "Optimism Flashblocks preflight did not retain its pending-state sampler"
+                            .to_owned(),
+                    ));
+                }
+                self.probe_pending_state(&pending_log_filters).await?;
+                (FlashblocksDelivery::PendingStatePolling, 0)
+            }
+        };
+        Ok(FlashblocksPreflight {
+            chain_id,
+            provider,
+            delivery,
+            pending_log_subscriptions,
+            pending_log_filters: pending_log_filters.len(),
+            advertised_capabilities,
+        })
+    }
+
+    /// Ingest one standardized update from an application-managed source.
+    ///
+    /// This method is synchronous and performs no provider I/O. The update is
+    /// validated against the configured source identity, normalized through
+    /// the same preconfirmation deduplication used by provider subscriptions,
+    /// and queued for ordinary [`EventSubscriber`] delivery. Stale provider
+    /// generations and stale invalidations cannot revoke newer speculative
+    /// state. Indexed snapshots must begin at zero, advance exactly one index at
+    /// a time, preserve their base identity and cumulative transaction prefix,
+    /// and bind delta logs only to newly appended transactions.
+    #[cfg(feature = "raw-flashblocks-json")]
+    pub fn ingest_flashblock_update(
+        &mut self,
+        update: FlashblockUpdate,
+    ) -> Result<(), SubscriberError> {
+        self.ingest_flashblock_update_with_ingress(
+            update,
+            FlashblockIngressTiming::new(Instant::now()),
+        )
+    }
+
+    /// Ingest one standardized update with its original typed source arrival.
+    ///
+    /// This timing is observability-only and cannot mutate canonical state or
+    /// grant trigger authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same validation and resource errors as
+    /// [`Self::ingest_flashblock_update`].
+    #[cfg(feature = "raw-flashblocks-json")]
+    pub fn ingest_flashblock_update_with_ingress(
+        &mut self,
+        update: FlashblockUpdate,
+        timing: FlashblockIngressTiming,
+    ) -> Result<(), SubscriberError> {
+        validate_subscriber_config(&self.config)?;
+        self.validate_flashblocks_setup()?;
+        let configured =
+            self.external_flashblocks_provider
+                .as_ref()
+                .ok_or(SubscriberError::InvalidConfig(
+                    "standardized Flashblock updates require configure_external_flashblock_updates",
+                ))?;
+
+        match update {
+            FlashblockUpdate::Snapshot(batch) => {
+                if batch.flashblock.provider.endpoint != configured.endpoint {
+                    return Err(SubscriberError::Provider(
+                        "external Flashblock update came from an unexpected provider endpoint"
+                            .into(),
+                    ));
+                }
+                if batch.flashblock.provider.generation < configured.generation
+                    || self.latest_preconfirmation.as_ref().is_some_and(|latest| {
+                        latest.provider.endpoint == batch.flashblock.provider.endpoint
+                            && latest.provider.generation > batch.flashblock.provider.generation
+                    })
+                {
+                    return Ok(());
+                }
+                if self
+                    .rejected_external_flashblock_generation
+                    .is_some_and(|rejected| batch.flashblock.provider.generation <= rejected)
+                {
+                    return Err(SubscriberError::Provider(
+                        "external Flashblock provider generation was previously rejected".into(),
+                    ));
+                }
+                validate_standard_flashblock_snapshot(&batch)?;
+                if self.validate_external_flashblock_sequence(&batch)? {
+                    return Ok(());
+                }
+                let required = self.pending_record_count().saturating_add(batch.logs.len());
+                if required > self.config.max_pending_records {
+                    self.invalidate_preconfirmation_snapshot();
+                    self.last_external_flashblock_snapshot = None;
+                    return Err(SubscriberError::ResourceExhausted(format!(
+                        "external preconfirmation records require {required} pending records, above the configured limit of {}",
+                        self.config.max_pending_records
+                    )));
+                }
+                let accepted_snapshot = (*batch).clone();
+                let FlashblockSnapshot { flashblock, logs } = *batch;
+                let logs = self.filter_preconfirmed_logs(&flashblock, logs)?;
+                self.last_external_flashblock_snapshot = Some(accepted_snapshot);
+                if let Some(provider) = self.external_flashblocks_provider.as_mut() {
+                    provider.generation = provider.generation.max(flashblock.provider.generation);
+                }
+                if !logs.is_empty() {
+                    self.enqueue_event(SubscriberEvent::PreconfirmedLogs {
+                        flashblock,
+                        logs,
+                        timing,
+                    });
+                }
+            }
+            FlashblockUpdate::Invalidated(invalidation) => {
+                if invalidation.provider.endpoint != configured.endpoint {
+                    return Err(SubscriberError::Provider(
+                        "external Flashblock invalidation came from an unexpected provider endpoint"
+                            .into(),
+                    ));
+                }
+                if self.latest_preconfirmation.as_ref().is_some_and(|latest| {
+                    latest.provider == invalidation.provider
+                        && latest.payload_id == Some(invalidation.payload_id)
+                }) {
+                    self.invalidate_preconfirmation_snapshot();
+                    self.last_external_flashblock_snapshot = None;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "raw-flashblocks-json")]
+    fn validate_external_flashblock_sequence(
+        &self,
+        snapshot: &FlashblockSnapshot,
+    ) -> Result<bool, SubscriberError> {
+        let Some(previous) = self.last_external_flashblock_snapshot.as_ref() else {
+            if snapshot.flashblock.index != Some(0) {
+                return Err(SubscriberError::Provider(
+                    "external Flashblock payload generation must begin at index zero".into(),
+                ));
+            }
+            return Ok(false);
+        };
+
+        if previous.flashblock.provider == snapshot.flashblock.provider
+            && previous.flashblock.payload_id == snapshot.flashblock.payload_id
+        {
+            let previous_index = previous
+                .flashblock
+                .index
+                .expect("validated indexed snapshot");
+            let current_index = snapshot
+                .flashblock
+                .index
+                .expect("validated indexed snapshot");
+            if current_index == previous_index {
+                if previous == snapshot {
+                    return Ok(true);
+                }
+                return Err(SubscriberError::Provider(
+                    "external Flashblock repeated the same index with conflicting content".into(),
+                ));
+            }
+            if current_index < previous_index {
+                return Err(SubscriberError::Provider(format!(
+                    "external Flashblock index regressed from {previous_index} to {current_index}"
+                )));
+            }
+            if current_index > previous_index.saturating_add(1) {
+                return Err(SubscriberError::Provider(format!(
+                    "external Flashblock index skipped from {previous_index} to {current_index}"
+                )));
+            }
+            if current_index == previous_index.saturating_add(1)
+                && !previous.flashblock.same_base_identity(&snapshot.flashblock)
+            {
+                return Err(SubscriberError::Provider(
+                    "external Flashblock base identity changed within one payload generation"
+                        .into(),
+                ));
+            }
+            if current_index == previous_index.saturating_add(1)
+                && !snapshot
+                    .flashblock
+                    .transaction_hashes
+                    .starts_with(&previous.flashblock.transaction_hashes)
+            {
+                return Err(SubscriberError::Provider(
+                    "external Flashblock cumulative transaction membership changed its prior prefix"
+                        .into(),
+                ));
+            }
+            let prior_transaction_count =
+                u64::try_from(previous.flashblock.transaction_hashes.len()).unwrap_or(u64::MAX);
+            if current_index == previous_index.saturating_add(1)
+                && snapshot.logs.iter().any(|log| {
+                    log.transaction_index
+                        .is_some_and(|index| index < prior_transaction_count)
+                })
+            {
+                return Err(SubscriberError::Provider(
+                    "external Flashblock delta log does not belong to a newly appended transaction"
+                        .into(),
+                ));
+            }
+        } else if snapshot.flashblock.index != Some(0) {
+            return Err(SubscriberError::Provider(
+                "external Flashblock payload generation must begin at index zero".into(),
+            ));
+        }
+        Ok(false)
+    }
+
+    async fn probe_pending_state(&mut self, filters: &[Filter]) -> Result<(), SubscriberError> {
+        self.flashblocks_rpc_metrics.pending_block_requests = self
+            .flashblocks_rpc_metrics
+            .pending_block_requests
+            .saturating_add(1);
+        let pending = self
+            .fetch_op_pending_block()
+            .await
+            .map_err(PendingFlashblockPollError::into_subscriber)?
+            .ok_or_else(|| {
+                SubscriberError::Provider(
+                    "provider returned no pending block during Flashblocks preflight".into(),
+                )
+            })?;
+        self.certify_op_pending_parent(&pending)
+            .await
+            .map_err(PendingFlashblockPollError::into_subscriber)?;
+        for filter in filters {
+            self.record_rpc(
+                SubscriberRpcCause::PendingStateSample,
+                SubscriberRpcMethod::EthGetLogs,
+            );
+            self.flashblocks_rpc_metrics.pending_log_requests = self
+                .flashblocks_rpc_metrics
+                .pending_log_requests
+                .saturating_add(1);
+            self.flashblocks_state_provider
+                .as_ref()
+                .unwrap_or(&self.provider)
+                .get_logs(
+                    &filter
+                        .clone()
+                        .from_block(BlockNumberOrTag::Latest)
+                        .to_block(BlockNumberOrTag::Pending),
+                )
+                .await
+                .map_err(provider_error)?;
+        }
+        self.record_rpc(
+            SubscriberRpcCause::PendingStateSample,
+            SubscriberRpcMethod::EthGetTransactionReceipt,
+        );
+        self.flashblocks_rpc_metrics.pending_receipt_requests = self
+            .flashblocks_rpc_metrics
+            .pending_receipt_requests
+            .saturating_add(1);
+        let _: serde_json::Value = self
+            .flashblocks_state_provider
+            .as_ref()
+            .unwrap_or(&self.provider)
+            .raw_request(Cow::Borrowed("eth_getTransactionReceipt"), (B256::ZERO,))
+            .await
+            .map_err(provider_error)?;
+        Ok(())
+    }
+
+    async fn certify_op_pending_parent(
+        &mut self,
+        pending: &N::BlockResponse,
+    ) -> Result<N::HeaderResponse, PendingFlashblockPollError> {
+        let pending_header = pending.header();
+        let pending_number = pending_header.number();
+        let parent_hash = pending_header.parent_hash();
+        if pending_number == 0 || parent_hash.is_zero() {
+            return Err(PendingFlashblockPollError::Integrity(
+                SubscriberError::Provider(
+                    "OP pending block omitted a certifiable canonical parent".into(),
+                ),
+            ));
+        }
+        self.record_rpc(
+            SubscriberRpcCause::CanonicalHeadCertification,
+            SubscriberRpcMethod::EthGetBlockByHash,
+        );
+        self.flashblocks_rpc_metrics.canonical_head_requests = self
+            .flashblocks_rpc_metrics
+            .canonical_head_requests
+            .saturating_add(1);
+        let parent = self
+            .flashblocks_state_provider
+            .as_ref()
+            .unwrap_or(&self.provider)
+            .get_block_by_hash(parent_hash)
+            .await
+            .map_err(pending_flashblock_request_error)?
+            .ok_or_else(|| {
+                PendingFlashblockPollError::Request(SubscriberError::Provider(
+                    "Flashblocks provider returned no exact OP pending parent block".into(),
+                ))
+            })?;
+        let parent_header = parent.header();
+        if parent_header.hash() != parent_hash
+            || parent_header.number().checked_add(1) != Some(pending_number)
+        {
+            return Err(PendingFlashblockPollError::Integrity(
+                SubscriberError::Provider(
+                    "OP pending block does not extend its exact certified parent".into(),
+                ),
+            ));
+        }
+        Ok(parent_header.clone())
+    }
+
+    async fn fetch_op_pending_block(
+        &mut self,
+    ) -> Result<Option<N::BlockResponse>, PendingFlashblockPollError> {
+        self.record_rpc(
+            SubscriberRpcCause::PendingStateSample,
+            SubscriberRpcMethod::EthGetBlockByNumber,
+        );
+        let state_provider = self
+            .flashblocks_state_provider
+            .as_ref()
+            .unwrap_or(&self.provider);
+        let value: Option<serde_json::Value> = state_provider
+            .raw_request(
+                Cow::Borrowed("eth_getBlockByNumber"),
+                (BlockNumberOrTag::Pending, true),
+            )
+            .await
+            .map_err(pending_flashblock_request_error)?;
+        value
+            .map(normalize_op_pending_block::<N>)
+            .transpose()
+            .map_err(PendingFlashblockPollError::Integrity)
+    }
+
+    /// Resolve the provider's chain identity once. The assignment happens only
+    /// after a complete RPC response, so cancelling the future leaves the
+    /// subscriber cleanly retryable.
+    async fn ensure_chain_id(&mut self) -> Result<u64, SubscriberError> {
+        if let Some(chain_id) = self.chain_id {
+            return Ok(chain_id);
+        }
+        self.record_rpc(
+            SubscriberRpcCause::ChainIdentity,
+            SubscriberRpcMethod::EthChainId,
+        );
+        let chain_id = self.provider.get_chain_id().await.map_err(provider_error)?;
+        self.chain_id = Some(chain_id);
+        Ok(chain_id)
+    }
+
+    fn validate_flashblocks_setup(&self) -> Result<(), SubscriberError> {
+        if self.config.preconfirmations == PreconfirmationMode::Disabled {
+            if self.uses_external_flashblock_updates() {
+                return Err(SubscriberError::InvalidConfig(
+                    "external Flashblock updates require preconfirmations to be preferred or required",
+                ));
+            }
+            return Ok(());
+        }
+        if self.uses_external_flashblock_updates() {
+            return Ok(());
+        }
+        if self.provider_ref.is_none() {
+            return Err(SubscriberError::InvalidConfig(
+                "Flashblocks require a stable provider ref from a pinned provider lease",
+            ));
+        }
+        let Some(chain_id) = self.chain_id else {
+            return Ok(());
+        };
+        match flashblocks_adapter(chain_id) {
+            Some(FlashblocksAdapter::NativeSubscriptions)
+                if resolve_subscriber_transport(self.mode)? != SubscriberTransport::PubSub
+                    && self.config.preconfirmations == PreconfirmationMode::Required =>
+            {
+                return Err(SubscriberError::Unsupported(
+                    "Base Flashblocks require pubsub for newFlashblocks and pendingLogs",
+                ));
+            }
+            Some(FlashblocksAdapter::NativeSubscriptions) => {}
+            Some(_) => {}
+            None if self.config.preconfirmations == PreconfirmationMode::Required => {
+                return Err(SubscriberError::Unsupported(
+                    "Flashblocks are currently implemented for Base and OP chains",
+                ));
+            }
+            None => {}
+        }
+        Ok(())
+    }
+
     /// Subscribe first, then catch an exact staged owner up through a verified
     /// canonical block.
     ///
@@ -5856,6 +16114,12 @@ where
     /// [`reconcile_interest_owners`](Self::reconcile_interest_owners), so a
     /// driver adopting several owners should call the bulk API once rather than
     /// invoking this method in a loop.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SubscriberOwnerError`] when the epoch is not staged, lacks a
+    /// baseline, conflicts/regresses, provider certification or transport
+    /// fails, returned logs are invalid, or subscriber resources are exhausted.
     pub async fn reconcile_interest_owner(
         &mut self,
         epoch: &SubscriberOwnerEpoch,
@@ -5886,6 +16150,13 @@ where
     /// failure leaves every target staged with its prior progress unchanged;
     /// live canonical delivery consumed during the attempt is preserved while
     /// excluding the failed target epochs from its staged-owner audience.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SubscriberOwnerError`] when an epoch is not staged, lacks a
+    /// baseline, conflicts/regresses, provider certification or transport
+    /// fails, returned logs are invalid, or subscriber resources are exhausted.
+    /// Target progress remains unchanged on error.
     pub async fn reconcile_interest_owners(
         &mut self,
         epochs: &[SubscriberOwnerEpoch],
@@ -5897,6 +16168,8 @@ where
         if epochs.is_empty() {
             return Ok(Vec::new());
         }
+
+        self.ensure_chain_id().await?;
 
         let mut seen = HashSet::new();
         let mut plans = Vec::with_capacity(epochs.len());
@@ -5956,7 +16229,7 @@ where
             plans.push(SubscriberOwnerReconcilePlan {
                 epoch: epoch.clone(),
                 interests: entry.interests.clone(),
-                retained: position.clone(),
+                retained: *position,
                 from_block,
             });
         }
@@ -5966,30 +16239,42 @@ where
         self.ensure_streams().await?;
         let provider = self.provider.clone();
         let filters = merged_owner_reconcile_filters(&plans, through.number);
-        let retained = plans.iter().map(|plan| plan.retained.clone()).collect();
+        let retained = plans.iter().map(|plan| plan.retained).collect();
         let target_epochs: HashSet<_> = plans.iter().map(|plan| plan.epoch.clone()).collect();
-        let fetch = fetch_owner_catchup::<P, N>(provider, filters, retained, through);
+        let fetch = fetch_owner_catchup::<P, N>(
+            provider,
+            filters,
+            retained,
+            through,
+            SubscriberOwnerCatchupOptions {
+                target_preverified: false,
+                max_logs: self.config.max_pending_records,
+                max_log_bytes: self.config.max_backfill_log_bytes,
+                max_requests_in_flight: self.config.max_reconcile_requests_in_flight,
+                cause: SubscriberRpcCause::OwnerReconcile,
+            },
+            Arc::clone(&self.rpc_counters),
+        );
         let SubscriberOwnerCatchup { logs, certified } =
             self.drive_reconcile_fetch(fetch, &target_epochs).await?;
 
-        self.pending_backfills.retain(|queued| {
-            queued
-                .epoch
-                .as_ref()
-                .is_none_or(|epoch| !target_epochs.contains(epoch))
-        });
         let records = logs
             .into_iter()
             .map(|log| log_input_record(log, InputSource::Backfill))
             .collect();
-        for record in dedupe_records(sort_records(records)) {
+        let mut routed_records = Vec::new();
+        for record in dedupe_records(sort_records(records)).map_err(|error| {
+            SubscriberError::InvalidBackfill(format!(
+                "conflicting duplicate owner catch-up record: {error}"
+            ))
+        })? {
             let block_number = match &record.input {
                 ReactiveInput::Log(log) => log
                     .block_number
                     .expect("bulk catch-up logs were validated before commit"),
                 _ => unreachable!("bulk owner catch-up contains log records only"),
             };
-            let owners = plans
+            let owners: Vec<SubscriberOwnerEpoch> = plans
                 .iter()
                 .filter(|plan| block_number >= plan.from_block)
                 .filter(|plan| {
@@ -5999,6 +16284,25 @@ where
                 })
                 .map(|plan| plan.epoch.clone())
                 .collect();
+            if !owners.is_empty() {
+                routed_records.push((record, owners));
+            }
+        }
+        self.ensure_pending_record_capacity(
+            routed_records.len(),
+            "owner reconciliation historical records",
+        )?;
+
+        // Nothing provider-derived becomes authoritative until every record is
+        // known to fit. In particular, preserve queued retry state and owner
+        // progress when the bounded delivery queue cannot accept the catch-up.
+        self.pending_backfills.retain(|queued| {
+            queued
+                .epoch
+                .as_ref()
+                .is_none_or(|epoch| !target_epochs.contains(epoch))
+        });
+        for (record, owners) in routed_records {
             self.enqueue_owner_record_for_owners_unmerged(record, owners);
         }
         self.promote_reconcile_owner_records(&target_epochs);
@@ -6009,7 +16313,7 @@ where
         for plan in plans {
             let item = SubscriberOwnerProgress {
                 owner: plan.epoch.clone(),
-                through: certified.clone(),
+                through: certified,
             };
             let entry = self
                 .owned_interests
@@ -6056,6 +16360,7 @@ where
             })?;
             self.buffer_reconcile_event_for_owners(&event, target_epochs);
             self.enqueue_event_excluding_owners(event, target_epochs);
+            self.check_resource_error()?;
         }
     }
 
@@ -6072,6 +16377,11 @@ where
     ///
     /// The control future is polled first. Therefore a ready shutdown/removal
     /// command cannot starve behind a continuously ready subscriber queue.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SubscriberError`] when the subscriber poll encounters a
+    /// transport, continuity, decoding, configuration, or resource failure.
     pub async fn next_scoped_batch_or<C, F>(
         &mut self,
         control: Pin<&mut F>,
@@ -6102,16 +16412,31 @@ where
     /// cancellation-safety invariants of this poll and prioritizes ready control.
     pub fn next_scoped_batch(&mut self) -> SubscriberNextScopedBatch<'_, N> {
         Box::pin(async {
+            self.check_resource_error()?;
+            if self.chain_id.is_none()
+                && (!self.pending_records.is_empty()
+                    || !self.pending_chain_controls.is_empty()
+                    || !self.pending_backfills.is_empty()
+                    || !self.interests.is_empty())
+            {
+                self.ensure_chain_id().await?;
+            }
+            if let Some(batch) = self.drain_next_scoped_batch() {
+                return Ok(Some(batch));
+            }
+
+            // Subscribe/adopt the complete desired topology before resolving
+            // any queued historical upper bound. Live streams therefore own
+            // every event that can arrive while the bounded backfill is in
+            // flight, including the coordinated registration window.
+            self.ensure_streams().await?;
+            self.check_resource_error()?;
             if let Some(batch) = self.drain_next_scoped_batch() {
                 return Ok(Some(batch));
             }
 
             self.drain_pending_backfills().await?;
-            if let Some(batch) = self.drain_next_scoped_batch() {
-                return Ok(Some(batch));
-            }
-
-            self.ensure_streams().await?;
+            self.check_resource_error()?;
             if let Some(batch) = self.drain_next_scoped_batch() {
                 return Ok(Some(batch));
             }
@@ -6126,6 +16451,7 @@ where
                 };
 
                 self.enqueue_event(event);
+                self.check_resource_error()?;
                 if let Some(batch) = self.drain_next_scoped_batch() {
                     return Ok(Some(batch));
                 }
@@ -6171,39 +16497,64 @@ where
             AlloySubscriberState::Uninitialized | AlloySubscriberState::Empty => desired.clone(),
         };
 
-        let mut connected = Vec::new();
         for source in missing {
-            let stream = self.connect_source_stream(source.clone()).await?;
+            let stream = match self.connect_source_stream(source.clone()).await {
+                Ok(stream) => stream,
+                Err(error)
+                    if source.is_flashblocks()
+                        && self.config.preconfirmations == PreconfirmationMode::Preferred =>
+                {
+                    tracing::warn!(
+                        stream = source.label(),
+                        error = %error,
+                        "Flashblocks source unavailable; canonical delivery remains active"
+                    );
+                    if self.config.reconnect.enabled {
+                        self.schedule_flashblock_reconnect(
+                            source,
+                            self.config.reconnect.retry_delay,
+                        );
+                    }
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            // Publish each successful connection before any later await. If a
+            // second connection or anchored catch-up fails/cancels, this stream
+            // remains live and the next reconcile skips reconnecting it.
+            self.install_source_stream(source.clone(), stream);
+            if self.source_requires_backfill(&source) {
+                self.queue_source_backfill(source);
+            }
+        }
+
+        while let Some(source) = self.pending_source_backfills.front().cloned() {
+            let desired_and_live = desired.iter().any(|item| item.same_key(&source))
+                && matches!(
+                    &self.state,
+                    AlloySubscriberState::Active(streams) if streams.contains_source(&source)
+                );
+            if !desired_and_live {
+                self.pending_source_backfills.pop_front();
+                continue;
+            }
+
             // Anchored catch-up for a source with a known delivery watermark
             // (seeded by a drained adoption backfill, or inherited from a
             // filter shape that was live before): subscribe first, then fetch
-            // the gap, so nothing lands between the two.
-            if let Some(event) = self.backfill_reconnected_source(&source).await? {
+            // the gap, so nothing lands between the two. Pop only after the
+            // request succeeds; errors and cancellation retain retry intent.
+            let event = self.backfill_reconnected_source(&source).await?;
+            self.pending_source_backfills.pop_front();
+            if let Some(event) = event {
                 self.enqueue_event(event);
             }
-            connected.push((source, stream));
         }
 
-        match &mut self.state {
-            AlloySubscriberState::Active(streams) => {
-                streams.retain_sources(&desired);
-                for (source, stream) in connected {
-                    streams.push(source, stream);
-                }
-                if streams.is_empty() {
-                    self.state = AlloySubscriberState::Empty;
-                }
-            }
-            AlloySubscriberState::Uninitialized | AlloySubscriberState::Empty => {
-                let mut streams = SubscriberStreams::new();
-                for (source, stream) in connected {
-                    streams.push(source, stream);
-                }
-                self.state = if streams.is_empty() {
-                    AlloySubscriberState::Empty
-                } else {
-                    AlloySubscriberState::Active(streams)
-                };
+        if let AlloySubscriberState::Active(streams) = &mut self.state {
+            streams.retain_sources(&desired);
+            if streams.is_empty() {
+                self.state = AlloySubscriberState::Empty;
             }
         }
 
@@ -6211,6 +16562,77 @@ where
         self.sources_dirty = false;
         self.retire_unreferenced_filters();
         Ok(())
+    }
+
+    fn install_source_stream(
+        &mut self,
+        source: SubscriberStreamSource,
+        stream: BoxStream<'static, SubscriberEvent<N>>,
+    ) {
+        match &mut self.state {
+            AlloySubscriberState::Active(streams) => {
+                if streams.contains_source(&source) {
+                    return;
+                }
+                streams.push(source, stream);
+            }
+            AlloySubscriberState::Uninitialized | AlloySubscriberState::Empty => {
+                let mut streams = SubscriberStreams::new();
+                streams.push(source, stream);
+                self.state = AlloySubscriberState::Active(streams);
+            }
+        }
+        // A partially completed reconcile is still a topology change. Advance
+        // the revision now rather than only at the final clean boundary.
+        self.bump_stream_revision();
+    }
+
+    fn schedule_flashblock_reconnect(
+        &mut self,
+        source: SubscriberStreamSource,
+        first_delay: Duration,
+    ) {
+        if self
+            .pending_flashblock_reconnect_sources
+            .iter()
+            .any(|pending| pending.same_key(&source))
+        {
+            return;
+        }
+        self.pending_flashblock_reconnect_sources
+            .push(source.clone());
+        self.pending_flashblock_reconnects
+            .push(flashblock_reconnect_future(
+                self.provider.root().clone(),
+                source,
+                self.config.max_batch_size,
+                self.config.reconnect.clone(),
+                first_delay,
+                self.config.flashblock_poll_interval,
+                Arc::clone(&self.rpc_counters),
+            ));
+    }
+
+    fn reschedule_preferred_flashblock(&mut self, source: SubscriberStreamSource) {
+        if !self.config.reconnect.enabled {
+            return;
+        }
+        self.schedule_flashblock_reconnect(source, self.config.reconnect.max_delay);
+    }
+
+    fn source_requires_backfill(&self, source: &SubscriberStreamSource) -> bool {
+        matches!(source, SubscriberStreamSource::PubSubLog { id, .. }
+            if self.last_seen_log_blocks.contains_key(id))
+    }
+
+    fn queue_source_backfill(&mut self, source: SubscriberStreamSource) {
+        if !self
+            .pending_source_backfills
+            .iter()
+            .any(|pending| pending.same_key(&source))
+        {
+            self.pending_source_backfills.push_back(source);
+        }
     }
 
     /// Fetch queued adoption/continuity backfills, oldest first.
@@ -6228,56 +16650,144 @@ where
         while let Some(queued) = self.pending_backfills.front() {
             // Owner was removed while its backfill was queued.
             let epoch = queued.epoch.clone();
-            let owner_exists = match &epoch {
-                Some(epoch) => self.interest_owner_state(epoch).is_some(),
-                None => self.owner_interests(&queued.owner).is_some(),
+            let owner = queued.owner.clone();
+            let owner_exists = match (&epoch, &owner) {
+                (Some(epoch), _) => self.interest_owner_state(epoch).is_some(),
+                (None, Some(owner)) => self.owner_interests(owner).is_some(),
+                (None, None) => true,
             };
             if !owner_exists {
                 self.pending_backfills.pop_front();
                 continue;
             }
-            let filter = queued.filter.clone();
+            let filters = queued.filters.clone();
             let backfill = queued.backfill;
 
             let to_block = match backfill.end_block() {
                 Some(to_block) => to_block,
-                None => self
-                    .provider
-                    .get_block_number()
-                    .await
-                    .map_err(provider_error)?,
+                None => {
+                    self.record_rpc(
+                        SubscriberRpcCause::LazyBackfill,
+                        SubscriberRpcMethod::EthBlockNumber,
+                    );
+                    self.provider
+                        .get_block_number()
+                        .await
+                        .map_err(provider_error)?
+                }
             };
             if to_block < backfill.start_block() {
-                // Anchor already at (or past) the provider head: nothing to
-                // fetch, and the anchor keeps its current value.
+                // An exclusive post-baseline range can be empty when the
+                // provider is still exactly at the retained head. Consume the
+                // work only after validating that head and seed the filter at
+                // the proven baseline so reconnect catch-up starts at C + 1.
+                let certified = if let Some(retained) = backfill.retained_anchor() {
+                    let actual = fetch_provider_block_ref::<P, N>(
+                        &self.provider,
+                        retained.number,
+                        &self.rpc_counters,
+                        SubscriberRpcCause::LazyBackfill,
+                    )
+                    .await?;
+                    if !block_ref_satisfies_expected(&actual, retained) {
+                        return Err(SubscriberError::InvalidBackfill(format!(
+                            "retained anchor {}:{:?} conflicts with provider block {}:{:?}",
+                            retained.number, retained.hash, actual.number, actual.hash
+                        )));
+                    }
+                    if to_block < retained.number {
+                        return Err(SubscriberError::InvalidBackfill(format!(
+                            "backfill upper bound {to_block} precedes retained anchor {}",
+                            retained.number
+                        )));
+                    }
+                    Some(actual)
+                } else {
+                    None
+                };
                 self.pending_backfills.pop_front();
+                for filter in &filters {
+                    let source_id = self.log_source_id(filter);
+                    if let Some(certified) = certified {
+                        self.last_seen_log_blocks
+                            .entry(source_id)
+                            .and_modify(|anchor| *anchor = (*anchor).max(certified.number))
+                            .or_insert(certified.number);
+                    }
+                }
+                if owner.is_none()
+                    && let Some(certified) = certified
+                {
+                    self.pending_chain_controls
+                        .push_back(global_backfill_barrier(backfill, certified));
+                }
+                if !self.pending_chain_controls.is_empty() {
+                    break;
+                }
                 continue;
             }
 
-            let range = filter
-                .clone()
-                .from_block(backfill.start_block())
-                .to_block(to_block);
-            let logs = self
-                .provider
-                .get_logs(&range)
-                .await
-                .map_err(provider_error)?;
+            let through = fetch_provider_block_ref::<P, N>(
+                &self.provider,
+                to_block,
+                &self.rpc_counters,
+                SubscriberRpcCause::LazyBackfill,
+            )
+            .await?;
+            let request_filters =
+                merged_lazy_backfill_filters(&filters, backfill.start_block(), through.number);
+            let retained = backfill.retained_anchor().copied().into_iter().collect();
+            let SubscriberOwnerCatchup {
+                mut logs,
+                certified,
+            } = fetch_owner_catchup::<&P, N>(
+                &self.provider,
+                request_filters,
+                retained,
+                through,
+                SubscriberOwnerCatchupOptions {
+                    target_preverified: true,
+                    max_logs: self.config.max_pending_records,
+                    max_log_bytes: self.config.max_backfill_log_bytes,
+                    max_requests_in_flight: self.config.max_reconcile_requests_in_flight,
+                    cause: SubscriberRpcCause::LazyBackfill,
+                },
+                Arc::clone(&self.rpc_counters),
+            )
+            .await
+            .map_err(lazy_backfill_error)?;
+            logs.sort_by_key(|log| {
+                (
+                    log.block_number.unwrap_or_default(),
+                    log.transaction_index.unwrap_or_default(),
+                    log.log_index.unwrap_or_default(),
+                )
+            });
+            logs.dedup();
+            self.ensure_pending_record_capacity(logs.len(), "lazy subscriber backfill records")?;
 
             // Fetch succeeded: consume the entry, deliver, and advance the
-            // anchor through the fetched bound.
+            // complete filter group through one globally ordered window.
             self.pending_backfills.pop_front();
-            let source_id = self.log_source_id(&filter);
-            self.enqueue_backfilled_logs(logs, Some(source_id), epoch.as_ref(), Some(backfill));
-            if epoch.is_none() {
+            if let Some(epoch) = epoch.as_ref() {
+                self.enqueue_backfilled_logs(logs, None, Some(epoch), Some(backfill));
+            } else if let Some(owner) = owner.as_ref() {
+                self.enqueue_compat_owner_backfilled_logs(logs, owner, backfill);
+            } else {
+                self.enqueue_backfilled_logs(logs, None, None, Some(backfill));
+                self.pending_chain_controls
+                    .push_back(global_backfill_barrier(backfill, certified));
+            }
+            for filter in &filters {
+                let source_id = self.log_source_id(filter);
                 let anchor = self
                     .last_seen_log_blocks
                     .entry(source_id)
-                    .or_insert(to_block);
-                *anchor = (*anchor).max(to_block);
+                    .or_insert(certified.number);
+                *anchor = (*anchor).max(certified.number);
             }
 
-            if !self.pending_records.is_empty() {
+            if !self.pending_records.is_empty() || !self.pending_chain_controls.is_empty() {
                 break;
             }
         }
@@ -6285,10 +16795,19 @@ where
     }
 
     fn stream_sources(&mut self) -> Result<Vec<SubscriberStreamSource>, SubscriberError> {
-        match resolve_subscriber_transport(self.mode)? {
-            SubscriberTransport::PubSub => Ok(self.pubsub_stream_sources()),
-            SubscriberTransport::Polling => Ok(self.polling_stream_sources()),
-        }
+        let sources = match resolve_subscriber_transport(self.mode)? {
+            SubscriberTransport::PubSub => self.pubsub_stream_sources(),
+            SubscriberTransport::Polling => self.polling_stream_sources(),
+        };
+        #[cfg(feature = "raw-flashblocks-json")]
+        let sources = {
+            let mut sources = sources;
+            if self.external_flashblock_update_channel_opened {
+                sources.push(SubscriberStreamSource::ExternalFlashblockUpdates);
+            }
+            sources
+        };
+        Ok(sources)
     }
 
     fn pubsub_stream_sources(&mut self) -> Vec<SubscriberStreamSource> {
@@ -6308,7 +16827,32 @@ where
         }
 
         if needs_header_block_stream(&self.interests) {
-            sources.push(SubscriberStreamSource::PubSubBlockHeaders);
+            if !self.uses_external_flashblock_updates()
+                && self.config.preconfirmations != PreconfirmationMode::Disabled
+                && self.chain_id.and_then(flashblocks_adapter).is_some()
+            {
+                sources.push(SubscriberStreamSource::CanonicalHeadPolling);
+            } else {
+                sources.push(SubscriberStreamSource::PubSubBlockHeaders);
+            }
+        }
+
+        if self.config.preconfirmations != PreconfirmationMode::Disabled
+            && !self.uses_external_flashblock_updates()
+        {
+            match self.chain_id.and_then(flashblocks_adapter) {
+                Some(FlashblocksAdapter::NativeSubscriptions) => {
+                    sources.push(SubscriberStreamSource::BaseFlashblocks);
+                    for filter in self.log_stream_filters() {
+                        let id = self.log_source_id(&filter);
+                        sources.push(SubscriberStreamSource::BasePendingLog { id, filter });
+                    }
+                }
+                Some(FlashblocksAdapter::PendingStatePolling) => {
+                    sources.push(SubscriberStreamSource::OpPendingFlashblocks);
+                }
+                None => {}
+            }
         }
 
         sources
@@ -6323,6 +16867,14 @@ where
 
         if needs_pending_hash_stream(&self.interests) {
             sources.push(SubscriberStreamSource::PollingPendingHashes);
+        }
+
+        if self.config.preconfirmations != PreconfirmationMode::Disabled
+            && !self.uses_external_flashblock_updates()
+            && self.chain_id.and_then(flashblocks_adapter)
+                == Some(FlashblocksAdapter::PendingStatePolling)
+        {
+            sources.push(SubscriberStreamSource::OpPendingFlashblocks);
         }
 
         sources
@@ -6347,6 +16899,16 @@ where
             SubscriberStreamSource::PubSubLog { id, filter } => {
                 self.connect_pubsub_log_stream(id, filter).await
             }
+            SubscriberStreamSource::BasePendingLog { id, filter } => {
+                self.connect_base_pending_log_stream(id, filter).await
+            }
+            SubscriberStreamSource::BaseFlashblocks => self.connect_base_flashblock_stream().await,
+            SubscriberStreamSource::OpPendingFlashblocks => {
+                self.connect_op_flashblock_tick_stream()
+            }
+            SubscriberStreamSource::CanonicalHeadPolling => {
+                self.connect_canonical_head_tick_stream()
+            }
             SubscriberStreamSource::PubSubPendingHashes => {
                 self.connect_pubsub_pending_hash_stream().await
             }
@@ -6358,6 +16920,24 @@ where
             }
             SubscriberStreamSource::PollingPendingHashes => {
                 self.connect_polling_pending_hash_stream().await
+            }
+            #[cfg(feature = "raw-flashblocks-json")]
+            SubscriberStreamSource::ExternalFlashblockUpdates => {
+                let receiver = self.external_flashblock_updates.take().ok_or_else(|| {
+                    SubscriberError::Provider(
+                        "external Flashblock update channel receiver is unavailable".into(),
+                    )
+                })?;
+                let updates = stream::unfold(receiver, |mut receiver| async move {
+                    receiver
+                        .recv()
+                        .await
+                        .map(|update| (SubscriberEvent::ExternalFlashblockUpdate(update), receiver))
+                });
+                Ok(stream_with_termination(
+                    updates,
+                    SubscriberStreamSource::ExternalFlashblockUpdates,
+                ))
             }
         }
     }
@@ -6373,15 +16953,22 @@ where
                 id,
                 filter: filter.clone(),
             };
-            let stream = self
+            self.record_rpc(
+                SubscriberRpcCause::StreamSubscription,
+                SubscriberRpcMethod::EthSubscribe,
+            );
+            let subscription = self
                 .provider
                 .subscribe_logs(&filter)
-                .channel_size(self.config.max_batch_size.max(1))
+                .channel_size(self.log_channel_size())
                 .await
-                .map_err(provider_error)?
-                .into_stream()
-                .map(move |log| SubscriberEvent::Log { source_id: id, log });
-            Ok(stream_with_termination(stream, source))
+                .map_err(provider_error)?;
+            Ok(gap_observing_stream(
+                subscription,
+                source,
+                Arc::clone(&self.gap_counters),
+                move |log| SubscriberEvent::Log { source_id: id, log },
+            ))
         }
 
         #[cfg(not(feature = "reactive-ws"))]
@@ -6393,11 +16980,129 @@ where
         }
     }
 
+    async fn connect_base_pending_log_stream(
+        &mut self,
+        id: usize,
+        filter: Filter,
+    ) -> Result<BoxStream<'static, SubscriberEvent<N>>, SubscriberError> {
+        #[cfg(feature = "reactive-ws")]
+        {
+            let source = SubscriberStreamSource::BasePendingLog {
+                id,
+                filter: filter.clone(),
+            };
+            let params = base_pending_log_filter(&filter)?;
+            self.record_rpc(
+                SubscriberRpcCause::StreamSubscription,
+                SubscriberRpcMethod::EthSubscribe,
+            );
+            let subscription = self
+                .provider
+                .subscribe::<_, Log>(("pendingLogs", params))
+                .channel_size(self.log_channel_size())
+                .await
+                .map_err(provider_error)?;
+            Ok(gap_observing_stream(
+                subscription,
+                source,
+                Arc::clone(&self.gap_counters),
+                move |log| SubscriberEvent::BasePendingLogTimed {
+                    source_id: id,
+                    log,
+                    timing: FlashblockIngressTiming::new(Instant::now()),
+                },
+            ))
+        }
+
+        #[cfg(not(feature = "reactive-ws"))]
+        {
+            let _ = (id, filter);
+            Err(SubscriberError::Unsupported(
+                "Base Flashblocks require the reactive-ws feature",
+            ))
+        }
+    }
+
+    async fn connect_base_flashblock_stream(
+        &mut self,
+    ) -> Result<BoxStream<'static, SubscriberEvent<N>>, SubscriberError> {
+        #[cfg(feature = "reactive-ws")]
+        {
+            self.record_rpc(
+                SubscriberRpcCause::StreamSubscription,
+                SubscriberRpcMethod::EthSubscribe,
+            );
+            let stream = self
+                .provider
+                .subscribe::<_, BaseFlashblockWirePayload>(("newFlashblocks",))
+                .channel_size(self.config.max_batch_size.max(1))
+                .await
+                .map_err(provider_error)?
+                .into_stream()
+                .map(|payload| SubscriberEvent::BaseFlashblockTimed {
+                    payload,
+                    timing: FlashblockIngressTiming::new(Instant::now()),
+                });
+            Ok(stream_with_termination(
+                stream,
+                SubscriberStreamSource::BaseFlashblocks,
+            ))
+        }
+
+        #[cfg(not(feature = "reactive-ws"))]
+        {
+            Err(SubscriberError::Unsupported(
+                "Base Flashblocks require the reactive-ws feature",
+            ))
+        }
+    }
+
+    fn connect_canonical_head_tick_stream(
+        &self,
+    ) -> Result<BoxStream<'static, SubscriberEvent<N>>, SubscriberError> {
+        let mut interval = tokio::time::interval(self.config.canonical_head_poll_interval);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let stream = stream::unfold(interval, |mut interval| async move {
+            interval.tick().await;
+            Some((SubscriberEvent::CanonicalHeadTick, interval))
+        });
+        Ok(stream_with_termination(
+            stream,
+            SubscriberStreamSource::CanonicalHeadPolling,
+        ))
+    }
+
+    fn connect_op_flashblock_tick_stream(
+        &self,
+    ) -> Result<BoxStream<'static, SubscriberEvent<N>>, SubscriberError> {
+        let first_tick = tokio::time::Instant::now() + self.config.flashblock_poll_interval;
+        let mut interval =
+            tokio::time::interval_at(first_tick, self.config.flashblock_poll_interval);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let stream = stream::unfold(interval, |mut interval| async move {
+            interval.tick().await;
+            Some((
+                SubscriberEvent::OpFlashblockTickTimed(
+                    FlashblockIngressTiming::new(Instant::now()),
+                ),
+                interval,
+            ))
+        });
+        Ok(stream_with_termination(
+            stream,
+            SubscriberStreamSource::OpPendingFlashblocks,
+        ))
+    }
+
     async fn connect_pubsub_pending_hash_stream(
         &mut self,
     ) -> Result<BoxStream<'static, SubscriberEvent<N>>, SubscriberError> {
         #[cfg(feature = "reactive-ws")]
         {
+            self.record_rpc(
+                SubscriberRpcCause::StreamSubscription,
+                SubscriberRpcMethod::EthSubscribe,
+            );
             let stream = self
                 .provider
                 .subscribe_pending_transactions()
@@ -6425,17 +17130,21 @@ where
     ) -> Result<BoxStream<'static, SubscriberEvent<N>>, SubscriberError> {
         #[cfg(feature = "reactive-ws")]
         {
-            let stream = self
+            self.record_rpc(
+                SubscriberRpcCause::StreamSubscription,
+                SubscriberRpcMethod::EthSubscribe,
+            );
+            let subscription = self
                 .provider
                 .subscribe_blocks()
                 .channel_size(self.config.max_batch_size.max(1))
                 .await
-                .map_err(provider_error)?
-                .into_stream()
-                .map(SubscriberEvent::BlockHeader);
-            Ok(stream_with_termination(
-                stream,
+                .map_err(provider_error)?;
+            Ok(gap_observing_stream(
+                subscription,
                 SubscriberStreamSource::PubSubBlockHeaders,
+                Arc::clone(&self.gap_counters),
+                SubscriberEvent::BlockHeader,
             ))
         }
 
@@ -6456,6 +17165,10 @@ where
             let source = SubscriberStreamSource::PollingLog {
                 filter: filter.clone(),
             };
+            self.record_rpc(
+                SubscriberRpcCause::StreamSubscription,
+                SubscriberRpcMethod::EthSubscribe,
+            );
             let stream = self
                 .provider
                 .watch_logs(&filter)
@@ -6481,6 +17194,10 @@ where
     ) -> Result<BoxStream<'static, SubscriberEvent<N>>, SubscriberError> {
         #[cfg(feature = "reactive-polling")]
         {
+            self.record_rpc(
+                SubscriberRpcCause::StreamSubscription,
+                SubscriberRpcMethod::EthSubscribe,
+            );
             let stream = self
                 .provider
                 .watch_pending_transactions()
@@ -6505,10 +17222,65 @@ where
 
     async fn next_event(&mut self) -> Result<Option<SubscriberEvent<N>>, SubscriberError> {
         loop {
-            let event = match &mut self.state {
-                AlloySubscriberState::Active(streams) => streams.next().await,
+            let ready = match &mut self.state {
+                AlloySubscriberState::Active(streams)
+                    if !self.pending_flashblock_reconnects.is_empty() =>
+                {
+                    let stream_event = Box::pin(streams.next());
+                    let reconnect = Box::pin(self.pending_flashblock_reconnects.next());
+                    match select(reconnect, stream_event).await {
+                        Either::Left((reconnect, pending_event)) => {
+                            drop(pending_event);
+                            let Some((source, result)) = reconnect else {
+                                continue;
+                            };
+                            SubscriberReady::FlashblockReconnect(source, result)
+                        }
+                        Either::Right((event, pending_reconnect)) => {
+                            drop(pending_reconnect);
+                            SubscriberReady::Event(event)
+                        }
+                    }
+                }
+                AlloySubscriberState::Active(streams) => {
+                    SubscriberReady::Event(streams.next().await)
+                }
+                AlloySubscriberState::Uninitialized | AlloySubscriberState::Empty
+                    if !self.pending_flashblock_reconnects.is_empty() =>
+                {
+                    let Some((source, result)) = self.pending_flashblock_reconnects.next().await
+                    else {
+                        continue;
+                    };
+                    SubscriberReady::FlashblockReconnect(source, result)
+                }
                 AlloySubscriberState::Uninitialized | AlloySubscriberState::Empty => {
                     return Ok(None);
+                }
+            };
+
+            let event = match ready {
+                SubscriberReady::Event(event) => event,
+                SubscriberReady::FlashblockReconnect(source, result) => {
+                    self.pending_flashblock_reconnect_sources
+                        .retain(|pending| !pending.same_key(&source));
+                    match result {
+                        Ok(stream) => {
+                            self.install_source_stream(source, stream);
+                        }
+                        Err(error)
+                            if self.config.preconfirmations == PreconfirmationMode::Preferred =>
+                        {
+                            tracing::warn!(
+                                stream = source.label(),
+                                error = %error,
+                                "Flashblocks reconnect window exhausted; canonical delivery remains active"
+                            );
+                            self.reschedule_preferred_flashblock(source);
+                        }
+                        Err(error) => return Err(error),
+                    }
+                    continue;
                 }
             };
 
@@ -6521,20 +17293,1350 @@ where
 
             match event {
                 SubscriberEvent::StreamTerminated(source) => {
+                    if source.is_external_flashblocks() {
+                        #[cfg(feature = "raw-flashblocks-json")]
+                        {
+                            self.external_flashblock_update_channel_opened = false;
+                        }
+                        if let AlloySubscriberState::Active(streams) = &mut self.state {
+                            streams
+                                .entries
+                                .retain(|entry| !entry.source.is_external_flashblocks());
+                            streams.normalize_next_index();
+                        }
+                        self.invalidate_preconfirmation_snapshot();
+                        if self.config.preconfirmations == PreconfirmationMode::Required {
+                            return Err(SubscriberError::Provider(
+                                "required external Flashblock update channel closed".into(),
+                            ));
+                        }
+                        return Ok(Some(SubscriberEvent::FlashblockInvalidated));
+                    }
                     // Persist the missing-source intent before the first await.
                     // If a control command cancels this poll during reconnect,
                     // the next poll will reconcile the desired/live diff.
+                    if source.is_flashblocks() {
+                        self.invalidate_flashblock_generation();
+                        return Ok(Some(SubscriberEvent::FlashblockInvalidated));
+                    }
                     self.sources_dirty = true;
                     self.bump_stream_revision();
                     if let Some(backfill_event) = self.reconnect_source_stream(source).await? {
                         self.sources_dirty = false;
-                        return Ok(Some(backfill_event));
+                        if let Some(backfill_event) =
+                            self.normalize_flashblock_event(backfill_event).await?
+                        {
+                            self.verify_event_log_blocks(&backfill_event).await?;
+                            return Ok(Some(backfill_event));
+                        }
                     }
                     self.sources_dirty = false;
                 }
-                event => return Ok(Some(event)),
+                SubscriberEvent::StreamGap { source, gap } => {
+                    if let Some(backfill_event) = self.recover_stream_gap(&source, gap).await? {
+                        self.verify_event_log_blocks(&backfill_event).await?;
+                        return Ok(Some(backfill_event));
+                    }
+                }
+                event => {
+                    let Some(event) = self.normalize_flashblock_event(event).await? else {
+                        continue;
+                    };
+                    self.verify_event_log_blocks(&event).await?;
+                    return Ok(Some(event));
+                }
             }
         }
+    }
+
+    fn invalidate_flashblock_generation(&mut self) {
+        self.pending_records
+            .retain(|record| record.scope != SubscriberInputScope::Preconfirmed);
+        self.pending_preconfirmation_invalidation = true;
+        self.reset_flashblock_tracking();
+        if let Some(provider) = self.provider_ref.as_mut() {
+            provider.generation = provider.generation.saturating_add(1);
+        }
+        if let AlloySubscriberState::Active(streams) = &mut self.state {
+            streams
+                .entries
+                .retain(|entry| !entry.source.is_flashblocks());
+            streams.normalize_next_index();
+        }
+        let reconnect_sources = self
+            .stream_sources()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(SubscriberStreamSource::is_flashblocks)
+            .collect::<Vec<_>>();
+        self.pending_flashblock_reconnects.clear();
+        self.pending_flashblock_reconnect_sources.clear();
+        if self.config.preconfirmations == PreconfirmationMode::Required
+            || self.config.reconnect.enabled
+        {
+            for source in reconnect_sources {
+                self.schedule_flashblock_reconnect(source, self.config.reconnect.initial_delay);
+            }
+        }
+        self.sources_dirty = false;
+        self.bump_stream_revision();
+    }
+
+    async fn normalize_flashblock_event(
+        &mut self,
+        event: SubscriberEvent<N>,
+    ) -> Result<Option<SubscriberEvent<N>>, SubscriberError> {
+        let event = match event {
+            SubscriberEvent::BasePendingLog { source_id, log } => {
+                SubscriberEvent::BasePendingLogTimed {
+                    source_id,
+                    log,
+                    timing: FlashblockIngressTiming::new(Instant::now()),
+                }
+            }
+            SubscriberEvent::BaseFlashblock(payload) => SubscriberEvent::BaseFlashblockTimed {
+                payload,
+                timing: FlashblockIngressTiming::new(Instant::now()),
+            },
+            SubscriberEvent::OpFlashblockTick => {
+                SubscriberEvent::OpFlashblockTickTimed(FlashblockIngressTiming::new(Instant::now()))
+            }
+            event => event,
+        };
+        match event {
+            #[cfg(feature = "raw-flashblocks-json")]
+            SubscriberEvent::ExternalFlashblockUpdate(queued) => {
+                let provider = queued.update.provider().clone();
+                match self.ingest_flashblock_update_with_ingress(queued.update, queued.timing) {
+                    Ok(()) => {
+                        let _ = queued.acknowledgement.send(Ok(()));
+                        Ok(Some(SubscriberEvent::FlashblockObserved))
+                    }
+                    Err(error)
+                        if self.config.preconfirmations == PreconfirmationMode::Preferred =>
+                    {
+                        let recoverable_capacity =
+                            matches!(error, SubscriberError::ResourceExhausted(_));
+                        if !recoverable_capacity
+                            && let Some(configured) = self.external_flashblocks_provider.as_mut()
+                            && configured.endpoint == provider.endpoint
+                        {
+                            self.rejected_external_flashblock_generation = Some(
+                                self.rejected_external_flashblock_generation
+                                    .map_or(provider.generation, |rejected| {
+                                        rejected.max(provider.generation)
+                                    }),
+                            );
+                            configured.generation = configured
+                                .generation
+                                .max(provider.generation.saturating_add(1));
+                        }
+                        self.invalidate_preconfirmation_snapshot();
+                        self.last_external_flashblock_snapshot = None;
+                        let _ = queued
+                            .acknowledgement
+                            .send(Err(FlashblockUpdateChannelError::Rejected));
+                        tracing::warn!(
+                            provider = %provider.endpoint,
+                            generation = provider.generation,
+                            error = %error,
+                            "external Flashblock update rejected; canonical delivery remains active"
+                        );
+                        Ok(Some(SubscriberEvent::FlashblockInvalidated))
+                    }
+                    Err(error) => {
+                        let _ = queued
+                            .acknowledgement
+                            .send(Err(FlashblockUpdateChannelError::Rejected));
+                        Err(error)
+                    }
+                }
+            }
+            SubscriberEvent::BasePendingLogTimed {
+                source_id,
+                log,
+                timing,
+            } => {
+                let block_number = log.block_number.ok_or_else(|| {
+                    SubscriberError::Provider(
+                        "pendingLogs item is missing its pending block number".into(),
+                    )
+                })?;
+                let transaction_hash = log.transaction_hash.ok_or_else(|| {
+                    SubscriberError::Provider(
+                        "pendingLogs item is missing its transaction hash".into(),
+                    )
+                })?;
+                let matching = self.latest_preconfirmation.as_ref().filter(|flashblock| {
+                    flashblock.block_number == block_number
+                        && flashblock.contains_transaction(&transaction_hash)
+                });
+                let Some(flashblock) = matching.cloned() else {
+                    if self
+                        .latest_preconfirmation
+                        .as_ref()
+                        .is_some_and(|latest| block_number < latest.block_number)
+                    {
+                        return Ok(None);
+                    }
+                    if self.unmatched_pending_logs.len() >= self.config.max_pending_records {
+                        return Err(SubscriberError::ResourceExhausted(
+                            "unmatched pendingLogs exceeded max_pending_records".into(),
+                        ));
+                    }
+                    self.unmatched_pending_logs
+                        .push_back((source_id, log, timing));
+                    return Ok(None);
+                };
+                let logs = self.filter_preconfirmed_logs(&flashblock, vec![log])?;
+                Ok(Some(if logs.is_empty() {
+                    SubscriberEvent::FlashblockObserved
+                } else {
+                    SubscriberEvent::PreconfirmedLogs {
+                        flashblock,
+                        logs,
+                        timing,
+                    }
+                }))
+            }
+            SubscriberEvent::BaseFlashblockTimed {
+                payload,
+                timing: source_timing,
+            } => {
+                let (flashblock, recover_pending_snapshot) =
+                    self.accept_base_flashblock(payload)?;
+                if std::mem::take(&mut self.sealed_block_pending_certification)
+                    && let Some(header_event) =
+                        self.certify_canonical_head_on_sealed_block().await?
+                {
+                    // Queued rather than returned: the flashblock event this
+                    // arm is normalizing still has to reach the consumer.
+                    self.enqueue_event(header_event);
+                }
+                let mut logs = Vec::new();
+                let mut retained = VecDeque::new();
+                let mut timing = source_timing;
+                while let Some((source_id, log, log_timing)) =
+                    self.unmatched_pending_logs.pop_front()
+                {
+                    let transaction_hash = log.transaction_hash;
+                    if log.block_number == Some(flashblock.block_number)
+                        && transaction_hash
+                            .as_ref()
+                            .is_some_and(|hash| flashblock.contains_transaction(hash))
+                    {
+                        let _ = source_id;
+                        timing = timing.earliest(log_timing);
+                        logs.push(log);
+                    } else if log
+                        .block_number
+                        .is_some_and(|number| number >= flashblock.block_number)
+                    {
+                        retained.push_back((source_id, log, log_timing));
+                    } else {
+                        // A late log for an older speculative block can no
+                        // longer be applied to the active cumulative branch.
+                    }
+                }
+                self.unmatched_pending_logs = retained;
+
+                let indexed_recovery = recover_pending_snapshot.then(|| {
+                    let payload_id = flashblock
+                        .payload_id
+                        .expect("indexed recovery carries a payload id");
+                    let index = flashblock.index.expect("indexed recovery carries an index");
+                    let last_diff = self
+                        .base_flashblock_transactions
+                        .as_ref()
+                        .filter(|(known_payload, known_index, _, _)| {
+                            *known_payload == payload_id && *known_index == index
+                        })
+                        .map(|(_, _, _, last_diff)| last_diff.clone())
+                        .unwrap_or_default();
+                    (payload_id, index, last_diff)
+                });
+                if recover_pending_snapshot {
+                    if let Some(event) = self
+                        .fetch_pending_flashblock_with_timing(indexed_recovery, timing)
+                        .await
+                        .map_err(PendingFlashblockPollError::into_subscriber)?
+                    {
+                        return Ok(Some(event));
+                    }
+                    self.invalidate_flashblock_generation();
+                    return Ok(Some(SubscriberEvent::FlashblockInvalidated));
+                }
+                let logs = self.filter_preconfirmed_logs(&flashblock, logs)?;
+                Ok(Some(if logs.is_empty() {
+                    SubscriberEvent::FlashblockObserved
+                } else {
+                    SubscriberEvent::PreconfirmedLogs {
+                        flashblock,
+                        logs,
+                        timing,
+                    }
+                }))
+            }
+            SubscriberEvent::OpFlashblockTickTimed(timing) => {
+                self.poll_op_pending_flashblock(timing).await
+            }
+            SubscriberEvent::CanonicalHeadTick => {
+                if self.canonical_head_certification_is_current() {
+                    // The flashblock stream already drove a certification inside
+                    // this window; polling again would buy nothing.
+                    self.flashblocks_rpc_metrics.suppressed_canonical_head_polls = self
+                        .flashblocks_rpc_metrics
+                        .suppressed_canonical_head_polls
+                        .saturating_add(1);
+                    Ok(None)
+                } else {
+                    self.fetch_certified_canonical_head().await
+                }
+            }
+            SubscriberEvent::PreconfirmedLogs {
+                flashblock,
+                logs,
+                timing,
+            } => {
+                let logs = self.filter_preconfirmed_logs(&flashblock, logs)?;
+                Ok(Some(if logs.is_empty() {
+                    SubscriberEvent::FlashblockObserved
+                } else {
+                    SubscriberEvent::PreconfirmedLogs {
+                        flashblock,
+                        logs,
+                        timing,
+                    }
+                }))
+            }
+            SubscriberEvent::FlashblockObserved => Ok(None),
+            SubscriberEvent::BasePendingLog { .. }
+            | SubscriberEvent::BaseFlashblock(_)
+            | SubscriberEvent::OpFlashblockTick => unreachable!("normalized above"),
+            event => Ok(Some(event)),
+        }
+    }
+
+    /// Whether a certification already happened inside the current poll window.
+    fn canonical_head_certification_is_current(&self) -> bool {
+        self.last_canonical_head_certification
+            .is_some_and(|at| at.elapsed() < self.config.canonical_head_poll_interval)
+    }
+
+    /// Certify the sealed canonical head because a new block just started.
+    ///
+    /// A `newFlashblocks` payload at index zero opens a block, which means the
+    /// previous one sealed — the exact moment a certification is worth
+    /// spending. Driving it from that signal instead of a blind timer costs one
+    /// request per block rather than one per interval, and detects the head
+    /// sooner.
+    async fn certify_canonical_head_on_sealed_block(
+        &mut self,
+    ) -> Result<Option<SubscriberEvent<N>>, SubscriberError> {
+        if !needs_header_block_stream(&self.interests) {
+            return Ok(None);
+        }
+        if self.canonical_head_certification_is_current() {
+            return Ok(None);
+        }
+        self.fetch_certified_canonical_head().await
+    }
+
+    async fn fetch_certified_canonical_head(
+        &mut self,
+    ) -> Result<Option<SubscriberEvent<N>>, SubscriberError> {
+        self.last_canonical_head_certification = Some(Instant::now());
+        tokio::time::timeout(
+            self.config.canonical_head_request_timeout,
+            self.fetch_certified_canonical_head_inner(),
+        )
+        .await
+        .map_err(|_| {
+            SubscriberError::Provider(format!(
+                "canonical head certification timed out after {:?}",
+                self.config.canonical_head_request_timeout
+            ))
+        })?
+    }
+
+    async fn fetch_certified_canonical_head_inner(
+        &mut self,
+    ) -> Result<Option<SubscriberEvent<N>>, SubscriberError> {
+        if self.chain_id.and_then(flashblocks_adapter)
+            == Some(FlashblocksAdapter::PendingStatePolling)
+        {
+            if !self.reserve_flashblock_rpc_methods(2) {
+                return Ok(None);
+            }
+            self.flashblocks_rpc_metrics.pending_block_requests = self
+                .flashblocks_rpc_metrics
+                .pending_block_requests
+                .saturating_add(1);
+            let pending = self
+                .fetch_op_pending_block()
+                .await
+                .map_err(PendingFlashblockPollError::into_subscriber)?
+                .ok_or_else(|| {
+                    SubscriberError::Provider(
+                        "provider returned no OP pending block while certifying its parent".into(),
+                    )
+                })?;
+            let header = self
+                .certify_op_pending_parent(&pending)
+                .await
+                .map_err(PendingFlashblockPollError::into_subscriber)?;
+            let certified = BlockRef {
+                number: header.number(),
+                hash: header.hash(),
+                parent_hash: Some(header.parent_hash()),
+                timestamp: Some(header.timestamp()),
+            };
+            if self.last_certified_canonical_head.as_ref() == Some(&certified) {
+                return Ok(None);
+            }
+            self.last_certified_canonical_head = Some(certified);
+            return Ok(Some(SubscriberEvent::BlockHeader(header)));
+        }
+        self.record_rpc(
+            SubscriberRpcCause::CanonicalHeadCertification,
+            SubscriberRpcMethod::EthGetBlockByNumber,
+        );
+        self.flashblocks_rpc_metrics.canonical_head_requests = self
+            .flashblocks_rpc_metrics
+            .canonical_head_requests
+            .saturating_add(1);
+        let block = self
+            .provider
+            .get_block_by_number(BlockNumberOrTag::Latest)
+            .await
+            .map_err(provider_error)?
+            .ok_or_else(|| {
+                SubscriberError::Provider(
+                    "provider returned no latest block while certifying canonical head".into(),
+                )
+            })?;
+        let header = block.header();
+        if header.hash().is_zero() {
+            return Err(SubscriberError::Provider(
+                "provider returned a placeholder hash for the latest canonical head".into(),
+            ));
+        }
+        let certified = BlockRef {
+            number: header.number(),
+            hash: header.hash(),
+            parent_hash: Some(header.parent_hash()),
+            timestamp: Some(header.timestamp()),
+        };
+        if self.last_certified_canonical_head.as_ref() == Some(&certified) {
+            return Ok(None);
+        }
+        self.last_certified_canonical_head = Some(certified);
+        Ok(Some(SubscriberEvent::BlockHeader(header.clone())))
+    }
+
+    fn accept_base_flashblock(
+        &mut self,
+        payload: BaseFlashblockWirePayload,
+    ) -> Result<(FlashblockRef, bool), SubscriberError> {
+        let provider = self.provider_ref.clone().ok_or({
+            SubscriberError::InvalidConfig(
+                "Flashblocks require a stable provider ref from a pinned provider lease",
+            )
+        })?;
+
+        let (flashblock, recover_pending_snapshot) = match payload {
+            BaseFlashblockWirePayload::Indexed(payload) => {
+                if payload.index == 0 {
+                    let base = payload.base.clone().ok_or_else(|| {
+                        SubscriberError::Provider(
+                            "indexed newFlashblocks item zero omitted its base header".into(),
+                        )
+                    })?;
+                    // A new payload id at index zero opens a block, so the
+                    // previous one just sealed. Certifying on that signal is
+                    // what lets the interval timer stop guessing.
+                    if self
+                        .base_flashblock_header
+                        .as_ref()
+                        .is_none_or(|(known, _)| *known != payload.payload_id)
+                    {
+                        self.sealed_block_pending_certification = true;
+                    }
+                    self.base_flashblock_header = Some((payload.payload_id, base));
+                }
+
+                let base = self
+                    .base_flashblock_header
+                    .as_ref()
+                    .filter(|(payload_id, _)| *payload_id == payload.payload_id)
+                    .map(|(_, base)| base);
+                let block_number = base.map(|base| base.block_number).or_else(|| {
+                    payload
+                        .metadata
+                        .as_ref()
+                        .map(|metadata| metadata.block_number)
+                });
+                let block_number = block_number.ok_or_else(|| {
+                    SubscriberError::Provider(
+                        "indexed newFlashblocks payload omitted both base and metadata block number"
+                            .into(),
+                    )
+                })?;
+                let diff_transactions = flashblock_transaction_hashes(&payload.diff.transactions)?;
+                let transaction_hashes = match self.base_flashblock_transactions.as_mut() {
+                    Some((known_payload, known_index, transactions, last_diff))
+                        if *known_payload == payload.payload_id =>
+                    {
+                        if payload.index < *known_index {
+                            return self
+                                .latest_preconfirmation
+                                .clone()
+                                .map(|flashblock| (flashblock, false))
+                                .ok_or_else(|| {
+                                    SubscriberError::Provider(
+                                        "regressive indexed Flashblock arrived without an active snapshot"
+                                            .into(),
+                                    )
+                                });
+                        }
+                        if payload.index == *known_index {
+                            if *last_diff != diff_transactions {
+                                return Err(SubscriberError::Provider(
+                                    "conflicting duplicate indexed Flashblock payload".into(),
+                                ));
+                            }
+                        } else {
+                            if diff_transactions
+                                .iter()
+                                .any(|hash| transactions.contains(hash))
+                            {
+                                return Err(SubscriberError::Provider(
+                                    "indexed Flashblock repeated a transaction from an earlier diff"
+                                        .into(),
+                                ));
+                            }
+                            transactions.extend(diff_transactions.iter().copied());
+                            *known_index = payload.index;
+                            *last_diff = diff_transactions;
+                        }
+                        transactions.clone()
+                    }
+                    _ => {
+                        self.base_flashblock_transactions = Some((
+                            payload.payload_id,
+                            payload.index,
+                            diff_transactions.clone(),
+                            diff_transactions.clone(),
+                        ));
+                        diff_transactions
+                    }
+                };
+                let partial_block_hash = non_placeholder_hash(payload.diff.block_hash);
+                let transactions_root = payload
+                    .diff
+                    .transactions_root
+                    .and_then(non_placeholder_hash);
+                let parent_hash = base.and_then(|base| non_placeholder_hash(base.parent_hash));
+                let state_root = non_placeholder_hash(payload.diff.state_root);
+                let timestamp = base.map(|base| base.timestamp);
+                let base_fee_per_gas = base.and_then(|base| base.base_fee_per_gas);
+                let beneficiary = base.and_then(|base| base.beneficiary);
+                let prevrandao = base
+                    .and_then(|base| base.prevrandao)
+                    .and_then(non_placeholder_hash);
+                let gas_limit = base.and_then(|base| base.gas_limit);
+                let content_hash = flashblock_content_hash(FlashblockContentCommitment {
+                    provider: &provider,
+                    payload_id: Some(payload.payload_id),
+                    index: Some(payload.index),
+                    block_number,
+                    partial_block_hash,
+                    parent_hash,
+                    state_root,
+                    transactions_root,
+                    transaction_hashes: &transaction_hashes,
+                    timestamp,
+                    base_fee_per_gas,
+                    beneficiary,
+                    prevrandao,
+                    gas_limit,
+                });
+                let flashblock = FlashblockRef {
+                    provider,
+                    payload_id: Some(payload.payload_id),
+                    index: Some(payload.index),
+                    block_number,
+                    content_hash,
+                    partial_block_hash,
+                    parent_hash,
+                    state_root,
+                    transactions_root,
+                    transaction_hashes,
+                    timestamp,
+                    base_fee_per_gas,
+                    beneficiary,
+                    prevrandao,
+                    gas_limit,
+                };
+                if let Some(previous) = self.latest_preconfirmation.as_ref()
+                    && previous.same_payload(&flashblock)
+                    && previous.index == flashblock.index
+                    && previous.content_hash != flashblock.content_hash
+                {
+                    return Err(SubscriberError::Provider(
+                        "conflicting duplicate indexed Flashblock content".into(),
+                    ));
+                }
+                let recover = match self.latest_preconfirmation.as_ref() {
+                    Some(previous) if previous.same_payload(&flashblock) => {
+                        if let (Some(previous), Some(current)) = (previous.index, flashblock.index)
+                        {
+                            if current < previous {
+                                return Ok((flashblock, false));
+                            }
+                            current > previous.saturating_add(1)
+                        } else {
+                            false
+                        }
+                    }
+                    Some(_) => payload.index != 0,
+                    None => payload.index != 0,
+                };
+                (flashblock, recover)
+            }
+            BaseFlashblockWirePayload::Block(payload) => {
+                let transaction_hashes = flashblock_transaction_hashes(&payload.transactions)?;
+                let parent_hash = non_placeholder_hash(payload.parent_hash);
+                let state_root = non_placeholder_hash(payload.state_root);
+                let transactions_root = payload.transactions_root.and_then(non_placeholder_hash);
+                let partial_block_hash = non_placeholder_hash(payload.hash);
+                let prevrandao = payload.mix_hash.and_then(non_placeholder_hash);
+                let content_hash = flashblock_content_hash(FlashblockContentCommitment {
+                    provider: &provider,
+                    payload_id: None,
+                    index: None,
+                    block_number: payload.number,
+                    partial_block_hash,
+                    parent_hash,
+                    state_root,
+                    transactions_root,
+                    transaction_hashes: &transaction_hashes,
+                    timestamp: Some(payload.timestamp),
+                    base_fee_per_gas: payload.base_fee_per_gas,
+                    beneficiary: payload.miner,
+                    prevrandao,
+                    gas_limit: payload.gas_limit,
+                });
+                let flashblock = FlashblockRef {
+                    provider,
+                    payload_id: None,
+                    index: None,
+                    block_number: payload.number,
+                    content_hash,
+                    partial_block_hash,
+                    parent_hash,
+                    state_root,
+                    transactions_root,
+                    transaction_hashes,
+                    timestamp: Some(payload.timestamp),
+                    base_fee_per_gas: payload.base_fee_per_gas,
+                    beneficiary: payload.miner,
+                    prevrandao,
+                    gas_limit: payload.gas_limit,
+                };
+                if let Some(previous) = self.latest_preconfirmation.as_ref()
+                    && flashblock.same_payload(previous)
+                    && flashblock.content_hash != previous.content_hash
+                    && !flashblock.is_cumulative_successor_of(previous)
+                {
+                    return Err(SubscriberError::Provider(
+                        "cumulative Flashblock transaction membership is non-monotonic".into(),
+                    ));
+                }
+                (flashblock, false)
+            }
+        };
+        Ok((flashblock, recover_pending_snapshot))
+    }
+
+    async fn poll_op_pending_flashblock(
+        &mut self,
+        timing: FlashblockIngressTiming,
+    ) -> Result<Option<SubscriberEvent<N>>, SubscriberError> {
+        match self
+            .fetch_pending_flashblock_with_timing(None, timing)
+            .await
+        {
+            Ok(event) => {
+                self.consecutive_flashblock_poll_failures = 0;
+                Ok(event)
+            }
+            Err(PendingFlashblockPollError::Request(error)) => {
+                self.flashblocks_rpc_metrics.failed_requests = self
+                    .flashblocks_rpc_metrics
+                    .failed_requests
+                    .saturating_add(1);
+                self.consecutive_flashblock_poll_failures =
+                    self.consecutive_flashblock_poll_failures.saturating_add(1);
+                if self.consecutive_flashblock_poll_failures
+                    >= self.config.max_consecutive_flashblock_poll_failures
+                {
+                    return Err(error);
+                }
+                tracing::warn!(
+                    consecutive_failures = self.consecutive_flashblock_poll_failures,
+                    failure_limit = self.config.max_consecutive_flashblock_poll_failures,
+                    error = %error,
+                    "Optimism pending-state Flashblocks request failed; retrying on the next tick"
+                );
+                Ok(None)
+            }
+            Err(PendingFlashblockPollError::Integrity(error)) => Err(error),
+        }
+    }
+
+    #[cfg(test)]
+    async fn fetch_pending_flashblock(
+        &mut self,
+        indexed_recovery: Option<(FixedBytes<8>, u64, Vec<B256>)>,
+    ) -> Result<Option<SubscriberEvent<N>>, PendingFlashblockPollError> {
+        self.fetch_pending_flashblock_with_timing(
+            indexed_recovery,
+            FlashblockIngressTiming::new(Instant::now()),
+        )
+        .await
+    }
+
+    async fn fetch_pending_flashblock_with_timing(
+        &mut self,
+        indexed_recovery: Option<(FixedBytes<8>, u64, Vec<B256>)>,
+        timing: FlashblockIngressTiming,
+    ) -> Result<Option<SubscriberEvent<N>>, PendingFlashblockPollError> {
+        let samples_pending_range = self.chain_id.and_then(flashblocks_adapter)
+            == Some(FlashblocksAdapter::PendingStatePolling);
+        if samples_pending_range {
+            let fixed_methods = 2_usize.saturating_add(self.log_stream_filters().len());
+            if !self.reserve_flashblock_rpc_methods(fixed_methods) {
+                return Ok(None);
+            }
+        }
+        let state_provider = if samples_pending_range {
+            self.flashblocks_state_provider
+                .as_ref()
+                .unwrap_or(&self.provider)
+        } else {
+            &self.provider
+        };
+        let latest = if samples_pending_range {
+            None
+        } else {
+            self.record_rpc(
+                SubscriberRpcCause::CanonicalHeadCertification,
+                SubscriberRpcMethod::EthBlockNumber,
+            );
+            self.flashblocks_rpc_metrics.canonical_head_requests = self
+                .flashblocks_rpc_metrics
+                .canonical_head_requests
+                .saturating_add(1);
+            Some(
+                state_provider
+                    .get_block_number()
+                    .await
+                    .map_err(pending_flashblock_request_error)?,
+            )
+        };
+        self.flashblocks_rpc_metrics.pending_block_requests = self
+            .flashblocks_rpc_metrics
+            .pending_block_requests
+            .saturating_add(1);
+        let pending_block = if samples_pending_range {
+            self.fetch_op_pending_block().await?
+        } else {
+            self.record_rpc(
+                SubscriberRpcCause::PendingStateSample,
+                SubscriberRpcMethod::EthGetBlockByNumber,
+            );
+            self.provider
+                .get_block_by_number(BlockNumberOrTag::Pending)
+                .await
+                .map_err(pending_flashblock_request_error)?
+        };
+        let Some(block) = pending_block else {
+            if self.config.preconfirmations == PreconfirmationMode::Required {
+                return Err(PendingFlashblockPollError::Request(
+                    SubscriberError::Provider(
+                        "Flashblocks provider returned no pending block".into(),
+                    ),
+                ));
+            }
+            return Ok(None);
+        };
+        let latest = if samples_pending_range {
+            self.certify_op_pending_parent(&block).await?.number()
+        } else {
+            latest.expect("non-OP pending recovery fetched a canonical height")
+        };
+        let header = block.header();
+        if header.number() <= latest {
+            return Ok(None);
+        }
+
+        let provider = self.provider_ref.clone().ok_or({
+            PendingFlashblockPollError::Integrity(SubscriberError::InvalidConfig(
+                "Flashblocks require a stable provider ref from a pinned provider lease",
+            ))
+        })?;
+        let parent_hash = Some(header.parent_hash());
+        let transaction_hashes = if let Some(hashes) = block.transactions().as_hashes() {
+            hashes.to_vec()
+        } else if let Some(transactions) = block.transactions().as_transactions() {
+            transactions
+                .iter()
+                .map(|transaction| transaction.tx_hash())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let state_root = non_placeholder_hash(header.state_root());
+        let transactions_root = non_placeholder_hash(header.transactions_root());
+        let partial_block_hash = non_placeholder_hash(header.hash());
+        let prevrandao = header.mix_hash().and_then(non_placeholder_hash);
+        let content_hash = flashblock_content_hash(FlashblockContentCommitment {
+            provider: &provider,
+            payload_id: None,
+            index: None,
+            block_number: header.number(),
+            partial_block_hash,
+            parent_hash,
+            state_root,
+            transactions_root,
+            transaction_hashes: &transaction_hashes,
+            timestamp: Some(header.timestamp()),
+            base_fee_per_gas: header.base_fee_per_gas(),
+            beneficiary: Some(header.beneficiary()),
+            prevrandao,
+            gas_limit: Some(header.gas_limit()),
+        });
+        let flashblock = FlashblockRef {
+            provider,
+            payload_id: None,
+            index: None,
+            block_number: header.number(),
+            content_hash,
+            partial_block_hash,
+            parent_hash,
+            state_root,
+            transactions_root,
+            transaction_hashes,
+            timestamp: Some(header.timestamp()),
+            base_fee_per_gas: header.base_fee_per_gas(),
+            beneficiary: Some(header.beneficiary()),
+            prevrandao,
+            gas_limit: Some(header.gas_limit()),
+        };
+        if samples_pending_range
+            && self
+                .latest_preconfirmation
+                .as_ref()
+                .is_some_and(|previous| !previous.same_payload(&flashblock))
+        {
+            // Revoke as soon as the sampled payload changes, before any
+            // follow-up receipt await can fail or be cancelled.
+            self.invalidate_preconfirmation_snapshot();
+        }
+        if let Some((payload_id, index, last_diff)) = indexed_recovery {
+            self.base_flashblock_transactions = Some((
+                payload_id,
+                index,
+                flashblock.transaction_hashes.clone(),
+                last_diff,
+            ));
+        }
+        let repeats_pending_snapshot = self
+            .latest_preconfirmation
+            .as_ref()
+            .is_some_and(|previous| previous == &flashblock);
+        if repeats_pending_snapshot && !samples_pending_range {
+            return Ok(None);
+        }
+
+        if let Some(previous) = self.latest_preconfirmation.as_ref()
+            && flashblock.same_payload(previous)
+            && !flashblock.is_cumulative_successor_of(previous)
+        {
+            if samples_pending_range {
+                // OP pending-state reads are not atomic and paid endpoints can
+                // briefly expose a shorter backend view. Never publish the
+                // regression. Revoke the active overlay and require a fresh,
+                // internally coherent sample on a later tick instead.
+                self.invalidate_preconfirmation_snapshot();
+                return Ok(Some(SubscriberEvent::FlashblockInvalidated));
+            }
+            return Err(PendingFlashblockPollError::Integrity(
+                SubscriberError::Provider(
+                    "sampled cumulative Flashblock transaction membership is non-monotonic".into(),
+                ),
+            ));
+        }
+
+        let mut logs = self.fetch_pending_logs(flashblock.block_number).await?;
+        if samples_pending_range {
+            let (mut receipt_logs, completed_receipts, unavailable_receipts) =
+                self.fetch_pending_transaction_receipts(&flashblock).await?;
+            logs.append(&mut receipt_logs);
+            logs.retain(|log| log.block_number == Some(flashblock.block_number));
+            for log in &logs {
+                let transaction_hash = log.transaction_hash.ok_or_else(|| {
+                    PendingFlashblockPollError::Integrity(SubscriberError::Provider(
+                        "pre-confirmed log is missing its transaction hash".into(),
+                    ))
+                })?;
+                if !flashblock.contains_transaction(&transaction_hash) {
+                    self.flashblocks_rpc_metrics.raced_samples =
+                        self.flashblocks_rpc_metrics.raced_samples.saturating_add(1);
+                    return Ok(None);
+                }
+            }
+            let logs = self
+                .filter_preconfirmed_logs(&flashblock, logs)
+                .map_err(PendingFlashblockPollError::Integrity)?;
+            self.preconfirmed_unavailable_receipts
+                .extend(unavailable_receipts);
+            for transaction_hash in &completed_receipts {
+                self.preconfirmed_unavailable_receipts
+                    .remove(transaction_hash);
+            }
+            self.preconfirmed_receipted_transactions
+                .extend(completed_receipts);
+            if repeats_pending_snapshot && logs.is_empty() {
+                return Ok(None);
+            }
+            return Ok(Some(if logs.is_empty() {
+                SubscriberEvent::FlashblockObserved
+            } else {
+                SubscriberEvent::PreconfirmedLogs {
+                    flashblock,
+                    logs,
+                    timing,
+                }
+            }));
+        }
+        let logs = self
+            .filter_preconfirmed_logs(&flashblock, logs)
+            .map_err(PendingFlashblockPollError::Integrity)?;
+        Ok(Some(if logs.is_empty() {
+            SubscriberEvent::FlashblockObserved
+        } else {
+            SubscriberEvent::PreconfirmedLogs {
+                flashblock,
+                logs,
+                timing,
+            }
+        }))
+    }
+
+    async fn fetch_pending_logs(
+        &mut self,
+        pending_block_number: u64,
+    ) -> Result<Vec<Log>, PendingFlashblockPollError> {
+        let mut logs = Vec::new();
+        let samples_pending_range = self.chain_id.and_then(flashblocks_adapter)
+            == Some(FlashblocksAdapter::PendingStatePolling);
+        let state_provider = if samples_pending_range {
+            self.flashblocks_state_provider
+                .as_ref()
+                .unwrap_or(&self.provider)
+        } else {
+            &self.provider
+        };
+        for filter in self.log_stream_filters() {
+            self.record_rpc(
+                SubscriberRpcCause::PendingStateSample,
+                SubscriberRpcMethod::EthGetLogs,
+            );
+            self.flashblocks_rpc_metrics.pending_log_requests = self
+                .flashblocks_rpc_metrics
+                .pending_log_requests
+                .saturating_add(1);
+            let filter = if samples_pending_range {
+                filter
+                    .from_block(pending_block_number)
+                    .to_block(BlockNumberOrTag::Pending)
+            } else {
+                filter
+                    .from_block(BlockNumberOrTag::Pending)
+                    .to_block(BlockNumberOrTag::Pending)
+            };
+            logs.extend(
+                state_provider
+                    .get_logs(&filter)
+                    .await
+                    .map_err(pending_flashblock_request_error)?,
+            );
+        }
+        if samples_pending_range {
+            logs.retain(|log| log.block_number == Some(pending_block_number));
+        }
+        Ok(logs)
+    }
+
+    async fn fetch_pending_transaction_receipts(
+        &mut self,
+        flashblock: &FlashblockRef,
+    ) -> Result<(Vec<Log>, Vec<B256>, Vec<B256>), PendingFlashblockPollError> {
+        let receipt_allowance = self.pending_receipt_request_allowance();
+        let receipt_limit = self
+            .config
+            .max_pending_transaction_receipts_per_tick
+            .min(receipt_allowance);
+        if receipt_limit == 0 {
+            return Ok((Vec::new(), Vec::new(), Vec::new()));
+        }
+        let mut transaction_hashes = Vec::with_capacity(receipt_limit);
+        for transaction_hash in &flashblock.transaction_hashes {
+            if !self
+                .preconfirmed_receipted_transactions
+                .contains(transaction_hash)
+                && !self
+                    .preconfirmed_unavailable_receipts
+                    .contains(transaction_hash)
+            {
+                transaction_hashes.push(*transaction_hash);
+                if transaction_hashes.len() == receipt_limit {
+                    break;
+                }
+            }
+        }
+        if transaction_hashes.len() < receipt_limit {
+            for transaction_hash in &flashblock.transaction_hashes {
+                if self
+                    .preconfirmed_unavailable_receipts
+                    .contains(transaction_hash)
+                {
+                    transaction_hashes.push(*transaction_hash);
+                    if transaction_hashes.len() == receipt_limit {
+                        break;
+                    }
+                }
+            }
+        }
+        if transaction_hashes.is_empty() {
+            return Ok((Vec::new(), Vec::new(), Vec::new()));
+        }
+        let reserved = self.reserve_flashblock_rpc_methods(transaction_hashes.len());
+        debug_assert!(reserved, "receipt allowance must remain reserved until use");
+        if !reserved {
+            return Ok((Vec::new(), Vec::new(), Vec::new()));
+        }
+        self.rpc_counters.record_many(
+            SubscriberRpcCause::PendingStateSample,
+            SubscriberRpcMethod::EthGetTransactionReceipt,
+            transaction_hashes.len() as u64,
+        );
+        self.flashblocks_rpc_metrics.pending_receipt_requests = self
+            .flashblocks_rpc_metrics
+            .pending_receipt_requests
+            .saturating_add(transaction_hashes.len() as u64);
+        let state_provider = self
+            .flashblocks_state_provider
+            .as_ref()
+            .unwrap_or(&self.provider);
+        let client = state_provider.client();
+        let mut batch = BatchRequest::new(client);
+        let mut waiters = Vec::with_capacity(transaction_hashes.len());
+        for transaction_hash in transaction_hashes {
+            let waiter = batch
+                .add_call::<_, serde_json::Value>("eth_getTransactionReceipt", &(transaction_hash,))
+                .map_err(pending_flashblock_request_error)?;
+            waiters.push((transaction_hash, waiter));
+        }
+        batch
+            .send()
+            .await
+            .map_err(pending_flashblock_request_error)?;
+        let mut logs = Vec::new();
+        let mut completed = Vec::new();
+        let mut unavailable = Vec::new();
+        for (transaction_hash, waiter) in waiters {
+            let value = waiter.await.map_err(pending_flashblock_request_error)?;
+            if let Some(mut receipt_logs) =
+                normalize_pending_transaction_receipt(transaction_hash, value)
+                    .map_err(PendingFlashblockPollError::Integrity)?
+            {
+                self.flashblocks_rpc_metrics.pending_receipts_completed = self
+                    .flashblocks_rpc_metrics
+                    .pending_receipts_completed
+                    .saturating_add(1);
+                logs.append(&mut receipt_logs);
+                completed.push(transaction_hash);
+            } else {
+                self.flashblocks_rpc_metrics.pending_receipts_unavailable = self
+                    .flashblocks_rpc_metrics
+                    .pending_receipts_unavailable
+                    .saturating_add(1);
+                unavailable.push(transaction_hash);
+            }
+        }
+        Ok((logs, completed, unavailable))
+    }
+
+    fn pending_receipt_request_allowance(&mut self) -> usize {
+        self.prune_flashblock_rpc_request_times();
+        let rolling_capacity = self
+            .config
+            .max_flashblock_rpc_requests_per_second
+            .saturating_sub(self.flashblock_rpc_request_times.len());
+        rolling_capacity.min(self.pending_receipt_requests_per_tick_capacity())
+    }
+
+    fn pending_receipt_requests_per_tick_capacity(&self) -> usize {
+        let interval_nanos = self.config.flashblock_poll_interval.as_nanos().max(1);
+        let ticks_per_second = Duration::from_secs(1).as_nanos().div_ceil(interval_nanos);
+        let ticks_per_second = usize::try_from(ticks_per_second).unwrap_or(usize::MAX);
+        self.pending_receipt_requests_per_second_capacity()
+            .checked_div(ticks_per_second)
+            .unwrap_or(0)
+    }
+
+    fn pending_receipt_requests_per_second_capacity(&self) -> usize {
+        let interval_nanos = self.config.flashblock_poll_interval.as_nanos().max(1);
+        let ticks_per_second = Duration::from_secs(1).as_nanos().div_ceil(interval_nanos);
+        let ticks_per_second = usize::try_from(ticks_per_second).unwrap_or(usize::MAX);
+        let fixed_methods_per_tick = 2_usize.saturating_add(self.log_stream_filters().len());
+        let mut reserved_methods = ticks_per_second.saturating_mul(fixed_methods_per_tick);
+        if needs_header_block_stream(&self.interests) {
+            let canonical_interval_nanos =
+                self.config.canonical_head_poll_interval.as_nanos().max(1);
+            let canonical_ticks = Duration::from_secs(1)
+                .as_nanos()
+                .div_ceil(canonical_interval_nanos);
+            let canonical_ticks = usize::try_from(canonical_ticks).unwrap_or(usize::MAX);
+            reserved_methods = reserved_methods.saturating_add(canonical_ticks.saturating_mul(2));
+        }
+        self.config
+            .max_flashblock_rpc_requests_per_second
+            .saturating_sub(reserved_methods)
+    }
+
+    fn reserve_flashblock_rpc_methods(&mut self, methods: usize) -> bool {
+        self.prune_flashblock_rpc_request_times();
+        if self
+            .flashblock_rpc_request_times
+            .len()
+            .saturating_add(methods)
+            > self.config.max_flashblock_rpc_requests_per_second
+        {
+            return false;
+        }
+        let now = Instant::now();
+        for _ in 0..methods {
+            self.flashblock_rpc_request_times.push_back(now);
+        }
+        true
+    }
+
+    fn prune_flashblock_rpc_request_times(&mut self) {
+        let now = Instant::now();
+        while self
+            .flashblock_rpc_request_times
+            .front()
+            .is_some_and(|requested| now.duration_since(*requested) >= Duration::from_secs(1))
+        {
+            self.flashblock_rpc_request_times.pop_front();
+        }
+    }
+
+    fn filter_preconfirmed_logs(
+        &mut self,
+        flashblock: &FlashblockRef,
+        mut logs: Vec<Log>,
+    ) -> Result<Vec<Log>, SubscriberError> {
+        let samples_pending_range = self.chain_id.and_then(flashblocks_adapter)
+            == Some(FlashblocksAdapter::PendingStatePolling);
+        if self
+            .latest_preconfirmation
+            .as_ref()
+            .is_some_and(|previous| !previous.same_payload(flashblock))
+        {
+            // A new payload revokes the previous overlay even when none of the
+            // caller's log filters matched in the replacement. Otherwise a
+            // quiet block could leave stale speculative signing authority
+            // active until an unrelated canonical pool event arrived.
+            self.invalidate_preconfirmation_snapshot();
+        }
+        if self
+            .latest_preconfirmation
+            .as_ref()
+            .is_none_or(|previous| !previous.same_payload(flashblock))
+        {
+            self.preconfirmed_seen_logs.clear();
+        }
+        if let Some(previous) = self.latest_preconfirmation.as_ref()
+            && previous.same_payload(flashblock)
+            && let (Some(previous_index), Some(current_index)) = (previous.index, flashblock.index)
+            && current_index < previous_index
+        {
+            return Ok(Vec::new());
+        }
+        self.latest_preconfirmation = Some(flashblock.clone());
+
+        logs.sort_by_key(|log| (log.transaction_index.unwrap_or(u64::MAX), log.log_index));
+        let mut filtered = Vec::new();
+        for mut log in logs {
+            if log.removed || log.block_number != Some(flashblock.block_number) {
+                return Err(SubscriberError::Provider(
+                    "pre-confirmed log disagrees with its Flashblock snapshot".into(),
+                ));
+            }
+            let transaction_hash = log.transaction_hash.ok_or_else(|| {
+                SubscriberError::Provider(
+                    "pre-confirmed log is missing its transaction hash".into(),
+                )
+            })?;
+            let log_index = log.log_index.ok_or_else(|| {
+                SubscriberError::Provider("pre-confirmed log is missing its log index".into())
+            })?;
+            let transaction_index =
+                flashblock
+                    .transaction_index(&transaction_hash)
+                    .ok_or_else(|| {
+                        SubscriberError::Provider(
+                        "pre-confirmed log transaction is absent from the cumulative Flashblock"
+                            .into(),
+                    )
+                    })?;
+            if log
+                .transaction_index
+                .is_some_and(|reported| reported != transaction_index)
+            {
+                return Err(SubscriberError::Provider(
+                    "pre-confirmed log transaction index disagrees with cumulative membership"
+                        .into(),
+                ));
+            }
+            let reported_hash = log.block_hash.and_then(non_placeholder_hash);
+            if !samples_pending_range
+                && let Some(reported) = reported_hash
+                && reported != flashblock.content_hash
+                && flashblock
+                    .partial_block_hash
+                    .is_some_and(|expected| reported != expected)
+            {
+                return Err(SubscriberError::Provider(
+                    "pre-confirmed log partial block hash disagrees with its Flashblock snapshot"
+                        .into(),
+                ));
+            }
+            log.block_hash = Some(flashblock.content_hash);
+            log.block_timestamp = flashblock.timestamp.or(log.block_timestamp);
+            log.transaction_index = Some(transaction_index);
+            if self
+                .preconfirmed_seen_logs
+                .insert((transaction_hash, log_index))
+                && log_matches_any_interest(&log, &self.interests)
+            {
+                filtered.push(log);
+            }
+        }
+        Ok(filtered)
+    }
+
+    async fn verify_event_log_blocks(
+        &mut self,
+        event: &SubscriberEvent<N>,
+    ) -> Result<(), SubscriberError> {
+        if !self.config.verify_log_block_context {
+            return Ok(());
+        }
+        match event {
+            SubscriberEvent::Log { log, .. } => self.verify_log_block_context(log).await,
+            SubscriberEvent::BackfilledLogs { logs, .. } | SubscriberEvent::Logs(logs) => {
+                for log in logs {
+                    self.verify_log_block_context(log).await?;
+                }
+                Ok(())
+            }
+            #[cfg(feature = "raw-flashblocks-json")]
+            SubscriberEvent::ExternalFlashblockUpdate(_) => Ok(()),
+            SubscriberEvent::BlockHeader(_)
+            | SubscriberEvent::PendingHash(_)
+            | SubscriberEvent::PendingHashes(_)
+            | SubscriberEvent::BasePendingLog { .. }
+            | SubscriberEvent::BasePendingLogTimed { .. }
+            | SubscriberEvent::BaseFlashblock { .. }
+            | SubscriberEvent::BaseFlashblockTimed { .. }
+            | SubscriberEvent::OpFlashblockTick
+            | SubscriberEvent::OpFlashblockTickTimed(_)
+            | SubscriberEvent::CanonicalHeadTick
+            | SubscriberEvent::PreconfirmedLogs { .. }
+            | SubscriberEvent::FlashblockInvalidated
+            | SubscriberEvent::FlashblockObserved
+            | SubscriberEvent::StreamTerminated(_)
+            | SubscriberEvent::StreamGap { .. } => Ok(()),
+        }
+    }
+
+    async fn verify_log_block_context(&mut self, log: &Log) -> Result<(), SubscriberError> {
+        if log.removed {
+            return Ok(());
+        }
+        let number = log.block_number.ok_or_else(|| {
+            SubscriberError::Provider(
+                "canonical log is missing its block number during context verification".into(),
+            )
+        })?;
+        let hash = log.block_hash.ok_or_else(|| {
+            SubscriberError::Provider(
+                "canonical log is missing its block hash during context verification".into(),
+            )
+        })?;
+        let key = (number, hash);
+        if self.verified_log_blocks.contains_key(&key) {
+            return Ok(());
+        }
+        let provider = self
+            .log_verification_provider
+            .as_ref()
+            .unwrap_or(&self.provider);
+        self.rpc_counters.record(
+            SubscriberRpcCause::LogBlockVerification,
+            SubscriberRpcMethod::EthGetBlockByNumber,
+        );
+        let block = provider
+            .get_block_by_number(BlockNumberOrTag::Number(number))
+            .await
+            .map_err(provider_error)?
+            .ok_or_else(|| {
+                SubscriberError::Provider(format!(
+                    "canonical log block {number} is unavailable during context verification"
+                ))
+            })?;
+        let header = block.header();
+        let verified = BlockRef {
+            number: header.number(),
+            hash: header.hash(),
+            parent_hash: Some(header.parent_hash()),
+            timestamp: Some(header.timestamp()),
+        };
+        if verified.number != number
+            || verified.hash != hash
+            || log
+                .block_timestamp
+                .is_some_and(|timestamp| verified.timestamp != Some(timestamp))
+        {
+            return Err(SubscriberError::Provider(format!(
+                "canonical log block {number}:{hash:?} disagrees with the provider's current canonical identity"
+            )));
+        }
+        self.verified_log_blocks.insert(key, verified);
+        self.verified_log_block_order.push_back(key);
+        let capacity = self.config.reconnect.dedupe_window.max(1);
+        while self.verified_log_block_order.len() > capacity {
+            if let Some(evicted) = self.verified_log_block_order.pop_front() {
+                self.verified_log_blocks.remove(&evicted);
+            }
+        }
+        Ok(())
     }
 
     fn enqueue_event(&mut self, event: SubscriberEvent<N>) {
@@ -6560,10 +18662,23 @@ where
                     self.buffer_reconcile_log_for_owners(log, InputSource::Poll, target_epochs);
                 }
             }
+            #[cfg(feature = "raw-flashblocks-json")]
+            SubscriberEvent::ExternalFlashblockUpdate(_) => {}
             SubscriberEvent::BlockHeader(_)
             | SubscriberEvent::PendingHash(_)
             | SubscriberEvent::PendingHashes(_)
-            | SubscriberEvent::StreamTerminated(_) => {}
+            | SubscriberEvent::BasePendingLog { .. }
+            | SubscriberEvent::BasePendingLogTimed { .. }
+            | SubscriberEvent::BaseFlashblock { .. }
+            | SubscriberEvent::BaseFlashblockTimed { .. }
+            | SubscriberEvent::OpFlashblockTick
+            | SubscriberEvent::OpFlashblockTickTimed(_)
+            | SubscriberEvent::CanonicalHeadTick
+            | SubscriberEvent::PreconfirmedLogs { .. }
+            | SubscriberEvent::FlashblockInvalidated
+            | SubscriberEvent::FlashblockObserved
+            | SubscriberEvent::StreamTerminated(_)
+            | SubscriberEvent::StreamGap { .. } => {}
         }
     }
 
@@ -6573,15 +18688,14 @@ where
         source: InputSource,
         target_epochs: &HashSet<SubscriberOwnerEpoch>,
     ) {
-        let record = log_input_record(log.clone(), source);
+        let record = self.with_chain_id(log_input_record(log.clone(), source));
         let owners = self
             .staged_owners_for_record(&record)
             .into_iter()
             .filter(|owner| target_epochs.contains(owner))
             .collect::<Vec<_>>();
         if !owners.is_empty() {
-            self.pending_reconcile_owner_records
-                .push_back(BufferedSubscriberOwnerRecord { record, owners });
+            self.push_pending_reconcile_record(BufferedSubscriberOwnerRecord { record, owners });
         }
     }
 
@@ -6673,6 +18787,7 @@ where
             SubscriberEvent::BlockHeader(header) => {
                 if needs_header_block_stream(&self.interests) {
                     let record = block_header_input_record::<N>(header);
+                    self.note_attestable_canonical_block(&record);
                     self.enqueue_record_with_excluded_owners(record, excluded);
                 }
             }
@@ -6688,7 +18803,37 @@ where
                     );
                 }
             }
-            SubscriberEvent::StreamTerminated(_) => {}
+            SubscriberEvent::PreconfirmedLogs {
+                flashblock,
+                logs,
+                timing,
+            } => {
+                for log in logs {
+                    let record = self
+                        .with_chain_id(preconfirmed_log_input_record::<N>(log, flashblock.clone()));
+                    self.push_pending_record(SubscriberInputRecord {
+                        record,
+                        scope: SubscriberInputScope::Preconfirmed,
+                        preconfirmation_timing: Some(timing),
+                    });
+                }
+            }
+            SubscriberEvent::FlashblockInvalidated => {
+                self.pending_preconfirmation_invalidation = true;
+            }
+            SubscriberEvent::BasePendingLog { .. }
+            | SubscriberEvent::BasePendingLogTimed { .. }
+            | SubscriberEvent::BaseFlashblock { .. }
+            | SubscriberEvent::BaseFlashblockTimed { .. }
+            | SubscriberEvent::OpFlashblockTick
+            | SubscriberEvent::OpFlashblockTickTimed(_)
+            | SubscriberEvent::CanonicalHeadTick
+            | SubscriberEvent::FlashblockObserved => {}
+            #[cfg(feature = "raw-flashblocks-json")]
+            SubscriberEvent::ExternalFlashblockUpdate(_) => {}
+            // `next_event` intercepts a gap and recovers it before delivery;
+            // this arm keeps the classification exhaustive.
+            SubscriberEvent::StreamTerminated(_) | SubscriberEvent::StreamGap { .. } => {}
         }
     }
 
@@ -6711,7 +18856,7 @@ where
         excluded: Option<&HashSet<SubscriberOwnerEpoch>>,
     ) {
         for log in logs {
-            if range.is_some_and(|range| {
+            if range.as_ref().is_some_and(|range| {
                 log.block_number.is_some_and(|block| {
                     block < range.start_block() || range.end_block().is_some_and(|end| block > end)
                 })
@@ -6737,6 +18882,36 @@ where
                     self.enqueue_record_with_excluded_owners(record, excluded);
                 }
             }
+        }
+    }
+
+    fn enqueue_compat_owner_backfilled_logs(
+        &mut self,
+        logs: Vec<Log>,
+        owner: &HandlerId,
+        range: SubscriberBackfill,
+    ) {
+        let interests = self
+            .owned_interests
+            .iter()
+            .find(|entry| {
+                &entry.owner == owner
+                    && entry.epoch.is_none()
+                    && entry.state == SubscriberOwnerState::Active
+            })
+            .map(|entry| entry.interests.clone());
+        let Some(interests) = interests else {
+            return;
+        };
+        for log in logs {
+            if log.block_number.is_some_and(|block| {
+                block < range.start_block() || range.end_block().is_some_and(|end| block > end)
+            }) || !log_matches_any_interest(&log, &interests)
+            {
+                continue;
+            }
+            let record = log_input_record(log, InputSource::Backfill);
+            self.enqueue_compat_owner_record(record, owner.clone());
         }
     }
 
@@ -6792,25 +18967,116 @@ where
         &mut self,
         source: SubscriberStreamSource,
     ) -> Result<Option<SubscriberEvent<N>>, SubscriberError> {
-        let stream = self.connect_source_stream(source.clone()).await?;
-        let backfill_event = self.backfill_reconnected_source(&source).await?;
-
-        match &mut self.state {
-            AlloySubscriberState::Active(streams) => streams.push(source, stream),
-            AlloySubscriberState::Uninitialized | AlloySubscriberState::Empty => {
-                return Err(SubscriberError::Provider(
-                    "Alloy subscriber state changed before reconnect completed".to_owned(),
-                ));
-            }
+        if matches!(
+            &self.state,
+            AlloySubscriberState::Active(streams) if streams.contains_source(&source)
+        ) {
+            // A prior attempt installed the stream before its catch-up await
+            // failed or was cancelled. Retry only the unfinished historical
+            // window; reconnecting again would create a duplicate live source.
+            let backfill_event = self.backfill_reconnected_source(&source).await?;
+            self.pending_source_backfills
+                .retain(|pending| !pending.same_key(&source));
+            return Ok(backfill_event);
         }
+        let stream = self.connect_source_stream(source.clone()).await?;
+        if !matches!(self.state, AlloySubscriberState::Active(_)) {
+            return Err(SubscriberError::Provider(
+                "Alloy subscriber state changed before reconnect completed".to_owned(),
+            ));
+        }
+        self.install_source_stream(source.clone(), stream);
+        if self.source_requires_backfill(&source) {
+            self.queue_source_backfill(source.clone());
+        }
+        let backfill_event = self.backfill_reconnected_source(&source).await?;
+        self.pending_source_backfills
+            .retain(|pending| !pending.same_key(&source));
 
         Ok(backfill_event)
+    }
+
+    /// Recover from notification loss on a still-connected stream.
+    ///
+    /// The policy differs by stream because what a gap costs differs:
+    ///
+    /// - **Canonical logs** are authoritative and unrecoverable downstream, so
+    ///   the exact missed range is refetched. This is the only case that spends
+    ///   an RPC, and it spends the minimum: one bounded window per gap.
+    /// - **Canonical headers** are self-healing at the consumer. A driver that
+    ///   walks a replacement header's parent lineage back to retained canonical
+    ///   history recovers the skipped blocks from the next header it receives,
+    ///   so refetching here would duplicate that work. The gap is counted so the
+    ///   self-healing is visible rather than assumed.
+    /// - **Pre-confirmation logs** are speculative by construction. A punctured
+    ///   preview must not be published, so the snapshot is discarded and the
+    ///   next complete generation replaces it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a canonical log gap cannot be bounded because the
+    /// source has no delivery anchor yet. Silently continuing would mean knowing
+    /// that logs were lost and doing nothing, which is exactly the failure this
+    /// machinery exists to eliminate.
+    async fn recover_stream_gap(
+        &mut self,
+        source: &SubscriberStreamSource,
+        gap: SubscriberStreamGap,
+    ) -> Result<Option<SubscriberEvent<N>>, SubscriberError> {
+        match source {
+            SubscriberStreamSource::PubSubLog { id, .. } => {
+                self.reset_log_attestation();
+                if !self.last_seen_log_blocks.contains_key(id) {
+                    return Err(SubscriberError::Provider(format!(
+                        "Alloy subscriber {} lost notifications ({gap}) before establishing a \
+                         delivery anchor, so the missed range cannot be bounded",
+                        source.label()
+                    )));
+                }
+                let event = self
+                    .backfill_source_window(source, SubscriberRpcCause::GapBackfill)
+                    .await?;
+                self.gap_counters.record_log_gap_healed();
+                Ok(event)
+            }
+            SubscriberStreamSource::PubSubBlockHeaders => {
+                self.gap_counters.record_header_gap();
+                Ok(None)
+            }
+            SubscriberStreamSource::BasePendingLog { .. } => {
+                self.gap_counters.record_preconfirmation_gap();
+                self.invalidate_preconfirmation_snapshot();
+                Ok(Some(SubscriberEvent::FlashblockInvalidated))
+            }
+            _ => Ok(None),
+        }
     }
 
     async fn backfill_reconnected_source(
         &mut self,
         source: &SubscriberStreamSource,
     ) -> Result<Option<SubscriberEvent<N>>, SubscriberError> {
+        self.backfill_source_window(source, SubscriberRpcCause::ReconnectBackfill)
+            .await
+    }
+
+    /// Refetch a log source's window from its delivery anchor to the current
+    /// head.
+    ///
+    /// Shared by the two situations that lose a bounded range of canonical logs
+    /// — a stream that terminated and reconnected, and a stream that stayed
+    /// connected but dropped notifications. `cause` attributes the requests to
+    /// whichever of those spent them, so
+    /// [`rpc_stats`](Self::rpc_stats) can distinguish reconnect churn from
+    /// backpressure loss.
+    async fn backfill_source_window(
+        &mut self,
+        source: &SubscriberStreamSource,
+        cause: SubscriberRpcCause,
+    ) -> Result<Option<SubscriberEvent<N>>, SubscriberError> {
+        if source.is_flashblocks() {
+            return Ok(None);
+        }
         let SubscriberStreamSource::PubSubLog { id, filter } = source else {
             return Ok(None);
         };
@@ -6818,6 +19084,7 @@ where
             return Ok(None);
         };
 
+        self.record_rpc(cause, SubscriberRpcMethod::EthBlockNumber);
         let latest = self
             .provider
             .get_block_number()
@@ -6827,6 +19094,7 @@ where
             return Ok(None);
         }
 
+        self.record_rpc(cause, SubscriberRpcMethod::EthGetLogs);
         let logs = self
             .provider
             .get_logs(&filter.clone().from_block(from_block).to_block(latest))
@@ -6849,26 +19117,124 @@ where
         record: ReactiveInputRecord<N>,
         excluded: Option<&HashSet<SubscriberOwnerEpoch>>,
     ) {
+        let record = self.with_chain_id(record);
         let mut owners = self.staged_owners_for_record(&record);
         if let Some(excluded) = excluded {
             owners.retain(|owner| !excluded.contains(owner));
         }
         let canonical_duplicate = self.should_skip_recent_duplicate(&record);
         let owners = self.filter_recent_owner_duplicates(&record, owners);
+        let compatibility_owners = self.compatibility_owners_for_record(&record);
+        let (already_served, newly_served): (Vec<_>, Vec<_>) = compatibility_owners
+            .into_iter()
+            .partition(|owner| self.compatibility_owner_has_seen(&record, owner));
         if canonical_duplicate {
             if !owners.is_empty() {
-                self.pending_records.push_back(SubscriberInputRecord {
-                    record,
+                self.push_pending_record(SubscriberInputRecord {
+                    record: record.clone(),
                     scope: SubscriberInputScope::OwnerOnly { owners },
+                    preconfirmation_timing: None,
+                });
+            }
+            if !newly_served.is_empty() {
+                for owner in &newly_served {
+                    self.remember_compatibility_owner_record(&record, owner);
+                }
+                self.push_pending_record(SubscriberInputRecord {
+                    record,
+                    scope: SubscriberInputScope::OwnerOnlyHandlers {
+                        owners: newly_served,
+                    },
+                    preconfirmation_timing: None,
                 });
             }
             return;
         }
         self.remember_record(&record);
-        self.pending_records.push_back(SubscriberInputRecord {
+        for owner in already_served.iter().chain(&newly_served) {
+            self.remember_compatibility_owner_record(&record, owner);
+        }
+        self.push_pending_record(SubscriberInputRecord {
             record,
-            scope: SubscriberInputScope::Canonical { owners },
+            scope: if already_served.is_empty() {
+                SubscriberInputScope::Canonical { owners }
+            } else {
+                SubscriberInputScope::CanonicalResidual {
+                    owners,
+                    excluded: already_served,
+                }
+            },
+            preconfirmation_timing: None,
         });
+    }
+
+    fn enqueue_compat_owner_record(&mut self, record: ReactiveInputRecord<N>, owner: HandlerId) {
+        let record = self.with_chain_id(record);
+        if self.compatibility_owner_has_seen(&record, &owner) {
+            return;
+        }
+        self.remember_compatibility_owner_record(&record, &owner);
+        self.push_pending_record(SubscriberInputRecord {
+            record,
+            scope: SubscriberInputScope::OwnerOnlyHandlers {
+                owners: vec![owner],
+            },
+            preconfirmation_timing: None,
+        });
+    }
+
+    fn compatibility_owners_for_record(&self, record: &ReactiveInputRecord<N>) -> Vec<HandlerId> {
+        self.owned_interests
+            .iter()
+            .filter(|entry| entry.epoch.is_none() && entry.state == SubscriberOwnerState::Active)
+            .filter(|entry| {
+                entry
+                    .interests
+                    .iter()
+                    .any(|interest| interest_matches(interest, &record.input))
+            })
+            .map(|entry| entry.owner.clone())
+            .collect()
+    }
+
+    fn compatibility_owner_has_seen(
+        &self,
+        record: &ReactiveInputRecord<N>,
+        owner: &HandlerId,
+    ) -> bool {
+        should_dedupe_record(record)
+            && self
+                .recent_compat_owner_input_ref_sets
+                .get(owner)
+                .is_some_and(|seen| seen.contains(&record.input_ref()))
+    }
+
+    fn remember_compatibility_owner_record(
+        &mut self,
+        record: &ReactiveInputRecord<N>,
+        owner: &HandlerId,
+    ) {
+        if !should_dedupe_record(record) || self.config.reconnect.dedupe_window == 0 {
+            return;
+        }
+        let input_ref = record.input_ref();
+        let seen = self
+            .recent_compat_owner_input_ref_sets
+            .entry(owner.clone())
+            .or_default();
+        if !seen.insert(input_ref) {
+            return;
+        }
+        let recent = self
+            .recent_compat_owner_input_refs
+            .entry(owner.clone())
+            .or_default();
+        recent.push_back(input_ref);
+        while recent.len() > self.config.reconnect.dedupe_window {
+            if let Some(evicted) = recent.pop_front() {
+                seen.remove(&evicted);
+            }
+        }
     }
 
     fn enqueue_owner_record(
@@ -6901,6 +19267,7 @@ where
         owners: Vec<SubscriberOwnerEpoch>,
         merge_pending: bool,
     ) {
+        let record = self.with_chain_id(record);
         let owners = self.filter_recent_owner_duplicates(&record, owners);
         if owners.is_empty() {
             return;
@@ -6918,20 +19285,100 @@ where
             {
                 let pending_owners = match &mut pending.scope {
                     SubscriberInputScope::Canonical { owners }
-                    | SubscriberInputScope::OwnerOnly { owners } => owners,
+                    | SubscriberInputScope::CanonicalResidual { owners, .. }
+                    | SubscriberInputScope::OwnerOnly { owners } => Some(owners),
+                    SubscriberInputScope::OwnerOnlyHandlers { .. }
+                    | SubscriberInputScope::Preconfirmed => None,
                 };
-                for owner in owners {
-                    if !pending_owners.contains(&owner) {
-                        pending_owners.push(owner);
+                if let Some(pending_owners) = pending_owners {
+                    for owner in owners {
+                        if !pending_owners.contains(&owner) {
+                            pending_owners.push(owner);
+                        }
                     }
+                    return;
                 }
-                return;
             }
         }
-        self.pending_records.push_back(SubscriberInputRecord {
+        self.push_pending_record(SubscriberInputRecord {
             record,
             scope: SubscriberInputScope::OwnerOnly { owners },
+            preconfirmation_timing: None,
         });
+    }
+
+    fn push_pending_record(&mut self, record: SubscriberInputRecord<N>) {
+        if self.pending_record_count() >= self.config.max_pending_records {
+            self.note_resource_error(format!(
+                "pending record queues reached the configured limit of {}",
+                self.config.max_pending_records
+            ));
+            return;
+        }
+        self.pending_records.push_back(record);
+    }
+
+    fn ensure_pending_record_capacity(
+        &mut self,
+        additional: usize,
+        operation: &str,
+    ) -> Result<(), SubscriberError> {
+        let required = self.pending_record_count().saturating_add(additional);
+        if required > self.config.max_pending_records {
+            self.note_resource_error(format!(
+                "{operation} require {required} pending records, above the configured limit of {}",
+                self.config.max_pending_records
+            ));
+            return self.check_resource_error();
+        }
+        Ok(())
+    }
+
+    fn push_pending_reconcile_record(&mut self, record: BufferedSubscriberOwnerRecord<N>) {
+        if self.pending_record_count() >= self.config.max_pending_records {
+            self.note_resource_error(format!(
+                "pending record queues reached the configured limit of {}",
+                self.config.max_pending_records
+            ));
+            return;
+        }
+        self.pending_reconcile_owner_records.push_back(record);
+    }
+
+    fn pending_record_count(&self) -> usize {
+        self.pending_records
+            .len()
+            .saturating_add(self.pending_reconcile_owner_records.len())
+    }
+
+    fn note_resource_error(&mut self, message: String) {
+        if self.resource_error.is_none() {
+            self.resource_error = Some(message);
+        }
+    }
+
+    fn check_resource_error(&self) -> Result<(), SubscriberError> {
+        match &self.resource_error {
+            Some(message) => Err(SubscriberError::ResourceExhausted(message.clone())),
+            None => Ok(()),
+        }
+    }
+
+    fn with_chain_id(&self, mut record: ReactiveInputRecord<N>) -> ReactiveInputRecord<N> {
+        record.context.chain_id = self.chain_id;
+        if self.config.verify_log_block_context
+            && let ReactiveInput::Log(log) = &record.input
+            && !log.removed
+            && let (Some(number), Some(hash)) = (log.block_number, log.block_hash)
+            && let Some(verified) = self.verified_log_blocks.get(&(number, hash)).copied()
+        {
+            record.context.block = Some(verified);
+            record.context.chain_status = ChainStatus::Included {
+                block: verified,
+                confirmations: 0,
+            };
+        }
+        record
     }
 
     fn staged_owners_for_record(
@@ -7012,7 +19459,86 @@ where
     }
 }
 
-#[cfg(any(feature = "reactive-ws", feature = "reactive-polling", test))]
+/// Turn a pubsub subscription into a stream that reports dropped notifications
+/// instead of hiding them.
+///
+/// [`Subscription::into_stream`] is deliberately not used: it treats both a
+/// lagged receiver and an undecodable payload as `continue`, logging at `debug`
+/// and moving on, so a consumer cannot distinguish a complete stream from a
+/// punctured one. Consuming the raw subscription makes a broadcast `Lagged` a
+/// first-class [`SubscriberEvent::StreamGap`], while `Closed` still ends the
+/// stream so the existing reconnect path handles a genuine disconnect unchanged.
+///
+/// [`Subscription::into_stream`]: alloy_pubsub::Subscription::into_stream
+#[cfg(feature = "reactive-ws")]
+fn gap_observing_stream<N, T, F>(
+    subscription: alloy_pubsub::Subscription<T>,
+    source: SubscriberStreamSource,
+    gap_counters: Arc<SubscriberStreamGapCounters>,
+    to_event: F,
+) -> BoxStream<'static, SubscriberEvent<N>>
+where
+    N: Network + 'static,
+    T: serde::de::DeserializeOwned + Send + 'static,
+    F: FnMut(T) -> SubscriberEvent<N> + Send + 'static,
+{
+    // The decode closure and the receiver both live in the unfold state, so no
+    // borrow is held across an await point.
+    struct GapState<T, F> {
+        raw: alloy_pubsub::RawSubscription,
+        to_event: F,
+        source: SubscriberStreamSource,
+        gap_counters: Arc<SubscriberStreamGapCounters>,
+        _item: PhantomData<fn() -> T>,
+    }
+
+    let state = GapState {
+        raw: subscription.into_raw(),
+        to_event,
+        source: source.clone(),
+        gap_counters,
+        _item: PhantomData::<fn() -> T>,
+    };
+
+    let stream = stream::unfold(state, |mut state| async move {
+        let gap = match state.raw.recv().await {
+            Ok(value) => match serde_json::from_str::<T>(value.get()) {
+                Ok(item) => {
+                    let event = (state.to_event)(item);
+                    return Some((event, state));
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        stream = state.source.label(),
+                        error = %error,
+                        "pubsub notification did not decode; treating it as lost data"
+                    );
+                    SubscriberStreamGap::Undecodable
+                }
+            },
+            Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                tracing::warn!(
+                    stream = state.source.label(),
+                    skipped,
+                    "pubsub notification channel overflowed; the missed window will be recovered"
+                );
+                SubscriberStreamGap::Lagged { skipped }
+            }
+            // A closed channel is a disconnect, not a gap. Ending the stream
+            // lets `stream_with_termination` drive the existing reconnect.
+            Err(broadcast::error::RecvError::Closed) => return None,
+        };
+        state.gap_counters.record_gap(gap);
+        let event = SubscriberEvent::StreamGap {
+            source: state.source.clone(),
+            gap,
+        };
+        Some((event, state))
+    });
+
+    stream_with_termination(stream, source)
+}
+
 fn stream_with_termination<N, S>(
     stream: S,
     source: SubscriberStreamSource,
@@ -7026,6 +19552,184 @@ where
             SubscriberEvent::StreamTerminated(source)
         }))
         .boxed()
+}
+
+fn flashblock_reconnect_future<N>(
+    provider: RootProvider<N>,
+    source: SubscriberStreamSource,
+    channel_size: usize,
+    reconnect: SubscriberReconnectConfig,
+    first_delay: Duration,
+    flashblock_poll_interval: Duration,
+    counters: Arc<SubscriberRpcCounters>,
+) -> FlashblockReconnectFuture<N>
+where
+    N: Network + 'static,
+{
+    Box::pin(async move {
+        if !reconnect.enabled {
+            let error = SubscriberError::Provider(format!(
+                "Alloy subscriber {} stream terminated and reconnect is disabled",
+                source.label()
+            ));
+            return (source, Err(error));
+        }
+
+        let mut attempts = 0_usize;
+        let mut delay = first_delay;
+        let mut retry_delay = reconnect.retry_delay;
+        loop {
+            attempts = attempts.saturating_add(1);
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
+            match connect_flashblock_source_once(
+                &provider,
+                source.clone(),
+                channel_size,
+                flashblock_poll_interval,
+                counters.as_ref(),
+            )
+            .await
+            {
+                Ok(stream) => return (source, Ok(stream)),
+                Err(error) if reconnect_attempts_exhausted(attempts, &reconnect) => {
+                    return (
+                        source.clone(),
+                        Err(SubscriberError::Provider(format!(
+                            "Alloy subscriber {} stream reconnect failed after {attempts} attempt(s): {error}",
+                            source.label()
+                        ))),
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        stream = source.label(),
+                        attempts,
+                        error = %error,
+                        "Flashblocks reconnect attempt failed"
+                    );
+                    delay = retry_delay;
+                    retry_delay = next_reconnect_delay(retry_delay, reconnect.max_delay);
+                }
+            }
+        }
+    })
+}
+
+async fn connect_flashblock_source_once<N>(
+    provider: &RootProvider<N>,
+    source: SubscriberStreamSource,
+    channel_size: usize,
+    flashblock_poll_interval: Duration,
+    counters: &SubscriberRpcCounters,
+) -> Result<BoxStream<'static, SubscriberEvent<N>>, SubscriberError>
+where
+    N: Network + 'static,
+{
+    #[cfg(not(feature = "reactive-ws"))]
+    let _ = (provider, counters);
+
+    match source {
+        SubscriberStreamSource::BasePendingLog { id, filter } => {
+            #[cfg(feature = "reactive-ws")]
+            {
+                let source = SubscriberStreamSource::BasePendingLog {
+                    id,
+                    filter: filter.clone(),
+                };
+                let params = base_pending_log_filter(&filter)?;
+                counters.record(
+                    SubscriberRpcCause::StreamSubscription,
+                    SubscriberRpcMethod::EthSubscribe,
+                );
+                let stream = provider
+                    .subscribe::<_, Log>(("pendingLogs", params))
+                    .channel_size(channel_size.max(1))
+                    .await
+                    .map_err(provider_error)?
+                    .into_stream()
+                    .map(move |log| SubscriberEvent::BasePendingLogTimed {
+                        source_id: id,
+                        log,
+                        timing: FlashblockIngressTiming::new(Instant::now()),
+                    });
+                Ok(stream_with_termination(stream, source))
+            }
+            #[cfg(not(feature = "reactive-ws"))]
+            {
+                let _ = (id, filter, channel_size);
+                Err(SubscriberError::Unsupported(
+                    "Base Flashblocks require the reactive-ws feature",
+                ))
+            }
+        }
+        SubscriberStreamSource::BaseFlashblocks => {
+            #[cfg(feature = "reactive-ws")]
+            {
+                counters.record(
+                    SubscriberRpcCause::StreamSubscription,
+                    SubscriberRpcMethod::EthSubscribe,
+                );
+                let stream = provider
+                    .subscribe::<_, BaseFlashblockWirePayload>(("newFlashblocks",))
+                    .channel_size(channel_size.max(1))
+                    .await
+                    .map_err(provider_error)?
+                    .into_stream()
+                    .map(|payload| SubscriberEvent::BaseFlashblockTimed {
+                        payload,
+                        timing: FlashblockIngressTiming::new(Instant::now()),
+                    });
+                Ok(stream_with_termination(
+                    stream,
+                    SubscriberStreamSource::BaseFlashblocks,
+                ))
+            }
+            #[cfg(not(feature = "reactive-ws"))]
+            {
+                let _ = channel_size;
+                Err(SubscriberError::Unsupported(
+                    "Base Flashblocks require the reactive-ws feature",
+                ))
+            }
+        }
+        SubscriberStreamSource::OpPendingFlashblocks => {
+            let first_tick = tokio::time::Instant::now();
+            let mut interval = tokio::time::interval_at(first_tick, flashblock_poll_interval);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let stream = stream::unfold(interval, |mut interval| async move {
+                interval.tick().await;
+                Some((
+                    SubscriberEvent::OpFlashblockTickTimed(FlashblockIngressTiming::new(
+                        Instant::now(),
+                    )),
+                    interval,
+                ))
+            });
+            Ok(stream_with_termination(
+                stream,
+                SubscriberStreamSource::OpPendingFlashblocks,
+            ))
+        }
+        source => Err(SubscriberError::InvalidConfig(match source {
+            SubscriberStreamSource::PubSubLog { .. }
+            | SubscriberStreamSource::CanonicalHeadPolling
+            | SubscriberStreamSource::PubSubPendingHashes
+            | SubscriberStreamSource::PubSubBlockHeaders
+            | SubscriberStreamSource::PollingLog { .. }
+            | SubscriberStreamSource::PollingPendingHashes => {
+                "Flashblocks reconnect received a canonical source"
+            }
+            SubscriberStreamSource::BasePendingLog { .. }
+            | SubscriberStreamSource::BaseFlashblocks
+            | SubscriberStreamSource::OpPendingFlashblocks => unreachable!(),
+            #[cfg(feature = "raw-flashblocks-json")]
+            SubscriberStreamSource::ExternalFlashblockUpdates => {
+                "Flashblocks reconnect cannot own an application-managed source"
+            }
+        })),
+    }
 }
 
 fn aggregate_interests<N: Network>(
@@ -7075,8 +19779,2239 @@ fn should_dedupe_record<N: Network>(record: &ReactiveInputRecord<N>) -> bool {
 #[cfg(test)]
 mod subscriber_helper_tests {
     use super::*;
+    use alloy_json_rpc::{RequestPacket, ResponsePacket};
     use alloy_provider::ProviderBuilder;
-    use alloy_transport::mock::Asserter;
+    use alloy_rpc_client::RpcClient;
+    use alloy_transport::{TransportError, TransportFut, mock::Asserter};
+    use std::task::{Context, Poll};
+    use tower::Service;
+
+    #[derive(Clone, Debug)]
+    struct NeverRespondingTransport;
+
+    impl Service<RequestPacket> for NeverRespondingTransport {
+        type Response = ResponsePacket;
+        type Error = TransportError;
+        type Future = TransportFut<'static>;
+
+        fn poll_ready(&mut self, _context: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _request: RequestPacket) -> Self::Future {
+            Box::pin(futures::future::pending())
+        }
+    }
+
+    fn indexed_flashblock(transaction_hash: B256, state_root: B256) -> BaseFlashblockWirePayload {
+        BaseFlashblockWirePayload::Indexed(BaseFlashblockPayload {
+            payload_id: FixedBytes::repeat_byte(0x11),
+            index: 0,
+            base: Some(BaseFlashblockBase {
+                parent_hash: B256::repeat_byte(100),
+                block_number: 101,
+                timestamp: 1_700_000_101,
+                gas_limit: Some(30_000_000),
+                base_fee_per_gas: Some(7),
+                beneficiary: Some(Address::repeat_byte(0xcb)),
+                prevrandao: Some(B256::repeat_byte(0x77)),
+            }),
+            diff: BaseFlashblockDiff {
+                state_root,
+                block_hash: B256::ZERO,
+                transactions: vec![serde_json::Value::String(format!("{transaction_hash:#x}"))],
+                transactions_root: None,
+            },
+            metadata: None,
+        })
+    }
+
+    fn base_flashblock_event(payload: BaseFlashblockWirePayload) -> SubscriberEvent<Ethereum> {
+        SubscriberEvent::BaseFlashblockTimed {
+            payload,
+            timing: FlashblockIngressTiming::new(Instant::now()),
+        }
+    }
+
+    #[test]
+    fn duplicate_flashblock_transaction_membership_is_rejected() {
+        let transaction = format!("{:#x}", B256::repeat_byte(0x41));
+        let transactions = vec![
+            serde_json::Value::String(transaction.clone()),
+            serde_json::Value::String(transaction),
+        ];
+        assert!(matches!(
+            flashblock_transaction_hashes(&transactions),
+            Err(SubscriberError::Provider(ref message)) if message.contains("duplicate")
+        ));
+    }
+
+    #[test]
+    fn conflicting_duplicate_indexed_flashblock_is_rejected() {
+        let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig::default(),
+        )
+        .with_provider_ref(ProviderRef::new("base-paid", 7));
+        subscriber.chain_id = Some(8_453);
+
+        subscriber
+            .accept_base_flashblock(indexed_flashblock(
+                B256::repeat_byte(0x41),
+                B256::repeat_byte(0xa1),
+            ))
+            .expect("first indexed preview");
+        assert!(matches!(
+            subscriber.accept_base_flashblock(indexed_flashblock(
+                B256::repeat_byte(0x42),
+                B256::repeat_byte(0xa2),
+            )),
+            Err(SubscriberError::Provider(ref message))
+                if message.contains("conflicting duplicate")
+        ));
+    }
+
+    #[tokio::test]
+    async fn duplicate_index_with_changed_commitment_is_rejected() {
+        let transaction = B256::repeat_byte(0x41);
+        let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig::default(),
+        )
+        .with_provider_ref(ProviderRef::new("base-paid", 7));
+        subscriber.chain_id = Some(8_453);
+
+        subscriber
+            .normalize_flashblock_event(base_flashblock_event(indexed_flashblock(
+                transaction,
+                B256::repeat_byte(0xa1),
+            )))
+            .await
+            .expect("first indexed preview");
+
+        let BaseFlashblockWirePayload::Indexed(mut conflicting) =
+            indexed_flashblock(transaction, B256::repeat_byte(0xa1))
+        else {
+            unreachable!()
+        };
+        conflicting.diff.state_root = B256::repeat_byte(0xbb);
+        assert!(matches!(
+            subscriber
+                .normalize_flashblock_event(base_flashblock_event(
+                    BaseFlashblockWirePayload::Indexed(conflicting),
+                ))
+                .await,
+            Err(SubscriberError::Provider(ref message))
+                if message.contains("conflicting duplicate indexed Flashblock content")
+        ));
+    }
+
+    #[tokio::test]
+    async fn indexed_gap_recovery_seeds_later_cumulative_membership() {
+        let transaction_a = B256::repeat_byte(0x41);
+        let transaction_b = B256::repeat_byte(0x42);
+        let transaction_c = B256::repeat_byte(0x43);
+        let transaction_d = B256::repeat_byte(0x44);
+        let asserter = Asserter::new();
+        asserter.push_success(&100_u64);
+        let pending = rpc_block(101, B256::ZERO).with_transactions(
+            alloy_network::primitives::BlockTransactions::Hashes(vec![
+                transaction_a,
+                transaction_b,
+                transaction_c,
+            ]),
+        );
+        asserter.push_success(&Some(pending));
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig::default(),
+        )
+        .with_provider_ref(ProviderRef::new("base-paid", 7));
+        subscriber.chain_id = Some(8_453);
+
+        subscriber
+            .normalize_flashblock_event(base_flashblock_event(indexed_flashblock(
+                transaction_a,
+                B256::repeat_byte(0xa1),
+            )))
+            .await
+            .expect("index zero preview");
+        let BaseFlashblockWirePayload::Indexed(mut gap) =
+            indexed_flashblock(transaction_c, B256::repeat_byte(0xa3))
+        else {
+            unreachable!()
+        };
+        gap.index = 2;
+        gap.base = None;
+        gap.metadata = Some(BaseFlashblockMetadata { block_number: 101 });
+        subscriber
+            .normalize_flashblock_event(base_flashblock_event(BaseFlashblockWirePayload::Indexed(
+                gap,
+            )))
+            .await
+            .expect("the missing index is recovered from pending state");
+
+        let BaseFlashblockWirePayload::Indexed(mut next) =
+            indexed_flashblock(transaction_d, B256::repeat_byte(0xa4))
+        else {
+            unreachable!()
+        };
+        next.index = 3;
+        next.base = None;
+        next.metadata = Some(BaseFlashblockMetadata { block_number: 101 });
+        let (next, recover) = subscriber
+            .accept_base_flashblock(BaseFlashblockWirePayload::Indexed(next))
+            .expect("the next diff extends the recovered cumulative set");
+        assert!(!recover);
+        assert_eq!(
+            next.transaction_hashes,
+            vec![transaction_a, transaction_b, transaction_c, transaction_d]
+        );
+    }
+
+    #[tokio::test]
+    async fn unrecoverable_indexed_gap_revokes_the_generation() {
+        let asserter = Asserter::new();
+        asserter.push_success(&100_u64);
+        asserter.push_success(&Some(rpc_block(100, B256::repeat_byte(0x64))));
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig {
+                preconfirmations: PreconfirmationMode::Preferred,
+                ..SubscriberConfig::default()
+            },
+        )
+        .with_provider_ref(ProviderRef::new("base-paid", 7));
+        subscriber.chain_id = Some(8_453);
+
+        subscriber
+            .normalize_flashblock_event(base_flashblock_event(indexed_flashblock(
+                B256::repeat_byte(0x41),
+                B256::repeat_byte(0xa1),
+            )))
+            .await
+            .expect("index zero preview");
+        let BaseFlashblockWirePayload::Indexed(mut gap) =
+            indexed_flashblock(B256::repeat_byte(0x43), B256::repeat_byte(0xa3))
+        else {
+            unreachable!()
+        };
+        gap.index = 2;
+        gap.base = None;
+        gap.metadata = Some(BaseFlashblockMetadata { block_number: 101 });
+        let event = subscriber
+            .normalize_flashblock_event(base_flashblock_event(BaseFlashblockWirePayload::Indexed(
+                gap,
+            )))
+            .await
+            .expect("preferred mode fails closed without pending recovery")
+            .expect("generation invalidation is observable");
+        assert!(matches!(event, SubscriberEvent::FlashblockInvalidated));
+        assert!(subscriber.latest_preconfirmation.is_none());
+        assert_eq!(subscriber.provider_ref.as_ref().unwrap().generation, 8);
+    }
+
+    #[test]
+    fn base_flashblock_wire_decodes_cumulative_block_shape() {
+        let payload: BaseFlashblockWirePayload = serde_json::from_str(
+            r#"{
+                "hash":"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "number":"0x2ef403b",
+                "parentHash":"0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "stateRoot":"0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                "timestamp":"0x6a68dd59",
+                "transactions":[]
+            }"#,
+        )
+        .expect("decode current Base newFlashblocks shape");
+        let BaseFlashblockWirePayload::Block(payload) = payload else {
+            panic!("expected cumulative block-shaped payload")
+        };
+        assert_eq!(payload.number, 49_233_979);
+        assert_eq!(payload.timestamp, 1_785_257_305);
+        assert_eq!(payload.hash, B256::repeat_byte(0xaa));
+        assert_eq!(payload.parent_hash, B256::repeat_byte(0xbb));
+        assert_eq!(payload.state_root, B256::repeat_byte(0xcc));
+    }
+
+    #[tokio::test]
+    async fn zero_hash_pending_log_waits_for_the_preview_containing_its_transaction() {
+        let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig::default(),
+        )
+        .with_provider_ref(ProviderRef::new("base-paid", 7));
+        subscriber.base_interests = vec![ReactiveInterest::Logs(LogInterest {
+            provider_filter: Filter::new().address(Address::repeat_byte(0x42)),
+            local_matcher: None,
+            route_key: None,
+        })];
+        subscriber.interests = subscriber.base_interests.clone();
+
+        let first: BaseFlashblockWirePayload = serde_json::from_str(
+            r#"{
+                "hash":"0x0000000000000000000000000000000000000000000000000000000000000000",
+                "number":"0x65",
+                "parentHash":"0x6464646464646464646464646464646464646464646464646464646464646464",
+                "stateRoot":"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "transactionsRoot":"0x1111111111111111111111111111111111111111111111111111111111111111",
+                "timestamp":"0x6553f165",
+                "transactions":["0x4141414141414141414141414141414141414141414141414141414141414141"]
+            }"#,
+        )
+        .expect("decode first cumulative preview");
+        subscriber
+            .normalize_flashblock_event(base_flashblock_event(first))
+            .await
+            .expect("first preview is accepted");
+
+        let mut second_log = rpc_log(false);
+        second_log.block_hash = Some(B256::ZERO);
+        second_log.block_number = Some(102);
+        second_log.block_timestamp = Some(1_700_000_102);
+        second_log.transaction_hash = Some(B256::repeat_byte(0x42));
+        second_log.transaction_index = Some(0);
+        second_log.log_index = Some(0);
+
+        let pending_log_ingress = Instant::now() - Duration::from_millis(25);
+        let before_preview = subscriber
+            .normalize_flashblock_event(SubscriberEvent::BasePendingLogTimed {
+                source_id: 0,
+                log: second_log,
+                timing: FlashblockIngressTiming::new(pending_log_ingress),
+            })
+            .await
+            .expect("a zero-hash log for the next block must be buffered");
+        assert!(before_preview.is_none());
+
+        let second: BaseFlashblockWirePayload = serde_json::from_str(
+            r#"{
+                "hash":"0x0000000000000000000000000000000000000000000000000000000000000000",
+                "number":"0x66",
+                "parentHash":"0x6565656565656565656565656565656565656565656565656565656565656565",
+                "stateRoot":"0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "transactionsRoot":"0x2222222222222222222222222222222222222222222222222222222222222222",
+                "timestamp":"0x6553f166",
+                "transactions":["0x4242424242424242424242424242424242424242424242424242424242424242"]
+            }"#,
+        )
+        .expect("decode second cumulative preview");
+        let event = subscriber
+            .normalize_flashblock_event(base_flashblock_event(second))
+            .await
+            .expect("second preview is accepted")
+            .expect("the matching buffered log is released");
+        let SubscriberEvent::PreconfirmedLogs {
+            flashblock,
+            logs,
+            timing,
+        } = event
+        else {
+            panic!("expected a preconfirmed log batch")
+        };
+        assert_eq!(timing.source_ingress(), pending_log_ingress);
+        assert_eq!(flashblock.block_number, 102);
+        assert_ne!(flashblock.content_hash, B256::ZERO);
+        assert_eq!(flashblock.partial_block_hash, None);
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].transaction_hash, Some(B256::repeat_byte(0x42)));
+        assert_eq!(logs[0].block_hash, Some(flashblock.content_hash));
+    }
+
+    #[test]
+    fn flashblock_endpoints_certify_canonical_heads_instead_of_trusting_newheads() {
+        let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig {
+                preconfirmations: PreconfirmationMode::Required,
+                ..SubscriberConfig::default()
+            },
+        )
+        .with_provider_ref(ProviderRef::new("base-paid", 7));
+        subscriber.chain_id = Some(8_453);
+        subscriber.interests = vec![ReactiveInterest::Blocks(BlockInterest::default())];
+
+        let sources = subscriber.pubsub_stream_sources();
+        assert!(
+            sources
+                .iter()
+                .any(|source| matches!(source, SubscriberStreamSource::CanonicalHeadPolling))
+        );
+        assert!(
+            !sources
+                .iter()
+                .any(|source| matches!(source, SubscriberStreamSource::PubSubBlockHeaders))
+        );
+    }
+
+    #[test]
+    #[cfg(all(feature = "raw-flashblocks-json", feature = "reactive-ws"))]
+    fn external_flashblocks_keep_normal_canonical_pubsub_sources_on_any_chain() {
+        let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig {
+                preconfirmations: PreconfirmationMode::Required,
+                ..SubscriberConfig::default()
+            },
+        );
+        subscriber
+            .configure_external_flashblock_updates(ProviderRef::new("raw-json", 4))
+            .expect("configure external source");
+        subscriber.chain_id = Some(1);
+        subscriber.base_interests = vec![
+            ReactiveInterest::Blocks(BlockInterest::default()),
+            log_interest_matching_rpc_log(),
+        ];
+        subscriber.interests = subscriber.base_interests.clone();
+
+        let pubsub = subscriber.pubsub_stream_sources();
+        assert!(
+            pubsub
+                .iter()
+                .any(|source| matches!(source, SubscriberStreamSource::PubSubBlockHeaders))
+        );
+        assert!(
+            pubsub
+                .iter()
+                .any(|source| matches!(source, SubscriberStreamSource::PubSubLog { .. }))
+        );
+        assert!(pubsub.iter().all(|source| !matches!(
+            source,
+            SubscriberStreamSource::BaseFlashblocks
+                | SubscriberStreamSource::BasePendingLog { .. }
+                | SubscriberStreamSource::OpPendingFlashblocks
+                | SubscriberStreamSource::CanonicalHeadPolling
+        )));
+        assert!(
+            subscriber
+                .polling_stream_sources()
+                .iter()
+                .all(|source| { !matches!(source, SubscriberStreamSource::OpPendingFlashblocks) })
+        );
+        assert!(
+            subscriber
+                .capabilities()
+                .supports(SubscriberCapability::Preconfirmations)
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "raw-flashblocks-json")]
+    fn external_flashblocks_are_rejected_when_preconfirmations_are_disabled() {
+        let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig::default(),
+        );
+        subscriber
+            .configure_external_flashblock_updates(ProviderRef::new("raw-json", 4))
+            .expect("configure external source");
+        subscriber.chain_id = Some(1);
+
+        assert!(matches!(
+            subscriber.validate_flashblocks_setup(),
+            Err(SubscriberError::InvalidConfig(message))
+                if message.contains("require preconfirmations")
+        ));
+    }
+
+    #[tokio::test]
+    #[cfg(all(feature = "raw-flashblocks-json", feature = "reactive-ws"))]
+    async fn external_flashblocks_configuration_is_rejected_after_registration_starts() {
+        let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
+        let mut fresh = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig {
+                preconfirmations: PreconfirmationMode::Preferred,
+                ..SubscriberConfig::default()
+            },
+        );
+        fresh
+            .configure_external_flashblock_updates(ProviderRef::new("raw-json", 4))
+            .expect("construction-time external source");
+
+        let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
+        let mut started = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig {
+                preconfirmations: PreconfirmationMode::Preferred,
+                ..SubscriberConfig::default()
+            },
+        )
+        .with_provider_ref(ProviderRef::new("canonical", 3));
+        started.chain_id = Some(8_453);
+        started
+            .register_interests(&[log_interest_matching_rpc_log()])
+            .await
+            .expect("register canonical topology");
+
+        assert!(matches!(
+            started.configure_external_flashblock_updates(ProviderRef::new("raw-json", 4)),
+            Err(SubscriberError::InvalidConfig(message))
+                if message.contains("before subscriber registration")
+        ));
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "raw-flashblocks-json")]
+    async fn external_flashblocks_preflight_performs_no_flashblocks_rpc() {
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        let source = ProviderRef::new("raw-json", 4);
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig {
+                preconfirmations: PreconfirmationMode::Required,
+                ..SubscriberConfig::default()
+            },
+        );
+        subscriber
+            .configure_external_flashblock_updates(source.clone())
+            .expect("configure external source");
+        subscriber.chain_id = Some(1);
+        subscriber.base_interests = vec![log_interest_matching_rpc_log()];
+        subscriber.interests = subscriber.base_interests.clone();
+        let desired = subscriber.pubsub_stream_sources();
+        let mut streams = SubscriberStreams::new();
+        for source in desired {
+            streams.push(source, stream::pending().boxed());
+        }
+        subscriber.state = AlloySubscriberState::Active(streams);
+        subscriber.sources_dirty = false;
+
+        let preflight = subscriber
+            .establish_flashblocks_preflight(1)
+            .await
+            .expect("external source preflight");
+        assert_eq!(preflight.provider(), &source);
+        assert_eq!(preflight.delivery(), FlashblocksDelivery::ExternalUpdates);
+        assert_eq!(preflight.pending_log_subscriptions(), 0);
+        assert_eq!(subscriber.flashblocks_rpc_metrics().total_requests(), 0);
+        assert!(asserter.read_q().is_empty());
+    }
+
+    #[tokio::test]
+    #[cfg(all(feature = "raw-flashblocks-json", feature = "reactive-ws"))]
+    async fn bounded_external_channel_survives_subscriber_move_and_closure_keeps_canonical_stream()
+    {
+        let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
+        let source = ProviderRef::new("raw-json", 4);
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig {
+                preconfirmations: PreconfirmationMode::Preferred,
+                ..SubscriberConfig::default()
+            },
+        );
+        subscriber
+            .configure_external_flashblock_updates(source.clone())
+            .expect("configure external source");
+        subscriber.chain_id = Some(1);
+        subscriber.base_interests = vec![log_interest_matching_rpc_log()];
+        subscriber.interests = subscriber.base_interests.clone();
+        let filter = subscriber.log_stream_filters().remove(0);
+        let source_id = subscriber.log_source_id(&filter);
+        let mut streams = SubscriberStreams::new();
+        streams.push(
+            SubscriberStreamSource::PubSubLog {
+                id: source_id,
+                filter,
+            },
+            stream::pending().boxed(),
+        );
+        subscriber.state = AlloySubscriberState::Active(streams);
+        subscriber.sources_dirty = false;
+
+        let sender = subscriber
+            .open_external_flashblock_update_channel(2)
+            .expect("bounded external queue");
+        let external = SubscriberStreamSource::ExternalFlashblockUpdates;
+        let update_stream = subscriber
+            .connect_source_stream(external.clone())
+            .await
+            .expect("attach receiver as subscriber source");
+        subscriber.install_source_stream(external, update_stream);
+        subscriber.sources_dirty = false;
+
+        let mut adapter = RawJsonFlashblocksAdapter::new(source);
+        let frame = br#"{
+            "payload_id":"0x1111111111111111",
+            "index":0,
+            "base":{
+                "parent_hash":"0x0606060606060606060606060606060606060606060606060606060606060606",
+                "block_number":"0x7",
+                "timestamp":"0x6553f107"
+            },
+            "diff":{
+                "state_root":"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "block_hash":"0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "transactions":["0x01"]
+            },
+            "metadata":{
+                "block_number":7,
+                "receipts":{
+                    "0x5fe7f977e71dba2ea1a68e21057beebb9be2ac30c6410aa38d4f3fbe41dcffd2":{
+                        "logs":[{
+                            "address":"0x4242424242424242424242424242424242424242",
+                            "topics":["0x0101010101010101010101010101010101010101010101010101010101010101"],
+                            "data":"0x"
+                        }]
+                    }
+                }
+            }
+        }"#;
+        let update = adapter
+            .ingest_json(frame)
+            .expect("valid raw update")
+            .expect("snapshot update");
+        let valid_update = update.clone();
+        let sending = {
+            let sender = sender.clone();
+            tokio::spawn(async move { sender.send(update).await })
+        };
+
+        let preview = subscriber
+            .next_scoped_batch()
+            .await
+            .expect("poll preview")
+            .expect("preview batch");
+        assert_eq!(preview.records().len(), 1);
+        assert!(preview.records()[0].scope().is_preconfirmed());
+        assert_eq!(
+            preview.records()[0].context.source,
+            InputSource::Flashblocks
+        );
+        assert!(subscriber.latest_preconfirmation.is_some());
+        assert_eq!(sending.await.expect("sender task"), Ok(()));
+
+        let mut invalid_update = valid_update.clone();
+        let FlashblockUpdate::Snapshot(snapshot) = &mut invalid_update else {
+            unreachable!("fixture is a snapshot")
+        };
+        snapshot.logs[0].block_hash = Some(B256::repeat_byte(0xee));
+        let rejecting = {
+            let sender = sender.clone();
+            tokio::spawn(async move { sender.send(invalid_update).await })
+        };
+        let rejected = subscriber
+            .next_scoped_batch()
+            .await
+            .expect("preferred mode keeps polling")
+            .expect("rejected update invalidation");
+        assert!(rejected.preconfirmation_invalidated());
+        assert!(rejected.records().is_empty());
+        assert!(subscriber.latest_preconfirmation.is_none());
+        assert_eq!(
+            rejecting.await.expect("sender task"),
+            Err(FlashblockUpdateChannelError::Rejected)
+        );
+        subscriber
+            .ingest_flashblock_update(valid_update)
+            .expect("rejected generation is ignored thereafter");
+        assert!(subscriber.latest_preconfirmation.is_none());
+
+        let _reset = adapter
+            .reset(ProviderRef::new("raw-json", 5))
+            .expect("advance rejected source generation");
+        let recovered_update = adapter
+            .ingest_json(frame)
+            .expect("valid replacement generation")
+            .expect("replacement snapshot update");
+        let recovering = {
+            let sender = sender.clone();
+            tokio::spawn(async move { sender.send(recovered_update).await })
+        };
+        let recovered = subscriber
+            .next_scoped_batch()
+            .await
+            .expect("poll replacement generation")
+            .expect("replacement preview batch");
+        assert_eq!(recovered.records().len(), 1);
+        assert!(matches!(
+            &recovered.records()[0].context.chain_status,
+            ChainStatus::Preconfirmed { flashblock }
+                if flashblock.provider == ProviderRef::new("raw-json", 5)
+        ));
+        assert_eq!(recovering.await.expect("sender task"), Ok(()));
+
+        drop(sender);
+        let invalidation = subscriber
+            .next_scoped_batch()
+            .await
+            .expect("poll channel closure")
+            .expect("closure invalidation");
+        assert!(invalidation.preconfirmation_invalidated());
+        assert!(invalidation.records().is_empty());
+        assert!(subscriber.latest_preconfirmation.is_none());
+        assert!(matches!(
+            &subscriber.state,
+            AlloySubscriberState::Active(streams)
+                if streams.entries.iter().any(|entry| matches!(
+                    entry.source,
+                    SubscriberStreamSource::PubSubLog { id, .. } if id == source_id
+                ))
+        ));
+    }
+
+    #[tokio::test]
+    #[cfg(all(feature = "raw-flashblocks-json", feature = "reactive-ws"))]
+    async fn required_external_channel_closure_fails_the_subscriber_closed() {
+        let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
+        let source = ProviderRef::new("raw-json", 4);
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig {
+                preconfirmations: PreconfirmationMode::Required,
+                ..SubscriberConfig::default()
+            },
+        );
+        subscriber
+            .configure_external_flashblock_updates(source)
+            .expect("configure external source");
+        subscriber.chain_id = Some(1);
+        subscriber.base_interests = vec![log_interest_matching_rpc_log()];
+        subscriber.interests = subscriber.base_interests.clone();
+        subscriber.state = AlloySubscriberState::Active(SubscriberStreams::new());
+        subscriber.sources_dirty = false;
+
+        let sender = subscriber
+            .open_external_flashblock_update_channel(1)
+            .expect("bounded external queue");
+        let external = SubscriberStreamSource::ExternalFlashblockUpdates;
+        let update_stream = subscriber
+            .connect_source_stream(external.clone())
+            .await
+            .expect("attach receiver as subscriber source");
+        subscriber.install_source_stream(external, update_stream);
+        subscriber.sources_dirty = false;
+        drop(sender);
+
+        assert!(matches!(
+            subscriber.next_scoped_batch().await,
+            Err(SubscriberError::Provider(ref message))
+                if message.contains("required external Flashblock update channel closed")
+        ));
+    }
+
+    #[tokio::test]
+    #[cfg(all(feature = "raw-flashblocks-json", feature = "reactive-ws"))]
+    async fn required_external_channel_rejects_a_queued_malformed_update() {
+        let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
+        let source = ProviderRef::new("raw-json", 4);
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig {
+                preconfirmations: PreconfirmationMode::Required,
+                ..SubscriberConfig::default()
+            },
+        );
+        subscriber
+            .configure_external_flashblock_updates(source.clone())
+            .expect("configure external source");
+        subscriber.chain_id = Some(1);
+        subscriber.base_interests = vec![log_interest_matching_rpc_log()];
+        subscriber.interests = subscriber.base_interests.clone();
+        subscriber.state = AlloySubscriberState::Active(SubscriberStreams::new());
+        subscriber.sources_dirty = false;
+
+        let sender = subscriber
+            .open_external_flashblock_update_channel(1)
+            .expect("bounded external queue");
+        let external = SubscriberStreamSource::ExternalFlashblockUpdates;
+        let update_stream = subscriber
+            .connect_source_stream(external.clone())
+            .await
+            .expect("attach receiver as subscriber source");
+        subscriber.install_source_stream(external, update_stream);
+        subscriber.sources_dirty = false;
+
+        let mut adapter = RawJsonFlashblocksAdapter::new(source);
+        let mut update = adapter
+            .ingest_json(
+                br#"{
+                    "payload_id":"0x1111111111111111",
+                    "index":0,
+                    "base":{
+                        "parent_hash":"0x0606060606060606060606060606060606060606060606060606060606060606",
+                        "block_number":"0x7",
+                        "timestamp":"0x6553f107"
+                    },
+                    "diff":{
+                        "state_root":"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                        "block_hash":"0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                        "transactions":[]
+                    },
+                    "metadata":{"block_number":7,"receipts":{}}
+                }"#,
+            )
+            .expect("valid raw frame")
+            .expect("snapshot update");
+        let FlashblockUpdate::Snapshot(snapshot) = &mut update else {
+            unreachable!("fixture is a snapshot")
+        };
+        snapshot.flashblock.content_hash = B256::ZERO;
+        let sending = tokio::spawn(async move { sender.send(update).await });
+
+        assert!(matches!(
+            subscriber.next_scoped_batch().await,
+            Err(SubscriberError::Provider(ref message))
+                if message.contains("content commitment is invalid")
+        ));
+        assert_eq!(
+            sending.await.expect("sender task"),
+            Err(FlashblockUpdateChannelError::Rejected)
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(all(feature = "raw-flashblocks-json", feature = "reactive-ws"))]
+    async fn bounded_external_channel_reports_capacity_rejection_and_accepts_a_new_generation() {
+        let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
+        let source = ProviderRef::new("raw-json", 4);
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig {
+                preconfirmations: PreconfirmationMode::Preferred,
+                max_pending_records: 1,
+                ..SubscriberConfig::default()
+            },
+        );
+        subscriber
+            .configure_external_flashblock_updates(source.clone())
+            .expect("configure external source");
+        subscriber.chain_id = Some(1);
+        subscriber.base_interests = vec![log_interest_matching_rpc_log()];
+        subscriber.interests = subscriber.base_interests.clone();
+        subscriber.state = AlloySubscriberState::Active(SubscriberStreams::new());
+        subscriber.sources_dirty = false;
+
+        let sender = subscriber
+            .open_external_flashblock_update_channel(1)
+            .expect("bounded external queue");
+        let external = SubscriberStreamSource::ExternalFlashblockUpdates;
+        let update_stream = subscriber
+            .connect_source_stream(external.clone())
+            .await
+            .expect("attach receiver as subscriber source");
+        subscriber.install_source_stream(external, update_stream);
+        subscriber.sources_dirty = false;
+
+        let first_frame = br#"{
+            "payload_id":"0x1111111111111111",
+            "index":0,
+            "base":{
+                "parent_hash":"0x0606060606060606060606060606060606060606060606060606060606060606",
+                "block_number":"0x7",
+                "timestamp":"0x6553f107"
+            },
+            "diff":{
+                "state_root":"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "block_hash":"0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "transactions":["0x01"]
+            },
+            "metadata":{
+                "block_number":7,
+                "receipts":{
+                    "0x5fe7f977e71dba2ea1a68e21057beebb9be2ac30c6410aa38d4f3fbe41dcffd2":{
+                        "logs":[{
+                            "address":"0x4242424242424242424242424242424242424242",
+                            "topics":["0x0101010101010101010101010101010101010101010101010101010101010101"],
+                            "data":"0x"
+                        }]
+                    }
+                }
+            }
+        }"#;
+        let second_frame = br#"{
+            "payload_id":"0x1111111111111111",
+            "index":1,
+            "diff":{
+                "state_root":"0xabababababababababababababababababababababababababababababababab",
+                "block_hash":"0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                "transactions":["0x02"]
+            },
+            "metadata":{
+                "block_number":7,
+                "receipts":{
+                    "0xf2ee15ea639b73fa3db9b34a245bdfa015c260c598b211bf05a1ecc4b3e3b4f2":{
+                        "logs":[
+                            {"address":"0x4444444444444444444444444444444444444444","topics":[],"data":"0x"},
+                            {"address":"0x4545454545454545454545454545454545454545","topics":[],"data":"0x"}
+                        ]
+                    }
+                }
+            }
+        }"#;
+        let mut adapter = RawJsonFlashblocksAdapter::new(source);
+        let first = adapter
+            .ingest_json(first_frame)
+            .expect("valid first frame")
+            .expect("first snapshot");
+        let first_send = {
+            let sender = sender.clone();
+            tokio::spawn(async move { sender.send(first).await })
+        };
+        let first_batch = subscriber
+            .next_scoped_batch()
+            .await
+            .expect("poll first preview")
+            .expect("first preview batch");
+        assert_eq!(first_batch.records().len(), 1);
+        assert_eq!(first_send.await.expect("sender task"), Ok(()));
+
+        let oversized = adapter
+            .ingest_json(second_frame)
+            .expect("valid oversized delta")
+            .expect("oversized standardized snapshot");
+        let rejected_send = {
+            let sender = sender.clone();
+            tokio::spawn(async move { sender.send(oversized).await })
+        };
+        let invalidation = subscriber
+            .next_scoped_batch()
+            .await
+            .expect("poll capacity rejection")
+            .expect("capacity invalidation batch");
+        assert!(invalidation.preconfirmation_invalidated());
+        assert_eq!(
+            rejected_send.await.expect("sender task"),
+            Err(FlashblockUpdateChannelError::Rejected)
+        );
+        assert_eq!(subscriber.rejected_external_flashblock_generation, None);
+
+        let _ = adapter
+            .reset(ProviderRef::new("raw-json", 5))
+            .expect("advance after local capacity rejection");
+        let recovered = adapter
+            .ingest_json(first_frame)
+            .expect("valid recovered frame")
+            .expect("recovered snapshot");
+        let recovered_send = {
+            let sender = sender.clone();
+            tokio::spawn(async move { sender.send(recovered).await })
+        };
+        let recovered_batch = subscriber
+            .next_scoped_batch()
+            .await
+            .expect("poll recovered generation")
+            .expect("recovered preview batch");
+        assert_eq!(recovered_batch.records().len(), 1);
+        assert!(matches!(
+            &recovered_batch.records()[0].context.chain_status,
+            ChainStatus::Preconfirmed { flashblock }
+                if flashblock.provider == ProviderRef::new("raw-json", 5)
+        ));
+        assert_eq!(recovered_send.await.expect("sender task"), Ok(()));
+    }
+
+    #[tokio::test]
+    async fn certified_canonical_heads_are_deduplicated_and_reject_placeholder_hashes() {
+        let asserter = Asserter::new();
+        let certified = rpc_block(101, B256::repeat_byte(0x65));
+        asserter.push_success(&Some(certified.clone()));
+        asserter.push_success(&Some(certified));
+        asserter.push_success(&Some(rpc_block(102, B256::ZERO)));
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig::default(),
+        );
+
+        assert!(matches!(
+            subscriber
+                .fetch_certified_canonical_head()
+                .await
+                .expect("first certified head"),
+            Some(SubscriberEvent::BlockHeader(_))
+        ));
+        assert!(
+            subscriber
+                .fetch_certified_canonical_head()
+                .await
+                .expect("duplicate certified head")
+                .is_none()
+        );
+        assert!(matches!(
+            subscriber.fetch_certified_canonical_head().await,
+            Err(SubscriberError::Provider(ref message))
+                if message.contains("placeholder hash")
+        ));
+    }
+
+    #[tokio::test]
+    async fn canonical_head_certification_times_out_a_silent_provider() {
+        let provider =
+            ProviderBuilder::new().connect_client(RpcClient::new(NeverRespondingTransport, true));
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig {
+                preconfirmations: PreconfirmationMode::Required,
+                canonical_head_request_timeout: Duration::from_millis(10),
+                ..SubscriberConfig::default()
+            },
+        );
+        subscriber.chain_id = Some(8_453);
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(100),
+            subscriber.fetch_certified_canonical_head(),
+        )
+        .await
+        .expect("subscriber must bound a silent provider request");
+        assert!(matches!(
+            result,
+            Err(SubscriberError::Provider(ref message))
+                if message.contains("canonical head certification timed out")
+        ));
+    }
+
+    #[tokio::test]
+    async fn optimism_canonical_head_is_the_exact_parent_of_pending() {
+        let asserter = Asserter::new();
+        queue_op_pending(&asserter, rpc_block(101, B256::ZERO));
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig {
+                preconfirmations: PreconfirmationMode::Required,
+                ..SubscriberConfig::default()
+            },
+        );
+        subscriber.chain_id = Some(10);
+        subscriber.interests = vec![ReactiveInterest::Blocks(BlockInterest::default())];
+
+        let event = subscriber
+            .fetch_certified_canonical_head()
+            .await
+            .expect("OP pending parent can be certified")
+            .expect("the first certified parent is emitted");
+        let SubscriberEvent::BlockHeader(header) = event else {
+            panic!("expected a certified canonical block header")
+        };
+        assert_eq!(header.number(), 100);
+        assert_eq!(header.hash, B256::repeat_byte(0x64));
+        assert_eq!(
+            subscriber
+                .flashblocks_rpc_metrics()
+                .pending_block_requests(),
+            1
+        );
+        assert_eq!(
+            subscriber
+                .flashblocks_rpc_metrics()
+                .canonical_head_requests(),
+            1
+        );
+        assert!(asserter.read_q().is_empty());
+    }
+
+    #[test]
+    fn optimism_uses_one_bounded_pending_state_stream() {
+        let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig {
+                preconfirmations: PreconfirmationMode::Required,
+                ..SubscriberConfig::default()
+            },
+        )
+        .with_provider_ref(ProviderRef::new("op-paid", 11));
+        subscriber.chain_id = Some(10);
+        subscriber.base_interests = vec![ReactiveInterest::Logs(LogInterest {
+            provider_filter: Filter::new().address(Address::repeat_byte(0x42)),
+            local_matcher: None,
+            route_key: None,
+        })];
+        subscriber.interests = subscriber.base_interests.clone();
+
+        let sources = subscriber.pubsub_stream_sources();
+        assert_eq!(
+            sources
+                .iter()
+                .filter(|source| matches!(source, SubscriberStreamSource::OpPendingFlashblocks))
+                .count(),
+            1
+        );
+        assert!(sources.iter().all(|source| !matches!(
+            source,
+            SubscriberStreamSource::BaseFlashblocks | SubscriberStreamSource::BasePendingLog { .. }
+        )));
+    }
+
+    #[test]
+    fn optimism_default_receipt_budget_reserves_every_fixed_sampler_method() {
+        let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig {
+                preconfirmations: PreconfirmationMode::Required,
+                ..SubscriberConfig::default()
+            },
+        );
+        subscriber.chain_id = Some(10);
+        subscriber.base_interests = vec![log_interest_matching_rpc_log()];
+        subscriber.interests = subscriber.base_interests.clone();
+
+        // At 250 ms, the sampler reserves 4 * (exact parent + pending block +
+        // one filtered log request) = 12 methods. The remaining 28 exact
+        // receipt methods stay below the configured 40-method ceiling.
+        assert_eq!(
+            subscriber.pending_receipt_requests_per_second_capacity(),
+            28
+        );
+        assert_eq!(subscriber.pending_receipt_requests_per_tick_capacity(), 7);
+
+        subscriber
+            .interests
+            .push(ReactiveInterest::Blocks(BlockInterest::default()));
+        assert_eq!(
+            subscriber.pending_receipt_requests_per_second_capacity(),
+            24
+        );
+        assert_eq!(subscriber.pending_receipt_requests_per_tick_capacity(), 6);
+        subscriber.interests.pop();
+
+        for _ in 0..4 {
+            assert!(subscriber.reserve_flashblock_rpc_methods(3));
+            assert_eq!(subscriber.pending_receipt_request_allowance(), 7);
+            assert!(subscriber.reserve_flashblock_rpc_methods(7));
+        }
+        assert!(!subscriber.reserve_flashblock_rpc_methods(1));
+        subscriber.reset_flashblock_tracking();
+        assert!(
+            !subscriber.reserve_flashblock_rpc_methods(1),
+            "a reconnect must not reset an endpoint's rolling quota window"
+        );
+    }
+
+    #[test]
+    fn flashblocks_config_rejects_a_zero_rpc_budget() {
+        let config = SubscriberConfig {
+            preconfirmations: PreconfirmationMode::Required,
+            max_flashblock_rpc_requests_per_second: 0,
+            ..SubscriberConfig::default()
+        };
+
+        assert!(matches!(
+            validate_subscriber_config(&config),
+            Err(SubscriberError::InvalidConfig(
+                "SubscriberConfig::max_flashblock_rpc_requests_per_second must be greater than zero"
+            ))
+        ));
+    }
+
+    #[test]
+    fn flashblocks_config_rejects_a_zero_canonical_head_request_timeout() {
+        let config = SubscriberConfig {
+            preconfirmations: PreconfirmationMode::Required,
+            canonical_head_request_timeout: Duration::ZERO,
+            ..SubscriberConfig::default()
+        };
+
+        assert!(matches!(
+            validate_subscriber_config(&config),
+            Err(SubscriberError::InvalidConfig(
+                "SubscriberConfig::canonical_head_request_timeout must be greater than zero"
+            ))
+        ));
+    }
+
+    #[tokio::test]
+    async fn optimism_preflight_rejects_a_budget_without_receipt_capacity() {
+        let asserter = Asserter::new();
+        asserter.push_success(&serde_json::json!(["flashblocksv1"]));
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig {
+                preconfirmations: PreconfirmationMode::Required,
+                // Four ticks reserve three fixed methods each. Three remaining
+                // methods cannot fund even one receipt on every tick.
+                max_flashblock_rpc_requests_per_second: 15,
+                ..SubscriberConfig::default()
+            },
+        )
+        .with_provider_ref(ProviderRef::new("op-paid", 12));
+        subscriber.chain_id = Some(10);
+        subscriber.base_interests = vec![log_interest_matching_rpc_log()];
+        subscriber.interests = subscriber.base_interests.clone();
+        let desired = subscriber.pubsub_stream_sources();
+        let mut streams = SubscriberStreams::new();
+        for source in desired {
+            streams.push(source, stream::pending().boxed());
+        }
+        subscriber.state = AlloySubscriberState::Active(streams);
+        subscriber.sources_dirty = false;
+        assert!(matches!(
+            subscriber.establish_flashblocks_preflight(10).await,
+            Err(SubscriberError::InvalidConfig(message))
+                if message.contains("leaves no capacity for OP transaction receipts")
+        ));
+        assert!(asserter.read_q().is_empty());
+    }
+
+    #[cfg(feature = "reactive-ws")]
+    #[tokio::test]
+    async fn flashblocks_preflight_proves_chain_and_both_subscription_lanes() {
+        let asserter = Asserter::new();
+        asserter.push_success(&serde_json::json!({"flashblocks": true}));
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig {
+                preconfirmations: PreconfirmationMode::Required,
+                ..SubscriberConfig::default()
+            },
+        )
+        .with_provider_ref(ProviderRef::new("base-paid", 7));
+        subscriber.chain_id = Some(8_453);
+        subscriber.base_interests = vec![log_interest_matching_rpc_log()];
+        subscriber.interests = subscriber.base_interests.clone();
+        let desired = subscriber.pubsub_stream_sources();
+        let mut streams = SubscriberStreams::new();
+        for source in desired {
+            streams.push(source, stream::pending().boxed());
+        }
+        subscriber.state = AlloySubscriberState::Active(streams);
+        subscriber.sources_dirty = false;
+
+        let preflight = subscriber
+            .establish_flashblocks_preflight(8_453)
+            .await
+            .expect("preflight succeeds");
+
+        assert_eq!(preflight.chain_id(), 8_453);
+        assert_eq!(preflight.provider(), &ProviderRef::new("base-paid", 7));
+        assert_eq!(
+            preflight.delivery(),
+            FlashblocksDelivery::NativeSubscriptions
+        );
+        assert_eq!(preflight.pending_log_subscriptions(), 1);
+        assert_eq!(preflight.pending_log_filters(), 1);
+        assert_eq!(
+            preflight.advertised_capabilities(),
+            Some(&serde_json::json!({"flashblocks": true}))
+        );
+    }
+
+    #[tokio::test]
+    async fn optimism_preflight_probes_pending_state_without_native_subscriptions() {
+        let asserter = Asserter::new();
+        asserter.push_success(&serde_json::json!(["flashblocksv1"]));
+        queue_op_pending(&asserter, rpc_block(101, B256::ZERO));
+        asserter.push_success(&Vec::<Log>::new());
+        asserter.push_success(&serde_json::json!([]));
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig {
+                preconfirmations: PreconfirmationMode::Required,
+                ..SubscriberConfig::default()
+            },
+        )
+        .with_provider_ref(ProviderRef::new("op-paid", 12));
+        subscriber.chain_id = Some(10);
+        subscriber.base_interests = vec![log_interest_matching_rpc_log()];
+        subscriber.interests = subscriber.base_interests.clone();
+        let desired = subscriber.pubsub_stream_sources();
+        let mut streams = SubscriberStreams::new();
+        for source in desired {
+            streams.push(source, stream::pending().boxed());
+        }
+        subscriber.state = AlloySubscriberState::Active(streams);
+        subscriber.sources_dirty = false;
+
+        let preflight = subscriber
+            .establish_flashblocks_preflight(10)
+            .await
+            .expect("Optimism pending-state preflight succeeds");
+
+        assert_eq!(preflight.chain_id(), 10);
+        assert_eq!(preflight.provider(), &ProviderRef::new("op-paid", 12));
+        assert_eq!(
+            preflight.delivery(),
+            FlashblocksDelivery::PendingStatePolling
+        );
+        assert_eq!(preflight.pending_log_subscriptions(), 0);
+        assert_eq!(preflight.pending_log_filters(), 1);
+        assert_eq!(
+            preflight.advertised_capabilities(),
+            Some(&serde_json::json!(["flashblocksv1"]))
+        );
+        assert!(asserter.read_q().is_empty());
+    }
+
+    #[test]
+    fn optimism_full_pending_block_normalizes_op_transaction_types_to_hashes() {
+        let transaction_hash = B256::repeat_byte(0x7e);
+        let mut value = serde_json::to_value(rpc_block(101, B256::ZERO))
+            .expect("serialize pending block fixture");
+        value["transactions"] = serde_json::json!([{
+            "type": "0x7e",
+            "hash": transaction_hash,
+            "sourceHash": B256::repeat_byte(0x11),
+            "from": Address::repeat_byte(0x22),
+            "to": Address::repeat_byte(0x33)
+        }]);
+
+        let block = normalize_op_pending_block::<Ethereum>(value)
+            .expect("OP-specific transaction bodies are reduced to hashes");
+
+        assert_eq!(
+            block.transactions().as_hashes(),
+            Some(&[transaction_hash][..])
+        );
+    }
+
+    #[tokio::test]
+    async fn optimism_sampler_does_not_retry_malformed_pending_content() {
+        let asserter = Asserter::new();
+        let mut pending = serde_json::to_value(rpc_block(101, B256::ZERO))
+            .expect("serialize pending block fixture");
+        pending["transactions"] = serde_json::json!([{"type": "0x7e"}]);
+        asserter.push_success(&Some(pending));
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig {
+                preconfirmations: PreconfirmationMode::Required,
+                ..SubscriberConfig::default()
+            },
+        )
+        .with_provider_ref(ProviderRef::new("op-paid", 12));
+        subscriber.chain_id = Some(10);
+
+        let error = match subscriber
+            .normalize_flashblock_event(SubscriberEvent::OpFlashblockTick)
+            .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("malformed provider content must fail immediately"),
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("transaction is missing its hash")
+        );
+        assert_eq!(subscriber.flashblocks_rpc_metrics().failed_requests(), 0);
+        assert!(asserter.read_q().is_empty());
+    }
+
+    #[tokio::test]
+    async fn optimism_sampler_certifies_the_pending_block_by_exact_parent_hash() {
+        let asserter = Asserter::new();
+        queue_op_pending(&asserter, rpc_block(101, B256::ZERO));
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig {
+                preconfirmations: PreconfirmationMode::Required,
+                ..SubscriberConfig::default()
+            },
+        )
+        .with_provider_ref(ProviderRef::new("op-paid", 12));
+        subscriber.chain_id = Some(10);
+
+        assert!(
+            subscriber
+                .fetch_pending_flashblock(None)
+                .await
+                .expect("the exact parent certifies the pending payload")
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn optimism_sampler_rejects_a_nonconsecutive_pending_parent() {
+        let asserter = Asserter::new();
+        asserter.push_success(&Some(rpc_block(101, B256::ZERO)));
+        asserter.push_success(&Some(rpc_block(99, B256::repeat_byte(0x64))));
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig {
+                preconfirmations: PreconfirmationMode::Required,
+                ..SubscriberConfig::default()
+            },
+        )
+        .with_provider_ref(ProviderRef::new("op-paid", 12));
+        subscriber.chain_id = Some(10);
+
+        assert!(matches!(
+            subscriber.fetch_pending_flashblock(None).await,
+            Err(PendingFlashblockPollError::Integrity(SubscriberError::Provider(
+                ref message
+            ))) if message.contains("does not extend its exact certified parent")
+        ));
+        assert!(asserter.read_q().is_empty());
+    }
+
+    #[tokio::test]
+    async fn optimism_sampler_rechecks_unchanged_content_without_republishing_logs() {
+        let asserter = Asserter::new();
+        let pending = rpc_block(101, B256::ZERO);
+        queue_op_pending(&asserter, pending.clone());
+        asserter.push_success(&Vec::<Log>::new());
+        queue_op_pending(&asserter, pending);
+        asserter.push_success(&Vec::<Log>::new());
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig {
+                preconfirmations: PreconfirmationMode::Required,
+                ..SubscriberConfig::default()
+            },
+        )
+        .with_provider_ref(ProviderRef::new("op-paid", 12));
+        subscriber.chain_id = Some(10);
+        subscriber.base_interests = vec![log_interest_matching_rpc_log()];
+        subscriber.interests = subscriber.base_interests.clone();
+
+        assert!(
+            subscriber
+                .fetch_pending_flashblock(None)
+                .await
+                .expect("first cumulative pending view")
+                .is_some()
+        );
+        assert!(
+            subscriber
+                .fetch_pending_flashblock(None)
+                .await
+                .expect("duplicate cumulative pending view")
+                .is_none()
+        );
+
+        assert_eq!(
+            subscriber.flashblocks_rpc_metrics(),
+            FlashblocksRpcMetrics {
+                capability_requests: 0,
+                provider_pair_chain_requests: 0,
+                canonical_head_requests: 2,
+                pending_block_requests: 2,
+                pending_log_requests: 2,
+                pending_receipt_requests: 0,
+                pending_receipts_completed: 0,
+                pending_receipts_unavailable: 0,
+                failed_requests: 0,
+                raced_samples: 0,
+                suppressed_canonical_head_polls: 0,
+            }
+        );
+        assert!(asserter.read_q().is_empty());
+    }
+
+    #[tokio::test]
+    async fn optimism_sampler_rechecks_logs_for_an_unchanged_pending_view() {
+        let asserter = Asserter::new();
+        let transaction = B256::repeat_byte(0x42);
+        let pending = rpc_block(101, B256::repeat_byte(0xa1)).with_transactions(
+            alloy_network::primitives::BlockTransactions::Hashes(vec![transaction]),
+        );
+        let mut log = rpc_log(false);
+        log.block_number = Some(101);
+        log.block_hash = Some(B256::repeat_byte(0xa2));
+        log.transaction_hash = Some(transaction);
+        log.transaction_index = Some(0);
+        log.log_index = Some(0);
+        queue_op_pending(&asserter, pending.clone());
+        asserter.push_success(&Vec::<Log>::new());
+        asserter.push_success(&serde_json::Value::Null);
+        queue_op_pending(&asserter, pending);
+        asserter.push_success(&vec![log]);
+        asserter.push_success(&serde_json::Value::Null);
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig {
+                preconfirmations: PreconfirmationMode::Required,
+                ..SubscriberConfig::default()
+            },
+        )
+        .with_provider_ref(ProviderRef::new("op-paid", 12));
+        subscriber.chain_id = Some(10);
+        subscriber.base_interests = vec![log_interest_matching_rpc_log()];
+        subscriber.interests = subscriber.base_interests.clone();
+
+        assert!(matches!(
+            subscriber
+                .normalize_flashblock_event(SubscriberEvent::OpFlashblockTick)
+                .await
+                .expect("first pending view is coherent"),
+            Some(SubscriberEvent::FlashblockObserved)
+        ));
+        assert!(matches!(
+            subscriber
+                .normalize_flashblock_event(SubscriberEvent::OpFlashblockTick)
+                .await
+                .expect("the unchanged view is checked again for lagging logs"),
+            Some(SubscriberEvent::PreconfirmedLogs { ref logs, .. }) if logs.len() == 1
+        ));
+        assert!(asserter.read_q().is_empty());
+    }
+
+    #[tokio::test]
+    async fn optimism_sampler_hydrates_exact_receipts_when_filtered_logs_are_empty() {
+        let asserter = Asserter::new();
+        let transaction = B256::repeat_byte(0x42);
+        let pending = rpc_block(101, B256::repeat_byte(0xa1)).with_transactions(
+            alloy_network::primitives::BlockTransactions::Hashes(vec![transaction]),
+        );
+        let mut log = rpc_log(false);
+        log.block_number = Some(101);
+        log.block_hash = Some(B256::repeat_byte(0xa2));
+        log.transaction_hash = Some(transaction);
+        log.transaction_index = Some(0);
+        log.log_index = Some(0);
+        queue_op_pending(&asserter, pending);
+        asserter.push_success(&Vec::<Log>::new());
+        asserter.push_success(&serde_json::json!({
+            "transactionHash": transaction,
+            "logs": [log]
+        }));
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig {
+                preconfirmations: PreconfirmationMode::Required,
+                ..SubscriberConfig::default()
+            },
+        )
+        .with_provider_ref(ProviderRef::new("op-paid", 12));
+        subscriber.chain_id = Some(10);
+        subscriber.base_interests = vec![log_interest_matching_rpc_log()];
+        subscriber.interests = subscriber.base_interests.clone();
+
+        let event = subscriber
+            .normalize_flashblock_event(SubscriberEvent::OpFlashblockTick)
+            .await
+            .expect("pending receipt fallback succeeds");
+        assert!(matches!(
+            event,
+            Some(SubscriberEvent::PreconfirmedLogs { ref logs, .. }) if logs.len() == 1
+        ));
+        assert_eq!(
+            subscriber
+                .flashblocks_rpc_metrics()
+                .pending_receipt_requests(),
+            1
+        );
+        assert!(asserter.read_q().is_empty());
+    }
+
+    #[tokio::test]
+    async fn optimism_receipt_hydration_is_bounded_and_resumes_on_the_next_tick() {
+        let asserter = Asserter::new();
+        let transaction_a = B256::repeat_byte(0x41);
+        let transaction_b = B256::repeat_byte(0x42);
+        let pending = rpc_block(101, B256::repeat_byte(0xa1)).with_transactions(
+            alloy_network::primitives::BlockTransactions::Hashes(vec![
+                transaction_a,
+                transaction_b,
+            ]),
+        );
+        let mut log = rpc_log(false);
+        log.block_number = Some(101);
+        log.transaction_hash = Some(transaction_b);
+        log.transaction_index = Some(1);
+        queue_op_pending(&asserter, pending.clone());
+        asserter.push_success(&Vec::<Log>::new());
+        asserter.push_success(&serde_json::json!({
+            "transactionHash": transaction_a,
+            "logs": []
+        }));
+        queue_op_pending(&asserter, pending);
+        asserter.push_success(&Vec::<Log>::new());
+        asserter.push_success(&serde_json::json!({
+            "transactionHash": transaction_b,
+            "logs": [log]
+        }));
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig {
+                preconfirmations: PreconfirmationMode::Required,
+                max_pending_transaction_receipts_per_tick: 1,
+                ..SubscriberConfig::default()
+            },
+        )
+        .with_provider_ref(ProviderRef::new("op-paid", 12));
+        subscriber.chain_id = Some(10);
+        subscriber.base_interests = vec![log_interest_matching_rpc_log()];
+        subscriber.interests = subscriber.base_interests.clone();
+
+        assert!(matches!(
+            subscriber
+                .normalize_flashblock_event(SubscriberEvent::OpFlashblockTick)
+                .await
+                .expect("the first bounded receipt is hydrated"),
+            Some(SubscriberEvent::FlashblockObserved)
+        ));
+        assert!(matches!(
+            subscriber
+                .normalize_flashblock_event(SubscriberEvent::OpFlashblockTick)
+                .await
+                .expect("the remaining receipt is hydrated on the next tick"),
+            Some(SubscriberEvent::PreconfirmedLogs { ref logs, .. }) if logs.len() == 1
+        ));
+        assert_eq!(
+            subscriber
+                .flashblocks_rpc_metrics()
+                .pending_receipt_requests(),
+            2
+        );
+        assert_eq!(subscriber.preconfirmed_receipted_transactions.len(), 2);
+        assert!(asserter.read_q().is_empty());
+    }
+
+    #[tokio::test]
+    async fn optimism_receipt_hydration_prioritizes_unattempted_hashes_over_null_retries() {
+        let asserter = Asserter::new();
+        let transaction_a = B256::repeat_byte(0x41);
+        let transaction_b = B256::repeat_byte(0x42);
+        let pending = rpc_block(101, B256::repeat_byte(0xa1)).with_transactions(
+            alloy_network::primitives::BlockTransactions::Hashes(vec![
+                transaction_a,
+                transaction_b,
+            ]),
+        );
+        let mut log = rpc_log(false);
+        log.block_number = Some(101);
+        log.transaction_hash = Some(transaction_b);
+        log.transaction_index = Some(1);
+        queue_op_pending(&asserter, pending.clone());
+        asserter.push_success(&Vec::<Log>::new());
+        asserter.push_success(&serde_json::Value::Null);
+        queue_op_pending(&asserter, pending);
+        asserter.push_success(&Vec::<Log>::new());
+        asserter.push_success(&serde_json::json!({
+            "transactionHash": transaction_b,
+            "logs": [log]
+        }));
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig {
+                preconfirmations: PreconfirmationMode::Required,
+                max_pending_transaction_receipts_per_tick: 1,
+                ..SubscriberConfig::default()
+            },
+        )
+        .with_provider_ref(ProviderRef::new("op-paid", 12));
+        subscriber.chain_id = Some(10);
+        subscriber.base_interests = vec![log_interest_matching_rpc_log()];
+        subscriber.interests = subscriber.base_interests.clone();
+
+        assert!(matches!(
+            subscriber
+                .normalize_flashblock_event(SubscriberEvent::OpFlashblockTick)
+                .await
+                .expect("the first null receipt remains retryable"),
+            Some(SubscriberEvent::FlashblockObserved)
+        ));
+        assert!(matches!(
+            subscriber
+                .normalize_flashblock_event(SubscriberEvent::OpFlashblockTick)
+                .await
+                .expect("the next unattempted receipt is not starved"),
+            Some(SubscriberEvent::PreconfirmedLogs { ref logs, .. }) if logs.len() == 1
+        ));
+        assert!(
+            subscriber
+                .preconfirmed_unavailable_receipts
+                .contains(&transaction_a)
+        );
+        assert!(
+            subscriber
+                .preconfirmed_receipted_transactions
+                .contains(&transaction_b)
+        );
+        assert!(asserter.read_q().is_empty());
+    }
+
+    #[tokio::test]
+    async fn optimism_receipt_batch_commits_dedupe_only_after_every_response_succeeds() {
+        let asserter = Asserter::new();
+        let transaction_a = B256::repeat_byte(0x41);
+        let transaction_b = B256::repeat_byte(0x42);
+        let pending = rpc_block(101, B256::repeat_byte(0xa1)).with_transactions(
+            alloy_network::primitives::BlockTransactions::Hashes(vec![
+                transaction_a,
+                transaction_b,
+            ]),
+        );
+        let mut log = rpc_log(false);
+        log.block_number = Some(101);
+        log.transaction_hash = Some(transaction_b);
+        log.transaction_index = Some(1);
+        queue_op_pending(&asserter, pending.clone());
+        asserter.push_success(&Vec::<Log>::new());
+        asserter.push_success(&serde_json::json!({
+            "transactionHash": transaction_a,
+            "logs": []
+        }));
+        asserter.push_failure_msg("receipt temporarily unavailable");
+        queue_op_pending(&asserter, pending);
+        asserter.push_success(&Vec::<Log>::new());
+        asserter.push_success(&serde_json::json!({
+            "transactionHash": transaction_a,
+            "logs": []
+        }));
+        asserter.push_success(&serde_json::json!({
+            "transactionHash": transaction_b,
+            "logs": [log]
+        }));
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig {
+                preconfirmations: PreconfirmationMode::Required,
+                max_pending_transaction_receipts_per_tick: 2,
+                max_consecutive_flashblock_poll_failures: 2,
+                ..SubscriberConfig::default()
+            },
+        )
+        .with_provider_ref(ProviderRef::new("op-paid", 12));
+        subscriber.chain_id = Some(10);
+        subscriber.base_interests = vec![log_interest_matching_rpc_log()];
+        subscriber.interests = subscriber.base_interests.clone();
+
+        assert!(
+            subscriber
+                .normalize_flashblock_event(SubscriberEvent::OpFlashblockTick)
+                .await
+                .expect("one failed receipt response remains retryable")
+                .is_none()
+        );
+        assert!(subscriber.preconfirmed_receipted_transactions.is_empty());
+        assert!(matches!(
+            subscriber
+                .normalize_flashblock_event(SubscriberEvent::OpFlashblockTick)
+                .await
+                .expect("the complete batch is retried transactionally"),
+            Some(SubscriberEvent::PreconfirmedLogs { ref logs, .. }) if logs.len() == 1
+        ));
+        assert_eq!(subscriber.preconfirmed_receipted_transactions.len(), 2);
+        assert_eq!(subscriber.flashblocks_rpc_metrics().failed_requests(), 1);
+        assert_eq!(
+            subscriber
+                .flashblocks_rpc_metrics()
+                .pending_receipt_requests(),
+            4
+        );
+        assert!(asserter.read_q().is_empty());
+    }
+
+    #[tokio::test]
+    async fn optimism_sampler_rejects_a_receipt_for_a_different_transaction() {
+        let asserter = Asserter::new();
+        let sampled_transaction = B256::repeat_byte(0x41);
+        let advanced_transaction = B256::repeat_byte(0x42);
+        let pending = rpc_block(101, B256::repeat_byte(0xa1)).with_transactions(
+            alloy_network::primitives::BlockTransactions::Hashes(vec![sampled_transaction]),
+        );
+        let mut log = rpc_log(false);
+        log.block_number = Some(101);
+        log.transaction_hash = Some(advanced_transaction);
+        queue_op_pending(&asserter, pending);
+        asserter.push_success(&Vec::<Log>::new());
+        asserter.push_success(&serde_json::json!({
+            "transactionHash": advanced_transaction,
+            "logs": [log]
+        }));
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig {
+                preconfirmations: PreconfirmationMode::Required,
+                ..SubscriberConfig::default()
+            },
+        )
+        .with_provider_ref(ProviderRef::new("op-paid", 12));
+        subscriber.chain_id = Some(10);
+        subscriber.base_interests = vec![log_interest_matching_rpc_log()];
+        subscriber.interests = subscriber.base_interests.clone();
+
+        let error = match subscriber
+            .normalize_flashblock_event(SubscriberEvent::OpFlashblockTick)
+            .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("a receipt for another transaction must fail closed"),
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("hash disagrees with its request")
+        );
+        assert!(asserter.read_q().is_empty());
+    }
+
+    #[tokio::test]
+    async fn optimism_sampler_revokes_then_recovers_from_a_regressive_pending_view() {
+        let asserter = Asserter::new();
+        let transaction_a = B256::repeat_byte(0x41);
+        let transaction_b = B256::repeat_byte(0x42);
+        let first = rpc_block(101, B256::repeat_byte(0xa1)).with_transactions(
+            alloy_network::primitives::BlockTransactions::Hashes(vec![
+                transaction_a,
+                transaction_b,
+            ]),
+        );
+        let regressive = rpc_block(101, B256::repeat_byte(0xa2)).with_transactions(
+            alloy_network::primitives::BlockTransactions::Hashes(vec![transaction_a]),
+        );
+        queue_op_pending(&asserter, first);
+        asserter.push_success(&Vec::<Log>::new());
+        asserter.push_success(&serde_json::Value::Null);
+        asserter.push_success(&serde_json::Value::Null);
+        queue_op_pending(&asserter, regressive.clone());
+        queue_op_pending(&asserter, regressive);
+        asserter.push_success(&Vec::<Log>::new());
+        asserter.push_success(&serde_json::Value::Null);
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig {
+                preconfirmations: PreconfirmationMode::Required,
+                ..SubscriberConfig::default()
+            },
+        )
+        .with_provider_ref(ProviderRef::new("op-paid", 12));
+        subscriber.chain_id = Some(10);
+        subscriber.base_interests = vec![log_interest_matching_rpc_log()];
+        subscriber.interests = subscriber.base_interests.clone();
+
+        assert!(
+            subscriber
+                .normalize_flashblock_event(SubscriberEvent::OpFlashblockTick)
+                .await
+                .expect("first pending view is coherent")
+                .is_some()
+        );
+        assert!(matches!(
+            subscriber
+                .normalize_flashblock_event(SubscriberEvent::OpFlashblockTick)
+                .await
+                .expect("regression revokes instead of terminating the stream"),
+            Some(SubscriberEvent::FlashblockInvalidated)
+        ));
+        assert!(subscriber.latest_preconfirmation.is_none());
+        assert!(subscriber.pending_preconfirmation_invalidation);
+        assert!(
+            subscriber
+                .normalize_flashblock_event(SubscriberEvent::OpFlashblockTick)
+                .await
+                .expect("a later coherent view establishes a fresh snapshot")
+                .is_some()
+        );
+        assert!(subscriber.latest_preconfirmation.is_some());
+        assert_eq!(subscriber.provider_ref.as_ref().unwrap().generation, 12);
+        assert!(asserter.read_q().is_empty());
+    }
+
+    #[tokio::test]
+    async fn optimism_new_quiet_payload_revokes_the_previous_snapshot() {
+        let asserter = Asserter::new();
+        let first = rpc_block(101, B256::repeat_byte(0xa1));
+        let second = rpc_block(102, B256::repeat_byte(0xa2));
+        queue_op_pending(&asserter, first);
+        asserter.push_success(&Vec::<Log>::new());
+        queue_op_pending(&asserter, second);
+        asserter.push_success(&Vec::<Log>::new());
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig {
+                preconfirmations: PreconfirmationMode::Required,
+                ..SubscriberConfig::default()
+            },
+        )
+        .with_provider_ref(ProviderRef::new("op-paid", 12));
+        subscriber.chain_id = Some(10);
+        subscriber.base_interests = vec![log_interest_matching_rpc_log()];
+        subscriber.interests = subscriber.base_interests.clone();
+
+        subscriber
+            .normalize_flashblock_event(SubscriberEvent::OpFlashblockTick)
+            .await
+            .expect("first quiet payload is observed");
+        assert!(!subscriber.pending_preconfirmation_invalidation);
+        subscriber
+            .normalize_flashblock_event(SubscriberEvent::OpFlashblockTick)
+            .await
+            .expect("replacement quiet payload is observed");
+        assert!(subscriber.pending_preconfirmation_invalidation);
+        assert_eq!(
+            subscriber
+                .latest_preconfirmation
+                .as_ref()
+                .map(|flashblock| flashblock.block_number),
+            Some(102)
+        );
+        assert!(asserter.read_q().is_empty());
+    }
+
+    #[tokio::test]
+    async fn optimism_sampler_rejects_malformed_pending_receipts() {
+        let asserter = Asserter::new();
+        let transaction = B256::repeat_byte(0x42);
+        let pending = rpc_block(101, B256::ZERO).with_transactions(
+            alloy_network::primitives::BlockTransactions::Hashes(vec![transaction]),
+        );
+        queue_op_pending(&asserter, pending);
+        asserter.push_success(&Vec::<Log>::new());
+        asserter.push_success(&serde_json::json!({"transactionHash": transaction}));
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig {
+                preconfirmations: PreconfirmationMode::Required,
+                ..SubscriberConfig::default()
+            },
+        )
+        .with_provider_ref(ProviderRef::new("op-paid", 12));
+        subscriber.chain_id = Some(10);
+        subscriber.base_interests = vec![log_interest_matching_rpc_log()];
+        subscriber.interests = subscriber.base_interests.clone();
+
+        let error = match subscriber
+            .normalize_flashblock_event(SubscriberEvent::OpFlashblockTick)
+            .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("malformed receipt content must fail closed"),
+        };
+        assert!(error.to_string().contains("missing its log array"));
+        assert_eq!(subscriber.flashblocks_rpc_metrics().failed_requests(), 0);
+        assert!(asserter.read_q().is_empty());
+    }
+
+    #[tokio::test]
+    async fn optimism_sampler_retries_when_logs_advance_past_the_sampled_block() {
+        let asserter = Asserter::new();
+        let transaction_a = B256::repeat_byte(0x41);
+        let transaction_b = B256::repeat_byte(0x42);
+        let first = rpc_block(101, B256::repeat_byte(0xa1)).with_transactions(
+            alloy_network::primitives::BlockTransactions::Hashes(vec![transaction_a]),
+        );
+        let second = rpc_block(101, B256::repeat_byte(0xa2)).with_transactions(
+            alloy_network::primitives::BlockTransactions::Hashes(vec![
+                transaction_a,
+                transaction_b,
+            ]),
+        );
+        let mut log = rpc_log(false);
+        log.block_number = Some(101);
+        log.block_hash = Some(B256::repeat_byte(0xa2));
+        log.transaction_hash = Some(transaction_b);
+        log.transaction_index = Some(1);
+        log.log_index = Some(0);
+        queue_op_pending(&asserter, first);
+        asserter.push_success(&vec![log.clone()]);
+        asserter.push_success(&serde_json::Value::Null);
+        queue_op_pending(&asserter, second);
+        asserter.push_success(&vec![log.clone()]);
+        asserter.push_success(&serde_json::Value::Null);
+        asserter.push_success(&serde_json::json!({
+            "transactionHash": transaction_b,
+            "logs": [log]
+        }));
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig {
+                preconfirmations: PreconfirmationMode::Required,
+                ..SubscriberConfig::default()
+            },
+        )
+        .with_provider_ref(ProviderRef::new("op-paid", 12));
+        subscriber.chain_id = Some(10);
+        subscriber.base_interests = vec![log_interest_matching_rpc_log()];
+        subscriber.interests = subscriber.base_interests.clone();
+
+        assert!(
+            subscriber
+                .normalize_flashblock_event(SubscriberEvent::OpFlashblockTick)
+                .await
+                .expect("a cross-request race remains retryable")
+                .is_none()
+        );
+        assert!(
+            subscriber
+                .normalize_flashblock_event(SubscriberEvent::OpFlashblockTick)
+                .await
+                .expect("the next coherent cumulative view is delivered")
+                .is_some()
+        );
+        assert_eq!(subscriber.flashblocks_rpc_metrics().raced_samples(), 1);
+        assert_eq!(subscriber.flashblocks_rpc_metrics().failed_requests(), 0);
+        assert!(asserter.read_q().is_empty());
+    }
+
+    #[tokio::test]
+    async fn optimism_sampler_uses_the_paired_pending_state_provider() {
+        let stream_asserter = Asserter::new();
+        let stream_provider = ProviderBuilder::new().connect_mocked_client(stream_asserter.clone());
+        let state_asserter = Asserter::new();
+        queue_op_pending(&state_asserter, rpc_block(101, B256::ZERO));
+        state_asserter.push_success(&Vec::<Log>::new());
+        let state_provider = ProviderBuilder::new().connect_mocked_client(state_asserter.clone());
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            stream_provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig {
+                preconfirmations: PreconfirmationMode::Required,
+                ..SubscriberConfig::default()
+            },
+        )
+        .with_provider_ref(ProviderRef::new("op-paid", 12))
+        .with_flashblocks_state_provider(state_provider);
+        subscriber.chain_id = Some(10);
+        subscriber.base_interests = vec![log_interest_matching_rpc_log()];
+        subscriber.interests = subscriber.base_interests.clone();
+
+        assert!(
+            subscriber
+                .normalize_flashblock_event(SubscriberEvent::OpFlashblockTick)
+                .await
+                .expect("paired pending-state reads succeed")
+                .is_some()
+        );
+        assert!(state_asserter.read_q().is_empty());
+        assert!(stream_asserter.read_q().is_empty());
+    }
+
+    #[tokio::test]
+    async fn optimism_sampler_retries_an_isolated_provider_request_failure() {
+        let asserter = Asserter::new();
+        let pending = rpc_block(101, B256::ZERO);
+        queue_op_pending(&asserter, pending.clone());
+        asserter.push_failure_msg("temporarily unavailable");
+        queue_op_pending(&asserter, pending);
+        asserter.push_success(&Vec::<Log>::new());
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig {
+                preconfirmations: PreconfirmationMode::Required,
+                max_consecutive_flashblock_poll_failures: 2,
+                ..SubscriberConfig::default()
+            },
+        )
+        .with_provider_ref(ProviderRef::new("op-paid", 12));
+        subscriber.chain_id = Some(10);
+        subscriber.base_interests = vec![log_interest_matching_rpc_log()];
+        subscriber.interests = subscriber.base_interests.clone();
+
+        assert!(
+            subscriber
+                .normalize_flashblock_event(SubscriberEvent::OpFlashblockTick)
+                .await
+                .expect("one request failure stays retryable")
+                .is_none()
+        );
+        assert!(
+            subscriber
+                .normalize_flashblock_event(SubscriberEvent::OpFlashblockTick)
+                .await
+                .expect("the next cumulative view retries the missing logs")
+                .is_some()
+        );
+        assert_eq!(subscriber.flashblocks_rpc_metrics().failed_requests(), 1);
+        assert!(asserter.read_q().is_empty());
+    }
+
+    #[tokio::test]
+    async fn optimism_sampler_surfaces_sustained_provider_request_failures() {
+        let asserter = Asserter::new();
+        asserter.push_failure_msg("temporarily unavailable");
+        asserter.push_failure_msg("still unavailable");
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig {
+                preconfirmations: PreconfirmationMode::Required,
+                max_consecutive_flashblock_poll_failures: 2,
+                ..SubscriberConfig::default()
+            },
+        )
+        .with_provider_ref(ProviderRef::new("op-paid", 12));
+        subscriber.chain_id = Some(10);
+
+        assert!(
+            subscriber
+                .normalize_flashblock_event(SubscriberEvent::OpFlashblockTick)
+                .await
+                .expect("the first request failure stays retryable")
+                .is_none()
+        );
+        let error = match subscriber
+            .normalize_flashblock_event(SubscriberEvent::OpFlashblockTick)
+            .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("the configured consecutive-failure limit must fail closed"),
+        };
+        assert!(error.to_string().contains("still unavailable"));
+        assert_eq!(subscriber.flashblocks_rpc_metrics().failed_requests(), 2);
+        assert!(asserter.read_q().is_empty());
+    }
+
+    #[tokio::test]
+    async fn flashblocks_preflight_rejects_a_mismatched_chain_before_subscribing() {
+        let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig {
+                preconfirmations: PreconfirmationMode::Required,
+                ..SubscriberConfig::default()
+            },
+        )
+        .with_provider_ref(ProviderRef::new("wrong-chain", 1));
+        subscriber.chain_id = Some(10);
+        subscriber.interests = vec![log_interest_matching_rpc_log()];
+
+        assert!(matches!(
+            subscriber.establish_flashblocks_preflight(8_453).await,
+            Err(SubscriberError::ChainMismatch {
+                expected: 8_453,
+                actual: 10
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn optimism_preflight_rejects_a_mismatched_paired_provider() {
+        let stream_asserter = Asserter::new();
+        let stream_provider = ProviderBuilder::new().connect_mocked_client(stream_asserter.clone());
+        let state_asserter = Asserter::new();
+        state_asserter.push_success(&serde_json::json!(["flashblocksv1"]));
+        state_asserter.push_success(&8_453_u64);
+        let state_provider = ProviderBuilder::new().connect_mocked_client(state_asserter.clone());
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            stream_provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig {
+                preconfirmations: PreconfirmationMode::Required,
+                ..SubscriberConfig::default()
+            },
+        )
+        .with_provider_ref(ProviderRef::new("op-paid", 12))
+        .with_flashblocks_state_provider(state_provider);
+        subscriber.chain_id = Some(10);
+        subscriber.base_interests = vec![log_interest_matching_rpc_log()];
+        subscriber.interests = subscriber.base_interests.clone();
+        let desired = subscriber.pubsub_stream_sources();
+        let mut streams = SubscriberStreams::new();
+        for source in desired {
+            streams.push(source, stream::pending().boxed());
+        }
+        subscriber.state = AlloySubscriberState::Active(streams);
+        subscriber.sources_dirty = false;
+        assert!(matches!(
+            subscriber.establish_flashblocks_preflight(10).await,
+            Err(SubscriberError::ChainMismatch {
+                expected: 10,
+                actual: 8_453
+            })
+        ));
+        assert!(state_asserter.read_q().is_empty());
+        assert!(stream_asserter.read_q().is_empty());
+    }
+
+    #[test]
+    fn unproven_parent_replacement_rewind_discards_every_unauthenticated_identity() {
+        let parent = BlockRef {
+            number: 79,
+            hash: B256::repeat_byte(0x79),
+            parent_hash: Some(B256::repeat_byte(0x78)),
+            timestamp: Some(1_700_000_079),
+        };
+        let old_tip = BlockRef {
+            number: 80,
+            hash: B256::repeat_byte(0x80),
+            parent_hash: Some(parent.hash),
+            timestamp: Some(1_700_000_080),
+        };
+        let replacement = BlockRef {
+            hash: B256::repeat_byte(0xe0),
+            parent_hash: Some(B256::repeat_byte(0xdf)),
+            ..old_tip
+        };
+        let mut state =
+            CanonicalSequenceState::new(vec![parent, old_tip], Some(old_tip), Some(parent), None);
+
+        let rewind = apply_sequence_canonical_block(&mut state, &replacement, false)
+            .expect("replacement metadata is structurally valid")
+            .expect("unknown parent is an observable rewind");
+
+        assert_eq!(rewind.common_ancestor, None);
+        assert_eq!(rewind.dropped, vec![parent, old_tip]);
+        assert_eq!(state.retained_canonical_history(), &[replacement]);
+        assert_eq!(state.coverage_head(), Some(&replacement));
+        assert_eq!(state.safe_head(), None);
+        assert_eq!(state.finalized_head(), None);
+    }
+
+    #[test]
+    fn handler_ids_are_non_empty_across_construction_and_deserialization() {
+        assert_eq!(HandlerId::try_new("").unwrap_err(), HandlerIdError);
+        let valid = HandlerId::try_new("owner-1").expect("non-empty id");
+        let encoded = serde_json::to_string(&valid).expect("serialize id");
+        assert_eq!(
+            serde_json::from_str::<HandlerId>(&encoded).expect("deserialize valid id"),
+            valid
+        );
+        assert!(serde_json::from_str::<HandlerId>(r#"""#).is_err());
+    }
 
     fn rpc_log(removed: bool) -> Log {
         Log {
@@ -7093,6 +22028,114 @@ mod subscriber_helper_tests {
             log_index: Some(5),
             removed,
         }
+    }
+
+    fn rpc_transaction(chain_id: Option<u64>) -> alloy_rpc_types_eth::Transaction {
+        use alloy_consensus::SignableTransaction as _;
+
+        let envelope: alloy_consensus::TxEnvelope = alloy_consensus::TxLegacy {
+            chain_id,
+            ..Default::default()
+        }
+        .into_signed(alloy_primitives::Signature::test_signature())
+        .into();
+        alloy_rpc_types_eth::Transaction {
+            inner: alloy_consensus::transaction::Recovered::new_unchecked(envelope, Address::ZERO),
+            block_hash: None,
+            block_number: None,
+            transaction_index: None,
+            effective_gas_price: None,
+        }
+    }
+
+    #[cfg(feature = "reactive-ws")]
+    fn rpc_log_at(block_number: u64, transaction_index: u64, log_index: u64) -> Log {
+        Log {
+            inner: alloy_primitives::Log::new_unchecked(
+                Address::repeat_byte(0x42),
+                vec![B256::repeat_byte(0x01)],
+                Bytes::new(),
+            ),
+            block_hash: Some(B256::repeat_byte(block_number as u8)),
+            block_number: Some(block_number),
+            block_timestamp: Some(1_700_000_000 + block_number),
+            transaction_hash: Some(B256::repeat_byte(0x20 + transaction_index as u8)),
+            transaction_index: Some(transaction_index),
+            log_index: Some(log_index),
+            removed: false,
+        }
+    }
+
+    #[cfg(any(
+        feature = "raw-flashblocks-json",
+        feature = "reactive-polling",
+        feature = "reactive-ws"
+    ))]
+    fn rpc_block(number: u64, hash: B256) -> alloy_rpc_types_eth::Block {
+        alloy_rpc_types_eth::Block::empty(alloy_rpc_types_eth::Header {
+            hash,
+            inner: alloy_consensus::Header {
+                number,
+                parent_hash: B256::repeat_byte(number.saturating_sub(1) as u8),
+                timestamp: 1_700_000_000 + number,
+                ..Default::default()
+            },
+            total_difficulty: None,
+            size: None,
+        })
+    }
+
+    fn queue_op_pending(asserter: &Asserter, pending: alloy_rpc_types_eth::Block) {
+        let parent = rpc_block(
+            pending.header().number().saturating_sub(1),
+            pending.header().parent_hash(),
+        );
+        asserter.push_success(&Some(pending));
+        asserter.push_success(&Some(parent));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[cfg(feature = "reactive-ws")]
+    async fn verified_log_context_fetches_and_caches_exact_parent_identity() {
+        let stream_asserter = Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(stream_asserter.clone());
+        let verification_asserter = Asserter::new();
+        verification_asserter.push_success(&Some(rpc_block(7, B256::repeat_byte(7))));
+        let verification_provider =
+            ProviderBuilder::new().connect_mocked_client(verification_asserter.clone());
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig {
+                verify_log_block_context: true,
+                ..SubscriberConfig::default()
+            },
+        )
+        .with_log_verification_provider(verification_provider);
+        let log = rpc_log_at(7, 0, 0);
+
+        subscriber
+            .verify_log_block_context(&log)
+            .await
+            .expect("verify live log block");
+        subscriber
+            .verify_log_block_context(&log)
+            .await
+            .expect("reuse verified block cache");
+        let record = subscriber.with_chain_id(log_input_record(log, InputSource::Subscription));
+
+        assert_eq!(
+            record.context.block.expect("verified block").parent_hash,
+            Some(B256::repeat_byte(6))
+        );
+        assert!(
+            verification_asserter.read_q().is_empty(),
+            "one provider lookup should verify every log in the same block"
+        );
+        assert!(
+            stream_asserter.read_q().is_empty(),
+            "verification must not use the high-volume stream provider"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -7141,11 +22184,266 @@ mod subscriber_helper_tests {
     }
 
     #[test]
+    fn owner_reconcile_dedupe_rejects_conflicts_and_preserves_compatible_enrichment() {
+        let set_context_timestamp = |record: &mut ReactiveInputRecord<Ethereum>,
+                                     timestamp: Option<u64>| {
+            record.context.block.as_mut().expect("block").timestamp = timestamp;
+            match &mut record.context.chain_status {
+                ChainStatus::Included { block, .. }
+                | ChainStatus::Safe { block }
+                | ChainStatus::Finalized { block }
+                | ChainStatus::Reorged {
+                    dropped_from: block,
+                } => block.timestamp = timestamp,
+                ChainStatus::Pending | ChainStatus::Preconfirmed { .. } => {
+                    panic!("log record is canonical")
+                }
+            }
+        };
+
+        let mut payload_only = log_input_record::<Ethereum>(rpc_log(false), InputSource::Backfill);
+        let payload_timestamp = match &payload_only.input {
+            ReactiveInput::Log(log) => log.block_timestamp.expect("timestamp"),
+            _ => unreachable!(),
+        };
+        set_context_timestamp(&mut payload_only, None);
+        let mut context_only = payload_only.clone();
+        if let ReactiveInput::Log(log) = &mut context_only.input {
+            log.block_timestamp = None;
+        }
+        set_context_timestamp(&mut context_only, Some(payload_timestamp + 1));
+        assert!(matches!(
+            dedupe_records(vec![payload_only, context_only]),
+            Err(ReactiveError::InvalidInputRecord { .. })
+        ));
+
+        let mut partial = log_input_record::<Ethereum>(rpc_log(false), InputSource::Backfill);
+        if let ReactiveInput::Log(log) = &mut partial.input {
+            log.block_timestamp = None;
+        }
+        set_context_timestamp(&mut partial, None);
+        let complete = log_input_record::<Ethereum>(rpc_log(false), InputSource::Subscription);
+        let deduped =
+            dedupe_records(vec![partial, complete]).expect("compatible metadata enriches");
+        assert_eq!(deduped.len(), 1);
+        deduped[0]
+            .validated_identity()
+            .expect("merged record remains coherent");
+        let resolved = resolve_record_block_payload_metadata(
+            &deduped[0],
+            *canonical_record_block(&deduped[0]).expect("canonical"),
+        )
+        .expect("effective block");
+        assert_eq!(resolved.timestamp, Some(payload_timestamp));
+    }
+
+    #[test]
+    fn full_block_bodies_are_never_suppressed_from_header_hash_alone() {
+        use alloy_rpc_types_eth::{Block, Header};
+
+        let block_ref = BlockRef {
+            number: 7,
+            hash: B256::repeat_byte(0x77),
+            parent_hash: Some(B256::repeat_byte(0x66)),
+            timestamp: Some(1_700_000_007),
+        };
+        let block = Block::empty(Header {
+            hash: block_ref.hash,
+            inner: alloy_consensus::Header {
+                number: block_ref.number,
+                parent_hash: block_ref.parent_hash.expect("parent"),
+                timestamp: block_ref.timestamp.expect("timestamp"),
+                ..Default::default()
+            },
+            total_difficulty: None,
+            size: None,
+        });
+        let record = ReactiveInputRecord::<Ethereum>::new(
+            ReactiveInput::FullBlock(block),
+            ReactiveContext {
+                chain_id: Some(1),
+                source: InputSource::Subscription,
+                chain_status: ChainStatus::Included {
+                    block: block_ref,
+                    confirmations: 0,
+                },
+                block: Some(block_ref),
+                transaction_index: None,
+                log_index: None,
+            },
+        );
+
+        assert!(!record.is_payload_deduplicable());
+        assert!(!record.same_deduplicable_payload(&record));
+        let retained = dedupe_scoped_records(vec![
+            (
+                record.clone(),
+                DeliveryAudience::All,
+                DeliveryScope::Canonical,
+            ),
+            (record, DeliveryAudience::All, DeliveryScope::Canonical),
+        ])
+        .expect("non-deduplicable bodies are preserved, not treated as conflicts");
+        assert_eq!(retained.len(), 2);
+    }
+
+    #[test]
+    fn hydrated_transaction_wrappers_reject_inclusion_and_chain_identity_conflicts() {
+        let pending_context = ReactiveContext {
+            chain_id: Some(1),
+            source: InputSource::Batch,
+            chain_status: ChainStatus::Pending,
+            block: None,
+            transaction_index: None,
+            log_index: None,
+        };
+        let mut included_pending = rpc_transaction(Some(1));
+        included_pending.block_hash = Some(B256::repeat_byte(0xaa));
+        assert!(matches!(
+            ReactiveInputRecord::<Ethereum>::new(
+                ReactiveInput::PendingTx(included_pending),
+                pending_context.clone(),
+            )
+            .validated_identity(),
+            Err(ReactiveError::InvalidInputRecord { .. })
+        ));
+        assert!(matches!(
+            ReactiveInputRecord::<Ethereum>::new(
+                ReactiveInput::PendingTx(rpc_transaction(Some(2))),
+                pending_context,
+            )
+            .validated_identity(),
+            Err(ReactiveError::InvalidInputRecord { .. })
+        ));
+
+        let block_ref = BlockRef {
+            number: 8,
+            hash: B256::repeat_byte(0x88),
+            parent_hash: Some(B256::repeat_byte(0x77)),
+            timestamp: Some(1_700_000_008),
+        };
+        let header = alloy_rpc_types_eth::Header {
+            hash: block_ref.hash,
+            inner: alloy_consensus::Header {
+                number: block_ref.number,
+                parent_hash: block_ref.parent_hash.expect("parent"),
+                timestamp: block_ref.timestamp.expect("timestamp"),
+                ..Default::default()
+            },
+            total_difficulty: None,
+            size: None,
+        };
+        let context = ReactiveContext {
+            chain_id: Some(1),
+            source: InputSource::Batch,
+            chain_status: ChainStatus::Included {
+                block: block_ref,
+                confirmations: 0,
+            },
+            block: Some(block_ref),
+            transaction_index: None,
+            log_index: None,
+        };
+        for transaction in [
+            alloy_rpc_types_eth::Transaction {
+                block_hash: Some(B256::repeat_byte(0xff)),
+                ..rpc_transaction(Some(1))
+            },
+            alloy_rpc_types_eth::Transaction {
+                block_hash: Some(block_ref.hash),
+                block_number: Some(block_ref.number),
+                transaction_index: Some(1),
+                ..rpc_transaction(Some(1))
+            },
+            rpc_transaction(Some(2)),
+        ] {
+            let block = alloy_rpc_types_eth::Block::new(
+                header.clone(),
+                alloy_network::primitives::BlockTransactions::Full(vec![transaction]),
+            );
+            assert!(matches!(
+                ReactiveInputRecord::<Ethereum>::new(
+                    ReactiveInput::FullBlock(block),
+                    context.clone(),
+                )
+                .validated_identity(),
+                Err(ReactiveError::InvalidInputRecord { .. })
+            ));
+        }
+    }
+
+    #[test]
+    #[cfg(any(feature = "reactive-polling", feature = "reactive-ws"))]
+    fn compatibility_owner_backfill_and_live_overlap_split_exact_audiences() {
+        let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::Auto,
+            SubscriberConfig::default(),
+        );
+        let owner = HandlerId::new("compat-owner");
+        subscriber
+            .add_interest_owner(
+                owner.clone(),
+                &[ReactiveInterest::Logs(LogInterest {
+                    provider_filter: Filter::new().address(Address::repeat_byte(0x42)),
+                    local_matcher: None,
+                    route_key: None,
+                })],
+            )
+            .unwrap();
+        let log = rpc_log(false);
+
+        subscriber.enqueue_compat_owner_record(
+            log_input_record(log.clone(), InputSource::Backfill),
+            owner.clone(),
+        );
+        subscriber.enqueue_event(SubscriberEvent::Log { source_id: 0, log });
+
+        let batch = subscriber
+            .drain_next_scoped_batch()
+            .expect("owner catch-up and residual live copies");
+        assert_eq!(batch.records.len(), 2);
+        assert_eq!(
+            batch.records[0].scope,
+            SubscriberInputScope::OwnerOnlyHandlers {
+                owners: vec![owner.clone()]
+            }
+        );
+        assert_eq!(
+            batch.records[1].scope,
+            SubscriberInputScope::CanonicalResidual {
+                owners: Vec::new(),
+                excluded: vec![owner.clone()]
+            }
+        );
+
+        let reactive = batch.into_reactive_batch();
+        assert_eq!(
+            reactive.record_audience(0),
+            Some(&DeliveryAudience::Owners(vec![owner.clone()]))
+        );
+        assert_eq!(
+            reactive.record_delivery_scope(0),
+            Some(DeliveryScope::OwnerCatchup)
+        );
+        assert_eq!(
+            reactive.record_audience(1),
+            Some(&DeliveryAudience::AllExcept(vec![owner]))
+        );
+        assert_eq!(
+            reactive.record_delivery_scope(1),
+            Some(DeliveryScope::Canonical)
+        );
+    }
+
+    #[test]
+    #[cfg(any(feature = "reactive-polling", feature = "reactive-ws"))]
     fn active_owner_replacement_commits_atomically_to_one_new_epoch() {
         let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
         let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
             provider,
-            SubscriberMode::Polling,
+            SubscriberMode::Auto,
             SubscriberConfig::default(),
         );
         let owner = HandlerId::new("replace-owner");
@@ -7180,6 +22478,514 @@ mod subscriber_helper_tests {
         assert_eq!(subscriber.registered_interests().len(), 1);
     }
 
+    #[test]
+    #[cfg(any(feature = "reactive-polling", feature = "reactive-ws"))]
+    fn compatibility_and_epoch_owner_lifecycles_cannot_mix() {
+        let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::Auto,
+            SubscriberConfig::default(),
+        );
+        let owner = HandlerId::new("one-lifecycle");
+        let interest = ReactiveInterest::Logs(LogInterest {
+            provider_filter: Filter::new().address(Address::repeat_byte(0x42)),
+            local_matcher: None,
+            route_key: None,
+        });
+        let epoch = subscriber
+            .stage_interest_owner(
+                owner.clone(),
+                std::slice::from_ref(&interest),
+                SubscriberOwnerStart::Live,
+            )
+            .expect("stage epoch owner");
+
+        assert!(matches!(
+            subscriber.add_interest_owner(owner.clone(), std::slice::from_ref(&interest)),
+            Err(SubscriberError::InvalidConfig(_))
+        ));
+        assert_eq!(
+            subscriber.interest_owner_state(&epoch),
+            Some(SubscriberOwnerState::Staged)
+        );
+        assert!(subscriber.abort_interest_owner(&epoch));
+        subscriber
+            .add_interest_owner(owner.clone(), std::slice::from_ref(&interest))
+            .expect("compatibility owner after epoch abort");
+        assert!(matches!(
+            subscriber.stage_interest_owner_replacement(
+                owner,
+                std::slice::from_ref(&interest),
+                SubscriberOwnerStart::Live,
+            ),
+            Err(SubscriberOwnerError::AlreadyRegistered(_))
+        ));
+    }
+
+    #[test]
+    fn pending_record_overflow_is_sticky_and_fail_closed() {
+        let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::Polling,
+            SubscriberConfig {
+                max_pending_records: 1,
+                ..SubscriberConfig::default()
+            },
+        );
+        subscriber.interests = vec![ReactiveInterest::Logs(LogInterest {
+            provider_filter: Filter::new().address(Address::repeat_byte(0x42)),
+            local_matcher: None,
+            route_key: None,
+        })];
+        subscriber.enqueue_event(SubscriberEvent::Log {
+            source_id: 0,
+            log: rpc_log(false),
+        });
+        let mut second = rpc_log(false);
+        second.log_index = Some(6);
+        second.transaction_hash = Some(B256::repeat_byte(0x04));
+        subscriber.enqueue_event(SubscriberEvent::Log {
+            source_id: 0,
+            log: second,
+        });
+
+        assert_eq!(subscriber.pending_records.len(), 1);
+        assert!(matches!(
+            subscriber.check_resource_error(),
+            Err(SubscriberError::ResourceExhausted(_))
+        ));
+        subscriber.reset_delivery_state();
+        assert!(subscriber.check_resource_error().is_ok());
+    }
+
+    #[test]
+    fn historical_log_payload_bytes_are_bounded_independently_of_log_count() {
+        let baseline = rpc_log(false);
+        let fixed_bytes =
+            validate_backfill_resource_limits(std::slice::from_ref(&baseline), 1, usize::MAX)
+                .expect("measure fixed log accounting");
+        let mut large = baseline;
+        large.inner = alloy_primitives::Log::new_unchecked(
+            Address::repeat_byte(0x42),
+            vec![B256::repeat_byte(0x01)],
+            Bytes::from(vec![0u8; 256]),
+        );
+
+        assert!(matches!(
+            validate_backfill_resource_limits(&[large], 1, fixed_bytes + 255),
+            Err(SubscriberError::ResourceExhausted(_))
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[cfg(feature = "reactive-polling")]
+    async fn reconcile_capacity_failure_does_not_publish_progress_or_partial_history() {
+        use alloy_rpc_types_eth::{Block, Header};
+
+        let asserter = Asserter::new();
+        let baseline = BlockRef {
+            number: 6,
+            hash: B256::repeat_byte(6),
+            parent_hash: Some(B256::repeat_byte(5)),
+            timestamp: Some(1_700_000_006),
+        };
+        let through = BlockRef {
+            number: 7,
+            hash: B256::repeat_byte(7),
+            parent_hash: Some(baseline.hash),
+            timestamp: Some(1_700_000_007),
+        };
+        let rpc_block = || -> Block {
+            Block::empty(Header {
+                hash: through.hash,
+                inner: alloy_consensus::Header {
+                    number: through.number,
+                    parent_hash: through.parent_hash.expect("parent"),
+                    timestamp: through.timestamp.expect("timestamp"),
+                    ..Default::default()
+                },
+                total_difficulty: None,
+                size: None,
+            })
+        };
+        let mut historical = rpc_log(false);
+        historical.block_hash = Some(through.hash);
+        historical.block_timestamp = through.timestamp;
+        asserter.push_success(&Some(rpc_block()));
+        asserter.push_success(&vec![historical]);
+        asserter.push_success(&Some(rpc_block()));
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::Polling,
+            SubscriberConfig {
+                max_pending_records: 1,
+                ..SubscriberConfig::default()
+            },
+        );
+        subscriber.chain_id = Some(1);
+        let interest = ReactiveInterest::Logs(LogInterest {
+            provider_filter: Filter::new().address(Address::repeat_byte(0x42)),
+            local_matcher: None,
+            route_key: None,
+        });
+        let epoch = subscriber
+            .stage_interest_owner(
+                HandlerId::new("capacity-owner"),
+                std::slice::from_ref(&interest),
+                SubscriberOwnerStart::PostBlock(baseline),
+            )
+            .expect("stage owner");
+        // Isolate the commit-side capacity edge: the live queue acquired one
+        // canonical record while the historical request was in flight.
+        subscriber.sources_dirty = false;
+        subscriber.state = AlloySubscriberState::Empty;
+        subscriber.push_pending_record(SubscriberInputRecord {
+            record: log_input_record(rpc_log(false), InputSource::Poll),
+            scope: SubscriberInputScope::Canonical { owners: Vec::new() },
+            preconfirmation_timing: None,
+        });
+
+        let error = subscriber
+            .reconcile_interest_owner(&epoch, through)
+            .await
+            .expect_err("historical delivery cannot displace the queued live record");
+        assert!(matches!(
+            error,
+            SubscriberOwnerError::Subscriber(SubscriberError::ResourceExhausted(_))
+        ));
+        assert!(subscriber.interest_owner_progress(&epoch).is_none());
+        assert_eq!(subscriber.pending_records.len(), 1);
+        assert!(matches!(
+            subscriber.pending_records[0].scope,
+            SubscriberInputScope::Canonical { .. }
+        ));
+    }
+
+    #[test]
+    #[cfg(any(feature = "reactive-polling", feature = "reactive-ws"))]
+    fn lazy_backfill_queue_capacity_failure_is_atomic() {
+        let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::Auto,
+            SubscriberConfig {
+                max_pending_backfills: 1,
+                ..SubscriberConfig::default()
+            },
+        );
+        let interest = |address| {
+            ReactiveInterest::Logs(LogInterest {
+                provider_filter: Filter::new().address(address),
+                local_matcher: None,
+                route_key: None,
+            })
+        };
+        subscriber
+            .add_interest_owner_with_backfill(
+                HandlerId::new("owner-a"),
+                &[interest(Address::repeat_byte(0x41))],
+                SubscriberBackfill::from_block(10),
+            )
+            .expect("first queued backfill");
+
+        let error = subscriber
+            .add_interest_owner_with_backfill(
+                HandlerId::new("owner-b"),
+                &[interest(Address::repeat_byte(0x42))],
+                SubscriberBackfill::from_block(10),
+            )
+            .expect_err("second backfill must exceed capacity");
+
+        assert!(matches!(error, SubscriberError::ResourceExhausted(_)));
+        assert!(
+            subscriber
+                .owner_interests(&HandlerId::new("owner-b"))
+                .is_none()
+        );
+        assert_eq!(subscriber.pending_backfills.len(), 1);
+    }
+
+    #[test]
+    #[cfg(any(feature = "reactive-polling", feature = "reactive-ws"))]
+    fn exact_owner_replacement_is_atomic_and_removes_crash_stale_owners() {
+        let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::Auto,
+            SubscriberConfig {
+                max_pending_backfills: 1,
+                ..SubscriberConfig::default()
+            },
+        );
+        let interest = |address| {
+            ReactiveInterest::Logs(LogInterest {
+                provider_filter: Filter::new().address(address),
+                local_matcher: None,
+                route_key: None,
+            })
+        };
+        subscriber
+            .add_interest_owner(
+                HandlerId::new("crash-stale"),
+                &[interest(Address::repeat_byte(0xee))],
+            )
+            .expect("seed stale owner");
+        subscriber.base_interests = vec![interest(Address::repeat_byte(0xdd))];
+        subscriber.rebuild_registered_interests();
+        subscriber.push_pending_record(SubscriberInputRecord {
+            record: log_input_record(rpc_log(false), InputSource::Poll),
+            scope: SubscriberInputScope::Canonical { owners: Vec::new() },
+            preconfirmation_timing: None,
+        });
+        let baseline = BlockRef {
+            number: 100,
+            hash: B256::repeat_byte(100),
+            parent_hash: Some(B256::repeat_byte(99)),
+            timestamp: Some(1_700_000_100),
+        };
+        let backfill = SubscriberBackfill::after_canonical_block(baseline).expect("C + 1");
+
+        let error = subscriber
+            .replace_interest_owners_with_global_backfill(
+                vec![
+                    (
+                        HandlerId::new("pool-a"),
+                        vec![interest(Address::repeat_byte(0xa1))],
+                    ),
+                    (
+                        HandlerId::new("pool-b"),
+                        vec![ReactiveInterest::Logs(LogInterest {
+                            // A distinct block option prevents provider-filter
+                            // fan-in, exercising the two-unit capacity edge.
+                            provider_filter: Filter::new()
+                                .address(Address::repeat_byte(0xb2))
+                                .from_block(7),
+                            local_matcher: None,
+                            route_key: None,
+                        })],
+                    ),
+                ],
+                backfill,
+            )
+            .expect_err("two backfills exceed atomic capacity");
+        assert!(matches!(error, SubscriberError::ResourceExhausted(_)));
+        assert!(
+            subscriber
+                .owner_interests(&HandlerId::new("crash-stale"))
+                .is_some(),
+            "failed replacement must preserve the prior topology"
+        );
+        assert!(
+            subscriber
+                .owner_interests(&HandlerId::new("pool-a"))
+                .is_none()
+        );
+        assert_eq!(subscriber.base_interests.len(), 1);
+        assert_eq!(subscriber.pending_records.len(), 1);
+
+        subscriber
+            .replace_interest_owners_with_global_backfill(
+                vec![(
+                    HandlerId::new("pool-a"),
+                    vec![interest(Address::repeat_byte(0xa1))],
+                )],
+                backfill,
+            )
+            .expect("replacement within capacity");
+        assert!(
+            subscriber
+                .owner_interests(&HandlerId::new("crash-stale"))
+                .is_none(),
+            "successful exact replacement removes stale owners"
+        );
+        assert!(
+            subscriber.base_interests.is_empty(),
+            "successful exact replacement removes stale unowned interests"
+        );
+        assert!(
+            subscriber.drain_next_scoped_batch().is_none(),
+            "stale canonical delivery must not escape before C + 1 recovery"
+        );
+        assert!(
+            subscriber
+                .owner_interests(&HandlerId::new("pool-a"))
+                .is_some()
+        );
+        assert_eq!(subscriber.pending_backfills.len(), 1);
+        assert_eq!(subscriber.pending_backfills[0].backfill, backfill);
+        assert!(
+            subscriber.pending_backfills[0].owner.is_none(),
+            "startup history must be global canonical catch-up, not owner-only"
+        );
+    }
+
+    #[test]
+    fn exclusive_canonical_backfill_rejects_block_number_overflow() {
+        let baseline = BlockRef {
+            number: u64::MAX,
+            hash: B256::repeat_byte(0xff),
+            parent_hash: None,
+            timestamp: None,
+        };
+        assert!(matches!(
+            SubscriberBackfill::after_canonical_block(baseline),
+            Err(SubscriberError::InvalidConfig(_))
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[cfg(any(feature = "reactive-polling", feature = "reactive-ws"))]
+    async fn exclusive_canonical_backfill_validates_the_retained_baseline_hash() {
+        let asserter = Asserter::new();
+        asserter.push_success(&101u64);
+        asserter.push_success(&Some(rpc_block(101, B256::repeat_byte(101))));
+        asserter.push_success(&Some(rpc_block(100, B256::repeat_byte(0xee))));
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::Auto,
+            SubscriberConfig::default(),
+        );
+        let baseline = BlockRef {
+            number: 100,
+            hash: B256::repeat_byte(0xaa),
+            parent_hash: None,
+            timestamp: None,
+        };
+        let backfill = SubscriberBackfill::after_canonical_block(baseline).expect("C + 1");
+        subscriber
+            .add_interest_owner_with_backfill(
+                HandlerId::new("pool"),
+                &[ReactiveInterest::Logs(LogInterest {
+                    provider_filter: Filter::new().address(Address::repeat_byte(0xa1)),
+                    local_matcher: None,
+                    route_key: None,
+                })],
+                backfill,
+            )
+            .expect("queue post-baseline backfill");
+
+        let error = subscriber
+            .drain_pending_backfills()
+            .await
+            .expect_err("provider branch differs at retained baseline");
+        assert!(matches!(error, SubscriberError::InvalidBackfill(_)));
+        assert_eq!(subscriber.pending_backfills.len(), 1);
+        assert_eq!(subscriber.pending_backfills[0].backfill.start_block(), 101);
+        assert!(subscriber.pending_records.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[cfg(feature = "reactive-ws")]
+    async fn coordinated_multifilter_windows_are_globally_sorted_for_owner_and_canonical_delivery()
+    {
+        let asserter = Asserter::new();
+        let retained = BlockRef {
+            number: 10,
+            hash: B256::repeat_byte(10),
+            parent_hash: Some(B256::repeat_byte(9)),
+            timestamp: Some(1_700_000_010),
+        };
+        let activation = BlockRef {
+            number: 12,
+            hash: B256::repeat_byte(12),
+            parent_hash: Some(B256::repeat_byte(11)),
+            timestamp: Some(1_700_000_012),
+        };
+
+        // 257 distinct logical block options cross the 256-filter request
+        // chunk boundary. Each window therefore makes two concurrent log
+        // requests whose responses deliberately arrive in reverse order.
+        asserter.push_success(&Some(rpc_block(retained.number, retained.hash)));
+        asserter.push_success(&vec![rpc_log_at(10, 2, 2)]);
+        asserter.push_success(&vec![rpc_log_at(10, 1, 1)]);
+        asserter.push_success(&Some(rpc_block(retained.number, retained.hash)));
+        asserter.push_success(&activation.number);
+        asserter.push_success(&Some(rpc_block(activation.number, activation.hash)));
+        asserter.push_success(&Some(rpc_block(retained.number, retained.hash)));
+        asserter.push_success(&vec![rpc_log_at(12, 2, 2)]);
+        asserter.push_success(&vec![rpc_log_at(11, 1, 1)]);
+        asserter.push_success(&Some(rpc_block(activation.number, activation.hash)));
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::Auto,
+            SubscriberConfig::default(),
+        );
+        let interests = (0..257)
+            .map(|start| {
+                ReactiveInterest::Logs(LogInterest {
+                    provider_filter: Filter::new()
+                        .address(Address::repeat_byte(0x42))
+                        .event_signature(B256::repeat_byte(0x01))
+                        .from_block(start),
+                    local_matcher: None,
+                    route_key: None,
+                })
+            })
+            .collect::<Vec<_>>();
+        subscriber
+            .add_interest_owner_with_canonical_catchup(
+                HandlerId::new("many-filters"),
+                &interests,
+                retained,
+            )
+            .expect("queue coordinated windows");
+        assert_eq!(subscriber.pending_backfills.len(), 2);
+        assert_eq!(subscriber.pending_backfills[0].filters.len(), 257);
+        assert_eq!(subscriber.pending_backfills[1].filters.len(), 257);
+
+        subscriber
+            .drain_pending_backfills()
+            .await
+            .expect("owner filter group");
+        let owner = subscriber
+            .drain_next_scoped_batch()
+            .expect("owner ordered batch");
+        assert_eq!(owner.records.len(), 2);
+        assert_eq!(owner.records[0].record.context.transaction_index, Some(1));
+        assert_eq!(owner.records[1].record.context.transaction_index, Some(2));
+        assert!(
+            owner.records.iter().all(|record| matches!(
+                record.scope,
+                SubscriberInputScope::OwnerOnlyHandlers { .. }
+            ))
+        );
+
+        subscriber
+            .drain_pending_backfills()
+            .await
+            .expect("global filter group");
+        let global = subscriber
+            .drain_next_scoped_batch()
+            .expect("global ordered batch");
+        assert_eq!(global.records.len(), 2);
+        assert_eq!(
+            global.records[0].record.context.block.map(|b| b.number),
+            Some(11)
+        );
+        assert_eq!(
+            global.records[1].record.context.block.map(|b| b.number),
+            Some(12)
+        );
+        assert!(
+            global
+                .records
+                .iter()
+                .all(|record| record.scope.is_canonical())
+        );
+        assert!(matches!(
+            global.chain_controls.as_slice(),
+            [ChainControl::Barrier {
+                block: Some(block),
+                ..
+            }] if block == &activation
+        ));
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     #[cfg(feature = "reactive-ws")]
     async fn aborting_staged_epoch_purges_only_its_buffered_delivery() {
@@ -7189,6 +22995,7 @@ mod subscriber_helper_tests {
             SubscriberMode::PubSub,
             SubscriberConfig::default(),
         );
+        subscriber.chain_id = Some(1);
         let interest = ReactiveInterest::Logs(LogInterest {
             provider_filter: Filter::new().address(Address::repeat_byte(0x42)),
             local_matcher: None,
@@ -7238,6 +23045,7 @@ mod subscriber_helper_tests {
             SubscriberMode::PubSub,
             SubscriberConfig::default(),
         );
+        subscriber.chain_id = Some(1);
         let epoch = subscriber
             .stage_interest_owner(
                 HandlerId::new("owner"),
@@ -7362,6 +23170,7 @@ mod subscriber_helper_tests {
             SubscriberMode::Polling,
             SubscriberConfig::default(),
         );
+        subscriber.chain_id = Some(1);
         subscriber.sources_dirty = false;
         let mut first_poll = true;
         let fetch = poll_fn(move |cx| {
@@ -7421,6 +23230,7 @@ mod subscriber_helper_tests {
             SubscriberMode::PubSub,
             SubscriberConfig::default(),
         );
+        subscriber.chain_id = Some(1);
         let interest = ReactiveInterest::Logs(LogInterest {
             provider_filter: Filter::new().address(Address::repeat_byte(0xac)),
             local_matcher: None,
@@ -7444,7 +23254,7 @@ mod subscriber_helper_tests {
         subscriber.sources_dirty = false;
 
         subscriber
-            .reconcile_interest_owner(&epoch, through.clone())
+            .reconcile_interest_owner(&epoch, through)
             .await
             .unwrap();
         assert_eq!(subscriber.log_anchor(&filter), Some(through.number));
@@ -7549,6 +23359,7 @@ mod subscriber_helper_tests {
                 ..SubscriberConfig::default()
             },
         );
+        subscriber.chain_id = Some(1);
         let interest = ReactiveInterest::Logs(LogInterest {
             provider_filter: Filter::new().address(Address::repeat_byte(0x42)),
             local_matcher: None,
@@ -7575,7 +23386,7 @@ mod subscriber_helper_tests {
             .unwrap();
         entry.progress = Some(SubscriberOwnerProgress {
             owner: epoch.clone(),
-            through: entry.baseline.clone().unwrap(),
+            through: entry.baseline.unwrap(),
         });
         entry.progress_stream_revision = Some(1);
 
@@ -7617,15 +23428,16 @@ mod subscriber_helper_tests {
         );
     }
 
-    #[test]
+    #[tokio::test]
     #[cfg(feature = "reactive-ws")]
-    fn pubsub_sources_assign_stable_log_ids_before_shared_streams() {
+    async fn pubsub_sources_assign_stable_log_ids_before_shared_streams() {
         let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
         let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
             provider,
             SubscriberMode::PubSub,
             SubscriberConfig::default(),
         );
+        subscriber.chain_id = Some(1);
         subscriber
             .register_interests(&[
                 ReactiveInterest::Logs(LogInterest {
@@ -7640,6 +23452,7 @@ mod subscriber_helper_tests {
                 }),
                 ReactiveInterest::PendingTransactions(PendingTxInterest::default()),
             ])
+            .await
             .expect("register base interests");
 
         // The two default-block-option log filters merge into one address
@@ -7679,6 +23492,7 @@ mod subscriber_helper_tests {
                 ..SubscriberConfig::default()
             },
         );
+        subscriber.chain_id = Some(1);
         subscriber.interests = vec![ReactiveInterest::PendingTransactions(
             PendingTxInterest::default(),
         )];
@@ -7701,6 +23515,334 @@ mod subscriber_helper_tests {
             matches!(result, Err(SubscriberError::Provider(ref message)) if message.contains("reconnect failed after 1 attempt")),
             "terminated pubsub streams should attempt reconnect before surfacing failure: {result:?}"
         );
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "reactive-ws")]
+    async fn flashblock_stream_termination_invalidates_before_reconnect_io() {
+        let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig {
+                preconfirmations: PreconfirmationMode::Required,
+                ..SubscriberConfig::default()
+            },
+        )
+        .with_provider_ref(ProviderRef::new("base-paid", 7));
+        subscriber.chain_id = Some(8_453);
+        subscriber.base_interests = vec![log_interest_matching_rpc_log()];
+        subscriber.interests = subscriber.base_interests.clone();
+        subscriber.sources_dirty = false;
+
+        let preview: BaseFlashblockWirePayload = serde_json::from_str(
+            r#"{
+                "hash":"0x0000000000000000000000000000000000000000000000000000000000000000",
+                "number":"0x65",
+                "parentHash":"0x6464646464646464646464646464646464646464646464646464646464646464",
+                "stateRoot":"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "transactionsRoot":"0x1111111111111111111111111111111111111111111111111111111111111111",
+                "timestamp":"0x6553f165",
+                "transactions":["0x4141414141414141414141414141414141414141414141414141414141414141"]
+            }"#,
+        )
+        .unwrap();
+        let (preview, _) = subscriber.accept_base_flashblock(preview).unwrap();
+        subscriber.latest_preconfirmation = Some(preview);
+
+        let mut streams = SubscriberStreams::new();
+        streams.push(
+            SubscriberStreamSource::BaseFlashblocks,
+            stream::once(async {
+                SubscriberEvent::<Ethereum>::StreamTerminated(
+                    SubscriberStreamSource::BaseFlashblocks,
+                )
+            })
+            .boxed(),
+        );
+        subscriber.state = AlloySubscriberState::Active(streams);
+
+        let batch = subscriber
+            .next_scoped_batch()
+            .await
+            .expect("termination handling succeeds")
+            .expect("invalidation is delivered");
+        assert!(batch.preconfirmation_invalidated());
+        assert!(subscriber.latest_preconfirmation.is_none());
+        assert_eq!(subscriber.provider_ref.as_ref().unwrap().generation, 8);
+        assert_eq!(subscriber.pending_flashblock_reconnects.len(), 2);
+        assert!(
+            subscriber
+                .pending_flashblock_reconnect_sources
+                .iter()
+                .any(|source| matches!(source, SubscriberStreamSource::BaseFlashblocks))
+        );
+        assert!(
+            subscriber
+                .pending_flashblock_reconnect_sources
+                .iter()
+                .any(|source| matches!(source, SubscriberStreamSource::BasePendingLog { .. }))
+        );
+        let AlloySubscriberState::Active(streams) = &subscriber.state else {
+            panic!("subscriber remains active while reconnect is pending")
+        };
+        assert!(
+            streams
+                .entries
+                .iter()
+                .all(|entry| !entry.source.is_flashblocks())
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "reactive-ws")]
+    async fn preferred_initial_flashblock_rejection_retains_canonical_streams() {
+        let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
+        let filter = Filter::new().address(Address::repeat_byte(0x42));
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig {
+                preconfirmations: PreconfirmationMode::Preferred,
+                reconnect: SubscriberReconnectConfig {
+                    enabled: false,
+                    ..SubscriberReconnectConfig::default()
+                },
+                ..SubscriberConfig::default()
+            },
+        )
+        .with_provider_ref(ProviderRef::new("base-paid", 1));
+        subscriber.chain_id = Some(8_453);
+        subscriber.base_interests = vec![ReactiveInterest::Logs(LogInterest {
+            provider_filter: filter.clone(),
+            local_matcher: None,
+            route_key: None,
+        })];
+        subscriber.interests = subscriber.base_interests.clone();
+        subscriber.log_source_ids.insert(filter.clone(), 0);
+        subscriber.next_log_source_id = 1;
+
+        let canonical_source = SubscriberStreamSource::PubSubLog {
+            id: 0,
+            filter: filter.clone(),
+        };
+        let mut streams = SubscriberStreams::new();
+        streams.push(
+            canonical_source.clone(),
+            stream::pending::<SubscriberEvent<Ethereum>>().boxed(),
+        );
+        subscriber.state = AlloySubscriberState::Active(streams);
+        subscriber.sources_dirty = true;
+
+        subscriber
+            .ensure_streams()
+            .await
+            .expect("preferred Flashblocks setup degrades to canonical-only");
+        let AlloySubscriberState::Active(streams) = &subscriber.state else {
+            panic!("canonical stream remains active")
+        };
+        assert!(streams.contains_source(&canonical_source));
+        assert!(
+            streams
+                .entries
+                .iter()
+                .all(|entry| !entry.source.is_flashblocks())
+        );
+        assert!(subscriber.pending_flashblock_reconnects.is_empty());
+        assert!(!subscriber.sources_dirty);
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "reactive-ws")]
+    async fn required_initial_flashblock_rejection_remains_fail_closed() {
+        let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
+        let filter = Filter::new().address(Address::repeat_byte(0x42));
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig {
+                preconfirmations: PreconfirmationMode::Required,
+                reconnect: SubscriberReconnectConfig {
+                    enabled: false,
+                    ..SubscriberReconnectConfig::default()
+                },
+                ..SubscriberConfig::default()
+            },
+        )
+        .with_provider_ref(ProviderRef::new("base-paid", 1));
+        subscriber.chain_id = Some(8_453);
+        subscriber.base_interests = vec![ReactiveInterest::Logs(LogInterest {
+            provider_filter: filter.clone(),
+            local_matcher: None,
+            route_key: None,
+        })];
+        subscriber.interests = subscriber.base_interests.clone();
+        subscriber.log_source_ids.insert(filter.clone(), 0);
+        subscriber.next_log_source_id = 1;
+
+        let canonical_source = SubscriberStreamSource::PubSubLog {
+            id: 0,
+            filter: filter.clone(),
+        };
+        let mut streams = SubscriberStreams::new();
+        streams.push(
+            canonical_source.clone(),
+            stream::pending::<SubscriberEvent<Ethereum>>().boxed(),
+        );
+        subscriber.state = AlloySubscriberState::Active(streams);
+        subscriber.sources_dirty = true;
+
+        let error = subscriber
+            .ensure_streams()
+            .await
+            .expect_err("required Flashblocks setup must fail closed");
+        assert!(matches!(error, SubscriberError::Provider(_)));
+        let AlloySubscriberState::Active(streams) = &subscriber.state else {
+            panic!("the already-connected canonical stream is retained")
+        };
+        assert!(streams.contains_source(&canonical_source));
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "reactive-ws")]
+    async fn preferred_flashblock_termination_preserves_canonical_delivery() {
+        let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
+        let filter = Filter::new().address(Address::repeat_byte(0x42));
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig {
+                preconfirmations: PreconfirmationMode::Preferred,
+                reconnect: SubscriberReconnectConfig {
+                    enabled: false,
+                    ..SubscriberReconnectConfig::default()
+                },
+                ..SubscriberConfig::default()
+            },
+        )
+        .with_provider_ref(ProviderRef::new("base-paid", 1));
+        subscriber.chain_id = Some(8_453);
+        subscriber.base_interests = vec![ReactiveInterest::Logs(LogInterest {
+            provider_filter: filter.clone(),
+            local_matcher: None,
+            route_key: None,
+        })];
+        subscriber.interests = subscriber.base_interests.clone();
+        subscriber.log_source_ids.insert(filter.clone(), 0);
+        subscriber.next_log_source_id = 1;
+        subscriber.sources_dirty = false;
+
+        let mut streams = SubscriberStreams::new();
+        streams.push(
+            SubscriberStreamSource::BaseFlashblocks,
+            stream::once(async {
+                SubscriberEvent::<Ethereum>::StreamTerminated(
+                    SubscriberStreamSource::BaseFlashblocks,
+                )
+            })
+            .boxed(),
+        );
+        streams.push(
+            SubscriberStreamSource::PubSubLog {
+                id: 0,
+                filter: filter.clone(),
+            },
+            stream::once(async {
+                SubscriberEvent::<Ethereum>::Log {
+                    source_id: 0,
+                    log: rpc_log(false),
+                }
+            })
+            .boxed(),
+        );
+        subscriber.state = AlloySubscriberState::Active(streams);
+
+        let invalidation = subscriber
+            .next_scoped_batch()
+            .await
+            .expect("preferred termination does not fail")
+            .expect("invalidation is delivered");
+        assert!(invalidation.preconfirmation_invalidated());
+
+        let canonical = subscriber
+            .next_scoped_batch()
+            .await
+            .expect("canonical stream remains healthy")
+            .expect("canonical log is delivered");
+        assert!(!canonical.preconfirmation_invalidated());
+        assert_eq!(canonical.records().len(), 1);
+        assert_eq!(
+            canonical.records()[0].record.context.source,
+            InputSource::Subscription
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "reactive-ws")]
+    async fn preferred_flashblock_reconnect_exhaustion_preserves_canonical_delivery() {
+        let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
+        let filter = Filter::new().address(Address::repeat_byte(0x42));
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig {
+                preconfirmations: PreconfirmationMode::Preferred,
+                reconnect: SubscriberReconnectConfig {
+                    enabled: false,
+                    ..SubscriberReconnectConfig::default()
+                },
+                ..SubscriberConfig::default()
+            },
+        )
+        .with_provider_ref(ProviderRef::new("base-paid", 1));
+        subscriber.chain_id = Some(8_453);
+        subscriber.base_interests = vec![ReactiveInterest::Logs(LogInterest {
+            provider_filter: filter.clone(),
+            local_matcher: None,
+            route_key: None,
+        })];
+        subscriber.interests = subscriber.base_interests.clone();
+        subscriber.log_source_ids.insert(filter.clone(), 0);
+        subscriber.next_log_source_id = 1;
+        subscriber.sources_dirty = false;
+
+        let canonical_source = SubscriberStreamSource::PubSubLog { id: 0, filter };
+        let mut streams = SubscriberStreams::new();
+        streams.push(
+            canonical_source,
+            stream::once(async {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+                SubscriberEvent::<Ethereum>::Log {
+                    source_id: 0,
+                    log: rpc_log(false),
+                }
+            })
+            .boxed(),
+        );
+        subscriber.state = AlloySubscriberState::Active(streams);
+
+        let source = SubscriberStreamSource::BaseFlashblocks;
+        subscriber
+            .pending_flashblock_reconnect_sources
+            .push(source.clone());
+        subscriber
+            .pending_flashblock_reconnects
+            .push(Box::pin(async move {
+                (
+                    source,
+                    Err(SubscriberError::Provider(
+                        "test reconnect window exhausted".to_owned(),
+                    )),
+                )
+            }));
+
+        let canonical = subscriber
+            .next_scoped_batch()
+            .await
+            .expect("preferred reconnect exhaustion does not fail")
+            .expect("canonical log is delivered");
+        assert_eq!(canonical.records().len(), 1);
+        assert!(subscriber.pending_flashblock_reconnects.is_empty());
     }
 
     #[test]
@@ -7938,7 +24080,9 @@ mod subscriber_helper_tests {
     #[cfg(feature = "reactive-ws")]
     async fn owner_backfill_seeds_reconnect_anchor_before_live_log() {
         let asserter = Asserter::new();
+        asserter.push_success(&Some(rpc_block(7, B256::repeat_byte(0x02))));
         asserter.push_success(&vec![rpc_log(false)]);
+        asserter.push_success(&Some(rpc_block(7, B256::repeat_byte(0x02))));
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
             provider,
@@ -8006,10 +24150,12 @@ mod subscriber_helper_tests {
             SubscriberMode::PubSub,
             SubscriberConfig::default(),
         );
+        subscriber.chain_id = Some(1);
         subscriber
             .register_interests(&[ReactiveInterest::PendingTransactions(
                 PendingTxInterest::default(),
             )])
+            .await
             .expect("register base pending interest");
         subscriber
             .add_interest_owner(
@@ -8062,8 +24208,135 @@ mod subscriber_helper_tests {
         ));
     }
 
-    // A log interest matching `rpc_log` (address 0x42, topic0 0x01).
+    #[tokio::test(flavor = "multi_thread")]
+    #[cfg(feature = "reactive-polling")]
+    async fn ensure_streams_retains_each_successful_connection_across_later_failure() {
+        let asserter = Asserter::new();
+        asserter.push_success(&U256::from(1));
+        asserter.push_failure_msg("second filter connection failed");
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::Polling,
+            SubscriberConfig {
+                max_log_addresses_per_subscription: 1,
+                ..SubscriberConfig::default()
+            },
+        );
+        subscriber.chain_id = Some(1);
+        subscriber
+            .register_interests(&[log_interest_for(0x41), log_interest_for(0x42)])
+            .await
+            .expect("register two independently connected filters");
+
+        let error = subscriber
+            .ensure_streams()
+            .await
+            .expect_err("second provider connection is forced to fail");
+        assert!(matches!(error, SubscriberError::Provider(_)));
+        assert!(subscriber.sources_dirty);
+        let retained_streams = match &subscriber.state {
+            AlloySubscriberState::Active(streams) => Some(streams.len()),
+            AlloySubscriberState::Uninitialized | AlloySubscriberState::Empty => None,
+        };
+        assert_eq!(
+            retained_streams,
+            Some(1),
+            "first connection must survive later error {error:?}; revision {}",
+            subscriber.stream_revision
+        );
+
+        asserter.push_success(&U256::from(2));
+        subscriber
+            .ensure_streams()
+            .await
+            .expect("retry connects only the missing source");
+        assert!(!subscriber.sources_dirty);
+        assert!(matches!(
+            &subscriber.state,
+            AlloySubscriberState::Active(streams) if streams.len() == 2
+        ));
+        assert!(asserter.read_q().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     #[cfg(feature = "reactive-ws")]
+    async fn cancelled_post_install_backfill_is_retried_without_reconnecting() {
+        let asserter = Asserter::new();
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig::default(),
+        );
+        subscriber.chain_id = Some(1);
+        subscriber
+            .register_interests(&[log_interest_for(0x43)])
+            .await
+            .expect("register log source");
+        let source = subscriber
+            .stream_sources()
+            .expect("one desired source")
+            .pop()
+            .expect("log source");
+        let SubscriberStreamSource::PubSubLog { id, .. } = source else {
+            panic!("expected pubsub log source")
+        };
+        subscriber.last_seen_log_blocks.insert(id, 6);
+
+        {
+            let source = SubscriberStreamSource::PubSubLog {
+                id,
+                filter: subscriber
+                    .log_stream_filters()
+                    .pop()
+                    .expect("provider filter"),
+            };
+            let interrupted = async {
+                subscriber.install_source_stream(
+                    source.clone(),
+                    stream::pending::<SubscriberEvent<Ethereum>>().boxed(),
+                );
+                subscriber.queue_source_backfill(source);
+                subscriber.sources_dirty = true;
+                futures::future::pending::<()>().await;
+            };
+            futures::pin_mut!(interrupted);
+            poll_fn(|cx| {
+                assert!(interrupted.as_mut().poll(cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+        }
+
+        assert_eq!(subscriber.pending_source_backfills.len(), 1);
+        assert!(matches!(
+            &subscriber.state,
+            AlloySubscriberState::Active(streams) if streams.len() == 1
+        ));
+
+        asserter.push_success(&7u64);
+        asserter.push_success(&Vec::<Log>::new());
+        subscriber
+            .ensure_streams()
+            .await
+            .expect("retry completes only the pending historical window");
+
+        assert!(subscriber.pending_source_backfills.is_empty());
+        assert!(!subscriber.sources_dirty);
+        assert!(matches!(
+            &subscriber.state,
+            AlloySubscriberState::Active(streams) if streams.len() == 1
+        ));
+        assert!(asserter.read_q().is_empty());
+    }
+
+    // A log interest matching `rpc_log` (address 0x42, topic0 0x01).
+    #[cfg(any(
+        feature = "raw-flashblocks-json",
+        feature = "reactive-polling",
+        feature = "reactive-ws"
+    ))]
     fn log_interest_matching_rpc_log() -> ReactiveInterest<Ethereum> {
         ReactiveInterest::Logs(LogInterest {
             provider_filter: Filter::new()
@@ -8074,7 +24347,7 @@ mod subscriber_helper_tests {
         })
     }
 
-    #[cfg(feature = "reactive-ws")]
+    #[cfg(any(feature = "reactive-ws", feature = "reactive-polling"))]
     fn log_interest_for(address: u8) -> ReactiveInterest<Ethereum> {
         ReactiveInterest::Logs(LogInterest {
             provider_filter: Filter::new().address(Address::repeat_byte(address)),
@@ -8090,7 +24363,9 @@ mod subscriber_helper_tests {
     async fn drain_backfill_retains_queue_entry_on_provider_error() {
         let asserter = Asserter::new();
         asserter.push_failure_msg("rate limited");
+        asserter.push_success(&Some(rpc_block(7, B256::repeat_byte(0x02))));
         asserter.push_success(&vec![rpc_log(false)]);
+        asserter.push_success(&Some(rpc_block(7, B256::repeat_byte(0x02))));
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let mut subscriber = AlloySubscriber::new(
             provider,
@@ -8129,7 +24404,9 @@ mod subscriber_helper_tests {
     #[cfg(feature = "reactive-ws")]
     async fn drain_backfill_seeds_anchor_on_empty_window() {
         let asserter = Asserter::new();
+        asserter.push_success(&Some(rpc_block(42, B256::repeat_byte(42))));
         asserter.push_success(&Vec::<Log>::new());
+        asserter.push_success(&Some(rpc_block(42, B256::repeat_byte(42))));
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let mut subscriber = AlloySubscriber::new(
             provider,
@@ -8167,7 +24444,9 @@ mod subscriber_helper_tests {
     async fn drain_backfill_open_ended_resolves_head_and_seeds_anchor() {
         let asserter = Asserter::new();
         asserter.push_success(&100u64); // get_block_number
+        asserter.push_success(&Some(rpc_block(100, B256::repeat_byte(100))));
         asserter.push_success(&Vec::<Log>::new()); // get_logs
+        asserter.push_success(&Some(rpc_block(100, B256::repeat_byte(100))));
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let mut subscriber = AlloySubscriber::new(
             provider,
@@ -8308,7 +24587,7 @@ mod subscriber_helper_tests {
             "the changed merged filter should queue exactly one continuity backfill"
         );
         let queued = &subscriber.pending_backfills[0];
-        assert_eq!(queued.owner, HandlerId::new("amm"));
+        assert_eq!(queued.owner, Some(HandlerId::new("amm")));
         assert_eq!(queued.backfill.start_block(), 50);
         assert_eq!(
             queued.backfill.end_block(),
@@ -8467,6 +24746,48 @@ fn resolve_auto_subscriber_transport() -> Result<SubscriberTransport, Subscriber
 }
 
 fn validate_subscriber_config(config: &SubscriberConfig) -> Result<(), SubscriberError> {
+    if config.preconfirmations != PreconfirmationMode::Disabled
+        && config.canonical_head_poll_interval.is_zero()
+    {
+        return Err(SubscriberError::InvalidConfig(
+            "SubscriberConfig::canonical_head_poll_interval must be greater than zero",
+        ));
+    }
+    if config.preconfirmations != PreconfirmationMode::Disabled
+        && config.canonical_head_request_timeout.is_zero()
+    {
+        return Err(SubscriberError::InvalidConfig(
+            "SubscriberConfig::canonical_head_request_timeout must be greater than zero",
+        ));
+    }
+    if config.preconfirmations != PreconfirmationMode::Disabled
+        && config.flashblock_poll_interval.is_zero()
+    {
+        return Err(SubscriberError::InvalidConfig(
+            "SubscriberConfig::flashblock_poll_interval must be greater than zero",
+        ));
+    }
+    if config.preconfirmations != PreconfirmationMode::Disabled
+        && config.max_consecutive_flashblock_poll_failures == 0
+    {
+        return Err(SubscriberError::InvalidConfig(
+            "SubscriberConfig::max_consecutive_flashblock_poll_failures must be greater than zero",
+        ));
+    }
+    if config.preconfirmations != PreconfirmationMode::Disabled
+        && config.max_pending_transaction_receipts_per_tick == 0
+    {
+        return Err(SubscriberError::InvalidConfig(
+            "SubscriberConfig::max_pending_transaction_receipts_per_tick must be greater than zero",
+        ));
+    }
+    if config.preconfirmations != PreconfirmationMode::Disabled
+        && config.max_flashblock_rpc_requests_per_second == 0
+    {
+        return Err(SubscriberError::InvalidConfig(
+            "SubscriberConfig::max_flashblock_rpc_requests_per_second must be greater than zero",
+        ));
+    }
     if config.max_batch_size == 0 {
         return Err(SubscriberError::InvalidConfig(
             "SubscriberConfig::max_batch_size must be greater than zero",
@@ -8475,6 +24796,26 @@ fn validate_subscriber_config(config: &SubscriberConfig) -> Result<(), Subscribe
     if config.max_log_addresses_per_subscription == 0 {
         return Err(SubscriberError::InvalidConfig(
             "SubscriberConfig::max_log_addresses_per_subscription must be greater than zero",
+        ));
+    }
+    if config.max_pending_records == 0 {
+        return Err(SubscriberError::InvalidConfig(
+            "SubscriberConfig::max_pending_records must be greater than zero",
+        ));
+    }
+    if config.max_pending_backfills == 0 {
+        return Err(SubscriberError::InvalidConfig(
+            "SubscriberConfig::max_pending_backfills must be greater than zero",
+        ));
+    }
+    if config.max_backfill_log_bytes == 0 {
+        return Err(SubscriberError::InvalidConfig(
+            "SubscriberConfig::max_backfill_log_bytes must be greater than zero",
+        ));
+    }
+    if config.max_reconcile_requests_in_flight == 0 {
+        return Err(SubscriberError::InvalidConfig(
+            "SubscriberConfig::max_reconcile_requests_in_flight must be greater than zero",
         ));
     }
     if config.reconnect.enabled {
@@ -8614,6 +24955,71 @@ fn validate_owner_backfill_logs(
     Ok(())
 }
 
+fn validate_backfill_resource_limits(
+    logs: &[Log],
+    max_logs: usize,
+    max_log_bytes: usize,
+) -> Result<usize, SubscriberError> {
+    if logs.len() > max_logs {
+        return Err(SubscriberError::ResourceExhausted(format!(
+            "historical response returned {} logs, above the configured limit of {max_logs}",
+            logs.len()
+        )));
+    }
+    let bytes = logs.iter().fold(0usize, |total, log| {
+        // Include fixed address/block/transaction/index fields in addition to
+        // the variable topic and data payload. This is deliberately a stable
+        // conservative accounting unit rather than Rust heap-layout size.
+        let fixed = 20usize + (32 * 3) + (8 * 4) + 1;
+        total
+            .saturating_add(fixed)
+            .saturating_add(log.topics().len().saturating_mul(32))
+            .saturating_add(log.inner.data.data.len())
+    });
+    if bytes > max_log_bytes {
+        return Err(SubscriberError::ResourceExhausted(format!(
+            "historical response retained approximately {bytes} log bytes, above the configured limit of {max_log_bytes}"
+        )));
+    }
+    Ok(bytes)
+}
+
+async fn fetch_provider_block_ref<P, N>(
+    provider: &P,
+    number: u64,
+    counters: &SubscriberRpcCounters,
+    cause: SubscriberRpcCause,
+) -> Result<BlockRef, SubscriberError>
+where
+    P: Provider<N> + Send + Sync,
+    N: Network,
+{
+    counters.record(cause, SubscriberRpcMethod::EthGetBlockByNumber);
+    let block = provider
+        .get_block_by_number(BlockNumberOrTag::Number(number))
+        .await
+        .map_err(provider_error)?
+        .ok_or_else(|| {
+            SubscriberError::InvalidBackfill(format!(
+                "canonical target block {number} is unavailable"
+            ))
+        })?;
+    let header = block.header();
+    Ok(BlockRef {
+        number: header.number(),
+        hash: header.hash(),
+        parent_hash: Some(header.parent_hash()),
+        timestamp: Some(header.timestamp()),
+    })
+}
+
+fn block_ref_satisfies_expected(actual: &BlockRef, expected: &BlockRef) -> bool {
+    actual.number == expected.number
+        && actual.hash == expected.hash
+        && optional_metadata_compatible(actual.parent_hash.as_ref(), expected.parent_hash.as_ref())
+        && optional_metadata_compatible(actual.timestamp.as_ref(), expected.timestamp.as_ref())
+}
+
 fn validate_owner_backfill_log_set(logs: &[Log]) -> Result<(), SubscriberOwnerError> {
     let mut positions = HashMap::new();
     let mut block_hashes = HashMap::new();
@@ -8709,54 +25115,135 @@ fn merged_owner_reconcile_filters<N: Network>(
     chunks
 }
 
+fn merged_lazy_backfill_filters(
+    filters: &[Filter],
+    from_block: u64,
+    through: u64,
+) -> Vec<SubscriberOwnerReconcileFilter> {
+    let mut requests = Vec::new();
+    for filters in filters.chunks(OWNER_RECONCILE_FILTERS_PER_CHUNK) {
+        let mut merged = Vec::new();
+        for filter in filters {
+            merge_log_subscription_filter(
+                &mut merged,
+                &filter.clone().from_block(from_block).to_block(through),
+            );
+        }
+        requests.extend(
+            merged
+                .into_iter()
+                .map(|filter| SubscriberOwnerReconcileFilter { filter, from_block }),
+        );
+    }
+    requests
+}
+
+fn lazy_backfill_error(error: SubscriberOwnerError) -> SubscriberError {
+    match error {
+        SubscriberOwnerError::Subscriber(error) => error,
+        error => SubscriberError::InvalidBackfill(error.to_string()),
+    }
+}
+
+fn global_backfill_barrier(backfill: SubscriberBackfill, certified: BlockRef) -> ChainControl {
+    let mut id = b"alloy-global-backfill-v1".to_vec();
+    id.extend_from_slice(&backfill.start_block().to_be_bytes());
+    id.extend_from_slice(&certified.number.to_be_bytes());
+    id.extend_from_slice(certified.hash.as_slice());
+    ChainControl::Barrier {
+        id,
+        block: Some(certified),
+    }
+}
+
 async fn fetch_owner_catchup<P, N>(
     provider: P,
     filters: Vec<SubscriberOwnerReconcileFilter>,
     retained: Vec<BlockRef>,
     through: BlockRef,
+    options: SubscriberOwnerCatchupOptions,
+    counters: Arc<SubscriberRpcCounters>,
 ) -> Result<SubscriberOwnerCatchup, SubscriberOwnerError>
 where
     P: Provider<N> + Send + Sync,
     N: Network,
 {
-    let _ = verify_provider_reconcile_target::<P, N>(&provider, &through).await?;
+    let counters = counters.as_ref();
+    if !options.target_preverified {
+        let _ =
+            verify_provider_reconcile_target::<P, N>(&provider, &through, counters, options.cause)
+                .await?;
+    }
     let mut certified_positions = HashSet::new();
     for position in retained {
         let target_certifies_position = position == through
             || (position.number.checked_add(1) == Some(through.number)
                 && through.parent_hash == Some(position.hash));
-        if !target_certifies_position && certified_positions.insert(position.clone()) {
-            let _ = verify_provider_reconcile_target::<P, N>(&provider, &position).await?;
+        if !target_certifies_position && certified_positions.insert(position) {
+            let _ = verify_provider_reconcile_target::<P, N>(
+                &provider,
+                &position,
+                counters,
+                options.cause,
+            )
+            .await?;
         }
     }
     let mut logs = Vec::new();
-    let requests = filters.into_iter().map(|filter| {
+    let mut total_log_bytes = 0usize;
+    let requests = stream::iter(filters.into_iter().map(|filter| {
         let provider = &provider;
         async move {
+            counters.record(options.cause, SubscriberRpcMethod::EthGetLogs);
             let logs = provider
                 .get_logs(&filter.filter)
                 .await
                 .map_err(provider_error)?;
             Ok::<_, SubscriberOwnerError>((filter.from_block, logs))
         }
-    });
-    for (from_block, fetched) in try_join_all(requests).await? {
+    }))
+    .buffer_unordered(options.max_requests_in_flight);
+    futures::pin_mut!(requests);
+    while let Some(result) = requests.next().await {
+        let (from_block, fetched) = result?;
+        let fetched_bytes =
+            validate_backfill_resource_limits(&fetched, options.max_logs, options.max_log_bytes)?;
         validate_owner_backfill_logs(&fetched, from_block, &through)?;
+        if logs.len().saturating_add(fetched.len()) > options.max_logs {
+            return Err(SubscriberError::ResourceExhausted(format!(
+                "bulk reconcile returned more than {} logs",
+                options.max_logs
+            ))
+            .into());
+        }
+        total_log_bytes = total_log_bytes.saturating_add(fetched_bytes);
+        if total_log_bytes > options.max_log_bytes {
+            return Err(SubscriberError::ResourceExhausted(format!(
+                "bulk reconcile retained approximately {total_log_bytes} log bytes, above the configured limit of {}",
+                options.max_log_bytes
+            ))
+            .into());
+        }
         logs.extend(fetched);
     }
     validate_owner_backfill_log_set(&logs)?;
-    let certified = verify_provider_reconcile_target::<P, N>(&provider, &through).await?;
+    let certified =
+        verify_provider_reconcile_target::<P, N>(&provider, &through, counters, options.cause)
+            .await?;
     Ok(SubscriberOwnerCatchup { logs, certified })
 }
 
 async fn verify_provider_reconcile_target<P, N>(
     provider: &P,
     expected: &BlockRef,
+    counters: &SubscriberRpcCounters,
+    cause: SubscriberRpcCause,
 ) -> Result<BlockRef, SubscriberOwnerError>
 where
     P: Provider<N> + Send + Sync,
     N: Network,
 {
+    counters.record(cause, SubscriberRpcMethod::EthGetBlockByNumber);
     let block = provider
         .get_block_by_number(BlockNumberOrTag::Number(expected.number))
         .await
@@ -8798,6 +25285,28 @@ fn log_input_record<N: Network>(log: Log, source: InputSource) -> ReactiveInputR
     )
 }
 
+fn preconfirmed_log_input_record<N: Network>(
+    log: Log,
+    flashblock: FlashblockRef,
+) -> ReactiveInputRecord<N> {
+    let block = flashblock.block_ref();
+    let provider = flashblock.provider.clone();
+    ReactiveInputRecord::new(
+        ReactiveInput::Log(log.clone()),
+        ReactiveContext {
+            chain_id: None,
+            source: InputSource::Flashblocks,
+            chain_status: ChainStatus::Preconfirmed {
+                flashblock: Arc::new(flashblock),
+            },
+            block: Some(block),
+            transaction_index: log.transaction_index,
+            log_index: log.log_index,
+        },
+    )
+    .with_provider(provider)
+}
+
 fn log_reactive_context(log: &Log) -> ReactiveContext {
     let block = match (log.block_hash, log.block_number) {
         (Some(hash), Some(number)) => Some(BlockRef {
@@ -8811,10 +25320,10 @@ fn log_reactive_context(log: &Log) -> ReactiveContext {
 
     let chain_status = match (&block, log.removed) {
         (Some(block), true) => ChainStatus::Reorged {
-            dropped_from: block.clone(),
+            dropped_from: *block,
         },
         (Some(block), false) => ChainStatus::Included {
-            block: block.clone(),
+            block: *block,
             confirmations: 0,
         },
         (None, _) => ChainStatus::Pending,
@@ -8846,7 +25355,7 @@ where
             chain_id: None,
             source: InputSource::Subscription,
             chain_status: ChainStatus::Included {
-                block: block.clone(),
+                block,
                 confirmations: 0,
             },
             block: Some(block),
@@ -8873,12 +25382,26 @@ fn pending_hash_input_record<N: Network>(
     )
 }
 
+#[cfg(feature = "reactive-ws")]
+fn base_pending_log_filter(filter: &Filter) -> Result<serde_json::Value, SubscriberError> {
+    let encoded = serde_json::to_value(filter)
+        .map_err(|error| SubscriberError::Provider(error.to_string()))?;
+    let serde_json::Value::Object(mut fields) = encoded else {
+        return Err(SubscriberError::Provider(
+            "Alloy log filter did not serialize as an object".into(),
+        ));
+    };
+    fields.retain(|key, _| key == "address" || key == "topics");
+    Ok(serde_json::Value::Object(fields))
+}
+
 fn provider_error(error: impl fmt::Display) -> SubscriberError {
     SubscriberError::Provider(error.to_string())
 }
 
 /// Subscriber error.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum SubscriberError {
     /// Invalid subscriber configuration.
     #[error("{0}")]
@@ -8886,7 +25409,698 @@ pub enum SubscriberError {
     /// Requested subscriber behavior is not implemented.
     #[error("{0}")]
     Unsupported(&'static str),
+    /// The pinned provider lease reports a different chain identity.
+    #[error("subscriber chain mismatch: expected {expected}, got {actual}")]
+    ChainMismatch {
+        /// Required chain id.
+        expected: u64,
+        /// Observed chain id.
+        actual: u64,
+    },
     /// Provider or transport error.
     #[error("provider error: {0}")]
     Provider(String),
+    /// A provider returned malformed, out-of-range, or non-canonical lazy
+    /// backfill data.
+    #[error("invalid canonical backfill: {0}")]
+    InvalidBackfill(String),
+    /// A configured subscriber memory/concurrency boundary was exceeded.
+    #[error("subscriber resource limit exceeded: {0}")]
+    ResourceExhausted(String),
+}
+
+/// Canonical head certification is the second unrequested request stream in the
+/// live path: on a Flashblocks endpoint it replaces the `newHeads` subscription
+/// with a fixed-interval poll, so it bills a request per tick regardless of
+/// whether the head actually moved.
+#[cfg(test)]
+mod canonical_head_rpc_stats_tests {
+    use super::*;
+    use alloy_provider::ProviderBuilder;
+    use alloy_rpc_types_eth::{Block, Header as RpcHeader};
+    use alloy_transport::mock::Asserter;
+
+    fn sealed_head() -> Block {
+        Block::empty(RpcHeader {
+            hash: B256::repeat_byte(0x65),
+            inner: alloy_consensus::Header {
+                number: 101,
+                parent_hash: B256::repeat_byte(0x64),
+                timestamp: 1_700_000_101,
+                ..alloy_consensus::Header::default()
+            },
+            total_difficulty: None,
+            size: None,
+        })
+    }
+
+    /// Two ticks, one new head: the poll that observes no change still costs a
+    /// request, and `rpc_stats` reports both. This is the in-process form of the
+    /// measured Base head-poll volume — the counter tracks requests issued, not
+    /// events produced.
+    #[tokio::test]
+    async fn unchanged_head_still_counts_its_certification_request() {
+        let asserter = Asserter::new();
+        asserter.push_success(&Some(sealed_head()));
+        asserter.push_success(&Some(sealed_head()));
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter.clone());
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig::default(),
+        );
+        subscriber.chain_id = Some(8_453);
+
+        let first = subscriber
+            .fetch_certified_canonical_head()
+            .await
+            .expect("first certification succeeds");
+        assert!(
+            matches!(first, Some(SubscriberEvent::BlockHeader(_))),
+            "a newly certified head is delivered"
+        );
+
+        let second = subscriber
+            .fetch_certified_canonical_head()
+            .await
+            .expect("second certification succeeds");
+        assert!(
+            second.is_none(),
+            "an unchanged head produces no event to deliver"
+        );
+
+        let stats = subscriber.rpc_stats();
+        assert_eq!(
+            stats.get(
+                SubscriberRpcCause::CanonicalHeadCertification,
+                SubscriberRpcMethod::EthGetBlockByNumber,
+            ),
+            2,
+            "both polls are billed even though only one advanced the head"
+        );
+        assert_eq!(stats.total(), 2, "certification is the only request issued");
+        assert_eq!(
+            subscriber
+                .flashblocks_rpc_metrics()
+                .canonical_head_requests(),
+            2,
+            "the attributed counter agrees with the Flashblocks-scoped one"
+        );
+        assert!(asserter.read_q().is_empty());
+    }
+}
+
+/// Notification loss on a live subscription must be observable and recoverable.
+///
+/// The premise of sourcing canonical logs from a subscription is that loss can be
+/// detected; `alloy-pubsub`'s typed stream defeats that by treating a lagged
+/// receiver and an undecodable payload as `continue`. These tests drive a real
+/// broadcast channel — overflowing it for real rather than simulating the error —
+/// and pin both the detection and the bounded recovery it triggers.
+#[cfg(all(test, feature = "reactive-ws"))]
+mod stream_gap_tests {
+    use super::*;
+    use alloy_provider::ProviderBuilder;
+    use alloy_transport::mock::Asserter;
+    use serde_json::value::RawValue;
+
+    fn raw_json(value: &serde_json::Value) -> Box<RawValue> {
+        RawValue::from_string(value.to_string()).expect("valid JSON")
+    }
+
+    fn wire_log(block_number: u64, log_index: u64) -> Box<RawValue> {
+        raw_json(&serde_json::json!({
+            "address": "0x0000000000000000000000000000000000000077",
+            "topics": ["0x1111111111111111111111111111111111111111111111111111111111111111"],
+            "data": "0x",
+            "blockHash": format!("0x{:064x}", block_number),
+            "blockNumber": format!("0x{block_number:x}"),
+            "transactionHash": format!("0x{:064x}", 0x20 + log_index),
+            "transactionIndex": format!("0x{log_index:x}"),
+            "logIndex": format!("0x{log_index:x}"),
+            "removed": false,
+        }))
+    }
+
+    fn log_source(id: usize) -> SubscriberStreamSource {
+        SubscriberStreamSource::PubSubLog {
+            id,
+            filter: Filter::new().address(Address::repeat_byte(0x77)),
+        }
+    }
+
+    /// Build a `Subscription<Log>` over a real broadcast channel so the test can
+    /// overflow it, feed it garbage, or close it.
+    fn wired_subscription(
+        capacity: usize,
+    ) -> (
+        tokio::sync::broadcast::Sender<Box<RawValue>>,
+        alloy_pubsub::Subscription<Log>,
+    ) {
+        let (tx, rx) = tokio::sync::broadcast::channel(capacity);
+        let raw = alloy_pubsub::RawSubscription {
+            rx,
+            local_id: B256::repeat_byte(0x5b),
+        };
+        (tx, raw.into_typed())
+    }
+
+    fn gap_stream(
+        subscription: alloy_pubsub::Subscription<Log>,
+        source: SubscriberStreamSource,
+        counters: Arc<SubscriberStreamGapCounters>,
+    ) -> BoxStream<'static, SubscriberEvent<Ethereum>> {
+        gap_observing_stream(subscription, source, counters, |log| SubscriberEvent::Log {
+            source_id: 0,
+            log,
+        })
+    }
+
+    /// A channel that overflows reports the loss. Under
+    /// `Subscription::into_stream` this same sequence yields only the surviving
+    /// notification, with the drop visible nowhere.
+    #[tokio::test]
+    async fn overflowing_channel_reports_the_gap_instead_of_skipping_it() {
+        let counters = Arc::new(SubscriberStreamGapCounters::default());
+        let (tx, subscription) = wired_subscription(2);
+        // Publish past capacity before the stream is ever polled.
+        for index in 0..5 {
+            tx.send(wire_log(100 + index, index))
+                .expect("receiver alive");
+        }
+        let mut stream = gap_stream(subscription, log_source(0), Arc::clone(&counters));
+
+        let first = stream.next().await.expect("an event is produced");
+        let SubscriberEvent::StreamGap { source, gap } = first else {
+            panic!("expected the dropped notifications to surface as a gap, got a delivery");
+        };
+        assert!(
+            matches!(source, SubscriberStreamSource::PubSubLog { id: 0, .. }),
+            "the gap must name the source that lost data"
+        );
+        assert_eq!(gap, SubscriberStreamGap::Lagged { skipped: 3 });
+        assert_eq!(gap.skipped(), Some(3));
+
+        // The surviving notifications still arrive after the gap is reported.
+        assert!(matches!(
+            stream.next().await,
+            Some(SubscriberEvent::Log { .. })
+        ));
+        assert_eq!(counters.snapshot().lagged_notifications(), 3);
+        assert_eq!(counters.snapshot().undecodable_notifications(), 0);
+    }
+
+    /// An unreadable payload is lost data, not a skippable curiosity: a filter's
+    /// matched set cannot be called complete while one notification is opaque.
+    #[tokio::test]
+    async fn undecodable_notification_fails_closed_as_a_gap() {
+        let counters = Arc::new(SubscriberStreamGapCounters::default());
+        let (tx, subscription) = wired_subscription(8);
+        tx.send(raw_json(&serde_json::json!({"not": "a log"})))
+            .expect("receiver alive");
+        tx.send(wire_log(101, 0)).expect("receiver alive");
+        let mut stream = gap_stream(subscription, log_source(0), Arc::clone(&counters));
+
+        assert_eq!(
+            stream.next().await.map(|event| matches!(
+                event,
+                SubscriberEvent::StreamGap {
+                    gap: SubscriberStreamGap::Undecodable,
+                    ..
+                }
+            )),
+            Some(true),
+        );
+        assert!(matches!(
+            stream.next().await,
+            Some(SubscriberEvent::Log { .. })
+        ));
+        let stats = counters.snapshot();
+        assert_eq!(stats.undecodable_notifications(), 1);
+        assert_eq!(stats.lagged_notifications(), 0);
+        assert_eq!(stats.total_gaps(), 1);
+    }
+
+    /// A closed channel is a disconnect, not a gap: it must still end the stream
+    /// so the existing reconnect path runs unchanged.
+    #[tokio::test]
+    async fn closed_channel_terminates_the_stream_for_reconnect() {
+        let counters = Arc::new(SubscriberStreamGapCounters::default());
+        let (tx, subscription) = wired_subscription(8);
+        tx.send(wire_log(101, 0)).expect("receiver alive");
+        drop(tx);
+        let mut stream = gap_stream(subscription, log_source(0), Arc::clone(&counters));
+
+        assert!(matches!(
+            stream.next().await,
+            Some(SubscriberEvent::Log { .. })
+        ));
+        assert!(
+            matches!(
+                stream.next().await,
+                Some(SubscriberEvent::StreamTerminated(
+                    SubscriberStreamSource::PubSubLog { id: 0, .. }
+                ))
+            ),
+            "a closed subscription must terminate, not report a gap"
+        );
+        assert_eq!(counters.snapshot().total_gaps(), 0);
+    }
+
+    fn mocked_subscriber(
+        asserter: Asserter,
+    ) -> AlloySubscriber<impl alloy_provider::Provider<Ethereum> + Clone, Ethereum> {
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        AlloySubscriber::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig::default(),
+        )
+    }
+
+    /// A canonical log gap refetches the source's window from its delivery
+    /// anchor to the current head, and charges the requests to `GapBackfill` so
+    /// backpressure loss is distinguishable from reconnect churn.
+    #[tokio::test]
+    async fn log_gap_refetches_the_missed_window_and_attributes_it() {
+        let asserter = Asserter::new();
+        asserter.push_success(&U256::from(104)); // eth_blockNumber
+        asserter.push_success(&vec![
+            serde_json::from_str::<Log>(wire_log(103, 0).get()).expect("log"),
+        ]);
+        let mut subscriber = mocked_subscriber(asserter.clone());
+        subscriber.chain_id = Some(1);
+        // The source has delivered through block 102.
+        subscriber.last_seen_log_blocks.insert(0, 102);
+
+        let event = subscriber
+            .recover_stream_gap(&log_source(0), SubscriberStreamGap::Lagged { skipped: 2 })
+            .await
+            .expect("a bounded window is recoverable");
+
+        assert!(
+            matches!(
+                event,
+                Some(SubscriberEvent::BackfilledLogs { source_id: 0, ref logs }) if logs.len() == 1
+            ),
+            "the missed window is delivered as backfill"
+        );
+        let stats = subscriber.rpc_stats();
+        assert_eq!(
+            stats.by_cause(SubscriberRpcCause::GapBackfill),
+            2,
+            "one head read plus one bounded eth_getLogs"
+        );
+        assert_eq!(
+            stats.by_cause(SubscriberRpcCause::ReconnectBackfill),
+            0,
+            "a live-stream gap is not reconnect churn"
+        );
+        assert_eq!(subscriber.stream_gap_stats().log_gaps_healed(), 1);
+        assert!(asserter.read_q().is_empty());
+    }
+
+    /// Without a delivery anchor the missed range has no lower bound. Continuing
+    /// would mean knowing logs were lost and doing nothing, so this fails closed.
+    #[tokio::test]
+    async fn log_gap_without_a_delivery_anchor_fails_closed() {
+        let mut subscriber = mocked_subscriber(Asserter::new());
+        subscriber.chain_id = Some(1);
+
+        let Err(error) = subscriber
+            .recover_stream_gap(&log_source(0), SubscriberStreamGap::Lagged { skipped: 9 })
+            .await
+        else {
+            panic!("an unbounded gap must not be silently ignored");
+        };
+
+        assert!(
+            matches!(&error, SubscriberError::Provider(message)
+                if message.contains("delivery anchor") && message.contains("lagged(9)")),
+            "the error must name the cause and the loss: {error}"
+        );
+        assert_eq!(subscriber.stream_gap_stats().log_gaps_healed(), 0);
+    }
+
+    /// Header gaps are recovered by the consumer's parent-lineage walk, so they
+    /// are counted rather than refetched — no provider request is spent.
+    #[tokio::test]
+    async fn header_gap_is_counted_without_spending_a_request() {
+        let asserter = Asserter::new();
+        let mut subscriber = mocked_subscriber(asserter.clone());
+        subscriber.chain_id = Some(1);
+
+        let event = subscriber
+            .recover_stream_gap(
+                &SubscriberStreamSource::PubSubBlockHeaders,
+                SubscriberStreamGap::Lagged { skipped: 1 },
+            )
+            .await
+            .expect("a header gap is not fatal");
+
+        assert!(event.is_none(), "no synthetic header is fabricated");
+        assert_eq!(subscriber.stream_gap_stats().header_gaps(), 1);
+        assert_eq!(
+            subscriber.rpc_stats().total(),
+            0,
+            "the lineage walk already covers this; refetching would duplicate it"
+        );
+        assert!(asserter.read_q().is_empty());
+    }
+
+    /// A punctured pre-confirmation must never be published: the speculative
+    /// snapshot is discarded and the next complete generation replaces it.
+    #[tokio::test]
+    async fn preconfirmation_gap_discards_the_speculative_snapshot() {
+        let mut subscriber = mocked_subscriber(Asserter::new());
+        subscriber.chain_id = Some(8_453);
+
+        let event = subscriber
+            .recover_stream_gap(
+                &SubscriberStreamSource::BasePendingLog {
+                    id: 0,
+                    filter: Filter::new(),
+                },
+                SubscriberStreamGap::Undecodable,
+            )
+            .await
+            .expect("a preview gap is recoverable by discarding it");
+
+        assert!(
+            matches!(event, Some(SubscriberEvent::FlashblockInvalidated)),
+            "the incomplete preview must be invalidated, not delivered"
+        );
+        assert_eq!(subscriber.stream_gap_stats().preconfirmation_gaps(), 1);
+        assert_eq!(subscriber.rpc_stats().total(), 0);
+    }
+
+    /// Gap counters are diagnostics and must not perturb the delivery path.
+    #[tokio::test]
+    async fn resetting_gap_stats_opens_a_new_window() {
+        let counters = Arc::new(SubscriberStreamGapCounters::default());
+        counters.record_gap(SubscriberStreamGap::Lagged { skipped: 4 });
+        counters.record_gap(SubscriberStreamGap::Undecodable);
+        counters.record_header_gap();
+        assert_eq!(counters.snapshot().total_gaps(), 5);
+
+        counters.reset();
+
+        assert_eq!(counters.snapshot(), SubscriberStreamGapStats::default());
+    }
+
+    /// Labels are part of the diagnostic contract for a metrics export.
+    #[test]
+    fn gap_labels_are_stable() {
+        assert_eq!(
+            SubscriberStreamGap::Lagged { skipped: 7 }.as_str(),
+            "lagged"
+        );
+        assert_eq!(SubscriberStreamGap::Undecodable.as_str(), "undecodable");
+        assert_eq!(
+            SubscriberStreamGap::Lagged { skipped: 7 }.to_string(),
+            "lagged(7)"
+        );
+        assert_eq!(SubscriberRpcCause::GapBackfill.as_str(), "gap_backfill");
+        assert_eq!(SubscriberStreamGap::Undecodable.skipped(), None);
+    }
+}
+
+/// The attestation must never outrun what the subscriber actually observed
+/// whole. These tests drive the watermark directly, because the interesting
+/// cases are the ones where it must *refuse* to advance.
+#[cfg(all(test, feature = "reactive-ws"))]
+mod log_coverage_attestation_tests {
+    use super::*;
+    use alloy_provider::ProviderBuilder;
+    use alloy_rpc_types_eth::Header as RpcHeader;
+    use alloy_transport::mock::Asserter;
+
+    fn header_record(number: u64) -> ReactiveInputRecord<Ethereum> {
+        block_header_input_record::<Ethereum>(RpcHeader {
+            hash: B256::repeat_byte(number as u8),
+            inner: alloy_consensus::Header {
+                number,
+                parent_hash: B256::repeat_byte((number - 1) as u8),
+                timestamp: 1_700_000_000 + number,
+                ..alloy_consensus::Header::default()
+            },
+            total_difficulty: None,
+            size: None,
+        })
+    }
+
+    fn subscriber(
+        mode: SubscriberMode,
+        with_log_interest: bool,
+    ) -> AlloySubscriber<impl alloy_provider::Provider<Ethereum> + Clone, Ethereum> {
+        let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
+        let mut subscriber = AlloySubscriber::new(provider, mode, SubscriberConfig::default());
+        if with_log_interest {
+            subscriber.interests = vec![ReactiveInterest::Logs(LogInterest {
+                provider_filter: Filter::new().address(Address::repeat_byte(0x77)),
+                local_matcher: None,
+                route_key: None,
+            })];
+        }
+        subscriber
+    }
+
+    fn queued_coverage(
+        subscriber: &mut AlloySubscriber<impl alloy_provider::Provider<Ethereum> + Clone, Ethereum>,
+    ) -> Vec<u64> {
+        subscriber.queue_log_coverage_attestation();
+        subscriber
+            .pending_chain_controls
+            .drain(..)
+            .filter_map(|control| match control {
+                ChainControl::LogCoverage(block) => Some(block.number),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn attestation_advances_with_observed_canonical_headers() {
+        let mut subscriber = subscriber(SubscriberMode::PubSub, true);
+
+        subscriber.note_attestable_canonical_block(&header_record(101));
+        assert_eq!(queued_coverage(&mut subscriber), vec![101]);
+
+        // Re-attesting the same block says nothing new and must not be emitted.
+        assert!(queued_coverage(&mut subscriber).is_empty());
+
+        subscriber.note_attestable_canonical_block(&header_record(102));
+        assert_eq!(queued_coverage(&mut subscriber), vec![102]);
+    }
+
+    /// The safety property: a gap discovered after a header was observed must
+    /// withdraw that header's candidacy. Attesting it would tell the consumer a
+    /// block was whole on the strength of an observation made before the loss
+    /// was known.
+    #[test]
+    fn a_detected_gap_withdraws_the_pending_attestation() {
+        let mut subscriber = subscriber(SubscriberMode::PubSub, true);
+        subscriber.note_attestable_canonical_block(&header_record(101));
+
+        subscriber.reset_log_attestation();
+
+        assert!(
+            queued_coverage(&mut subscriber).is_empty(),
+            "a withdrawn candidate must not be attested"
+        );
+
+        // Only a header observed after the gap re-establishes the watermark.
+        subscriber.note_attestable_canonical_block(&header_record(102));
+        assert_eq!(queued_coverage(&mut subscriber), vec![102]);
+    }
+
+    /// A withdrawn candidate must not let a *lower* block be attested later
+    /// either — the watermark is monotonic at the source, not just downstream.
+    #[test]
+    fn attestation_never_regresses_after_a_gap() {
+        let mut subscriber = subscriber(SubscriberMode::PubSub, true);
+        subscriber.note_attestable_canonical_block(&header_record(105));
+        assert_eq!(queued_coverage(&mut subscriber), vec![105]);
+
+        subscriber.reset_log_attestation();
+        subscriber.note_attestable_canonical_block(&header_record(103));
+
+        assert!(
+            queued_coverage(&mut subscriber).is_empty(),
+            "an older block must never be attested after a newer one"
+        );
+    }
+
+    /// The polling transport's watcher cannot observe a dropped notification, so
+    /// it must neither claim the capability nor emit the control.
+    #[test]
+    #[cfg(feature = "reactive-polling")]
+    fn polling_transport_neither_claims_nor_emits_the_attestation() {
+        let mut subscriber = subscriber(SubscriberMode::Polling, true);
+        assert!(!subscriber.attests_log_coverage());
+
+        subscriber.note_attestable_canonical_block(&header_record(101));
+
+        assert!(queued_coverage(&mut subscriber).is_empty());
+        assert!(
+            !EventSubscriber::capabilities(&subscriber)
+                .supports(SubscriberCapability::LogCoverageAttestation)
+        );
+    }
+
+    #[test]
+    fn pubsub_transport_claims_the_capability() {
+        let subscriber = subscriber(SubscriberMode::PubSub, true);
+        assert!(
+            EventSubscriber::capabilities(&subscriber)
+                .supports(SubscriberCapability::LogCoverageAttestation)
+        );
+    }
+
+    /// Nothing to attest about without log interests, so stay silent rather than
+    /// emit a vacuously true watermark a consumer might lean on.
+    #[test]
+    fn subscriber_without_log_interests_stays_silent() {
+        let mut subscriber = subscriber(SubscriberMode::PubSub, false);
+        assert!(!subscriber.attests_log_coverage());
+
+        subscriber.note_attestable_canonical_block(&header_record(101));
+
+        assert!(queued_coverage(&mut subscriber).is_empty());
+    }
+}
+
+/// The canonical head poll exists because a Flashblocks endpoint's `newHeads`
+/// may carry partial heads — but a fixed interval spends a request whether or
+/// not anything sealed. These tests pin that a certification driven by the
+/// flashblock stream suppresses the redundant tick, and that the timer still
+/// works unaided when no such signal exists.
+#[cfg(all(test, feature = "reactive-ws"))]
+mod canonical_head_suppression_tests {
+    use super::*;
+    use alloy_provider::ProviderBuilder;
+    use alloy_rpc_types_eth::{Block, Header as RpcHeader};
+    use alloy_transport::mock::Asserter;
+
+    fn sealed_head(number: u64) -> Block {
+        Block::empty(RpcHeader {
+            hash: B256::repeat_byte(number as u8),
+            inner: alloy_consensus::Header {
+                number,
+                parent_hash: B256::repeat_byte((number - 1) as u8),
+                timestamp: 1_700_000_000 + number,
+                ..alloy_consensus::Header::default()
+            },
+            total_difficulty: None,
+            size: None,
+        })
+    }
+
+    fn subscriber(
+        asserter: Asserter,
+    ) -> AlloySubscriber<impl alloy_provider::Provider<Ethereum> + Clone, Ethereum> {
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
+            provider,
+            SubscriberMode::PubSub,
+            SubscriberConfig::default(),
+        );
+        subscriber.chain_id = Some(8_453);
+        subscriber.interests = vec![ReactiveInterest::Blocks(BlockInterest::default())];
+        subscriber
+    }
+
+    /// A tick inside the window after a certification issues no request. This is
+    /// the whole saving: on a chain whose blocks seal faster than the interval,
+    /// most ticks cost nothing.
+    #[tokio::test]
+    async fn a_tick_inside_the_window_after_a_certification_costs_nothing() {
+        let asserter = Asserter::new();
+        asserter.push_success(&Some(sealed_head(101)));
+        let mut subscriber = subscriber(asserter.clone());
+
+        // One real certification, as the flashblock stream would drive.
+        let certified = subscriber
+            .certify_canonical_head_on_sealed_block()
+            .await
+            .expect("certification succeeds");
+        assert!(matches!(certified, Some(SubscriberEvent::BlockHeader(_))));
+
+        // A tick immediately afterwards is inside the poll window.
+        assert!(subscriber.canonical_head_certification_is_current());
+        let suppressed = subscriber
+            .certify_canonical_head_on_sealed_block()
+            .await
+            .expect("a suppressed certification is not an error");
+
+        assert!(suppressed.is_none());
+        assert_eq!(
+            subscriber.rpc_stats().get(
+                SubscriberRpcCause::CanonicalHeadCertification,
+                SubscriberRpcMethod::EthGetBlockByNumber,
+            ),
+            1,
+            "only the first certification may spend a request"
+        );
+        assert!(
+            asserter.read_q().is_empty(),
+            "the suppressed call must not consume a queued response"
+        );
+    }
+
+    /// Once the window lapses the certification runs again, so a stalled
+    /// flashblock stream degrades to the previous polling behaviour rather than
+    /// to silence.
+    #[tokio::test]
+    async fn certification_resumes_once_the_window_lapses() {
+        let asserter = Asserter::new();
+        asserter.push_success(&Some(sealed_head(101)));
+        asserter.push_success(&Some(sealed_head(102)));
+        let mut subscriber = subscriber(asserter.clone());
+
+        let _ = subscriber
+            .certify_canonical_head_on_sealed_block()
+            .await
+            .expect("first certification");
+
+        // Age the record past the poll interval.
+        subscriber.last_canonical_head_certification = Some(
+            Instant::now()
+                - subscriber.config.canonical_head_poll_interval
+                - Duration::from_millis(1),
+        );
+        assert!(!subscriber.canonical_head_certification_is_current());
+
+        let second = subscriber
+            .certify_canonical_head_on_sealed_block()
+            .await
+            .expect("second certification");
+
+        assert!(matches!(second, Some(SubscriberEvent::BlockHeader(_))));
+        assert_eq!(
+            subscriber
+                .rpc_stats()
+                .by_cause(SubscriberRpcCause::CanonicalHeadCertification),
+            2
+        );
+        assert!(asserter.read_q().is_empty());
+    }
+
+    /// A subscriber with no block-header interest has no head to certify, so the
+    /// signal must not manufacture a request.
+    #[tokio::test]
+    async fn without_a_header_interest_nothing_is_certified() {
+        let asserter = Asserter::new();
+        let mut subscriber = subscriber(asserter.clone());
+        subscriber.interests = Vec::new();
+
+        let certified = subscriber
+            .certify_canonical_head_on_sealed_block()
+            .await
+            .expect("no interest is not an error");
+
+        assert!(certified.is_none());
+        assert_eq!(subscriber.rpc_stats().total(), 0);
+        assert!(asserter.read_q().is_empty());
+    }
 }

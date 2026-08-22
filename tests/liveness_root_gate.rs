@@ -1,4 +1,4 @@
-//! Manager-authored red-green acceptance tests for Phase-8 step 4: the
+//! Red-green acceptance tests for Phase-8 step 4: the
 //! `storageHash` root gate.
 //!
 //! A `WholeAccount`-tracked contract's storage root is a sound per-account change
@@ -16,24 +16,28 @@
 
 mod common;
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use alloy_consensus::Header;
-use alloy_network::Ethereum;
+use alloy_consensus::{BlockHeader as _, Header};
+use alloy_network::{Ethereum, primitives::HeaderResponse as _};
 use alloy_primitives::{Address, B256, U256};
 use anyhow::Result;
 
 use common::setup_cache;
 use evm_fork_cache::cache::AccountProof;
 use evm_fork_cache::reactive::{
-    ChainStatus, InputSource, ReactiveConfig, ReactiveContext, ReactiveInput, ReactiveInputBatch,
-    ReactiveInputRecord, ReactiveReport, ReactiveRuntime, ResyncReason, RootGateCadence,
-    TrackingPolicy,
+    BlockRef, ChainControl, ChainStatus, InputSource, ReactiveConfig, ReactiveContext,
+    ReactiveInput, ReactiveInputBatch, ReactiveInputRecord, ReactiveReport, ReactiveRuntime,
+    ResyncReason, RootGateCadence, TrackingPolicy,
 };
 
 /// A canonical block-header input for block `number`.
-fn header_input(number: u64) -> ReactiveInput<Ethereum> {
-    let consensus = Header {
+fn canonical_header(number: u64) -> Header {
+    Header {
+        parent_hash: number
+            .checked_sub(1)
+            .map(|parent| canonical_header(parent).hash_slow())
+            .unwrap_or_default(),
         number,
         timestamp: 1_700_000_000 + number,
         base_fee_per_gas: Some(7),
@@ -41,8 +45,11 @@ fn header_input(number: u64) -> ReactiveInput<Ethereum> {
         gas_limit: 30_000_000,
         mix_hash: B256::repeat_byte(0xab),
         ..Default::default()
-    };
-    ReactiveInput::BlockHeader(alloy_rpc_types_eth::Header::new(consensus))
+    }
+}
+
+fn header_input(number: u64) -> ReactiveInput<Ethereum> {
+    ReactiveInput::BlockHeader(alloy_rpc_types_eth::Header::new(canonical_header(number)))
 }
 
 fn canonical_context(number: u64) -> ReactiveContext {
@@ -56,7 +63,7 @@ fn canonical_context(number: u64) -> ReactiveContext {
         chain_id: Some(1),
         source: InputSource::Batch,
         chain_status: ChainStatus::Included {
-            block: block.clone(),
+            block,
             confirmations: 0,
         },
         block: Some(block),
@@ -66,10 +73,88 @@ fn canonical_context(number: u64) -> ReactiveContext {
 }
 
 fn header_batch(number: u64) -> ReactiveInputBatch<Ethereum> {
+    let input = header_input(number);
+    let ReactiveInput::BlockHeader(header) = &input else {
+        unreachable!("header helper always returns a header")
+    };
+    let block = evm_fork_cache::reactive::BlockRef {
+        number: header.number(),
+        hash: header.hash(),
+        parent_hash: Some(header.parent_hash()),
+        timestamp: Some(header.timestamp()),
+    };
     ReactiveInputBatch::new(vec![ReactiveInputRecord::new(
-        header_input(number),
-        canonical_context(number),
+        input,
+        ReactiveContext {
+            chain_id: Some(1),
+            source: InputSource::Batch,
+            chain_status: ChainStatus::Included {
+                block,
+                confirmations: 0,
+            },
+            block: Some(block),
+            transaction_index: None,
+            log_index: None,
+        },
     )])
+}
+
+fn inert_canonical_batch(block: BlockRef) -> ReactiveInputBatch<Ethereum> {
+    let log = Log {
+        inner: PrimitiveLog::new_unchecked(
+            Address::repeat_byte(0xfe),
+            vec![B256::repeat_byte(0xef)],
+            Bytes::new(),
+        ),
+        block_hash: Some(block.hash),
+        block_number: Some(block.number),
+        block_timestamp: block.timestamp,
+        transaction_hash: Some(B256::repeat_byte(block.number as u8)),
+        transaction_index: Some(0),
+        log_index: Some(0),
+        removed: false,
+    };
+    ReactiveInputBatch::new(vec![ReactiveInputRecord::new(
+        ReactiveInput::Log(log),
+        ReactiveContext {
+            chain_id: Some(1),
+            source: InputSource::Batch,
+            chain_status: ChainStatus::Included {
+                block,
+                confirmations: 0,
+            },
+            block: Some(block),
+            transaction_index: Some(0),
+            log_index: Some(0),
+        },
+    )])
+}
+
+fn install_mutable_root_fetcher(
+    cache: &mut evm_fork_cache::cache::EvmCache,
+    initial_root: B256,
+) -> Arc<Mutex<B256>> {
+    let root = Arc::new(Mutex::new(initial_root));
+    let fetch_root = root.clone();
+    cache.set_account_proof_fetcher(Arc::new(move |requests, _block| {
+        let current = *fetch_root.lock().expect("root lock");
+        requests
+            .into_iter()
+            .map(|(address, _keys)| {
+                (
+                    address,
+                    Ok(AccountProof {
+                        storage_hash: current,
+                        balance: U256::ZERO,
+                        nonce: 0,
+                        code_hash: B256::ZERO,
+                        slots: Vec::new(),
+                    }),
+                )
+            })
+            .collect()
+    }));
+    root
 }
 
 /// Install an account-proof fetcher whose `storage_hash` for any address is a
@@ -206,8 +291,153 @@ async fn whole_account_root_unchanged_no_gap_or_resync() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn control_only_canonical_progress_drives_root_gate_cadence_and_detection() -> Result<()> {
+    let tracked = Address::repeat_byte(0x7a);
+    let mut cache = setup_cache().await?;
+    install_block_keyed_root_fetcher(
+        &mut cache,
+        10,
+        B256::repeat_byte(0xa1),
+        B256::repeat_byte(0xb2),
+    );
+    let mut runtime = ReactiveRuntime::<Ethereum>::new(ReactiveConfig::default());
+    runtime.set_root_gate_cadence(RootGateCadence::every_n_blocks(1));
+    runtime.track_account(tracked, TrackingPolicy::WholeAccount);
+
+    let block_10 = BlockRef {
+        number: 10,
+        hash: B256::repeat_byte(10),
+        parent_hash: Some(B256::repeat_byte(9)),
+        timestamp: Some(1_700_000_010),
+    };
+    let baseline = runtime.ingest_batch_with_resync(
+        &mut cache,
+        ReactiveInputBatch::new(Vec::new())
+            .with_chain_id(1)
+            .with_chain_controls([ChainControl::CanonicalProgress(block_10)]),
+    )?;
+    assert!(baseline.resyncs.is_empty());
+
+    let block_11 = BlockRef {
+        number: 11,
+        hash: B256::repeat_byte(11),
+        parent_hash: Some(block_10.hash),
+        timestamp: Some(1_700_000_011),
+    };
+    let moved = runtime.ingest_batch_with_resync(
+        &mut cache,
+        ReactiveInputBatch::new(Vec::new())
+            .with_chain_id(1)
+            .with_chain_controls([ChainControl::Barrier {
+                id: b"control-only-root-gate".to_vec(),
+                block: Some(block_11),
+            }]),
+    )?;
+
+    assert!(moved.reports.iter().any(|report| matches!(
+        report.as_ref(),
+        ReactiveReport::CoverageGap(gap) if gap.address == tracked && gap.block == 11
+    )));
+    assert!(
+        moved
+            .resyncs
+            .iter()
+            .any(|request| request.reason == ResyncReason::RootMoved)
+    );
+    assert_eq!(runtime.metrics().coverage_gaps, 1);
+    Ok(())
+}
+
+/// A root baseline observed on an orphaned branch must not survive the reorg.
+/// Otherwise the replacement block at the same height is ignored as stale and
+/// the first child of that replacement is falsely reported as an uncovered
+/// root move.
+#[tokio::test]
+async fn reorg_discards_orphaned_root_baseline_before_replacement_branch() -> Result<()> {
+    let tracked = Address::repeat_byte(0x79);
+    let ancestor = BlockRef {
+        number: 10,
+        hash: B256::repeat_byte(0x10),
+        parent_hash: Some(B256::repeat_byte(0x09)),
+        timestamp: Some(1_700_000_010),
+    };
+    let old_tip = BlockRef {
+        number: 11,
+        hash: B256::repeat_byte(0x11),
+        parent_hash: Some(ancestor.hash),
+        timestamp: Some(1_700_000_011),
+    };
+    let replacement = BlockRef {
+        number: 11,
+        hash: B256::repeat_byte(0xa1),
+        parent_hash: Some(ancestor.hash),
+        timestamp: Some(1_700_000_011),
+    };
+    let replacement_child = BlockRef {
+        number: 12,
+        hash: B256::repeat_byte(0xa2),
+        parent_hash: Some(replacement.hash),
+        timestamp: Some(1_700_000_012),
+    };
+
+    let root_a = B256::repeat_byte(0x31);
+    let root_b = B256::repeat_byte(0x32);
+    let root_c = B256::repeat_byte(0x33);
+    let mut cache = setup_cache().await?;
+    let current_root = install_mutable_root_fetcher(&mut cache, root_a);
+    let mut runtime = ReactiveRuntime::<Ethereum>::new(ReactiveConfig::default());
+    runtime.set_root_gate_cadence(RootGateCadence::every_n_blocks(1));
+    runtime.track_account(tracked, TrackingPolicy::WholeAccount);
+
+    runtime.ingest_batch_with_resync(&mut cache, inert_canonical_batch(ancestor))?;
+    *current_root.lock().expect("root lock") = root_b;
+    let orphan_report =
+        runtime.ingest_batch_with_resync(&mut cache, inert_canonical_batch(old_tip))?;
+    assert!(orphan_report.reports.iter().any(|report| matches!(
+        report.as_ref(),
+        ReactiveReport::CoverageGap(gap) if gap.address == tracked && gap.block == old_tip.number
+    )));
+
+    runtime.ingest_batch(
+        &mut cache,
+        ReactiveInputBatch::new(Vec::new())
+            .with_chain_id(1)
+            .with_chain_controls([ChainControl::Reorg {
+                common_ancestor: ancestor,
+                old_tip,
+                new_tip: replacement,
+            }]),
+    )?;
+
+    *current_root.lock().expect("root lock") = root_c;
+    let replacement_report =
+        runtime.ingest_batch_with_resync(&mut cache, inert_canonical_batch(replacement))?;
+    let child_report =
+        runtime.ingest_batch_with_resync(&mut cache, inert_canonical_batch(replacement_child))?;
+
+    for report in [&replacement_report, &child_report] {
+        assert!(
+            !report
+                .reports
+                .iter()
+                .any(|item| matches!(item.as_ref(), ReactiveReport::CoverageGap(_))),
+            "replacement-branch baseline adoption must not create a false coverage gap"
+        );
+        assert!(
+            !report
+                .resyncs
+                .iter()
+                .any(|request| request.reason == ResyncReason::RootMoved),
+            "replacement-branch baseline adoption must not schedule a false resync"
+        );
+    }
+    assert_eq!(runtime.metrics().coverage_gaps, 1);
+    Ok(())
+}
+
 // ----------------------------------------------------------------------------
-// Wave-7 (implementation-agent) tests: decoder-covered move, Scalars field move,
+// Wave-7 tests: decoder-covered move, Scalars field move,
 // and the Slots opt-out.
 // ----------------------------------------------------------------------------
 

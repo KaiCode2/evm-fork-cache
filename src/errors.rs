@@ -1015,6 +1015,10 @@ pub type CacheResult<T, E = CacheError> = Result<T, E>;
 /// reverts as [`SimError`].
 #[derive(Debug, thiserror::Error)]
 pub enum OverlayError {
+    /// The caller superseded this simulation scope while an EVM call was
+    /// executing. The overlay checkpoint has been reverted.
+    #[error("simulation was cooperatively cancelled")]
+    Cancelled,
     /// Transaction environment construction failed.
     #[error("failed to build transaction environment: {details}")]
     TxEnv {

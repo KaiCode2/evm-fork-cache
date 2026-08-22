@@ -1,12 +1,9 @@
-//! Manager-authored red-green acceptance tests for Phase 6 Track C: the
+//! Acceptance tests for Phase 6 Track C: the
 //! call-frame tracer (`CallTracer`) and the generalized public inspector seam
 //! (`EvmOverlay::call_raw_with_inspector` + `InspectorStack`).
 //!
-//! These describe the public contract before the implementation exists. The
-//! implementation agent must make them pass WITHOUT weakening, skipping, or
-//! rewriting them; if a test encodes a wrong assumption about EVM/mock behavior
-//! (as opposed to the feature contract), surface it to the manager with a
-//! justification rather than silently changing it.
+//! These describe the public contract. Keep their assertions intact unless a
+//! documented correction to an EVM or mock assumption is required.
 //!
 //! Fully offline (mocked provider, injected state).
 #![cfg(feature = "reactive")]

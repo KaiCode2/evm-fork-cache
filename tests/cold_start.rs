@@ -11,10 +11,9 @@
 //!
 //! Every test runs fully offline over a mocked provider; none reach the network
 //! (an unexpected RPC fetch errors against the empty mock queue, failing the
-//! test). These are manager-authored red-green acceptance tests. The
-//! implementation agent must make them pass without weakening, skipping, or
-//! rewriting them. Where they disagree with the original feature request, the
-//! implementation spec (`...cold-start-implementation-spec.md`) and these tests win.
+//! test). These are red-green acceptance tests. Keep their assertions intact;
+//! where they disagree with the original feature request, the implementation
+//! spec (`...cold-start-implementation-spec.md`) and these tests win.
 #![cfg(feature = "reactive")]
 
 mod common;

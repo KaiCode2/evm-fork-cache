@@ -608,7 +608,7 @@ async fn ingest_keeps_state_fresh_with_zero_fetches() -> Result<()> {
     Ok(())
 }
 
-/// WS-3 (manager-authored red-green): `derived_slots` must be bounded to the
+/// WS-3 red-green coverage: `derived_slots` must be bounded to the
 /// reorg horizon (`ReorgConfig::depth`), mirroring the `touched` ring, rather
 /// than growing unbounded across steady-state ingestion. With `depth = 3`,
 /// after ingesting 6 blocks that each touch a distinct `(address, slot)`, only

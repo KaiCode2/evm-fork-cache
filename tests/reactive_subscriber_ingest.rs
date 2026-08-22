@@ -8,10 +8,11 @@
 //!
 //! It runs offline by fetching the batch through the subscriber's `get_logs`
 //! backfill path (mockable), which produces exactly the same
-//! `ReactiveInputBatch` shape the live pubsub path emits. The live WebSocket
-//! transport plumbing itself is covered by the reconnect/termination unit tests
-//! in `tests/reactive_alloy_subscriber.rs`.
-#![cfg(feature = "reactive-ws")]
+//! `ReactiveInputBatch` shape used by every live transport. Polling is selected
+//! here because Alloy's mocked provider can install filter streams but cannot
+//! install WebSocket subscriptions. WebSocket reconnect/termination plumbing is
+//! covered separately in `tests/reactive_alloy_subscriber.rs`.
+#![cfg(feature = "reactive-polling")]
 
 mod common;
 
@@ -20,7 +21,7 @@ use std::sync::Arc;
 use alloy_network::Ethereum;
 use alloy_primitives::{Address, B256, Bytes, Log as PrimitiveLog, U256, keccak256};
 use alloy_provider::ProviderBuilder;
-use alloy_rpc_types_eth::{Filter, Log};
+use alloy_rpc_types_eth::{Block, Filter, Header, Log};
 use alloy_transport::mock::Asserter;
 use anyhow::{Result, bail};
 
@@ -93,6 +94,20 @@ fn swap_log(pool: Address, topic: B256, block_number: u64, value: u64) -> Log {
     }
 }
 
+fn rpc_block(block_number: u64) -> Block {
+    Block::empty(Header {
+        hash: B256::repeat_byte(block_number as u8),
+        inner: alloy_consensus::Header {
+            number: block_number,
+            parent_hash: B256::repeat_byte(block_number.saturating_sub(1) as u8),
+            timestamp: 1_700_000_000 + block_number,
+            ..Default::default()
+        },
+        total_difficulty: None,
+        size: None,
+    })
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn alloy_subscriber_batch_feeds_reactive_runtime_ingest_end_to_end() -> Result<()> {
     let pool = Address::repeat_byte(0xcd);
@@ -106,23 +121,29 @@ async fn alloy_subscriber_batch_feeds_reactive_runtime_ingest_end_to_end() -> Re
     // Real AlloySubscriber over a mocked provider; the backfill get_logs returns
     // one swap log carrying the post-state value.
     let asserter = Asserter::new();
+    asserter.push_success(&U256::from(1)); // eth_chainId
+    asserter.push_success(&U256::from(2)); // eth_newFilter before backfill
+    asserter.push_success(&Some(rpc_block(100)));
     asserter.push_success(&vec![swap_log(pool, topic, 100, new_value)]);
+    asserter.push_success(&Some(rpc_block(100)));
     let provider = ProviderBuilder::new().connect_mocked_client(asserter);
     let mut subscriber = AlloySubscriber::<_, Ethereum>::new(
         provider,
-        SubscriberMode::PubSub,
+        SubscriberMode::Polling,
         SubscriberConfig {
             hydrate_pending_transactions: false,
             ..SubscriberConfig::default()
         },
     );
-    subscriber.add_interest_owner_with_backfill(
-        HandlerId::new("pool"),
-        &[ReactiveInterest::Logs(LogInterest {
-            provider_filter: Filter::new().address(pool).event_signature(topic),
-            local_matcher: None,
-            route_key: None,
-        })],
+    subscriber.replace_interest_owners_with_global_backfill(
+        vec![(
+            HandlerId::new("pool"),
+            vec![ReactiveInterest::Logs(LogInterest {
+                provider_filter: Filter::new().address(pool).event_signature(topic),
+                local_matcher: None,
+                route_key: None,
+            })],
+        )],
         SubscriberBackfill::range(90, 100),
     )?;
 

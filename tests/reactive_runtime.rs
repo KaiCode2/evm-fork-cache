@@ -1,4 +1,4 @@
-//! Manager-authored acceptance tests for the reactive runtime feature.
+//! Acceptance tests for the reactive runtime feature.
 //!
 //! These tests intentionally describe the new public contract before the
 //! implementation exists. They should fail on the current log-only event pipeline
@@ -63,7 +63,7 @@ fn included_context(block_number: u64, log_index: u64) -> ReactiveContext {
         chain_id: Some(1),
         source: InputSource::Batch,
         chain_status: ChainStatus::Included {
-            block: block.clone(),
+            block,
             confirmations: 0,
         },
         block: Some(block),
@@ -164,6 +164,50 @@ struct CountingIndexedHandler {
     handle_calls: Arc<AtomicUsize>,
 }
 
+struct FailOnBlockWriter {
+    address: Address,
+    slot: U256,
+    fail_on: u64,
+}
+
+impl ReactiveHandler<Ethereum> for FailOnBlockWriter {
+    fn id(&self) -> HandlerId {
+        HandlerId::new("transactional-failure")
+    }
+
+    fn interests(&self) -> Vec<ReactiveInterest> {
+        vec![ReactiveInterest::Logs(LogInterest {
+            provider_filter: Filter::new().address(self.address),
+            local_matcher: None,
+            route_key: Some(RouteKeySpec::EmitterAddress),
+        })]
+    }
+
+    fn handle(
+        &self,
+        ctx: &ReactiveContext,
+        _input: &ReactiveInput<Ethereum>,
+        _state: &dyn StateView,
+    ) -> Result<HandlerOutcome, HandlerError> {
+        if ctx
+            .block
+            .as_ref()
+            .is_some_and(|block| block.number == self.fail_on)
+        {
+            return Err(HandlerError::new("forced later-record failure"));
+        }
+        Ok(HandlerOutcome {
+            effects: vec![ReactiveEffect::StateUpdate(StateUpdate::slot(
+                self.address,
+                self.slot,
+                U256::from(999),
+            ))],
+            quality: StateEffectQuality::ExactFromInput,
+            tags: Vec::new(),
+        })
+    }
+}
+
 impl ReactiveHandler<Ethereum> for CountingIndexedHandler {
     fn id(&self) -> HandlerId {
         self.id.clone()
@@ -245,6 +289,43 @@ async fn reactive_runtime_executes_the_same_indexed_candidates_as_the_registry()
     assert_eq!(matcher_b.load(Ordering::Relaxed), 1);
     assert_eq!(handle_a.load(Ordering::Relaxed), 0);
     assert_eq!(handle_b.load(Ordering::Relaxed), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn failed_direct_batch_restores_cache_and_runtime_atomically() -> Result<()> {
+    let address = Address::repeat_byte(0xdf);
+    let slot = U256::from(44);
+    let mut cache = setup_cache().await?;
+    let _ = cache.apply_update(&StateUpdate::slot(address, slot, U256::from(10)));
+    let mut runtime = ReactiveRuntime::<Ethereum>::new(ReactiveConfig::default());
+    runtime.register_handler(Arc::new(FailOnBlockWriter {
+        address,
+        slot,
+        fail_on: 801,
+    }))?;
+    let records = vec![
+        (
+            ReactiveInput::Log(rpc_log(address, vec![keccak256(b"Event()")], 800, 0, 0)),
+            included_context(800, 0),
+        ),
+        (
+            ReactiveInput::Log(rpc_log(address, vec![keccak256(b"Event()")], 801, 0, 0)),
+            included_context(801, 0),
+        ),
+    ];
+
+    runtime
+        .ingest_batch(&mut cache, batch(records))
+        .expect_err("the later record fails the whole batch");
+
+    assert_eq!(
+        cache.cached_storage_value(address, slot),
+        Some(U256::from(10)),
+        "earlier record writes must be rolled back"
+    );
+    assert!(runtime.last_canonical_block().is_none());
+    assert!(!runtime.has_journaled_handler_effects(&HandlerId::new("transactional-failure")));
     Ok(())
 }
 
@@ -946,7 +1027,7 @@ async fn reactive_runtime_batches_exact_resync_cancellation_in_queue_order() -> 
 
     assert_eq!(cancelled.len(), 2 * BACKLOG_EVENTS as usize);
     assert!(
-        cancelled.chunks_exact(2).all(|requests| {
+        cancelled.as_chunks::<2>().0.iter().all(|requests| {
             requests[0].id == ResyncId::new("pool-a") && requests[1].id == ResyncId::new("pool-b")
         }),
         "cancelled requests retain pending-queue order, not caller ID order"

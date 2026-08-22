@@ -46,9 +46,86 @@ around three capabilities that target exactly this workload:
 > exponential-backoff reconnect, and `get_logs` backfill) plus protocol-neutral
 > cold-start (2); and the optimistic verify-and-rerun loop (3). Honest remaining
 > transport work: full block bodies and full pending-transaction hydration are
-> follow-ups; owner-scoped log backfill is available for newly added reactive
-> interests. The public API still changes
+> follow-ups. Mid-lifecycle log owners use coordinated subscribe-first catch-up:
+> exact retained-block replay is owner-scoped, while later history uses global
+> canonical routing so every handler and rollback journal stays aligned. The
+> public API still changes
 > between minor versions — see [Stability](#stability).
+
+## Migrating to 0.4
+
+The reactive subscriber contract became asynchronous and explicitly durable in
+0.4. Existing consumers and extension crates should make these changes:
+
+- Await `ReactiveEngine` handler registration, bootstrap synchronization, and
+  unregistration calls. Subscriber desired state now commits before runtime
+  routing changes.
+- Update `EventSubscriber::register_interests` and every mutating
+  `InterestOwnerSubscriber` method (`upsert_*`, `replace_*`, owner add/backfill/
+  coordinated-catchup, and removal) to return `SubscriberOperation`. A failed or
+  cancelled future must leave the previous desired state authoritative, or block
+  delivery until reconciliation.
+- Handle `ReactiveEngine::into_parts` as fallible. An engine with a pending ACK
+  or checkpoint commit is returned intact in `Err(Box<ReactiveEngine<...>>)` so
+  protocol state cannot be silently discarded.
+- Treat `register_handler_with_backfill` as exact retained-block replay only:
+  start, end, and hash-certified anchor must name one block still present in the
+  runtime rollback journal. Use ordinary global canonical catch-up for wider
+  history; `register_handler` performs the coordinated mid-lifecycle path.
+- Construct `SubscriberConfig` with `..SubscriberConfig::default()` or provide
+  the new pending-record, pending-backfill, historical-byte, and reconcile
+  concurrency limits explicitly.
+- Implement `EventSubscriber::chain_id` for provider-backed and composite
+  sources. Resolve one authoritative network before delivery, reject mixed
+  child networks, stamp record contexts, and set
+  `ReactiveInputBatch::with_chain_id` on control-only batches.
+- Advertise `SubscriberCapability::DurableReplay` only when the complete
+  committed position survives reconnect and process restart without a gap. A
+  composite may rebuild an ephemeral live child by reconciling from a durable
+  historical cursor, but it must close that cutover before exposing live input.
+  Durable ACKs must be idempotent; a re-emitted token must identify the same
+  immutable delivery, and `restore_position` must preserve the old position on
+  error or retain only the exact restore as delivery-blocking pending intent.
+  Checkpointed ingest/restore rejects subscribers that do not uphold this
+  contract. `SubscriberResumePosition::new` now also requires the chain id.
+- For every tokened batch containing `BlockHeader`, `FullBlock`, or hydrated
+  `PendingTx` records, attach a stable `SubscriberPayloadCommitment` with
+  `ReactiveInputBatch::with_payload_commitment`. Compute it from a deterministic
+  canonical encoding of the complete provider payload; durable ingestion fails
+  closed when the core cannot witness these generic payloads and no commitment
+  is present.
+- Replace empty handler identities. `HandlerId::new("")` now panics and
+  deserialization rejects the reserved empty value; use a stable non-empty id,
+  or `HandlerId::try_new` when validating untrusted configuration.
+- Reinstall manual block-environment overrides after `EvmCache::set_block` or
+  `repin_to_block`. Repinning clears `NUMBER`, `BASEFEE`, `COINBASE`,
+  `PREVRANDAO`, `GASLIMIT`, and timestamp provenance. Prefer `advance_block`
+  when a complete canonical header is available.
+- Choose an explicit `SubscriberConfig::preconfirmations` policy. The default is
+  `PreconfirmationMode::Disabled`; `Preferred` falls back on unsupported chains,
+  keeps canonical subscriptions live through Flashblocks rejection,
+  termination, and background reconnect exhaustion, while `Required` fails
+  closed when the chain, transport, or stable provider identity cannot supply
+  Flashblocks.
+- Attach a `ProviderRef` to Flashblocks-enabled `AlloySubscriber` sessions. The
+  endpoint ID is propagated into every preconfirmed record so pending reads can
+  remain pinned to the announcing provider and later canonical reads can prefer it.
+- Enable `raw-flashblocks-json` only when an application receives the supported
+  receipt-enriched indexed JSON profile on a separate source socket. The crate
+  converts application-data frames but never opens, reconnects, or rate-limits
+  that socket. `BufferedRawJsonFlashblocksAdapter` optionally tolerates exactly
+  one missing index and one future frame for 300–500 milliseconds; the caller
+  still owns the monotonic timer and every lifecycle decision.
+- Use `SimulationCancellationToken` with
+  `EvmOverlay::call_raw_with_access_list_with_cancellation` when a provider-free
+  blocking simulation scope must be superseded after it has entered REVM. One
+  scope may be cloned across related multi-chain or access-list replay calls;
+  it cannot be reset and must not be carried to a later independent candidate.
+  `has_started()` reports the first instruction boundary reached by any call in
+  the scope, and a cancelled call returns `OverlayError::Cancelled` after
+  reverting its overlay checkpoint. Cancellation is observed between EVM
+  instructions, not inside an executing database callback or precompile. The
+  existing overlay call APIs remain unchanged.
 
 ## What it provides today
 
@@ -56,7 +133,11 @@ around three capabilities that target exactly this workload:
   on-disk persistence for accounts, storage, bytecode, and immutable metadata.
 - **Snapshots and overlays** — `snapshot()` produces an immutable,
   `Send + Sync` point-in-time view; each `EvmOverlay` is a cheap clone that
-  simulates in isolation, ideal for parallel candidate evaluation.
+  simulates in isolation, ideal for parallel candidate evaluation. A caller may
+  bind a cloneable `SimulationCancellationToken` scope to related access-list
+  call paths to stop stale REVM work at an instruction boundary without
+  provider I/O or changing uncancelled results. Construct the overlay without
+  an external database for that wholly provider-free guarantee.
 - **Bundle simulation** — `simulate_bundle` applies an ordered sequence of
   transactions over cumulative block state (each transaction sees the previous
   one's writes), with an `Atomic` / `AllowReverts(indices)` revert policy and
@@ -79,7 +160,7 @@ around three capabilities that target exactly this workload:
 - **Reactive runtime** — register pure handlers for logs, block notifications,
   and pending transaction signals. Handlers emit `StateUpdate`s, invalidations,
   resync requests, speculative signals, and hook signals; the runtime routes
-  inputs, deduplicates and orders canonical logs, validates pending semantics,
+  inputs, deduplicates and orders canonical logs within each batch, validates pending semantics,
   applies canonical cache mutations through `EvmCache::apply_updates`, and
   can optionally execute storage resync requests through the cache's
   provider-neutral storage batch fetcher before dispatching reports to hooks.
@@ -93,9 +174,24 @@ around three capabilities that target exactly this workload:
   The Alloy subscriber additionally merges compatible logical filters into
   provider-side address/topic supersets and splits them only at
   `SubscriberConfig::max_log_addresses_per_subscription` (default `1,024`).
+  Cross-batch replay/overlap remains the subscriber's responsibility: the
+  runtime intentionally carries no unbounded global input history. The Alloy
+  subscriber maintains bounded canonical and per-owner dedupe windows, and
+  fails closed if configured pending-record, lazy-backfill, historical-response,
+  or reconcile-concurrency limits are exceeded.
+  Every batch also carries an authoritative chain identity when available.
+  Record contexts and subscriber identity must agree with `EvmCache::chain_id`,
+  and control-only reorg/finality/barrier batches must set
+  `ReactiveInputBatch::with_chain_id`; mismatches fail before runtime mutation.
   Every delivered log is still matched against its original owner filter
   locally, so fan-in reduces WebSocket round trips without broadening logical
-  delivery.
+  delivery. Historical catch-up retains handler provenance through
+  `DeliveryAudience`, including mixed batches with record-level audiences, so
+  overlapping existing handlers do not re-apply a new owner's backfill. Its
+  `DeliveryScope::OwnerCatchup` records update only the requesting handler and
+  cannot rewind global canonical coverage, block context, finality, or the
+  rollback journal; ordinary historical recovery uses
+  `DeliveryScope::CanonicalProgress` and remains authoritative.
   Handlers with a complete static route set can return a `LogRouteIndex` of
   exact emitter, topic, or data-slice keys; registry inspection and live
   ingestion then select only matching indexed handlers plus legacy fallback
@@ -115,21 +211,29 @@ around three capabilities that target exactly this workload:
   immediately, retries three times by default with exponential backoff between
   later attempts, and backfills log subscriptions from the last seen block
   through `get_logs`, marking recovered records as `InputSource::Backfill` while
-  suppressing recent duplicate canonical inputs. HTTP polling `watch_logs` /
+  suppressing recent duplicate canonical inputs. Alloy catch-up issues one
+  complete-range `eth_getLogs` request per filter/window: the configured
+  response-byte limit rejects an oversized decoded result but does not split
+  the range or avoid provider result caps. Keep live registration/reconnect
+  windows bounded; use HyperSync (or another indexing `EventSubscriber`) for
+  deep or high-density history. HTTP polling `watch_logs` /
   `watch_pending_transactions` remains available behind the opt-in
   `reactive-polling` feature. For pool/feed churn (register a new AMM on a
   `PoolCreated` event; drop one that is no longer of interest), the recommended
   binding is `ReactiveEngine`, which owns a `ReactiveRuntime` plus an
   `EventSubscriber` and drives handler lifecycle as one operation:
-  `engine.register_handler(handler)` updates runtime routing and subscriber
-  interests together and — once ingestion has journaled a canonical block —
-  **backfills the new handler from that block automatically**, so a pool
-  discovered mid-stream misses none of its own logs between discovery and live
-  subscription (`register_handler_with_backfill` for deeper history,
+  `engine.register_handler(handler).await` commits subscriber interests before
+  runtime routing and — once ingestion has journaled a canonical block —
+  installs the live desired state first, replays the new owner at the retained
+  block, then catches the complete handler union up globally from the following
+  block through activation. A pool discovered mid-stream therefore misses no
+  logs and every later effect remains globally rollbackable
+  (`register_handler_with_backfill` for one explicit hash-certified
+  retained-block replay only,
   `register_handler_live_only` to opt out). Growing an existing handler's filter
   set is continuity-safe too: the changed subscription inherits the old delivery
   anchor and self-heals the gap. Use stable per-pool or per-adapter `HandlerId`
-  values. Dropping an adapter is `engine.unregister_handler(&id)` for
+  values. Dropping an adapter is `engine.unregister_handler(&id).await` for
   routing/transport, followed by
   `runtime.cancel_pending_resyncs_by_id(&request_ids)` once for all requests
   owned by that exact handler generation (or `cancel_pending_resync` for a
@@ -138,6 +242,311 @@ around three capabilities that target exactly this workload:
   vaults require caller-side ownership tracking. Cache eviction stays an
   explicit caller action. Full block bodies and full pending
   transaction hydration remain explicit follow-up transport work.
+
+  Durable subscribers may attach an opaque `SubscriberDeliveryToken` to each
+  `ReactiveInputBatch`; the engine invokes `acknowledge_delivery` only after
+  successful runtime ingestion (including the resync-executing path). A failed
+  acknowledgement is distinguishable from an ingest failure and leaves the
+  subscriber free to replay the batch with at-least-once semantics. For
+  restart-safe state, use `DurableCheckpointStore` with
+  `next_ingest_checkpointed` (or
+  `next_ingest_with_resync_checkpointed`): the engine atomically persists the
+  complete two-layer cache state, canonical block identity, subscriber identity,
+  handler-schema id, delivery token, and a core witness over that delivery's
+  validated identities, exact log payloads, routing, controls, and cursor
+  **before** acknowledgement. Network-generic full-block and hydrated-transaction
+  bodies remain part of the subscriber's immutable token contract because the
+  core cannot serialize every network response type. Disk or ACK failure
+  is retried before another batch is polled. A restored token suppresses
+  cross-process replay only when the incoming delivery reproduces its persisted
+  witness; token reuse with a different payload or cursor fails before ACK.
+  Once a commit is pending, a caller-side cache mutation fails closed rather
+  than being rebound to the older delivery metadata; restart from the last
+  durable checkpoint to recover that misuse.
+  Checkpointed ingestion and restore require the subscriber to advertise
+  `SubscriberCapability::DurableReplay`; the in-crate Alloy subscriber is an
+  ephemeral live transport and intentionally does not advertise it. Pair Alloy
+  with ordinary ingestion, or use a durable remote/provider extension for
+  restart-safe cursor replay. Load and
+  inspect the checkpoint metadata first and validate any non-finalized block
+  hash against an authoritative RPC. Prefer
+  `ReactiveEngine::restore_durable_checkpoint` to restore the already configured
+  cache, runtime, and subscriber atomically; the lower-level cache and engine
+  restore calls remain available when an application supplies its own
+  transaction boundary. A durable subscriber that needs asynchronous source
+  preparation before the synchronous restore hook can call
+  `ReactiveEngine::preview_durable_resume_position` on that same fresh engine,
+  await its provider-specific preparation with the returned position, and then
+  restore the identical checkpoint metadata. Preview and restore share one
+  validated runtime plan, including configured journal retention, so extensions
+  never need to decode the core's private runtime checkpoint or guess its
+  canonical history. Checkpointed ingestion needs a canonical coverage
+  anchor: a pending-transaction-only process must first restore an existing
+  canonical checkpoint or observe canonical progress, otherwise it returns
+  `MissingCheckpointBlock` without acknowledging the delivery. The ordinary warm-cache files
+  remain independent startup accelerators and are not a transaction boundary.
+  Durable files carry an integrity checksum and have a configurable 512 MiB
+  default encoded/file size ceiling. The ceiling bounds read and encode buffers,
+  but snapshot capture first owns a cache-state clone, whose memory must be
+  budgeted separately. The checksum detects damage but is not authentication;
+  protect the checkpoint path with normal service filesystem permissions. All
+  stores for one normalized path share in-process writer ordering, but a
+  deployment must still assign that path to exactly one writer process.
+  Snapshot capture holds the backend account, storage, and block-hash read locks
+  together, so queued lazy population cannot produce a torn combination of map
+  generations. The persisted exact block pin, `NUMBER`, and optional timestamp
+  are normalized to checkpoint metadata; header-only fields (`BASEFEE`,
+  `COINBASE`, `PREVRANDAO`, and `GASLIMIT`) are cleared when compact progress did
+  not prove them for that block.
+  Provider-neutral extensions can additionally attach an opaque
+  `SubscriberCheckpoint` for native resume state and advertise their exact
+  `SubscriberCapabilities`; the default capability set is empty so topology
+  validation fails closed. Reorg, safe/finalized, and source-cutover signals use
+  ordered in-band `ChainControl` values rather than an unordered side channel.
+  Barriers can certify an empty event range and advance the checkpoint coverage
+  anchor. `CanonicalProgress` and a block-bearing barrier prove **event-stream
+  coverage**, not a complete EVM header: they exact-hash pin lazy reads and
+  install known `NUMBER`/timestamp metadata, but clear unproven `BASEFEE`,
+  `COINBASE`, `PREVRANDAO`, and `GASLIMIT` values. A simulation that depends on
+  those opcodes is not header-ready until a full canonical header has been
+  ingested. Reorg controls execute before their replacement records; progress,
+  barrier, safe, and finalized controls execute after the records they certify.
+  A batch that interleaves those phases ambiguously is rejected before mutation.
+  Checkpoints persist the safe/finalized heads, pending repair queue,
+  bounded rollback journal, handler lifecycle provenance, freshness/root-gate
+  state, and metrics alongside cache state, so ACKed controls and in-window
+  rollback remain valid after restart. Contradictory controls—such as
+  a mismatched reorg old tip, finality regression, or a reorg crossing finalized
+  state—are rejected before mutation. Checkpointed ingestion also rejects an
+  explicit, implicit-parent, or removed-log reorg whose required rollback proof
+  is outside the retained effect journal, because partially rolled-back cache
+  state must never be saved and ACKed. Size
+  `ReactiveConfig::journal_depth` to at least the complete reorg horizon promised
+  by the subscriber. Direct batch ingestion is transactional on
+  errors by taking one complete mutable-cache snapshot; preserve source batching
+  to amortize that cost. Hooks run only after a batch has staged successfully,
+  but are in-process observers rather than a durable outbox, so externally
+  visible effects need idempotency and their own durable delivery. Serialization,
+  file writes, fsync, rename, and directory fsync run on Tokio's blocking pool;
+  snapshot capture itself is synchronous and temporarily owns that state copy.
+  The companion
+  [`evm-fork-cache-remote`](https://crates.io/crates/evm-fork-cache-remote) and
+  [`evm-fork-cache-hypersync`](https://crates.io/crates/evm-fork-cache-hypersync)
+  crates implement the versioned remote service client and a durable HyperSync
+  source without coupling provider-native types into this core crate.
+
+### Flashblocks delivery profiles
+
+Flashblocks are an opt-in subscriber mode layered onto the same handler and
+runtime path as canonical events:
+
+```rust,no_run
+use std::time::Duration;
+use evm_fork_cache::reactive::{
+    AlloySubscriber, PreconfirmationMode, ProviderRef, SubscriberConfig,
+    SubscriberMode,
+};
+# use alloy_network::Ethereum;
+# use alloy_provider::Provider;
+# fn configure<P: Provider<Ethereum>>(provider: P) {
+let config = SubscriberConfig {
+    preconfirmations: PreconfirmationMode::Required,
+    flashblock_poll_interval: Duration::from_millis(100),
+    ..SubscriberConfig::default()
+};
+let subscriber = AlloySubscriber::new(provider, SubscriberMode::PubSub, config)
+    .with_provider_ref(ProviderRef::new("flashblocks-primary", 1));
+# let _ = subscriber;
+# }
+```
+
+- **Base** (`8453`, `84532`) consumes native `newFlashblocks` plus
+  filter-shaped `pendingLogs`. Both subscription lanes and every recovery read
+  share one provider lease and generation.
+- Pending logs are buffered until the cumulative preview for the same block
+  contains their transaction hash. Provider-supplied zero `hash`/`blockHash`
+  placeholders are never used as identities; each exact cumulative view instead
+  receives a non-zero, provider-generation-scoped content commitment.
+- Indexed gaps recover once from the endpoint's cumulative `pending` snapshot.
+  Conflicting duplicate indices, duplicate transaction membership, an
+  unrecoverable gap, or either Base subscription ending invalidates the
+  complete speculative generation before reconnect I/O.
+- On Base Flashblocks endpoints, canonical progress is certified at
+  `canonical_head_poll_interval` through `eth_getBlockByNumber("latest")`.
+  Each certification is bounded by `canonical_head_request_timeout` (three
+  seconds by default); expiry fails the subscriber generation closed so its
+  owner can rotate the pinned provider.
+  The provider's `newHeads` feed is not trusted because Flashblocks-aware
+  endpoints may expose partial/preconfirmed progress through it.
+- **OP** (`10`, `11155420`) uses one generation-pinned sampler for the standard
+  `pending` block surface, exact hash-addressed parent certification, filtered
+  pending logs, and bounded exact transaction receipts. The sampler runs at
+  `flashblock_poll_interval`, deduplicates cumulative views, rejects
+  non-monotonic transaction membership, and enforces
+  `max_flashblock_rpc_requests_per_second` across actual method calls.
+- A separate state provider may be paired with the event provider through
+  `with_flashblocks_state_provider`; preflight verifies the paired chain before
+  publishing any pending data. This lets applications keep a WebSocket lease
+  for canonical streams while routing OP pending reads through the matching
+  provider's request/response endpoint.
+
+The built-in adapters emit `ChainStatus::Preconfirmed`, `InputSource::Flashblocks`, and
+`DeliveryScope::Preconfirmed`. `ReactiveRuntime` applies each cumulative
+Flashblock to a disposable overlay: a newer payload/provider generation replaces
+the previous preview, canonical input restores the saved canonical state before
+commit, and `discard_preconfirmation` restores it explicitly. The cache pins
+preconfirmed reads to `pending` and installs the preview's complete available
+EVM block environment. Admission requires an adopted canonical coverage head:
+the preview number must be exactly `canonical + 1` and its parent hash must equal
+the canonical coverage hash. A missing baseline, wrong or missing parent, or
+stale replay after canonical advancement revokes the active overlay and fails
+closed. Preconfirmed resyncs also use the `pending` block tag.
+The overlay never advances canonical
+coverage, finality, health, rollback journals, or durable checkpoints; the
+checkpointed engine rejects speculative batches rather than persisting them.
+
+After registering at least one active log interest, call
+`AlloySubscriber::establish_flashblocks_preflight(expected_chain_id)` with a
+15-second outer timeout. It verifies the pinned Base or OP chain and retains an
+optional opaque `op_supportedCapabilities` response. Base acknowledges both
+native subscription lanes; OP probes its bounded pending block, exact parent,
+filtered log, and receipt methods. The returned filter/subscription counts make
+the covered stream set explicit. Endpoint
+qualification still requires a live acceptance window that observes advancing
+Flashblocks and a correlated active-pool pending log; acknowledgement or a
+successful probe alone is not liveness.
+
+#### Receipt-enriched raw JSON adapter
+
+The default-off `raw-flashblocks-json` feature adds a chain-neutral converter
+for one explicit wire profile: `payload_id`, a monotonically increasing `index`,
+an index-zero `base` (or `static`) header, transaction deltas in
+`diff.transactions`, and an exact receipt map in `metadata.receipts`. It does
+not accept JSON-RPC subscription envelopes, receipt-less previews, or binary
+SSZ frames. Compatibility is determined by this schema, not by a chain allowlist
+or provider name.
+
+The adapter performs no network I/O and adds no WebSocket dependency. The
+application owns authentication, control frames, bounded channel capacity,
+inactivity detection, retry, backoff, and provider rotation. It should pass
+only complete application-data frames to the adapter:
+
+```rust,ignore
+use evm_fork_cache::reactive::{
+    AlloySubscriber, PreconfirmationMode, ProviderRef, RawJsonFlashblocksAdapter,
+    SubscriberConfig, SubscriberMode,
+};
+
+let source = ProviderRef::new("supplemental-flashblocks", generation);
+let mut adapter = RawJsonFlashblocksAdapter::new(source.clone());
+let mut subscriber = AlloySubscriber::new(canonical_provider, SubscriberMode::PubSub,
+    SubscriberConfig {
+        preconfirmations: PreconfirmationMode::Preferred,
+        ..SubscriberConfig::default()
+    });
+subscriber.configure_external_flashblock_updates(source)?;
+let updates = subscriber.open_external_flashblock_update_channel(1_024)?;
+
+// `subscriber` may now move into another runtime owner. The source task keeps
+// the bounded sender and remains responsible for socket lifecycle policy.
+
+match adapter.ingest_json(application_frame) {
+    Ok(Some(update)) => updates.send(update).await?,
+    Ok(None) => {} // identical duplicate or remainder of an invalid generation
+    Err(error) => {
+        // Treat an untrusted application-data error as a source-generation
+        // failure. Forward reset()'s invalidation before reconnecting outside
+        // the crate with a fresh ProviderRef generation.
+        let next_source = ProviderRef::new(
+            adapter.provider().endpoint.clone(),
+            adapter.provider().generation.saturating_add(1),
+        );
+        if let Some(invalidation) = adapter.reset(next_source)? {
+            updates.send(invalidation).await?;
+        }
+    }
+}
+```
+
+Selecting external updates suppresses only the built-in native/pending
+Flashblocks source. Ordinary canonical log and block-header subscriptions stay
+active, so speculative delivery remains additive and canonical reconciliation
+is unchanged. `ingest_flashblock_update` is synchronous, validates source
+generation, exact indexed sequencing, stable base identity, cumulative
+transaction prefixes, delta-log membership, log identity, and the content
+commitment, and performs no provider request. Stale snapshots and invalidations
+cannot revoke a newer generation. The optional bounded channel is an in-process
+ownership seam, not a transport or retry loop. `send(...).await` completes only
+after subscriber validation; `try_send` returns an acknowledgement receipt whose
+`wait` method reports that later verdict. `Rejected` requires the application to
+revoke and reconnect the source generation. Recoverable local-capacity rejection
+does not permanently quarantine the endpoint. Channel closure revokes the active
+preview, keeps canonical delivery alive in preferred mode, and fails required
+mode closed. Call `RawJsonFlashblocksAdapter::reset` and forward its returned
+invalidation whenever the source disconnects, is replaced, or returns an
+application-data or subscriber-admission error that cannot be proven irrelevant.
+
+Sources that have demonstrated occasional one-index delivery reordering may
+instead wrap the same normalization behavior with
+`BufferedRawJsonFlashblocksAdapter`. `ingest_json_at(frame, now_millis)` returns
+zero updates while it retains `expected + 1`, or the missing and retained
+snapshots in order when `expected` arrives before the deadline.
+`buffered_gap()` exposes `(missing_index, buffered_index, expires_at_millis)` so
+the application can schedule its own timer; it must call `expire_gap_at` at or
+after that deadline. Expiry emits `FlashblockInvalidationReason::IndexGap`,
+discards the one retained frame, and ignores late remainder frames until a new
+payload begins. Malformed data, conflicting duplicates, resource violations,
+and a second gap still fail immediately. The timeout is construction-bounded to
+300–500 milliseconds and the wrapper can retain only one parsed frame.
+
+This buffer is not a canonical-state cache and does not authorize trading or
+other downstream triggers. Its outputs remain speculative standardized updates
+subject to the subscriber's normal provenance, lineage, invalidation, and
+canonical reconciliation checks. `RawJsonFlashblocksAdapter` itself retains its
+existing immediate gap-invalidation semantics.
+
+Latency-sensitive callers may use `ingest_json_timed_at` and convert each
+`TimedFlashblockUpdate::source_ingress_millis` into their process-local
+`Instant` before `send_with_ingress`. A future frame retained across the single
+allowed gap keeps the arrival supplied with that frame; it is not restamped
+when the missing frame drains. `ReactiveInputBatch::preconfirmation_timing`
+then exposes the earliest contributing source arrival. This optional metadata
+is provider-free and observability-only: it never changes ordering, identity,
+canonical state, or trigger authority.
+
+For an externally managed source,
+`establish_flashblocks_preflight(expected_chain_id)` verifies the canonical
+subscriber's chain and stream topology but deliberately performs zero
+Flashblocks request/response calls. Notification liveness, schema compatibility,
+and active-interest coverage remain application acceptance checks.
+
+### Execution read-set warming
+
+`StorageAccessList` covers accounts, runtime-code identities, storage slots, and
+`BLOCKHASH` dependencies. Provider-backed caches can discover large unknown call
+read sets with exact-block `eth_createAccessList` probes through
+`EvmCache::prewarm_read_sets`; small or declared sets continue through the
+ordinary bulk loader. Required discovery fails with a typed error when no
+callback is installed or when it violates the one-result-per-call contract;
+individual provider failures remain indexed in the successful batch report.
+
+`EvmCache::hydrate_read_set` refreshes account headers and requested storage
+together with exact-pin `eth_getProof`, reports incomplete or malformed proof
+responses with typed causes, and rejects a runtime-code hash change instead of
+reusing slot identifiers across layouts. Because `eth_getProof` returns a code
+hash rather than bytecode, deployed runtime code must already be resident before
+exact hydration. Historical block hashes must likewise already be retained in
+the canonical cache. Absent bytecode or block hashes remain in `missing_after`,
+so `ReadSetHydrationReport::is_complete` stays false and callers can reject the
+candidate without an implicit hot-path read.
+
+Snapshots expose `resident_read_set` and `missing_read_set`, retain cached block
+hashes, and RPC-disconnected overlays return a precise `MissingState`. Consumers
+can therefore warm a canonical baseline before attaching subscriptions, prove a
+speculative simulation performed no provider reads, and carry newly discovered
+dependencies into the next canonical hydration cycle without issuing RPCs on a
+Flashblock hot path.
+
 - **Cold-start** — declaratively warm a working set of accounts and storage slots
   into the cache in one batched pass via `EvmCache::run_cold_start` and a
   `ColdStartPlanner` (discover slots via a view-call, then verify them), returning
@@ -201,6 +610,47 @@ around three capabilities that target exactly this workload:
   and `Panic(uint256)`) decode natively; register your own contract-defined
   custom errors in one line. Duplicate custom-error selectors keep the first
   registration and can be rejected explicitly with `try_register*`.
+
+### Composing event sources safely
+
+Remote and hybrid subscribers can keep a `CanonicalSequenceState` beside their
+own cursor and validate each complete delivery with
+`validate_canonical_sequence` before forwarding it. The result exposes the
+post-reorg/pre-record state, the fully validated next state, and ordered
+cache-free `CanonicalSequenceMutation`s. Implicit replacements identify the
+exact adjacent surviving parent and emit `Rewind` before `Canonical`; safe and
+finalized heads can never outrun canonical coverage. Strict public validation
+and checkpointed engine ingestion reject any rollback outside the retained
+history, while ordinary non-checkpointed runtime ingestion keeps its existing
+observable deep-reorg/degraded-health behavior. Checkpoint preflight and runtime
+validation use this same transition implementation rather than parallel state
+machines.
+
+Use `validate_canonical_sequence_diagnostic` (or the normalization counterpart)
+when recovery policy must distinguish intrinsically invalid input from
+`CanonicalSequenceError::IncompleteRollback`. The latter exposes a stable
+`CanonicalRollbackKind`, required ancestor, and oldest retained height;
+`requires_history()` supports a simple retry-with-older-history branch without
+parsing error prose. The original functions remain ergonomic wrappers returning
+`ReactiveError`. Sequence validation covers canonical metadata, not network
+binding: `CanonicalSequenceState` intentionally has no chain id, so a remote or
+composite service must enforce one authoritative chain before sharing it.
+
+For a historical/live cutover, use
+`normalize_and_validate_canonical_sequence`. It drops exact compatible older
+progress, preserves an older barrier as the same id with `block: None`, and
+retains equal-height progress/barriers that add missing parent or timestamp
+metadata. Older enrichment is intentionally not applied when its regressive
+control is not forwarded, keeping the extension state convergent with the
+runtime. Unknown or conflicting overlap remains an error.
+
+Stage the returned state and mutations atomically and commit them only at the
+same durable boundary as the source cursor/ACK. `CanonicalSequenceState` derives
+serde for caller convenience, but its serialized Rust layout is **not** a
+stable wire/checkpoint protocol. Persist it inside an application-owned,
+versioned envelope with explicit migrations. Validation does not silently trim
+history; call `retain_recent_history` after the matching cursor/ACK commits and
+keep a horizon at least as deep as the deployment's supported reorg window.
 
 ## Quick start
 
@@ -359,18 +809,33 @@ endpoint (they print instructions and exit if it is unset):
 | `bulk_storage_bench` | Advanced | Benchmark bulk `eth_call` storage extraction vs point reads: scaling, multicall dispatch, a full Uniswap V3 tick-range load, gzip, verified code-seed cold starts, and the provider's chunk ceiling. |
 | `fork_override_balance` | Intermediate | Discover a real token's balance slot and override it. |
 | `reactive_alloy_amm_live_probe` | Advanced | Subscribe to live mainnet AMM logs through the WebSocket-backed `AlloySubscriber`. |
+| `raw_json_flashblocks_subscriber_acceptance` | Advanced | Feed a caller-owned receipt-enriched raw WebSocket through the standardized subscriber path and correlate swap logs with an independent canonical WebSocket. Requires the default-off raw adapter feature and performs no HTTP RPC. |
 
 ```sh
 cargo run --example revert_decoding
 RPC_URL=https://eth.llamarpc.com cargo run --example fork_token_balance
 WS_RPC_URL=wss://example-mainnet-endpoint cargo run --example reactive_alloy_amm_live_probe
+RAW_FLASHBLOCKS_WS_URL=wss://raw-endpoint.example \
+CANONICAL_WS_URL=wss://canonical-endpoint.example \
+cargo run --release --features raw-flashblocks-json,reactive-ws \
+  --example raw_json_flashblocks_subscriber_acceptance
 ```
+
+The point-in-time raw/canonical acceptance results and their exact safety
+boundary are recorded in
+[`docs/raw-json-flashblocks-acceptance.md`](docs/raw-json-flashblocks-acceptance.md).
+They qualify the supported wire profile observed in that run, not every raw
+Flashblocks provider or future schema revision.
 
 ## Feature Flags
 
 Default features enable the reactive runtime and WebSocket/pubsub subscriber
 support (`reactive`, `reactive-ws`). The HTTP polling subscriber is opt-in:
 consumers that disable defaults can enable `reactive,reactive-polling`.
+The receipt-enriched raw JSON adapter is separately opt-in through
+`raw-flashblocks-json`. Its networked acceptance example owns one passive raw
+socket solely to demonstrate the consumer boundary; the library dependency
+surface still contains no raw-socket transport or reconnect policy.
 
 ## Foundry artifact etching
 
@@ -559,10 +1024,21 @@ deployments should opt into the strict/observable variants deliberately:
 - [ ] **Size reorg horizons deliberately.** `ReorgConfig::depth` and
   `ReactiveConfig::journal_depth` bound purge/rollback reach: a reorg *within* the
   journal is rolled back precisely, but effects from blocks that have already aged
-  out of the journal are **not** auto-purged. A reorg that deep escalates health
-  to `Unhealthy` (with a `warn!`) and leans on freshness validation as the
-  backstop — treat it as "resync before trusting sims" and size the horizons above
-  the deepest reorg you intend to recover precisely.
+  out of the journal are **not** auto-purged. The first incomplete recovery
+  degrades health and a repeated one escalates it to `Unhealthy`; freshness
+  validation is the backstop. Treat either as "resync before trusting sims" and size the horizons above
+  the deepest reorg you intend to recover precisely. Checkpointed ingestion
+  fails closed before applying or ACKing any explicit, implicit-parent, or
+  removed-log rollback outside the retained runtime journal; configure
+  `journal_depth` at least as deep as the event
+  source's advertised recovery window so production ingestion can continue.
+- [ ] **Treat a replacement branch as a cache-coherency boundary.** Journaled
+  reactive effects and cached `BLOCKHASH` entries are rolled back or invalidated,
+  but ordinary account/storage values populated lazily by `SharedBackend` are
+  not tagged with the branch hash that produced them. If a reorg can change a
+  lazily fetched value that no handler owns, explicitly purge/resync the affected
+  account (or rebuild the cache) before trusting simulations on the replacement
+  branch. See `docs/KNOWN_ISSUES.md` for the distinction from journal depth.
 - [ ] **Know your provider.** The default bulk storage loader needs `eth_call`
   state-override support (major providers have it; the fetcher latches to
   point reads after two fully-failed batches — a `warn!` you should alert on, or
@@ -595,6 +1071,24 @@ provider) so they are reproducible:
 | `create3` | CREATE3 address derivation. |
 | `mapping_probe` | **Trace-based slot discovery.** `discover_erc20_balance_slot` across Solidity/Vyper/Solady (near-identical — the sim dominates, layout detection is a few hash checks); end-to-end balance forging **cold vs. descriptor-cached**; overlay `mock_balance`; and typed `call_sol` vs. `call_raw` + manual decode (within noise). |
 | `reactive_routing` | Indexed log hit/miss routing versus compatibility scans, plus fallback/distinct/shared-key handler churn at 16–4,096 handlers. |
+| `raw_json_flashblocks` | Default-off receipt-enriched JSON conversion at one- and two-index fixtures, a 250-transaction/500-log payload, a bounded stress frame close to the 16 MiB compatibility ceiling, and standardized-update queue admission. No socket or provider I/O. |
+
+An Apple M1 Pro `arm64` release run on 2026-08-06 measured Criterion point
+estimates of 4.814 µs for index-zero conversion, 3.440 µs for a following
+delta, 459.46 µs (217.36 MiB/s) for the 250-transaction/500-log payload, and
+9.496 µs for batched non-blocking queue admission. Subscriber validation and
+its acknowledgement are excluded from that microbenchmark. These are offline
+CPU regression baselines, not notification-lead or end-to-end provider latency.
+The much larger stress case exists to make the worst permitted parsing budget
+visible; the 16 MiB library default is not a recommended production setting.
+Applications should record source frame/count distributions, add explicit
+headroom, and set the four `RawJsonFlashblocksLimits` bounds accordingly. On the
+same Apple M1 Pro in a 2026-08-10 release run, a 15,521,468-byte frame with
+17,000 transactions and 34,000 logs measured 43.051 ms (40.628–46.041 ms
+Criterion interval) and 343.83 MiB/s across 20 Criterion samples. A
+4,108,968-byte application-limit frame with 4,500 transactions and 9,000 logs
+measured 10.522 ms (9.621–11.616 ms) and 372.42 MiB/s; three of its 20 samples
+were high severe outliers and one was high mild.
 
 ```sh
 cargo bench                      # all offline benches
@@ -624,7 +1118,7 @@ protocol-specific storage layouts, and DeFi adapters belong in the companion
 releases** — the roadmap deliberately reshapes the API before the surface
 freezes. Each release documents its breaking changes in [`CHANGELOG.md`](CHANGELOG.md).
 
-- **MSRV:** Rust 1.88 (enforced in CI). Edition 2024.
+- **MSRV:** Rust 1.90 (enforced in CI). Edition 2024.
 - **Semver:** pre-1.0 minor versions may break; patch versions will not.
 - **Roadmap:** see [`docs/ROADMAP.md`](docs/ROADMAP.md) for the path to 1.0.
 - **Known issues / limitations:** see [`docs/KNOWN_ISSUES.md`](docs/KNOWN_ISSUES.md).

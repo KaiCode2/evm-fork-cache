@@ -131,7 +131,7 @@
 //!
 //! This crate is **pre-1.0** and developed against a phased roadmap (see
 //! `docs/ROADMAP.md`). Until 1.0, breaking changes may land in minor releases;
-//! each is recorded in the crate `CHANGELOG.md`. MSRV is Rust 1.88 (edition 2024).
+//! each is recorded in the crate `CHANGELOG.md`. MSRV is Rust 1.90 (edition 2024).
 //!
 //! The `examples/` directory has runnable, documented walkthroughs of each
 //! module — offline ones that need no network, plus a few that fork real chain
@@ -143,6 +143,7 @@ pub mod access_set;
 pub mod bulk_storage;
 pub mod bundle;
 pub mod cache;
+pub mod cancellation;
 #[cfg(feature = "reactive")]
 pub mod cold_start;
 pub mod create3;
@@ -159,6 +160,9 @@ pub mod reactive;
 pub mod state_update;
 pub mod tracing;
 
+pub use cancellation::SimulationCancellationToken;
+
+pub use access_list::{DEFAULT_CREATE_ACCESS_LIST_GAS_CAP, create_access_list_read_set};
 pub use access_set::StorageAccessList;
 // Bulk storage extraction over eth_call state overrides — the default batch
 // storage fetcher since 0.2.0 (see docs/bulk-storage-extraction.md).
@@ -174,12 +178,16 @@ pub use bundle::{BundleOptions, BundleResult, BundleTx, RevertPolicy, TxOutcome}
 // fully-qualified module paths (`cache::EvmCache`, `reactive::ReactiveRuntime`,
 // …) remain valid, so this is purely additive.
 pub use cache::{
-    AccountFieldsFetchFn, AccountProof, AccountProofFetchFn, BlockContextRequirements,
-    BlockStateAccountDiff, BlockStateDiff, BlockStateDiffFetchFn, BlockStateStorageDiff,
-    CacheSpeedMode, CallSimulationResult, CodeMismatch, CodeSeedState, CodeVerifyReport, EvmCache,
-    EvmCacheBuilder, EvmOverlay, EvmSnapshot, PrewarmReport, StorageBatchConfig,
-    StorageFetchStrategy, TxConfig, account_proof_fetcher, point_read_storage_fetcher,
-    provider_storage_fetcher,
+    AccessListFetchFn, AccountFieldsFetchFn, AccountProof, AccountProofFetchFn,
+    BlockContextRequirements, BlockStateAccountDiff, BlockStateDiff, BlockStateDiffFetchFn,
+    BlockStateStorageDiff, CacheSpeedMode, CallSimulationResult, CodeMismatch, CodeSeedState,
+    CodeVerifyReport, DEFAULT_MAX_DURABLE_CHECKPOINT_BYTES, DurableCheckpointBlock,
+    DurableCheckpointError, DurableCheckpointIdentity, DurableCheckpointMetadata,
+    DurableCheckpointStore, EvmCache, EvmCacheBuilder, EvmOverlay, EvmSnapshot,
+    LoadedDurableCheckpoint, PrewarmReport, ReadSetHydrationFailure, ReadSetHydrationReport,
+    ReadSetWarmupBatch, ReadSetWarmupCall, ReadSetWarmupConfig, ReadSetWarmupError,
+    ReadSetWarmupReport, ReadSetWarmupStrategy, StorageBatchConfig, StorageFetchStrategy, TxConfig,
+    account_proof_fetcher, point_read_storage_fetcher, provider_storage_fetcher,
 };
 #[cfg(feature = "reactive")]
 pub use cold_start::{
@@ -214,8 +222,11 @@ pub use mapping_probe::{
 };
 #[cfg(feature = "reactive")]
 pub use reactive::{
-    InterestOwnerSubscriber, ReactiveConfig, ReactiveEngine, ReactiveEngineError,
-    ReactiveEngineRegisterError, ReactiveHandler, ReactiveRuntime,
+    CheckpointedIngest, InterestOwnerSubscriber, ReactiveBaselineError, ReactiveCanonicalBaseline,
+    ReactiveCheckpointRestoreError, ReactiveConfig, ReactiveEngine, ReactiveEngineError,
+    ReactiveEngineRegisterError, ReactiveHandler, ReactiveRuntime, SubscriberPayloadCommitment,
+    SubscriberRpcCause, SubscriberRpcMethod, SubscriberRpcStats, SubscriberStreamGap,
+    SubscriberStreamGapStats,
 };
 pub use state_update::{
     AccountChange, AccountPatch, PurgeRecord, PurgeScope, SkippedAccountPatch, SkippedBalanceDelta,

@@ -273,7 +273,13 @@ pub fn decode_packed_values(data: &[u8], expected: usize) -> Option<Vec<U256>> {
     if data.len() != expected * 32 {
         return None;
     }
-    Some(data.chunks_exact(32).map(U256::from_be_slice).collect())
+    Some(
+        data.as_chunks::<32>()
+            .0
+            .iter()
+            .map(|chunk| U256::from_be_slice(chunk))
+            .collect(),
+    )
 }
 
 /// ABI-encode one `aggregate3` dispatch whose subcalls run the extractor at

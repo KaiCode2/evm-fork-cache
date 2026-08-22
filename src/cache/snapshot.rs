@@ -44,6 +44,8 @@ use alloy_primitives::{Address, B256, U256};
 use revm::primitives::hardfork::SpecId;
 use revm::state::{AccountInfo, Bytecode};
 
+use crate::access_set::StorageAccessList;
+
 /// Memoized, immutable flatten of the **cold layer-2** index (Pillar A).
 ///
 /// Holds layer-2 (`BlockchainDb`) account info and storage only; the layer-1
@@ -103,6 +105,13 @@ pub struct EvmSnapshot {
     /// excluded from `overlay_accounts` / `overlay_code_by_hash`.
     pub(crate) accounts_not_existing: HashSet<Address>,
     pub(crate) block_hashes: HashMap<u64, B256>,
+    /// Hash-pinned block identity captured from the cache's `BlockId`.
+    ///
+    /// This is deliberately separate from `block_hashes`: EVM `BLOCKHASH`
+    /// cannot return the current block's hash, while callers that attest an
+    /// immutable snapshot lineage still need to bind the snapshot to the
+    /// current canonical block.
+    pub(crate) block_context_hash: Option<B256>,
     // Block context
     pub(crate) block_number: Option<u64>,
     pub(crate) basefee: Option<u64>,
@@ -121,6 +130,136 @@ pub struct EvmSnapshot {
 }
 
 impl EvmSnapshot {
+    /// Chain ID captured by this immutable simulation snapshot.
+    pub const fn chain_id(&self) -> u64 {
+        self.chain_id
+    }
+
+    /// Block number installed in the snapshot's EVM context.
+    pub const fn block_number(&self) -> Option<u64> {
+        self.block_number
+    }
+
+    /// Return the exact `BLOCKHASH` value resident for `number` when one was
+    /// captured by this immutable snapshot.
+    ///
+    /// This lookup is provider-free and never infers a hash from the snapshot's
+    /// EVM block context. In particular, [`block_number`](Self::block_number)
+    /// being `Some(number)` does not make that number's hash resident; callers
+    /// receive `None` unless the cache held an explicit block-hash entry when the
+    /// snapshot was created.
+    pub fn block_hash(&self, number: u64) -> Option<B256> {
+        self.block_hashes.get(&number).copied()
+    }
+
+    /// Return the hash-pinned identity of the snapshot's current block context.
+    ///
+    /// This is `Some` only when the source cache was pinned with
+    /// `BlockId::Hash`; number/tag-pinned snapshots return `None`. It is not an
+    /// EVM `BLOCKHASH` value and is therefore kept separate from
+    /// [`block_hash`](Self::block_hash).
+    pub const fn block_context_hash(&self) -> Option<B256> {
+        self.block_context_hash
+    }
+
+    /// Base fee installed in the snapshot's EVM context.
+    pub const fn basefee(&self) -> Option<u64> {
+        self.basefee
+    }
+
+    /// Block beneficiary installed in the snapshot's EVM context.
+    pub const fn coinbase(&self) -> Option<Address> {
+        self.coinbase
+    }
+
+    /// PREVRANDAO value installed in the snapshot's EVM context.
+    pub const fn prevrandao(&self) -> Option<B256> {
+        self.prevrandao
+    }
+
+    /// Block gas limit installed in the snapshot's EVM context.
+    pub const fn gas_limit(&self) -> Option<u64> {
+        self.gas_limit
+    }
+
+    /// Timestamp installed in the snapshot's EVM context.
+    pub const fn timestamp(&self) -> Option<u64> {
+        self.timestamp
+    }
+
+    /// Enumerate account, code, explicit storage, and block-hash entries held by
+    /// this immutable snapshot.
+    ///
+    /// Accounts already proven absent are included because their `None` result
+    /// is locally authoritative. Storage entries implied to be zero by a
+    /// `StorageCleared` account are not enumerable; use
+    /// [`missing_read_set`](Self::missing_read_set) when checking a concrete
+    /// required set.
+    pub fn resident_read_set(&self) -> StorageAccessList {
+        let mut resident = StorageAccessList::default();
+        resident.accounts.extend(self.base.accounts.keys().copied());
+        resident
+            .accounts
+            .extend(self.overlay_accounts.keys().copied());
+        resident
+            .accounts
+            .extend(self.accounts_not_existing.iter().copied());
+        resident
+            .code_hashes
+            .extend(self.base.code_by_hash.keys().copied());
+        resident
+            .code_hashes
+            .extend(self.overlay_code_by_hash.keys().copied());
+        for (address, slots) in &self.base.storage {
+            resident
+                .slots
+                .extend(slots.keys().copied().map(|slot| (*address, slot)));
+        }
+        for (address, slots) in &self.overlay_storage {
+            resident
+                .slots
+                .extend(slots.keys().copied().map(|slot| (*address, slot)));
+        }
+        resident
+            .block_numbers
+            .extend(self.block_hashes.keys().copied());
+        resident
+    }
+
+    /// Return the concrete subset of `required` this snapshot cannot resolve
+    /// without an external database.
+    pub fn missing_read_set(&self, required: &StorageAccessList) -> StorageAccessList {
+        StorageAccessList {
+            accounts: required
+                .accounts
+                .iter()
+                .copied()
+                .filter(|address| {
+                    !self.accounts_not_existing.contains(address)
+                        && self.account_info(*address).is_none()
+                })
+                .collect(),
+            code_hashes: required
+                .code_hashes
+                .iter()
+                .copied()
+                .filter(|hash| self.code(*hash).is_none())
+                .collect(),
+            slots: required
+                .slots
+                .iter()
+                .copied()
+                .filter(|(address, slot)| self.storage_value(*address, *slot).is_none())
+                .collect(),
+            block_numbers: required
+                .block_numbers
+                .iter()
+                .copied()
+                .filter(|number| !self.block_hashes.contains_key(number))
+                .collect(),
+        }
+    }
+
     /// Account info as the EVM sees it: overlay (layer 1) wins, else the base
     /// (layer 2), else `None`.
     ///
@@ -162,6 +301,15 @@ impl EvmSnapshot {
             .and_then(|s| s.get(&slot).copied())
     }
 
+    /// Return the runtime-code hash resident for `address` in this snapshot.
+    ///
+    /// The lookup follows the same account-shadowing and known-absent rules as
+    /// EVM account reads. It is provider-free and is intended for callers that
+    /// bind offline evaluation to a reviewed deployed runtime identity.
+    pub fn account_code_hash(&self, address: Address) -> Option<B256> {
+        self.account_info(address).map(|info| info.code_hash)
+    }
+
     /// Bytecode by `code_hash`: overlay (layer 1) wins, else the base (layer 2).
     pub(crate) fn code(&self, code_hash: B256) -> Option<&Bytecode> {
         self.overlay_code_by_hash
@@ -200,6 +348,7 @@ mod tests {
             storage_cleared: HashSet::new(),
             accounts_not_existing: HashSet::new(),
             block_hashes: HashMap::new(),
+            block_context_hash: None,
             block_number: Some(100),
             basefee: Some(1000),
             coinbase: None,

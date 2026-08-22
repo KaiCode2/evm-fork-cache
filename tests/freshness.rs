@@ -293,6 +293,12 @@ async fn overlay_call_raw_with_access_list_captures_read_set() -> Result<()> {
 
     assert!(result.is_success(), "balanceOf should succeed: {result:?}");
     assert!(access.accounts.contains(&token), "token account touched");
+    assert!(
+        access
+            .code_hashes
+            .contains(&common::mock_erc20_runtime().hash_slow()),
+        "executed runtime code captured in read set"
+    );
     // The hashed balance slot for owner should be in the read set.
     let hashed = {
         use alloy_sol_types::SolValue;
@@ -2031,7 +2037,7 @@ async fn run_unverified_when_fixed_point_round_cap_exceeded() -> Result<()> {
     Ok(())
 }
 
-/// WS-1c (manager-authored red-green): the verdict taxonomy distinguishes a
+/// WS-1c red-green coverage: the verdict taxonomy distinguishes a
 /// storage-only confirmation from a full (storage + account) one, so callers can
 /// no longer mistake "no volatile storage slot changed" for "account state
 /// verified". The storage-only success verdict is renamed `Confirmed ->

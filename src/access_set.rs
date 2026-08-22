@@ -19,14 +19,23 @@ use serde::{Deserialize, Serialize};
 pub struct StorageAccessList {
     /// Contract addresses touched during execution.
     pub accounts: HashSet<Address>,
+    /// Runtime-code hashes requested during execution.
+    #[serde(default)]
+    pub code_hashes: HashSet<B256>,
     /// `(contract, slot)` pairs read or written during execution.
     pub slots: HashSet<(Address, U256)>,
+    /// Historical block numbers requested through the `BLOCKHASH` opcode.
+    #[serde(default)]
+    pub block_numbers: HashSet<u64>,
 }
 
 impl StorageAccessList {
     /// Returns true when no accounts or storage slots were captured.
     pub fn is_empty(&self) -> bool {
-        self.accounts.is_empty() && self.slots.is_empty()
+        self.accounts.is_empty()
+            && self.code_hashes.is_empty()
+            && self.slots.is_empty()
+            && self.block_numbers.is_empty()
     }
 
     /// Number of distinct accounts touched by the execution.
@@ -37,6 +46,16 @@ impl StorageAccessList {
     /// Number of distinct storage slots touched by the execution.
     pub fn slot_count(&self) -> usize {
         self.slots.len()
+    }
+
+    /// Number of distinct runtime-code hashes touched by the execution.
+    pub fn code_hash_count(&self) -> usize {
+        self.code_hashes.len()
+    }
+
+    /// Number of distinct historical block hashes touched by the execution.
+    pub fn block_hash_count(&self) -> usize {
+        self.block_numbers.len()
     }
 
     /// Merge another touch set into this one (set union of accounts and slots).
@@ -71,7 +90,40 @@ impl StorageAccessList {
     /// ```
     pub fn extend(&mut self, other: &Self) {
         self.accounts.extend(&other.accounts);
+        self.code_hashes.extend(&other.code_hashes);
         self.slots.extend(&other.slots);
+        self.block_numbers.extend(&other.block_numbers);
+    }
+
+    /// Return the subset of this required read set absent from `available`.
+    pub fn missing_from(&self, available: &Self) -> Self {
+        Self {
+            accounts: self
+                .accounts
+                .difference(&available.accounts)
+                .copied()
+                .collect(),
+            code_hashes: self
+                .code_hashes
+                .difference(&available.code_hashes)
+                .copied()
+                .collect(),
+            slots: self.slots.difference(&available.slots).copied().collect(),
+            block_numbers: self
+                .block_numbers
+                .difference(&available.block_numbers)
+                .copied()
+                .collect(),
+        }
+    }
+
+    /// Whether every account and slot in this read set is present in
+    /// `available`.
+    pub fn is_covered_by(&self, available: &Self) -> bool {
+        self.accounts.is_subset(&available.accounts)
+            && self.code_hashes.is_subset(&available.code_hashes)
+            && self.slots.is_subset(&available.slots)
+            && self.block_numbers.is_subset(&available.block_numbers)
     }
 
     /// Compute EIP-2929 gas saved when this touch set runs after `warm`.
@@ -139,10 +191,12 @@ mod tests {
             slots: [(account_a, slot_1), (account_b, slot_2)]
                 .into_iter()
                 .collect(),
+            ..Default::default()
         };
         let warm = StorageAccessList {
             accounts: [account_a].into_iter().collect(),
             slots: [(account_b, slot_2)].into_iter().collect(),
+            ..Default::default()
         };
 
         assert_eq!(al.marginal_gas_savings(&warm), 4500);
@@ -167,5 +221,52 @@ mod tests {
         );
         assert!(encoded.0.iter().any(|item| item.address == storage_contract
             && item.storage_keys == vec![B256::from(U256::from(4))]));
+    }
+
+    #[test]
+    fn missing_from_returns_only_unwarmed_accounts_and_slots() {
+        let warm_account = Address::repeat_byte(0x01);
+        let cold_account = Address::repeat_byte(0x02);
+        let warm_slot = (warm_account, U256::from(1));
+        let cold_slot = (cold_account, U256::from(2));
+        let required = StorageAccessList {
+            accounts: [warm_account, cold_account].into_iter().collect(),
+            slots: [warm_slot, cold_slot].into_iter().collect(),
+            ..Default::default()
+        };
+        let available = StorageAccessList {
+            accounts: [warm_account].into_iter().collect(),
+            slots: [warm_slot].into_iter().collect(),
+            ..Default::default()
+        };
+
+        let missing = required.missing_from(&available);
+
+        assert_eq!(missing.accounts, [cold_account].into_iter().collect());
+        assert_eq!(missing.slots, [cold_slot].into_iter().collect());
+        assert!(!required.is_covered_by(&available));
+        assert!(available.is_covered_by(&required));
+    }
+
+    #[test]
+    fn missing_from_includes_code_and_block_hash_dependencies() {
+        let warm_code = B256::repeat_byte(0x11);
+        let cold_code = B256::repeat_byte(0x22);
+        let required = StorageAccessList {
+            code_hashes: [warm_code, cold_code].into_iter().collect(),
+            block_numbers: [90, 91].into_iter().collect(),
+            ..Default::default()
+        };
+        let available = StorageAccessList {
+            code_hashes: [warm_code].into_iter().collect(),
+            block_numbers: [90].into_iter().collect(),
+            ..Default::default()
+        };
+
+        let missing = required.missing_from(&available);
+
+        assert_eq!(missing.code_hashes, [cold_code].into_iter().collect());
+        assert_eq!(missing.block_numbers, [91].into_iter().collect());
+        assert!(!required.is_covered_by(&available));
     }
 }

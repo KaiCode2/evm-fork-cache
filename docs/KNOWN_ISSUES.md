@@ -22,10 +22,12 @@ Confidence legend: **[V]** verified against the source during review;
    "no block pin" state; explicit construction uses
    `EvmCache::at_block(provider, block)`. `set_block` takes a concrete
    `BlockId`, sets `block_number` only for numeric pins, and clears it for
-   tag/hash pins. Every block change clears stale `basefee`; callers refresh
-   `NUMBER`/`BASEFEE` together with `set_block_context` after fetching the new
-   header. Freshness validation captures the cache's concrete snapshot pin and
-   passes it through to storage fetchers.
+   tag/hash pins. Every repin clears `NUMBER`, `BASEFEE`, `COINBASE`,
+   `PREVRANDAO`, `GASLIMIT`, and timestamp provenance so values from the old
+   header cannot leak into the new pin. Callers must reinstall any intentional
+   manual overrides, or use `advance_block` with a complete canonical header.
+   Freshness validation captures the cache's concrete snapshot pin and passes it
+   through to storage fetchers.
 
 3. **[FIXED] Synchronous layer-2 escape hatches have an invalidating wrapper.**
    Raw handles are now visibly named `unchecked_blockchain_db()` /
@@ -106,6 +108,12 @@ surface was moved out of this crate.
 
 ## Limitations by design / roadmap
 
+- **Unlearned speculative reads remain generation-local.** Same-payload
+  cumulative previews retain them, while replacement, reconnect, canonical
+  advancement, and explicit invalidation discard them. This is intentional:
+  learned read-set identities persist separately and are hydrated only against
+  an exact canonical point, so pending values can never leak into canonical
+  state.
 - **Storage-only freshness verification; `ConfirmedFull` is defined but not yet
   emitted.** The optimistic verify-and-rerun loop builds its verify set from the
   volatile storage *slots* in each sim's read set, and its success verdict says
@@ -148,19 +156,18 @@ surface was moved out of this crate.
   token emitting such a value would corrupt the reconstructed delta. Real ERC-20
   supplies are far below 2^255, so this is unreachable for honest tokens; a
   malicious token can misreport balances by other means regardless.
-- **[Hardened in 0.2.0] `BLOCKHASH` resolves to ZERO in ext-db-less overlays —
-  and the freshness validator now fails closed on it.** Snapshots do not track
-  block hashes (the live cache does not track them either), so an `EvmOverlay`
-  built without an `ext_db` returns `B256::ZERO` for in-lookback-range
-  `BLOCKHASH` reads. Since 0.2.0 the freshness pipeline records such reads
-  (`EvmOverlay::blockhash_zero_fallback`) and reports the batch
-  `Validation::Unverified` — on the optimistic pass **and** on corrected
-  re-runs — instead of silently confirming a result whose control flow may
-  depend on the real hash. Out-of-range reads return the spec-mandated ZERO
-  without a database call and are deliberately not flagged (they are correct
-  on-chain too). Direct, non-validator simulations over ext-db-less overlays
-  still observe ZERO; supply an `ext_db` or snapshot-provided hashes when
-  `BLOCKHASH` accuracy matters to such a sim.
+- **[Hardened in 0.2.0; canonical residency added in 0.4.0-alpha.2]
+  `BLOCKHASH` fails closed when its canonical value is absent.** The live cache
+  and its snapshots retain block hashes that have been loaded from canonical
+  state, and `hydrate_read_set` reports any required non-resident hash through
+  `missing_after`; it does not issue a separate hash fetch. An `EvmOverlay`
+  without a resident hash or `ext_db` still returns `B256::ZERO` for an
+  in-lookback-range read, but records that fallback. The freshness pipeline
+  therefore reports the batch `Validation::Unverified` on the optimistic pass
+  and on corrected re-runs instead of confirming control flow that may depend
+  on the real hash. Out-of-range reads return the spec-mandated ZERO without a
+  database call and are deliberately not flagged. Warm the canonical hash
+  before publishing an offline snapshot whenever `BLOCKHASH` accuracy matters.
 - **[Closed in 0.2.0] `EventPipeline::derived_slots` is bounded.** The
   event-derived `(address, slot)` set is now a block-horizon ring bounded to
   `ReorgConfig::depth` (mirroring the `touched` ring), so steady-state
@@ -180,8 +187,35 @@ surface was moved out of this crate.
   the freshness/validation loop is the backstop for that span. This is not silent:
   the runtime emits a `tracing::warn!` when a reorg references a block no longer in
   the journal. Set `journal_depth` above the deepest reorg you intend to recover
-  precisely. (The full conservative-purge fallback for aged-out blocks is a tracked
-  follow-up, not a known defect.)
+  precisely. The crash-safe `ReactiveEngine::*_checkpointed` paths are stricter:
+  an explicit reorg, implicit-parent replacement, or removed/reorged record whose
+  required rollback proof falls outside the retained effect journal is rejected
+  before cache mutation, durable save, or source ACK rather than checkpointing
+  partial recovery. Configure the runtime depth at least as large as the
+  subscriber's promised reorg window.
+  Ordinary direct/non-checkpointed ingestion retains the degraded partial-
+  recovery behavior above for compatibility. (The full conservative-purge
+  fallback for aged-out blocks is a tracked follow-up, not a known defect.)
+- **Replacement-branch rollback does not provenance-tag every lazy account or
+  storage read.** In-window reactive handler effects are journaled and rolled
+  back/purged, and displaced `BLOCKHASH` cache entries are now explicitly
+  invalidated. Ordinary account/storage values fetched lazily through
+  `SharedBackend`, however, are cached by address/slot rather than by the
+  canonical block hash that supplied them. Re-pinning to a replacement branch
+  cannot identify which of those values changed on that branch. This is
+  separate from the `journal_depth` limit: it can matter even for a shallow
+  reorg when a lazily read value is not maintained by a handler. Production
+  consumers should event-maintain and root-gate the state they rely on, or
+  explicitly purge/resync affected accounts (or reconstruct the cache) before
+  trusting replacement-branch simulations.
+- **`ChainControl::CanonicalProgress` certifies event coverage, not full-header
+  readiness.** Compact progress and block-bearing barriers exact-hash pin lazy
+  provider reads and install known `NUMBER`/timestamp metadata. They deliberately
+  clear `BASEFEE`, `COINBASE`, `PREVRANDAO`, and `GASLIMIT` unless a full header
+  for that exact number/hash was already verified. This is safe for event-state
+  catch-up, but a consumer whose simulation reads those opcodes must wait for or
+  fetch the full canonical header before treating the cache as EVM-environment
+  ready.
 - **Bundle `coinbase_payment` excludes the gas of `AllowReverts` transactions that
   actually revert.** `simulate_bundle` rolls a reverting whitelisted tx back to its
   inner checkpoint, which also undoes the gas that tx charged to the beneficiary. So
@@ -248,11 +282,18 @@ surface was moved out of this crate.
   remaining transport limits: **full block bodies**, **full pending-transaction
   hydration**, and non-log historical backfill are not implemented (the
   subscriber returns a typed `SubscriberError::Unsupported` for non-hash pending
-  interests). Mid-lifecycle handler registration through `ReactiveEngine`
-  backfills a new handler's logs from the runtime's last canonical block
-  automatically and catches the newly connected stream up from that anchor after
-  it subscribes, so the discovery→subscription window is closed without caller
-  bookkeeping; the bounded `dedupe_window` suppresses the overlap. The residual
+  interests). Alloy log catch-up is intended for bounded live gaps: each
+  filter/window uses one complete-range `eth_getLogs` request. The
+  `max_backfill_log_bytes` limit rejects a response after decoding, but ranges
+  are not adaptively split and provider result caps can fail a dense or deep
+  query first. Keep registration and reconnect windows modest; use HyperSync or
+  another indexing `EventSubscriber` for deep/high-density history.
+  Mid-lifecycle handler registration through `ReactiveEngine` adopts the live
+  desired state first, replays the new owner at the retained canonical block,
+  then catches the complete handler union up globally above that block through
+  activation. This closes the discovery→subscription window without leaving
+  later effects outside the global rollback journal; the bounded `dedupe_window`
+  suppresses overlap. The residual
   limit is a genuinely live-only registration (no anchor and no backfill
   requested): logs between the registration call and the live subscription start
   are not fetched. A reconnect after more than `dedupe_window` matching logs can
@@ -265,11 +306,45 @@ surface was moved out of this crate.
   tests). Composing `AlloySubscriber` output into `ReactiveRuntime::ingest_batch`
   end-to-end is now covered offline in `tests/reactive_subscriber_ingest.rs` (a
   real subscriber batch, produced via the mockable `get_logs` backfill path,
-  drives a real runtime ingest and asserts the cache write). The remaining paths
-  without dedicated integration coverage are the block-header ingest path, the
-  `ReactiveReport::Decoded` shape, the `EventDecoderHandler` adapter, and custom
-  pending-tx matcher/route-key routing; the live WebSocket transport plumbing is
-  covered by reconnect/termination unit tests but not by a networked end-to-end
-  test. These are tracked follow-ups, not known defects.
-- **Recent toolchain.** MSRV 1.88 and edition 2024 are intentional and
+  drives a real runtime ingest and asserts the cache write). Raw JSON preview,
+  invalidation, replacement, and canonical reconciliation are likewise covered
+  in `tests/raw_json_flashblocks_runtime.rs`. The paths without dedicated
+  integration coverage are the `EventDecoderHandler` adapter
+  and custom pending-tx matcher/route-key routing. Block-header ingestion is
+  covered in `tests/block_context.rs`, and decoded-report delivery is asserted
+  in `tests/reactive_engine.rs`. The live WebSocket transport plumbing is
+  covered by reconnect/termination unit tests. The opt-in
+  `raw_json_flashblocks_subscriber_acceptance` example covers one caller-owned
+  raw socket through standardized speculative/canonical subscriber delivery,
+  but it is intentionally not part of offline CI and does not validate every
+  provider wire profile. These are tracked follow-ups, not known defects.
+- **The optional raw JSON Flashblocks adapter supports one exact wire profile,
+  not arbitrary raw feeds.** With `raw-flashblocks-json`, callers may convert
+  receipt-enriched indexed JSON containing `payload_id`, `index`, an index-zero
+  `base`/`static` header, `diff.transactions`, and exact
+  `metadata.receipts`. JSON-RPC envelopes, receipt-less previews, and binary SSZ
+  require separate adapters. The core deliberately does not own the source
+  socket, authentication, liveness timeout, unbounded raw-frame receive queue, retry,
+  backoff, rate limit, or provider rotation. The optional standardized-update
+  handoff queue is bounded and exposes backpressure, but does not make any of
+  those lifecycle decisions. A caller must forward `reset()`'s
+  invalidation before retrying after disconnect, replacement, or an untrusted
+  application-data error. Schema drift is therefore an application acceptance
+  failure, never permission to synthesize missing receipts or poll HTTP. Queue
+  admission is distinct from subscriber acceptance: awaited sends return the
+  subscriber verdict, while non-blocking sends return an acknowledgement receipt.
+  A rejection requires caller-owned generation revocation/reconnect; local
+  subscriber capacity rejection does not permanently quarantine the endpoint.
+  The optional `BufferedRawJsonFlashblocksAdapter` retains at most one parsed
+  future frame across exactly one missing index for a construction-bounded
+  300–500 millisecond window. It starts no timer: callers must schedule from
+  `buffered_gap()` and invoke `expire_gap_at()`. It never promotes a preview to
+  canonical state and grants no downstream trigger authority.
+- **Speculative runtime state requires exact canonical lineage.** A
+  pre-confirmed batch is accepted only after the runtime has adopted a canonical
+  coverage head and only when the preview is its exact numbered child with the
+  matching parent hash. Applications must establish the canonical baseline
+  before enabling speculative delivery; missing or stale lineage fails closed
+  and revokes the active overlay.
+- **Recent toolchain.** MSRV 1.90 and edition 2024 are intentional and
   CI-enforced; consumers on older toolchains are not supported.

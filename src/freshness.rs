@@ -169,7 +169,7 @@ impl FreshnessParams {
 ///
 /// Resolution precedence is **slot ▸ account ▸ default** (see
 /// [`FreshnessRegistry::validity`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Validity {
     /// Caller-owned: immutable, or kept fresh out-of-band (e.g. via event
     /// writes). The freshness system never re-verifies or purges it.
@@ -190,7 +190,7 @@ pub enum Validity {
 /// changed via [`with_default`](Self::with_default)).
 ///
 /// The setters are builder-style (`&mut Self`) so they can be chained.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct FreshnessRegistry {
     default: Validity,
     accounts: HashMap<Address, Validity>,
@@ -255,6 +255,24 @@ impl FreshnessRegistry {
     /// Mark a single slot [`Validity::ValidThrough`] block/clock `n`.
     pub fn valid_through_slot(&mut self, addr: Address, slot: U256, n: u64) -> &mut Self {
         self.set_slot(addr, slot, Validity::ValidThrough(n))
+    }
+
+    /// Invalidate event-derived validity horizons from a dropped canonical
+    /// block onward while preserving caller-owned pinning and older horizons.
+    #[cfg(feature = "reactive")]
+    pub(crate) fn invalidate_valid_through_from(&mut self, first_dropped_block: u64) {
+        let invalidate = |validity: &mut Validity| {
+            if matches!(validity, Validity::ValidThrough(block) if *block >= first_dropped_block) {
+                *validity = Validity::Volatile;
+            }
+        };
+        invalidate(&mut self.default);
+        for validity in self.accounts.values_mut() {
+            invalidate(validity);
+        }
+        for validity in self.slots.values_mut() {
+            invalidate(validity);
+        }
     }
 
     /// Set the account-level validity for `addr`.

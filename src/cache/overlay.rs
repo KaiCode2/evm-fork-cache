@@ -9,7 +9,7 @@
 //! stay local to the overlay.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -27,6 +27,7 @@ use super::snapshot::EvmSnapshot;
 use super::{CallSimulationResult, IERC20, SimStatus, TxConfig, unix_timestamp_secs_saturating};
 use crate::access_set::StorageAccessList;
 use crate::bundle::{BundleOptions, BundleResult, BundleTx, RevertPolicy, TxOutcome};
+use crate::cancellation::SimulationCancellationToken;
 use crate::errors::{
     OverlayError, OverlayResult as Result, SimError, SimHostError, SimulationError,
     SimulationResult,
@@ -34,6 +35,23 @@ use crate::errors::{
 use crate::inspector::TransferInspector;
 use crate::mapping_probe::HashStorageProbe;
 use alloy_sol_types::SolCall;
+
+#[derive(Clone, Debug)]
+struct SimulationCancellationInspector {
+    token: SimulationCancellationToken,
+}
+
+impl<CTX, INTR> revm::Inspector<CTX, INTR> for SimulationCancellationInspector
+where
+    INTR: revm::interpreter::InterpreterTypes,
+{
+    fn step(&mut self, interpreter: &mut revm::interpreter::Interpreter<INTR>, _context: &mut CTX) {
+        self.token.mark_started();
+        if self.token.is_cancelled() {
+            interpreter.halt(revm::interpreter::InstructionResult::Stop);
+        }
+    }
+}
 
 type OverlayEvm<'a> = revm::MainnetEvm<
     Context<BlockEnv, TxEnv, CfgEnv, &'a mut EvmOverlay, Journal<&'a mut EvmOverlay>, ()>,
@@ -43,6 +61,46 @@ type InspectorOverlayEvm<'a, INSP> = revm::MainnetEvm<
     Context<BlockEnv, TxEnv, CfgEnv, &'a mut EvmOverlay, Journal<&'a mut EvmOverlay>, ()>,
     INSP,
 >;
+
+/// State an RPC-disconnected overlay could not resolve from its immutable
+/// snapshot.
+///
+/// The EVM database interface requires a value even when an offline snapshot is
+/// incomplete. [`EvmOverlay`] continues to return the protocol-neutral fallback
+/// (`None`, empty bytecode, ZERO storage, or ZERO block hash), but records every
+/// such fallback here. Callers must treat a non-empty report as an incomplete
+/// simulation rather than authoritative execution.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MissingState {
+    /// Account headers absent from the snapshot.
+    pub accounts: HashSet<Address>,
+    /// Runtime-code hashes absent from the snapshot.
+    pub code_hashes: HashSet<B256>,
+    /// Storage slots absent from the snapshot.
+    pub storage: HashSet<(Address, U256)>,
+    /// In-range block numbers whose hashes were absent from the snapshot.
+    pub block_hashes: HashSet<u64>,
+}
+
+impl MissingState {
+    /// Whether the offline overlay resolved every database read locally.
+    pub fn is_empty(&self) -> bool {
+        self.accounts.is_empty()
+            && self.code_hashes.is_empty()
+            && self.storage.is_empty()
+            && self.block_hashes.is_empty()
+    }
+
+    /// Convert unresolved reads into the generic execution read-set shape.
+    pub fn as_read_set(&self) -> StorageAccessList {
+        StorageAccessList {
+            accounts: self.accounts.clone(),
+            code_hashes: self.code_hashes.clone(),
+            slots: self.storage.clone(),
+            block_numbers: self.block_hashes.clone(),
+        }
+    }
+}
 
 /// Per-simulation mutable overlay on an immutable snapshot.
 ///
@@ -85,6 +143,8 @@ pub struct EvmOverlay {
     /// confirming a sim whose control flow may rest on a hash its overlays
     /// cannot resolve. Cleared by [`Self::reset`].
     blockhash_zero_fallback: bool,
+    /// Exact unresolved reads observed while no external database was attached.
+    missing_state: MissingState,
 }
 
 impl EvmOverlay {
@@ -103,6 +163,7 @@ impl EvmOverlay {
             reusable_buffer: Vec::with_capacity(buffer_capacity),
             buffer_capacity,
             blockhash_zero_fallback: false,
+            missing_state: MissingState::default(),
         }
     }
 
@@ -120,6 +181,7 @@ impl EvmOverlay {
         self.dirty_accounts.clear();
         self.dirty_storage.clear();
         self.blockhash_zero_fallback = false;
+        self.missing_state = MissingState::default();
         // Keep: snapshot Arc, ext_db, and the reusable buffer. The buffer is
         // already cleared after each call, so nothing to do for it here.
     }
@@ -139,6 +201,16 @@ impl EvmOverlay {
     /// correct on-chain too, so such reads are deliberately not flagged.
     pub fn blockhash_zero_fallback(&self) -> bool {
         self.blockhash_zero_fallback
+    }
+
+    /// Exact database reads that fell back because this overlay has no external
+    /// provider and its immutable snapshot did not contain the requested state.
+    ///
+    /// A non-empty report makes the simulation non-authoritative even when EVM
+    /// execution itself returned success: a missing storage slot, for example,
+    /// is represented as ZERO to satisfy the database trait.
+    pub fn missing_state(&self) -> &MissingState {
+        &self.missing_state
     }
 
     /// Chain ID of the block context captured by the underlying snapshot.
@@ -1033,6 +1105,12 @@ impl EvmOverlay {
                     for (address, account) in evm.journaled_state.state.iter() {
                         if account.is_touched() {
                             access_list.accounts.insert(*address);
+                            let code_hash = account.info.code_hash;
+                            if code_hash != B256::ZERO
+                                && code_hash != revm::primitives::KECCAK_EMPTY
+                            {
+                                access_list.code_hashes.insert(code_hash);
+                            }
                             for slot_key in account.storage.keys() {
                                 access_list.slots.insert((*address, *slot_key));
                             }
@@ -1046,6 +1124,113 @@ impl EvmOverlay {
                     // journal is not left dirty (mirrors `call_raw`).
                     evm.journaled_state.checkpoint_revert(checkpoint);
                     Err(OverlayError::transact(e))
+                }
+            }
+        };
+
+        self.reclaim_buffer(buffer);
+        outcome
+    }
+
+    /// Execute a non-committing call with cooperative cancellation.
+    ///
+    /// This has the same transaction and access-list semantics as
+    /// [`Self::call_raw_with_access_list_with`]. The supplied cancellation scope
+    /// may be shared by related overlay calls and is checked at every EVM
+    /// instruction boundary. If cancellation is observed, execution halts, the
+    /// journal checkpoint is reverted, and [`OverlayError::Cancelled`] is
+    /// returned. An uncancelled execution returns the same result and access-list
+    /// evidence as the existing API.
+    ///
+    /// Cancellation cannot interrupt a database callback or precompile that is
+    /// already executing; it is observed at the next EVM instruction boundary.
+    /// For a wholly provider-free cancellation path, construct this overlay with
+    /// no external database. A scope cannot be reset after cancellation and must
+    /// not be reused for a later independent candidate.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OverlayError::Cancelled`] when the token is cancelled, or the
+    /// same transaction-environment and host errors as
+    /// [`Self::call_raw_with_access_list_with`].
+    pub fn call_raw_with_access_list_with_cancellation(
+        &mut self,
+        from: Address,
+        to: Address,
+        calldata: Bytes,
+        tx: &TxConfig,
+        cancellation: &SimulationCancellationToken,
+    ) -> Result<(ExecutionResult, StorageAccessList)> {
+        if cancellation.is_cancelled() {
+            return Err(OverlayError::Cancelled);
+        }
+
+        let mut builder = TxEnv::builder()
+            .caller(from)
+            .kind(TxKind::Call(to))
+            .data(calldata)
+            .value(tx.value);
+        if let Some(gas_limit) = tx.gas_limit {
+            builder = builder.gas_limit(gas_limit);
+        }
+        if let Some(gas_price) = tx.gas_price {
+            builder = builder.gas_price(gas_price);
+        }
+        if let Some(nonce) = tx.nonce {
+            builder = builder.nonce(nonce);
+        }
+        if let Some(access_list) = &tx.access_list {
+            builder = builder.access_list(access_list.clone());
+        }
+        let tx_env = builder.build().map_err(OverlayError::tx_env)?;
+
+        let buffer = Rc::new(RefCell::new(std::mem::take(&mut self.reusable_buffer)));
+        let local = LocalContext {
+            shared_memory_buffer: Rc::clone(&buffer),
+            precompile_error_message: None,
+        };
+        let inspector = SimulationCancellationInspector {
+            token: cancellation.clone(),
+        };
+
+        let outcome = {
+            let mut evm = self.build_evm_with_inspector_local(inspector, local);
+            use revm::context_interface::JournalTr;
+            let checkpoint = evm.journaled_state.checkpoint();
+            match evm.inspect_one_tx(tx_env) {
+                Ok(result) => {
+                    let cancelled = cancellation.is_cancelled();
+                    let mut access_list = StorageAccessList::default();
+                    if !cancelled {
+                        for (address, account) in evm.journaled_state.state.iter() {
+                            if account.is_touched() {
+                                access_list.accounts.insert(*address);
+                                let code_hash = account.info.code_hash;
+                                if code_hash != B256::ZERO
+                                    && code_hash != revm::primitives::KECCAK_EMPTY
+                                {
+                                    access_list.code_hashes.insert(code_hash);
+                                }
+                                for slot_key in account.storage.keys() {
+                                    access_list.slots.insert((*address, *slot_key));
+                                }
+                            }
+                        }
+                    }
+                    evm.journaled_state.checkpoint_revert(checkpoint);
+                    if cancelled {
+                        Err(OverlayError::Cancelled)
+                    } else {
+                        Ok((result, access_list))
+                    }
+                }
+                Err(error) => {
+                    evm.journaled_state.checkpoint_revert(checkpoint);
+                    if cancellation.is_cancelled() {
+                        Err(OverlayError::Cancelled)
+                    } else {
+                        Err(OverlayError::transact(error))
+                    }
                 }
             }
         };
@@ -1344,6 +1529,7 @@ impl Database for EvmOverlay {
             }
             return Ok(info);
         }
+        self.missing_state.accounts.insert(address);
         Ok(None)
     }
 
@@ -1364,6 +1550,7 @@ impl Database for EvmOverlay {
         if let Some(ref ext_db) = self.ext_db {
             return ext_db.code_by_hash_ref(code_hash);
         }
+        self.missing_state.code_hashes.insert(code_hash);
         Ok(Bytecode::default())
     }
 
@@ -1390,6 +1577,7 @@ impl Database for EvmOverlay {
                 .insert(index, value);
             return Ok(value);
         }
+        self.missing_state.storage.insert((address, index));
         Ok(U256::ZERO)
     }
 
@@ -1400,13 +1588,12 @@ impl Database for EvmOverlay {
         if let Some(ref ext_db) = self.ext_db {
             return ext_db.block_hash_ref(number);
         }
-        // Snapshots never populate `block_hashes` (the live cache does not track
-        // block hashes), so without an `ext_db` the `BLOCKHASH` opcode resolves to
-        // ZERO. Overlays built internally (e.g. the freshness validator) pass
-        // `ext_db = None`; the fallback is recorded so the validator can fail
-        // closed (`Unverified`) instead of confirming a sim whose control flow
-        // may depend on the real hash. See `blockhash_zero_fallback()`.
+        // A hash that was not resident when the snapshot was taken cannot be
+        // fetched by an RPC-disconnected overlay, so `BLOCKHASH` resolves to
+        // ZERO. The fallback is recorded so readiness validation fails closed
+        // instead of confirming control flow that may depend on the real hash.
         self.blockhash_zero_fallback = true;
+        self.missing_state.block_hashes.insert(number);
         Ok(B256::ZERO)
     }
 }
@@ -1460,6 +1647,7 @@ mod tests {
             storage_cleared: HashSet::new(),
             accounts_not_existing: HashSet::new(),
             block_hashes,
+            block_context_hash: None,
             block_number: None,
             basefee: None,
             coinbase: None,

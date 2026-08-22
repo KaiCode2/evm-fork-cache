@@ -14,9 +14,11 @@
 //! 2. Ingest a canonical block. The runtime now has a canonical head.
 //! 3. Discover a new pool mid-stream and [`register_handler`](ReactiveEngine::register_handler)
 //!    it. Because the runtime has a canonical head, the new handler is
-//!    **backfilled from that block automatically** — the discovery→subscription
-//!    window closes with no caller bookkeeping. (`register_handler_with_backfill`
-//!    for deeper history; `register_handler_live_only` to opt out.)
+//!    live-adopted, replayed owner-only at that retained block, and globally
+//!    caught up above it through activation — the discovery→subscription window
+//!    closes with no caller bookkeeping. (`register_handler_with_backfill` for
+//!    an explicit replay of one retained block only;
+//!    `register_handler_live_only` to opt out.)
 //! 4. Retire a pool with the teardown recipe:
 //!    [`unregister_handler`](ReactiveEngine::unregister_handler) (routing +
 //!    transport) plus [`untrack_account`](ReactiveRuntime::untrack_account) (stop
@@ -25,7 +27,8 @@
 //!    queued repairs). Cache eviction stays an explicit caller action.
 //!
 //! In production the scripted subscriber is replaced by `AlloySubscriber` (which
-//! implements [`InterestOwnerSubscriber`]); the engine calls are identical.
+//! implements [`InterestOwnerSubscriber`]); the awaited engine calls are
+//! identical.
 //!
 //! Runs fully offline against a mocked provider — no network, no RPC key.
 //!
@@ -52,7 +55,7 @@ use evm_fork_cache::reactive::{
     InterestOwnerSubscriber, LogInterest, ReactiveConfig, ReactiveContext, ReactiveEffect,
     ReactiveEngine, ReactiveHandler, ReactiveInput, ReactiveInputBatch, ReactiveInputRecord,
     ReactiveInterest, ReactiveRuntime, RouteKeySpec, StateEffectQuality, SubscriberBackfill,
-    SubscriberError, SubscriberNextBatch, TrackingPolicy,
+    SubscriberNextBatch, SubscriberOperation, TrackingPolicy,
 };
 
 /// The storage slot each pool handler maintains from its swap logs (a stand-in
@@ -119,10 +122,12 @@ impl EventSubscriber<Ethereum> for ScriptedSubscriber {
     fn register_interests(
         &mut self,
         _interests: &[ReactiveInterest<Ethereum>],
-    ) -> Result<(), SubscriberError> {
-        // Full-replacement setup path — unused here; the engine drives owners.
-        self.owners.clear();
-        Ok(())
+    ) -> SubscriberOperation<'_, ()> {
+        Box::pin(async move {
+            // Full-replacement setup path — unused here; the engine drives owners.
+            self.owners.clear();
+            Ok(())
+        })
     }
 
     fn next_batch(&mut self) -> SubscriberNextBatch<'_, Ethereum> {
@@ -135,9 +140,12 @@ impl InterestOwnerSubscriber<Ethereum> for ScriptedSubscriber {
         &mut self,
         owner: HandlerId,
         interests: &[ReactiveInterest<Ethereum>],
-    ) -> Result<(), SubscriberError> {
-        self.owners.insert(owner, interests.to_vec());
-        Ok(())
+    ) -> SubscriberOperation<'_, ()> {
+        let interests = interests.to_vec();
+        Box::pin(async move {
+            self.owners.insert(owner, interests);
+            Ok(())
+        })
     }
 
     fn add_interest_owner_with_backfill(
@@ -145,17 +153,42 @@ impl InterestOwnerSubscriber<Ethereum> for ScriptedSubscriber {
         owner: HandlerId,
         interests: &[ReactiveInterest<Ethereum>],
         backfill: SubscriberBackfill,
-    ) -> Result<(), SubscriberError> {
-        self.add_interest_owner(owner.clone(), interests)?;
-        self.backfills.push((owner, backfill));
-        Ok(())
+    ) -> SubscriberOperation<'_, ()> {
+        let interests = interests.to_vec();
+        Box::pin(async move {
+            self.owners.insert(owner.clone(), interests);
+            self.backfills.push((owner, backfill));
+            Ok(())
+        })
+    }
+
+    fn add_interest_owner_with_canonical_catchup(
+        &mut self,
+        owner: HandlerId,
+        interests: &[ReactiveInterest<Ethereum>],
+        retained: BlockRef,
+    ) -> SubscriberOperation<'_, ()> {
+        let interests = interests.to_vec();
+        // This deterministic source does not advance while registration is in
+        // flight, so activation is still at C: owner catch-up covers exactly C
+        // and the required global C+1..activation interval is empty. A live
+        // implementation subscribes first, fetches that owner-only C slice,
+        // then globally catches every active interest up to its activation head.
+        let catchup = SubscriberBackfill::from_canonical_block_through(retained, retained.number);
+        Box::pin(async move {
+            let catchup = catchup?;
+            self.owners.insert(owner.clone(), interests);
+            self.backfills.push((owner, catchup));
+            Ok(())
+        })
     }
 
     fn remove_interest_owner(
         &mut self,
         owner: &HandlerId,
-    ) -> Option<Vec<ReactiveInterest<Ethereum>>> {
-        self.owners.remove(owner)
+    ) -> SubscriberOperation<'_, Option<Vec<ReactiveInterest<Ethereum>>>> {
+        let owner = owner.clone();
+        Box::pin(async move { Ok(self.owners.remove(&owner)) })
     }
 
     fn owner_interests(&self, owner: &HandlerId) -> Option<&[ReactiveInterest<Ethereum>]> {
@@ -190,7 +223,7 @@ fn swap_batch(pool: Address, block_number: u64, value: u64) -> ReactiveInputBatc
         chain_id: Some(1),
         source: InputSource::Subscription,
         chain_status: ChainStatus::Included {
-            block: block.clone(),
+            block,
             confirmations: 0,
         },
         block: Some(block),
@@ -214,10 +247,12 @@ async fn main() -> Result<()> {
 
     // 1. Register the first pool on a fresh runtime → live-only (no canonical
     //    head to backfill from yet).
-    engine.register_handler(Arc::new(PoolHandler {
-        id: HandlerId::new("pool-a"),
-        pool: pool_a,
-    }))?;
+    engine
+        .register_handler(Arc::new(PoolHandler {
+            id: HandlerId::new("pool-a"),
+            pool: pool_a,
+        }))
+        .await?;
     // Track pool-A so the root gate re-verifies its storage root on a cadence.
     engine
         .runtime_mut()
@@ -247,12 +282,14 @@ async fn main() -> Result<()> {
     );
 
     // 3. A PoolCreated event surfaces pool-B mid-stream. Registering it now
-    //    auto-anchors its log backfill to the runtime's canonical head — no
+    //    auto-anchors coordinated catch-up to the runtime's canonical head — no
     //    caller bookkeeping, no discovery→subscription gap.
-    engine.register_handler(Arc::new(PoolHandler {
-        id: HandlerId::new("pool-b"),
-        pool: pool_b,
-    }))?;
+    engine
+        .register_handler(Arc::new(PoolHandler {
+            id: HandlerId::new("pool-b"),
+            pool: pool_b,
+        }))
+        .await?;
     let (owner, backfill) = engine
         .subscriber()
         .backfills
@@ -282,7 +319,7 @@ async fn main() -> Result<()> {
     //    root-gate probes, and drop any queued repairs. Cache eviction (if you
     //    want the state gone) stays an explicit `StateUpdate::purge` / cache API
     //    call — deliberately not implied by unregistration.
-    let removed = engine.unregister_handler(&HandlerId::new("pool-a"));
+    let removed = engine.unregister_handler(&HandlerId::new("pool-a")).await?;
     let untracked = engine.runtime_mut().untrack_account(pool_a);
     let cancelled = engine.runtime_mut().cancel_pending_resyncs(pool_a);
     println!(

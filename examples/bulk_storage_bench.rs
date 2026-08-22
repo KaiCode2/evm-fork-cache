@@ -758,7 +758,7 @@ async fn scenario_custom_program(
         .map(|i| (USDC_WETH_V3_POOL, U256::from(POOL_OBSERVATIONS_SLOT + i)))
         .collect();
     let expected = fetch_map(bulk, &ring_slots, block)?;
-    for (i, chunk) in bytes.chunks_exact(32).enumerate() {
+    for (i, chunk) in bytes.as_chunks::<32>().0.iter().enumerate() {
         let key = (
             USDC_WETH_V3_POOL,
             U256::from(POOL_OBSERVATIONS_SLOT + i as u64),

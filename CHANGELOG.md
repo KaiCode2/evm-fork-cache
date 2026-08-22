@@ -10,11 +10,484 @@ versions (`0.x.0`); patch versions (`0.x.y`) are non-breaking. The roadmap in
 [`docs/ROADMAP.md`](docs/ROADMAP.md) deliberately reshapes the API before the
 surface freezes at 1.0.
 
-## [Unreleased]
+## [0.4.0-alpha.5] - 2026-08-22
 
-Remaining from the 0.2.0 plan and tracked as fast-follow: the toy
-constant-product AMM walkthrough and the dedicated reactive integration cases
-enumerated in [`docs/KNOWN_ISSUES.md`](docs/KNOWN_ISSUES.md).
+### Migration checklist
+
+- Add the new `SubscriberConfig::log_channel_size` field, or use
+  `..SubscriberConfig::default()` in struct literals. `None` preserves the
+  previous behaviour of sizing log subscriptions from `max_batch_size`.
+- Handle `ChainControl::LogCoverage` and `CanonicalSequenceMutation::LogCoverage`
+  in any exhaustive match. Both enums are `#[non_exhaustive]`, so a wildcard arm
+  already compiles; a source that cannot prove the attestation should ignore the
+  control rather than treat it as canonical progress.
+- Existing durable checkpoints are rejected as `InvalidFormat` and must be
+  rebuilt. `CHECKPOINT_VERSION` is now 7, the reactive runtime blob 4, and the
+  delivery witness 2, because each independently encodes state or controls whose
+  shape changed. A stale file fails closed instead of being decoded against the
+  newer layout.
+
+### Changed
+
+- Canonical head certification is now driven by the flashblock stream rather than
+  by a blind interval. A Flashblocks endpoint replaces the `newHeads`
+  subscription with a fixed-interval certification poll, because its `newHeads`
+  may carry partial heads — but the timer spent a request every interval whether
+  or not a block had sealed, so on a chain whose blocks are slower than the
+  interval most of those requests bought nothing.
+
+  A `newFlashblocks` payload opening a new block proves the previous one sealed,
+  which is the moment a certification is worth spending; the timer now suppresses
+  itself when a certification already happened inside its window. On Base this is
+  roughly one request per block instead of one per interval, and the head is
+  detected sooner because the trigger is a signal rather than a deadline.
+
+  `SubscriberConfig::canonical_head_poll_interval` is unchanged and keeps its
+  meaning as the liveness fallback: with no flashblock stream to drive
+  certification, nothing is suppressed and polling behaves exactly as before.
+  `FlashblocksRpcMetrics::suppressed_canonical_head_polls` reports how often the
+  timer stood down.
+
+### Fixed
+
+- Pubsub log, block-header, and OP Stack `pendingLogs` streams no longer lose
+  notifications silently. `alloy-pubsub`'s typed subscription stream treats both
+  a lagged broadcast receiver and an undecodable payload as `continue`, logging
+  at `debug` and moving on, so a bounded-channel overflow discarded canonical
+  logs with no error, no counter, and nothing a consumer could act on — while
+  still reporting an apparently complete stream. These streams now consume the
+  raw subscription, so a dropped notification becomes an observable gap and a
+  closed channel still terminates the stream for the existing reconnect path.
+
+  Recovery is scoped to what each stream costs. A canonical log gap refetches
+  exactly that source's window from its delivery anchor to the current head,
+  attributed to the new `SubscriberRpcCause::GapBackfill` so backpressure loss
+  is distinguishable from reconnect churn; a gap with no anchor yet fails closed
+  rather than continuing past known loss. A header gap is counted but not
+  refetched, because a consumer that walks a replacement header's parent lineage
+  back to retained canonical history already recovers the skipped blocks. A
+  pre-confirmation gap discards the speculative snapshot instead of publishing a
+  punctured preview.
+
+### Added
+
+- Added `ChainControl::LogCoverage`, a watermark attesting that no
+  log-notification loss went unhealed at or below the named block, plus
+  `ReactiveRuntime::log_coverage_head`,
+  `CanonicalSequenceState::with_log_coverage_head` / `log_coverage_head`,
+  `CanonicalSequenceMutation::LogCoverage`, and
+  `SubscriberCapability::LogCoverageAttestation`.
+
+  The guarantee is deliberately negative. A source cannot prove from its own log
+  stream that every matching log through block `N` arrived — a filter that
+  matched nothing for a hundred blocks is indistinguishable from one whose
+  notifications were dropped — but it can prove it detected no loss it did not
+  repair, which is exactly the fact a consumer cannot establish for itself. A
+  consumer combines the watermark with its own ordering evidence to decide when a
+  block's log set is closed.
+
+  The attestation makes no claim about chain progress and never advances the
+  cache's pinned block or the canonical coverage head. Validation rejects a
+  watermark that regresses, that outruns canonical coverage, or whose identity
+  disagrees with retained history; it is never inferred, so `None` means unknown
+  rather than complete, and a source that cannot detect loss neither advertises
+  the capability nor emits the control. `AlloySubscriber` attests only on the
+  pubsub transport, and withdraws a pending attestation when a gap is detected so
+  a block observed before the loss was known is never vouched for. The watermark
+  is carried through validation snapshots, staged mutations, and durable
+  checkpoints so it survives restore.
+- Added `AlloySubscriber::stream_gap_stats`, `SubscriberStreamGapStats`, and
+  `SubscriberStreamGap`, reporting notification loss observed on live
+  subscriptions and what healing it cost: lagged and undecodable notification
+  counts, canonical log gaps healed, header gaps, and pre-confirmation gaps. A
+  subscription reporting zeroes here is the evidence that its delivered log set
+  is complete, which is what makes treating the stream as authoritative safe
+  rather than optimistic. `reset_stream_gap_stats` opens a bounded window.
+- Added `SubscriberConfig::log_channel_size` so pubsub log backpressure can be
+  sized independently of `max_batch_size`. A high-volume filter sharing a
+  subscriber with small delivery batches previously had no way to buy headroom
+  without also enlarging every delivered batch.
+- Added `AlloySubscriber::rpc_stats` and `SubscriberRpcStats`, a complete account
+  of every provider request the reactive stack issues, attributed to both the
+  JSON-RPC method (`SubscriberRpcMethod`) and the mechanism responsible for it
+  (`SubscriberRpcCause`). Previously only the Flashblocks path was counted, so
+  canonical-path consumption — subscription installs, chain identity, owner
+  reconciliation, lazy and reconnect backfills, log-context verification, and
+  canonical head certification — was invisible from inside the process and
+  observable only on a provider invoice. Bulk owner catch-up and the free
+  functions it calls record through a shared counter, so a request is charged to
+  the mechanism that asked for it rather than to the helper both mechanisms
+  share. Counts are cumulative for the subscriber's lifetime and survive
+  reconnects and delivery-state resets; `reset_rpc_stats` opens a bounded
+  measurement window. This differs deliberately from `FlashblocksRpcMetrics`,
+  which stays scoped to one Flashblocks generation and remains the place for
+  outcomes that are not request counts.
+
+## [0.4.0-alpha.4] - 2026-08-11
+
+### Added
+
+- Added the provider-free, cloneable `SimulationCancellationToken` scope and
+  `EvmOverlay::call_raw_with_access_list_with_cancellation`. The REVM inspector
+  exposes a started latch, observes cancellation at instruction boundaries,
+  reverts the call checkpoint, and returns typed `OverlayError::Cancelled`;
+  uncancelled calls retain the existing result and access-list semantics. One
+  scope may cover related multi-chain or access-list replay calls, but cannot be
+  reset or carried into a later independent candidate. An executing database
+  callback or precompile remains cooperative only at the next instruction
+  boundary.
+- Added `EvmSnapshot::block_hash`, a provider-free read-only lookup that exposes
+  only block hashes resident when the immutable snapshot was created and never
+  infers a current block hash from EVM context alone.
+- Added `EvmSnapshot::block_context_hash`, which preserves a `BlockId::Hash`
+  current-block identity separately from EVM `BLOCKHASH` semantics, and
+  `account_code_hash(address)` for provider-free address-bound runtime
+  attestation. Both values are immutable after the snapshot is issued.
+- Added `BufferedRawJsonFlashblocksAdapter`, a provider-free wrapper that can
+  retain exactly one frame at exactly one missing index for a caller-selected
+  300–500 millisecond window. The caller owns the monotonic clock and timer;
+  expiry emits a typed `IndexGap` invalidation and quarantines the late
+  remainder until a new payload begins.
+- Added deterministic coverage for in-order drain, timeout, buffered conflicts,
+  second gaps, reset and payload replacement, malformed and resource-exhausting
+  frames, and the one-frame/one-index bound.
+- Added provider-free `FlashblockIngressTiming` metadata and timed raw/subscriber
+  handoff APIs. A buffered future frame retains its original caller-clock
+  arrival when the missing index later drains, and native Base/OP adapters stamp
+  ingress before normalization or pending-state materialization.
+- Exposed `FlashblockRef::same_base_identity` as a narrow provider-free lineage
+  predicate so consumers can avoid carrying a trace across pending-block base
+  replacement without treating a preview as canonical.
+
+### Changed
+
+- Raw JSON Flashblocks applications may opt into bounded single-index reorder
+  tolerance without changing `RawJsonFlashblocksAdapter`'s immediate behavior.
+  The wrapper remains transport-free and has no canonical-state or execution
+  authority.
+- Canonical-head certification requests used by Flashblocks generations now
+  fail closed after `SubscriberConfig::canonical_head_request_timeout` (three
+  seconds by default). A silently wedged request can therefore surface through
+  subscriber-driver failure and provider rotation instead of leaving canonical
+  progress indefinitely stalled.
+- Preconfirmation batches now carry the earliest source ingress among their
+  contributing records. The timing is optional for compatibility and affects
+  neither Flashblock identity nor canonical or execution authority.
+
+## [0.4.0-alpha.3] - 2026-08-07
+
+### Added
+
+- Added the default-off `raw-flashblocks-json` feature with a chain-neutral,
+  transport-free adapter for receipt-enriched indexed JSON Flashblocks. It
+  validates payload sequencing, exact receipt/transaction membership, bounded
+  resource use, cumulative identity, and structured log provenance before
+  emitting the existing standardized preconfirmation types.
+- Added the construction-only, fallible
+  `AlloySubscriber::configure_external_flashblock_updates` API and synchronous
+  `ingest_flashblock_update` so application-managed sources can enter the same
+  speculative overlay, invalidation, and canonical reconciliation path without
+  adding provider requests.
+- Added a single-open, bounded update channel so an application can retain a
+  cloneable sender after moving `AlloySubscriber` into a downstream runtime
+  owner. Every send now returns the subscriber's validation verdict rather than
+  queue admission alone; non-blocking sends return an awaitable acknowledgement.
+  Channel closure revokes the active preview; preferred mode retains canonical
+  delivery, while required mode fails closed.
+- Added an opt-in, caller-owned WebSocket acceptance example that forwards the
+  supported raw profile through `AlloySubscriber` and measures speculative to
+  canonical swap-log reconciliation without HTTP RPC or source retries.
+
+### Changed
+
+- Selecting an externally managed standardized source suppresses the built-in
+  chain-specific Flashblocks source while retaining ordinary canonical pubsub
+  logs and block headers. Socket control, timeout, retry, backoff, rate limiting,
+  and provider rotation remain application responsibilities.
+- External snapshots now reject an unexpected endpoint, invalid content
+  commitment, duplicate JSON receipt-map key, duplicate transaction or log
+  identity, or log/block membership mismatch, while stale generations are
+  ignored and cannot revoke newer state.
+  Subscriber-level validation now independently enforces an index-zero start,
+  exact index progression, exact same-index duplicates, stable base identity,
+  cumulative transaction prefixes, and delta logs belonging only to appended
+  transactions. A missing initial index, gap, conflicting duplicate, or caller
+  reset emits an explicit generation-scoped invalidation.
+- Recoverable local-capacity rejection no longer quarantines a provider
+  generation. Queued rejection is reported to the application so it can revoke
+  and reconnect the source while canonical delivery stays active.
+- Complete interest-owner replacement now preserves an invalidation when it
+  retires an active or queued speculative preview, preventing stale overlay
+  state from surviving a topology reset.
+- `ReactiveRuntime` now admits pre-confirmed state only when its pending block
+  is the exact numbered child of the adopted canonical coverage hash. Missing
+  baselines, missing or wrong parents, and stale replays after canonical
+  advancement fail closed and revoke any active overlay.
+- Added a bounded near-limit conversion benchmark. The crate's 16 MiB default
+  is a defensive compatibility ceiling, not a recommended application latency
+  budget; consumers should qualify their exact source and configure materially
+  smaller byte, index, transaction, and log limits where its observed profile
+  permits.
+
+## [0.4.0-alpha.2] - 2026-08-05
+
+### Migration checklist
+
+- Replace `FlashblockRef::block_hash` reads with
+  `FlashblockRef::content_hash` when identifying, comparing, or deduplicating
+  one exact cumulative speculative view. The content hash is scoped to the
+  provider generation and must never be treated as a canonical block hash.
+  Use the new optional `FlashblockRef::partial_block_hash` only when the
+  provider's non-placeholder partial hash is needed, and keep it speculative.
+- `ChainStatus::Preconfirmed::flashblock` is now an `Arc<FlashblockRef>` so all
+  logs from one cumulative preview share the same identity cheaply. Wrap
+  constructed values with `Arc::new`, borrow through the `Arc` for reads, and
+  use `Arc::clone` when retaining the reference.
+
+### Added
+
+- Added cache-owned execution read-set discovery and exact-block proof
+  hydration for account headers and storage, code-identity validation against
+  resident bytecode, and canonical block-hash residency checks, including
+  typed missing-state provenance and provider-read instrumentation.
+- Added `AlloySubscriber::establish_flashblocks_preflight` to verify a pinned
+  Base or OP chain and establish its chain-specific Flashblocks surface while
+  retaining optional provider capability evidence.
+- Added snapshot-resident/missing read-set inspection and offline block-hash
+  retention.
+- Added native `newFlashblocks` plus filtered `pendingLogs` subscriptions for
+  Base mainnet/testnet and a bounded pending block/log sampler for Optimism
+  mainnet/testnet through the standard subscriber output path.
+- Added per-generation Flashblocks RPC metrics for qualification and recovery
+  traffic.
+- Added exact transaction-receipt hydration for OP pending samples, with
+  per-tick and rolling per-second request budgets.
+- Added complete pending EVM context propagation for available number,
+  timestamp, base fee, beneficiary, randomness, and gas-limit fields.
+- Added generation-wide invalidation delivery so downstream consumers revoke a
+  published speculative snapshot before coupled Flashblock subscriptions are
+  re-established.
+
+### Changed
+
+- Raised the minimum supported Rust version to 1.90 and updated the locked
+  `ruint` dependency to the release that resolves `RUSTSEC-2026-0220`.
+- Read-set discovery now rejects a selected-but-unavailable access-list fetcher
+  and any callback result-count mismatch before partially warming the declared
+  slots. Exact hydration exposes structured failure causes, rejects duplicate
+  or unrequested proof slots, and fails closed when runtime bytecode or
+  historical block hashes are not already resident.
+- Alpha.2 CI now checks out the transport candidate by exact commit and applies
+  a release-delta authoring-hygiene gate before the locked release matrix.
+- Preconfirmed identity is now a non-zero, provider-generation-scoped content
+  commitment over the cumulative preview, with any real provider-reported
+  partial hash retained separately. Pending logs correlate by block number and
+  transaction membership rather than a pending block hash.
+- Base Flashblocks endpoints no longer treat `newHeads` as canonical because a
+  provider may expose partial heads there. Canonical progress is certified
+  through `eth_getBlockByNumber("latest")`.
+- Optimism pending-state sampling now pins cumulative blocks, exact canonical
+  parents, filtered logs, and receipts to one provider generation, retries
+  isolated request failures, and fails closed after a configurable consecutive
+  failure threshold.
+- Cumulative updates within one payload retain generation-local lazy fills;
+  replacement, reconnect, explicit discard, and canonical advancement restore
+  the exact canonical cache state.
+
+### Fixed
+
+- Rejected conflicting duplicate indices, duplicate cumulative transaction
+  membership, and unrecoverable indexed gaps before publishing incomplete or
+  ambiguous speculative state.
+- Reconnect now treats `newFlashblocks` and every `pendingLogs` stream as one
+  coupled generation, purges buffered records, increments provider provenance,
+  and performs one cumulative pending-state recovery after resubscription.
+- `PreconfirmationMode::Preferred` now isolates initial Flashblocks rejection,
+  Flashblocks stream termination, and exhausted Flashblocks reconnects from
+  the canonical subscriptions. Retry proceeds in the background while
+  canonical logs and heads remain deliverable; `Required` remains fail-closed.
+
+## [0.4.0-alpha.1] - 2026-07-28
+
+### Migration checklist
+
+- Await reactive engine registration, owner synchronization, and unregistration
+  calls. `EventSubscriber::register_interests` and mutating
+  `InterestOwnerSubscriber` methods now return `SubscriberOperation`; custom
+  implementations must preserve the previous committed desired state on error
+  or cancellation, or block delivery until reconciliation.
+- Handle the now-fallible `ReactiveEngine::into_parts`: `Ok((runtime,
+  subscriber))` is returned only with no pending delivery commit;
+  `Err(Box<engine>)` preserves an acknowledgement/checkpoint retry that must be
+  completed first.
+- `register_handler_with_backfill` now accepts only one hash-certified block
+  still present in the rollback journal. Use ordinary global canonical catch-up
+  for deeper history; owner-only historical effects cannot safely outlive their
+  journal attachment.
+- Add the new `SubscriberConfig` pending-record, pending-backfill,
+  historical-response-byte, and reconcile-concurrency fields, or use
+  `..SubscriberConfig::default()` in struct literals.
+- Provider-backed and composite subscribers should implement `chain_id()`,
+  resolve and reject mixed networks before delivery, stamp every record, and
+  bind control-only batches with `ReactiveInputBatch::with_chain_id`.
+- Advertise `DurableReplay` only when the complete committed position can be
+  restored without a gap. A composite may reconcile a rebuilt ephemeral live
+  child from durable history, but must close the cutover before delivery. ACK
+  must be idempotent, a replayed token must map to one immutable delivery, and a
+  failed `restore_position` must preserve the old position or retain only that
+  exact restore as delivery-blocking pending intent. Checkpointed ingest/restore
+  now rejects ephemeral subscribers, and `SubscriberResumePosition::new`
+  requires the chain id.
+- Attach a stable `SubscriberPayloadCommitment` with
+  `ReactiveInputBatch::with_payload_commitment` whenever a tokened delivery
+  contains `BlockHeader`, `FullBlock`, or hydrated `PendingTx` payloads. The
+  commitment must be derived from a deterministic canonical encoding; without
+  it, durable checkpoint ingestion rejects payloads that the core cannot
+  witness completely.
+- Replace empty handler identities. `HandlerId::new("")` now panics and
+  deserialization rejects the reserved empty value; use a stable non-empty id,
+  or `HandlerId::try_new` for untrusted input.
+- Reinstall manual block-environment overrides after `EvmCache::set_block` or
+  `repin_to_block`. Repinning clears `NUMBER`, `BASEFEE`, `COINBASE`,
+  `PREVRANDAO`, `GASLIMIT`, and timestamp provenance; use `advance_block` when
+  a complete canonical header is available.
+
+### Added
+
+- Added provider-provenanced preconfirmation batches and a disposable cache
+  branch that exposes speculative state without advancing canonical coverage,
+  durability, finality, or health.
+- Added Base-native `newFlashblocks` plus filtered `pendingLogs` correlation,
+  including cumulative payload sequencing, bounded unmatched-log retention,
+  reconnect reset, and pending-state gap recovery.
+- Added an OP Flashblocks adapter over the standard pending block/log surface,
+  with preferred fallback and required-mode validation.
+- Added provider IDs and generations to reactive input reports so downstream
+  reads can prefer the endpoint that announced not-yet-universal state.
+
+- `ReactiveInputBatch` can carry an opaque `SubscriberDeliveryToken`, and
+  `EventSubscriber::acknowledge_delivery` provides an idempotent post-ingest
+  commit hook. `ReactiveEngine::next_ingest*` acknowledges only after runtime
+  ingestion succeeds and reports acknowledgement failures distinctly, enabling
+  durable remote subscribers to replay an uncommitted batch safely.
+- Added `DurableCheckpointStore` and versioned checkpoint metadata binding one
+  atomic cache snapshot to chain, subscriber, handler-schema, canonical block,
+  and delivery-token identity. The checkpointed `ReactiveEngine` loops enforce
+  ingest -> synced checkpoint -> ACK ordering, retry failed commits before
+  polling, and suppress a restored token's cross-process replay. Checkpoints
+  also retain provider-opaque resume bytes, safe/finalized heads, pending
+  repair work, handler provenance, freshness/root-gate state, metrics, and the
+  bounded rollback journal; barrier-certified empty ranges advance the durable
+  coverage anchor. Files have an integrity checksum and configurable size bound;
+  same-path stores share cancellation-safe in-process writer ordering. Encoding
+  and filesystem durability work run on Tokio's blocking pool.
+- Durable delivery tokens now persist a core witness over validated identities,
+  exact log payloads, context, routing, controls, chain id, and provider cursor.
+  A same-token replay must reproduce it before skip-and-ACK; a manually supplied
+  token without a witness cannot use the replay shortcut. Network-generic full
+  block and hydrated-transaction bodies remain subject to the subscriber's
+  immutable-token contract. Tokenless barriers retain the prior token's witness
+  while advancing the overall provider cursor.
+- Durable snapshots now acquire all backend map read locks as one coherent
+  capture window and normalize their exact pin, EVM block number, and timestamp
+  to checkpoint metadata. Header fields not proven by compact progress are
+  cleared. Checkpoint format version 6 records the replay witness and exact
+  full-header environment provenance.
+- Added record-preserving `DeliveryAudience`, ordered in-band `ChainControl`
+  values for reorg/finality/barrier delivery, and fail-closed
+  `SubscriberCapabilities`. Alloy owner catch-up now preserves its exact
+  handler audience and non-canonical delivery scope through the generic
+  `EventSubscriber` path.
+- Added the provider-neutral `CanonicalSequenceState`,
+  `CanonicalSequenceValidation`, and `CanonicalSequenceMutation` surface plus
+  `validate_canonical_sequence` / `normalize_and_validate_canonical_sequence`.
+  Composite sources can now validate a whole envelope, stage replayable
+  rewind/canonical/finality mutations, and normalize exact historical/live
+  overlap without depending on runtime or cache internals. The state's serde
+  representation is caller convenience, not a stable wire/checkpoint schema;
+  durable consumers must wrap it in their own versioned envelope. Diagnostic
+  counterparts return structured `CanonicalSequenceError` /
+  `CanonicalRollbackKind` values so history exhaustion never requires prose
+  matching; `retain_recent_history` gives external checkpoint owners an
+  explicit bounded rollback horizon.
+- Added provider-neutral chain identity reporting and durable resume identity;
+  Alloy resolves `eth_chainId` once and stamps every emitted record. Added an
+  atomic cache/runtime/subscriber restore helper and bounded Alloy queues,
+  historical-response bytes, lazy backfills, and reconcile concurrency.
+  Control-only batches now require an explicit authoritative chain id.
+- Added `ReactiveEngine::preview_durable_resume_position` for durable
+  subscribers that must asynchronously prepare a source before the synchronous
+  restore hook. Preview and restore use one validated runtime plan, so retained
+  canonical history, delivery identity, and provider cursor cannot drift.
+
+### Changed
+
+- Canonical validation now enforces exact parent-height/hash uniqueness across
+  sparse history, records, aliases, and controls; preserves resolved metadata
+  in rewind/finality mutations; rejects removed/canonical contradictions at any
+  height; and anchors exact removals at their authenticated N-1 parent without
+  discarding compatible safe/finalized state. Non-checkpointed deep recovery
+  clears unauthenticated history and emits a typed reorg report even when no
+  journal entry remains, while checkpointed validation continues to reject an
+  incomplete rollback.
+- Chain controls now use explicit execution phases: reorgs run before
+  replacement records, while progress/barrier/finality controls commit after
+  the records they certify. Compact progress exact-hash pins the cache, retains
+  compatible same-block metadata, preserves only a verified exact full-header
+  environment, and keeps certified zero-event tails as durable journal anchors.
+- `HandlerId` is now non-empty by construction and deserialization; the empty
+  identity remains reserved for canonical/global protocol scope.
+- `EvmCache::set_block` and `repin_to_block` now clear every stale block-header
+  environment field, not only base fee. Manual overrides must be reinstalled
+  after a repin; `advance_block` remains the complete-header path.
+- Durable checkpoint writes preflight encoded size before allocating the
+  payload, retry collision-resistant temporary names, preserve destination
+  symlink-entry replacement semantics, and fail with a typed unsupported error
+  on platforms where the crate cannot provide atomic replacement. Unix
+  temporary and final checkpoint files are owner-only (`0600`).
+- `EventSubscriber::register_interests` and every mutating
+  `InterestOwnerSubscriber` operation now return a boxed, sendable
+  `SubscriberOperation` future. `ReactiveEngine` registration, bootstrap sync,
+  and unregistration consequently require `.await`, allowing remote subscribers
+  to wait for authoritative service-side acknowledgement. Handler registration
+  commits subscriber state before runtime routing, so failure or cancellation
+  cannot leave a runtime handler active without committed interests; failed
+  subscriber removal likewise preserves runtime routing.
+- Explicit chain controls now reject mismatched old tips, regressing or
+  conflicting finality, backward/conflicting barriers, and reorgs that cross
+  the finalized head before mutating cache or runtime state.
+- Canonical transition validation now requires exact adjacent parent anchors,
+  emits the complete dropped suffix before an implicit replacement, rejects
+  safe/finalized heads beyond coverage and broken adjacent snapshot links, and
+  retains equal-height metadata enrichment during overlap normalization. Older
+  compatible enrichment remains non-forwarding so extension and runtime state
+  converge. Durable checkpoint preflight now uses this same validator and maps
+  incomplete rollback proof to `CheckpointReorgOutsideJournal`; direct runtime
+  ingestion continues to surface/degrade on observable deep reorgs.
+- Runtime batches now roll back cache state and canonical bookkeeping together
+  on failure while retaining monotonic rejected-attempt metrics. Delivery
+  acknowledgements remain pending across errors or task cancellation and are
+  retried before later polling; checkpointed hooks are dispatched only after
+  staging succeeds.
+- Alloy stream reconciliation installs every successful source immediately and
+  retains unfinished subscribe-then-backfill intent across later connection
+  errors or task cancellation, so retries neither discard nor duplicate an
+  already-live source.
+- Pending checkpoint retries now fail closed if the cache generation changed
+  after ingestion, preventing unrelated state from being persisted under an
+  older delivery/runtime checkpoint. Checkpointed explicit controls, implicit
+  parent mismatches, and removed/reorged records also fail before
+  mutation/save/ACK when complete recovery is not proven by the retained effect
+  journal; `journal_depth` must cover the subscriber's recovery horizon.
+- Runtime input validation now rejects payload/context and cache-chain
+  disagreements, preserves distinct canonical/reorg and header/full-block
+  representations, and merges duplicate audiences only inside one batch.
+  Cross-batch replay suppression remains an explicit subscriber responsibility.
+- Checkpointed ingest and restore now require an advertised `DurableReplay`
+  capability and reject ephemeral subscribers before polling or state mutation;
+  the in-crate Alloy subscriber intentionally remains an ordinary live source.
+- Alloy dependencies are capped below 1.7 so fresh resolution cannot silently
+  select a release requiring a newer compiler than the declared Rust 1.90 MSRV.
 
 ## [0.3.0] - 2026-07-14
 
@@ -254,8 +727,9 @@ hedged picture):
   later). `register_handler` updates runtime routing and subscriber interests
   together and, once ingestion has journaled a canonical block, backfills the
   new handler from that block automatically — closing the discovery→subscription
-  gap with no caller bookkeeping (`register_handler_with_backfill` for deeper
-  history, `register_handler_live_only` to opt out; `sync_handler_interests`
+  gap with no caller bookkeeping (`register_handler_with_backfill` for one
+  explicit retained-block replay, `register_handler_live_only` to opt out;
+  `sync_handler_interests`
   bootstraps a pre-populated runtime). `unregister_handler` removes routing and
   transport for that handler only; the runtime adds `last_canonical_block()`,
   `pending_resyncs()`, `cancel_pending_resyncs(address)`, `handler_ids()`,
@@ -882,7 +1356,11 @@ pre-release development phases (see [`docs/ROADMAP.md`](docs/ROADMAP.md)).
 - `EvmCache` requires a multi-thread tokio runtime for any RPC-touching path.
 - See [`docs/KNOWN_ISSUES.md`](docs/KNOWN_ISSUES.md) for current limitations.
 
-[Unreleased]: https://github.com/KaiCode2/evm-fork-cache/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/KaiCode2/evm-fork-cache/compare/v0.4.0-alpha.4...HEAD
+[0.4.0-alpha.4]: https://github.com/KaiCode2/evm-fork-cache/compare/v0.4.0-alpha.3...v0.4.0-alpha.4
+[0.4.0-alpha.3]: https://github.com/KaiCode2/evm-fork-cache/compare/v0.4.0-alpha.2...v0.4.0-alpha.3
+[0.4.0-alpha.2]: https://github.com/KaiCode2/evm-fork-cache/compare/v0.4.0-alpha.1...v0.4.0-alpha.2
+[0.4.0-alpha.1]: https://github.com/KaiCode2/evm-fork-cache/compare/v0.3.0...v0.4.0-alpha.1
 [0.3.0]: https://github.com/KaiCode2/evm-fork-cache/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/KaiCode2/evm-fork-cache/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/KaiCode2/evm-fork-cache/compare/v0.1.0...v0.2.0

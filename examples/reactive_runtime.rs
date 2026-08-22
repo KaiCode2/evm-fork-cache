@@ -182,7 +182,7 @@ fn included(block: BlockRef, log_index: u64) -> ReactiveContext {
         chain_id: Some(1),
         source: InputSource::Batch,
         chain_status: ChainStatus::Included {
-            block: block.clone(),
+            block,
             confirmations: 0,
         },
         block: Some(block),
@@ -197,7 +197,7 @@ fn reorged(dropped: BlockRef, log_index: u64) -> ReactiveContext {
         chain_id: Some(1),
         source: InputSource::Batch,
         chain_status: ChainStatus::Reorged {
-            dropped_from: dropped.clone(),
+            dropped_from: dropped,
         },
         block: Some(dropped),
         transaction_index: Some(0),
@@ -263,7 +263,7 @@ async fn main() -> Result<()> {
                 0,
                 false,
             )),
-            included(canonical.clone(), 0),
+            included(canonical, 0),
         ),
     )?;
     println!("\n=== block {} ingested ===", canonical.number);
@@ -291,7 +291,7 @@ async fn main() -> Result<()> {
                 0,
                 true,
             )),
-            reorged(canonical.clone(), 0),
+            reorged(canonical, 0),
         ),
     )?;
     let reorg = report

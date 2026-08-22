@@ -1,4 +1,4 @@
-//! Manager-authored red-green acceptance tests for WS-4/WS-5: the queryable
+//! Red-green acceptance tests for WS-4/WS-5: the queryable
 //! `CacheHealth` state and `CacheMetrics` counters on `ReactiveRuntime`.
 //!
 //! These describe the public contract before the implementation exists:
@@ -59,7 +59,7 @@ fn included_context(block: BlockRef, log_index: u64) -> ReactiveContext {
         chain_id: Some(1),
         source: InputSource::Batch,
         chain_status: ChainStatus::Included {
-            block: block.clone(),
+            block,
             confirmations: 0,
         },
         block: Some(block),
@@ -145,14 +145,14 @@ async fn deep_reorg_beyond_journal_degrades_health() -> Result<()> {
         &mut cache,
         batch(
             ReactiveInput::Log(rpc_log(address, &b10, 10)),
-            included_context(b10.clone(), 10),
+            included_context(b10, 10),
         ),
     )?;
     runtime.ingest_batch(
         &mut cache,
         batch(
             ReactiveInput::Log(rpc_log(address, &b11, 11)),
-            included_context(b11.clone(), 11),
+            included_context(b11, 11),
         ),
     )?;
     assert_eq!(runtime.health(), CacheHealth::Healthy, "healthy so far");
@@ -163,7 +163,7 @@ async fn deep_reorg_beyond_journal_degrades_health() -> Result<()> {
         &mut cache,
         batch(
             ReactiveInput::Log(rpc_log(address, &b11_alt, 12)),
-            included_context(b11_alt.clone(), 12),
+            included_context(b11_alt, 12),
         ),
     )?;
 
@@ -206,21 +206,21 @@ async fn in_journal_reorg_recovers_without_degrading() -> Result<()> {
         &mut cache,
         batch(
             ReactiveInput::Log(rpc_log(address, &parent, 10)),
-            included_context(parent.clone(), 10),
+            included_context(parent, 10),
         ),
     )?;
     runtime.ingest_batch(
         &mut cache,
         batch(
             ReactiveInput::Log(rpc_log(address, &dropped, 20)),
-            included_context(dropped.clone(), 20),
+            included_context(dropped, 20),
         ),
     )?;
     let report = runtime.ingest_batch(
         &mut cache,
         batch(
             ReactiveInput::Log(rpc_log(address, &replacement, 30)),
-            included_context(replacement.clone(), 30),
+            included_context(replacement, 30),
         ),
     )?;
 
@@ -318,7 +318,7 @@ async fn resync_requests_and_failures_increment() -> Result<()> {
         &mut cache,
         batch(
             ReactiveInput::Log(rpc_log(address, &b5, 5)),
-            included_context(b5.clone(), 5),
+            included_context(b5, 5),
         ),
     )?;
 
@@ -418,7 +418,7 @@ async fn metrics_snapshot_starts_all_zero() -> Result<()> {
     Ok(())
 }
 
-/// WS-4 (manager-authored red-green): a forward gap in the canonical block
+/// WS-4 red-green coverage: a forward gap in the canonical block
 /// sequence (block N followed by N+k, k>1) is no longer silently accepted. The
 /// runtime emits a `ReactiveReport::MissedBlockRange { from, to }` for the skipped
 /// span, increments `missed_ranges`, and degrades health — while STILL accepting
@@ -440,7 +440,7 @@ async fn forward_block_gap_is_detected_and_degrades() -> Result<()> {
         &mut cache,
         batch(
             ReactiveInput::Log(rpc_log(address, &b10, 10)),
-            included_context(b10.clone(), 10),
+            included_context(b10, 10),
         ),
     )?;
     assert_eq!(runtime.health(), CacheHealth::Healthy);
@@ -449,7 +449,7 @@ async fn forward_block_gap_is_detected_and_degrades() -> Result<()> {
         &mut cache,
         batch(
             ReactiveInput::Log(rpc_log(address, &b15, 15)),
-            included_context(b15.clone(), 15),
+            included_context(b15, 15),
         ),
     )?;
 
@@ -480,7 +480,7 @@ async fn forward_block_gap_is_detected_and_degrades() -> Result<()> {
     Ok(())
 }
 
-/// WS-4 (manager-authored red-green): repeated trust-loss events escalate the
+/// WS-4 red-green coverage: repeated trust-loss events escalate the
 /// health state — the first degrades to `Degraded`, a second (here a second gap)
 /// escalates to `Unhealthy` (the "stop until rebuilt" signal).
 #[tokio::test]
@@ -501,7 +501,7 @@ async fn repeated_trust_loss_escalates_to_unhealthy() -> Result<()> {
             &mut cache,
             batch(
                 ReactiveInput::Log(rpc_log(address, b, b.number)),
-                included_context(b.clone(), b.number),
+                included_context(*b, b.number),
             ),
         )?;
     }
@@ -516,7 +516,7 @@ async fn repeated_trust_loss_escalates_to_unhealthy() -> Result<()> {
     Ok(())
 }
 
-/// WS-4 (manager-authored red-green): after the caller has repaired/resynced,
+/// WS-4 red-green coverage: after the caller has repaired/resynced,
 /// `reset_health` returns the runtime to `Healthy` (the self-heal completion).
 #[tokio::test]
 async fn reset_health_restores_healthy() -> Result<()> {
@@ -534,7 +534,7 @@ async fn reset_health_restores_healthy() -> Result<()> {
             &mut cache,
             batch(
                 ReactiveInput::Log(rpc_log(address, b, b.number)),
-                included_context(b.clone(), b.number),
+                included_context(*b, b.number),
             ),
         )?;
     }
@@ -545,7 +545,7 @@ async fn reset_health_restores_healthy() -> Result<()> {
     Ok(())
 }
 
-/// WS-4 (implementation agent): mixed trust-loss event types share the same
+/// WS-4: mixed trust-loss event types share the same
 /// escalation ladder. A deep reorg (journal_depth=1, parent aged out) degrades to
 /// `Degraded`, then a subsequent forward gap escalates to `Unhealthy`.
 #[tokio::test]
@@ -573,7 +573,7 @@ async fn mixed_trust_loss_events_escalate_to_unhealthy() -> Result<()> {
             &mut cache,
             batch(
                 ReactiveInput::Log(rpc_log(address, b, log_index)),
-                included_context(b.clone(), log_index),
+                included_context(*b, log_index),
             ),
         )?;
     }
@@ -584,7 +584,7 @@ async fn mixed_trust_loss_events_escalate_to_unhealthy() -> Result<()> {
         &mut cache,
         batch(
             ReactiveInput::Log(rpc_log(address, &b11_alt, 12)),
-            included_context(b11_alt.clone(), 12),
+            included_context(b11_alt, 12),
         ),
     )?;
     assert!(
@@ -598,7 +598,7 @@ async fn mixed_trust_loss_events_escalate_to_unhealthy() -> Result<()> {
         &mut cache,
         batch(
             ReactiveInput::Log(rpc_log(address, &b16, 16)),
-            included_context(b16.clone(), 16),
+            included_context(b16, 16),
         ),
     )?;
     assert!(
@@ -611,7 +611,7 @@ async fn mixed_trust_loss_events_escalate_to_unhealthy() -> Result<()> {
     Ok(())
 }
 
-/// WS-4 (implementation agent): the `MissedBlockRange` report's `block` field
+/// WS-4: the `MissedBlockRange` report's `block` field
 /// equals the arriving block number that revealed the gap.
 #[tokio::test]
 async fn missed_range_report_block_equals_arriving_block() -> Result<()> {
@@ -629,7 +629,7 @@ async fn missed_range_report_block_equals_arriving_block() -> Result<()> {
         &mut cache,
         batch(
             ReactiveInput::Log(rpc_log(address, &b10, 10)),
-            included_context(b10.clone(), 10),
+            included_context(b10, 10),
         ),
     )?;
 
@@ -637,7 +637,7 @@ async fn missed_range_report_block_equals_arriving_block() -> Result<()> {
         &mut cache,
         batch(
             ReactiveInput::Log(rpc_log(address, &b15, 15)),
-            included_context(b15.clone(), 15),
+            included_context(b15, 15),
         ),
     )?;
 

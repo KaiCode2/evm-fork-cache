@@ -21,6 +21,88 @@ fn manifest_no_longer_defines_protocols_feature_or_protocol_benchmarks() {
 }
 
 #[test]
+fn published_package_excludes_source_tree_release_audits() {
+    let manifest = read("Cargo.toml");
+
+    assert!(
+        manifest.contains("tests/public_release_surface.rs"),
+        "the source-tree release audit depends on files intentionally omitted from the published crate"
+    );
+}
+
+#[test]
+fn raw_json_flashblocks_remain_explicit_and_transport_free() {
+    let manifest = read("Cargo.toml");
+    let feature_section = manifest
+        .split("[features]")
+        .nth(1)
+        .expect("features section")
+        .split("[dependencies]")
+        .next()
+        .expect("feature boundary");
+
+    assert!(
+        feature_section.contains("default = [\"reactive\", \"reactive-ws\"]"),
+        "the raw adapter must remain excluded from default features"
+    );
+    assert!(
+        feature_section.contains("raw-flashblocks-json = [\"reactive\", \"tokio/sync\"]"),
+        "the raw adapter should add only the reactive core and its bounded in-process handoff"
+    );
+    let dependencies = manifest
+        .split("[dependencies]")
+        .nth(1)
+        .expect("dependencies section")
+        .split("[dev-dependencies]")
+        .next()
+        .expect("dependency boundary");
+    assert!(
+        !dependencies.contains("tokio-tungstenite =") && !dependencies.contains("tungstenite ="),
+        "the published raw adapter must not add a source-socket dependency"
+    );
+    assert!(
+        manifest.contains("name = \"raw_json_flashblocks_subscriber_acceptance\"")
+            && manifest.contains("required-features = [\"raw-flashblocks-json\", \"reactive-ws\"]"),
+        "the networked acceptance probe must remain explicit and default-excluded"
+    );
+}
+
+#[test]
+fn raw_json_acceptance_rejects_a_canonical_chain_mismatch() {
+    let acceptance = read("examples/raw_json_flashblocks_subscriber_acceptance.rs");
+
+    assert!(
+        acceptance.contains("establish_flashblocks_preflight(chain_id)"),
+        "the live acceptance probe must preflight its reported chain id against the canonical subscriber"
+    );
+}
+
+#[test]
+fn alpha2_changelog_explains_flashblock_identity_migration() {
+    let changelog = read("CHANGELOG.md");
+    let alpha2 = changelog
+        .split("## [0.4.0-alpha.2]")
+        .nth(1)
+        .expect("alpha.2 changelog section")
+        .split("## [0.4.0-alpha.1]")
+        .next()
+        .expect("alpha.2 changelog boundary");
+
+    for required in [
+        "### Migration checklist",
+        "`FlashblockRef::block_hash`",
+        "`FlashblockRef::content_hash`",
+        "`FlashblockRef::partial_block_hash`",
+        "`Arc<FlashblockRef>`",
+    ] {
+        assert!(
+            alpha2.contains(required),
+            "alpha.2 migration guidance should mention {required}"
+        );
+    }
+}
+
+#[test]
 fn protocol_modules_are_not_part_of_the_core_crate_surface() {
     for path in [
         "src/events/uniswap_v3.rs",
@@ -298,4 +380,40 @@ fn library_error_surface_is_typed_not_anyhow() {
             );
         }
     }
+}
+
+#[test]
+fn execution_read_set_surface_is_typed_and_fail_closed() {
+    let read_set = read("src/cache/read_set.rs");
+    let exports = read("src/lib.rs");
+
+    for required in [
+        "pub enum ReadSetWarmupError",
+        "AccessListFetcherUnavailable",
+        "AccessListResultCountMismatch",
+        "pub enum ReadSetHydrationFailure",
+        "ProofResultMissing",
+        "ProofResultDuplicate",
+        "ProofResultUnexpected",
+        "StorageSlotDuplicate",
+        "StorageSlotUnexpected",
+        "RuntimeCodeUnavailable",
+        "pub failures: Vec<ReadSetHydrationFailure>",
+    ] {
+        assert!(
+            read_set.contains(required),
+            "read-set API should retain its typed failure contract: {required}"
+        );
+    }
+    for required in ["ReadSetWarmupError", "ReadSetHydrationFailure"] {
+        assert!(
+            exports.contains(required),
+            "crate root should export the public read-set failure type: {required}"
+        );
+    }
+    assert!(
+        !read_set.contains("account_failures: Vec<(Address, String)>")
+            && !read_set.contains("unwrap_or_else(|| Ok(StorageAccessList::default()))"),
+        "read-set failures must not regress to strings or fabricated callback results"
+    );
 }

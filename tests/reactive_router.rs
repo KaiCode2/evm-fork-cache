@@ -1,4 +1,4 @@
-//! Manager-authored acceptance tests for reactive routing and filter planning.
+//! Acceptance tests for reactive routing and filter planning.
 //!
 //! These tests pin the public behavior for the provider filter consolidation
 //! and routing-index phase. They should fail before the router/registry surface
@@ -202,7 +202,7 @@ impl LogMatcher for TopicMatcher {
 }
 
 #[test]
-fn reactive_registry_consolidates_provider_filters_as_safe_superset() -> Result<()> {
+fn reactive_registry_keeps_independent_address_topic_pairs_exact() -> Result<()> {
     let token_a = Address::repeat_byte(0xa1);
     let token_b = Address::repeat_byte(0xb2);
     let sig_a = keccak256(b"TokenAEvent()");
@@ -227,18 +227,23 @@ fn reactive_registry_consolidates_provider_filters_as_safe_superset() -> Result<
     )))?;
 
     let filters = registry.log_subscription_filters();
-    assert_eq!(filters.len(), 1, "compatible log interests should merge");
-    let consolidated = &filters[0];
+    assert_eq!(
+        filters.len(),
+        2,
+        "address/topic pairs must not merge into a Cartesian-product superset"
+    );
 
     let wanted_a = rpc_log(token_a, vec![sig_a]);
     let wanted_b = rpc_log(token_b, vec![sig_b]);
     let overfetched = rpc_log(token_a, vec![sig_b]);
 
-    assert!(consolidated.rpc_matches(&wanted_a));
-    assert!(consolidated.rpc_matches(&wanted_b));
+    assert!(filters.iter().any(|filter| filter.rpc_matches(&wanted_a)));
+    assert!(filters.iter().any(|filter| filter.rpc_matches(&wanted_b)));
     assert!(
-        consolidated.rpc_matches(&overfetched),
-        "merged filters may be a safe provider-side superset"
+        !filters
+            .iter()
+            .any(|filter| filter.rpc_matches(&overfetched)),
+        "subscription planning must not introduce unrelated cross-product logs"
     );
 
     let route_a = registry.route_log(&wanted_a);

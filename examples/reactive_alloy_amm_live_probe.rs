@@ -17,6 +17,11 @@
 //! `--no-default-features --features reactive,reactive-polling` and set
 //! `LIVE_AMM_TRANSPORT=polling` to exercise the HTTP `watch_logs` fallback.
 
+#![cfg_attr(
+    not(any(feature = "reactive-ws", feature = "reactive-polling")),
+    allow(dead_code, unused_imports)
+)]
+
 use std::{
     collections::BTreeMap,
     time::{Duration, Instant},
@@ -196,7 +201,7 @@ where
             })
         })
         .collect::<Vec<_>>();
-    subscriber.register_interests(&interests)?;
+    subscriber.register_interests(&interests).await?;
 
     let started = Instant::now();
     let run_for = Duration::from_secs(run_seconds);
@@ -265,11 +270,7 @@ where
                     removed += 1;
                 }
                 (status, was_removed) => {
-                    bail!(
-                        "unexpected chain status {:?} for removed={}",
-                        status,
-                        was_removed
-                    );
+                    bail!("unexpected chain status {status:?} for removed={was_removed}");
                 }
             }
 
@@ -289,10 +290,7 @@ where
         }
     }
 
-    println!(
-        "summary: observed {} log(s), {} removed/reorged",
-        total, removed
-    );
+    println!("summary: observed {total} log(s), {removed} removed/reorged");
     for target in &targets {
         println!(
             "  {:<34} {}",
@@ -303,9 +301,7 @@ where
 
     if total < min_events {
         bail!(
-            "observed {} log(s), below LIVE_AMM_MIN_EVENTS={}; increase LIVE_AMM_SECONDS or use a filter-capable RPC endpoint",
-            total,
-            min_events
+            "observed {total} log(s), below LIVE_AMM_MIN_EVENTS={min_events}; increase LIVE_AMM_SECONDS or use a filter-capable RPC endpoint"
         );
     }
 
@@ -325,8 +321,7 @@ where
     let mut total = 0usize;
 
     println!(
-        "preflight: scanning recent AMM logs over blocks {}..={} with the same filters",
-        from, latest
+        "preflight: scanning recent AMM logs over blocks {from}..={latest} with the same filters"
     );
     for target in targets {
         let logs = provider
@@ -338,12 +333,11 @@ where
 
     if total == 0 {
         bail!(
-            "preflight observed zero AMM logs over the last {} block(s); filters or endpoint are not suitable for this probe",
-            blocks
+            "preflight observed zero AMM logs over the last {blocks} block(s); filters or endpoint are not suitable for this probe"
         );
     }
 
-    println!("preflight: observed {} recent log(s)", total);
+    println!("preflight: observed {total} recent log(s)");
     Ok(())
 }
 
