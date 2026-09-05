@@ -1,6 +1,6 @@
 [package]
 name = "evm-fork-cache"
-version = "0.4.0-alpha.5"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.90"
 license = "MIT OR Apache-2.0"
@@ -68,7 +68,7 @@ alloy-rlp = "0.3"
 alloy-rpc-client = ">=1.0.38, <1.7"
 alloy-rpc-types-eth = ">=1.0.38, <1.7"
 alloy-sol-types = ">=1.4, <1.7"
-alloy-transport-balancer = { version = "0.3.0-alpha.2", path = "../alloy-transport-balancer", default-features = false }
+alloy-transport-balancer = { version = "0.3.0", default-features = false }
 
 futures = "0.3"
 bincode = "1.3"

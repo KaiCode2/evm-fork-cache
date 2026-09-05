@@ -159,7 +159,7 @@ bincode_graph="$({
 } | sed -E 's# \(/[^)]*\)$##; s# \(\*\)$##')"
 expected_bincode_graph="$(printf '%s\n' \
   '0bincode v1.3.3' \
-  '1evm-fork-cache v0.4.0-alpha.5')"
+  '1evm-fork-cache v0.4.0')"
 if [[ "$bincode_graph" != "$expected_bincode_graph" ]]; then
   echo "The accepted bincode 1 compatibility scope changed." >&2
   echo "Expected:" >&2

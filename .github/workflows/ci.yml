@@ -7,7 +7,6 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  TRANSPORT_REF: 7868bea593dec5748ad7475d1909fc3a2de0d4ad
 
 permissions:
   contents: read
@@ -26,13 +25,6 @@ jobs:
         with:
           path: evm-fork-cache
           fetch-depth: 0
-
-      - name: Check out exact transport candidate
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-        with:
-          repository: KaiCode2/alloy-transport-balancer
-          ref: ${{ env.TRANSPORT_REF }}
-          path: alloy-transport-balancer
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
@@ -109,13 +101,6 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           path: evm-fork-cache
-
-      - name: Check out exact transport candidate
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-        with:
-          repository: KaiCode2/alloy-transport-balancer
-          ref: ${{ env.TRANSPORT_REF }}
-          path: alloy-transport-balancer
 
       - name: Install Rust 1.90 (declared MSRV)
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
