@@ -1,11 +1,11 @@
 # Releasing
 
-`evm-fork-cache` 0.4.0-alpha.4 adds bounded, caller-timed single-index reorder
+`evm-fork-cache` 0.4.0 adds bounded, caller-timed single-index reorder
 tolerance to the default-off raw JSON Flashblocks normalization layer, immutable
 snapshot lineage lookups, and provider-free cooperative cancellation scopes for
-related overlay calls. Publish `alloy-transport-balancer 0.3.0-alpha.2` first,
+related overlay calls. Publish `alloy-transport-balancer 0.3.0` first,
 then publish this crate before any extension crate that declares
-`evm-fork-cache = "0.4.0-alpha.4"`.
+`evm-fork-cache = "0.4.0"`.
 No release step is automatic: use clean, reviewed commits and never publish
 from a credential-bearing working tree.
 
@@ -53,9 +53,8 @@ Confirm every third-party `uses:` entry remains pinned to the officially
 verified full commit recorded in `SECURITY.md`, not a mutable tag or branch.
 The stable and MSRV jobs must use the same pinned `dtolnay/rust-toolchain`
 action with explicit `toolchain: stable` and `toolchain: 1.90.0` inputs.
-Confirm the workflow's transport checkout still names the reviewed exact
-candidate commit recorded in `SECURITY.md`; a moving branch is not an acceptable
-substitute.
+Library CI resolves the checked-in registry-only dependency graph. It must not
+introduce sibling source overrides.
 
 Inspect `cargo package --list --locked` and confirm that secrets, local databases,
 planning/spec documents, and build output are excluded while consumer
@@ -88,11 +87,11 @@ the core's retained canonical history exactly.
 
 ```bash
 cargo publish --locked
-git tag -s v0.4.0-alpha.4 -m "Release evm-fork-cache v0.4.0-alpha.4"
-git push origin v0.4.0-alpha.4
+git tag -s v0.4.0 -m "Release evm-fork-cache v0.4.0"
+git push origin v0.4.0
 ```
 
-Wait for 0.4.0-alpha.4 to appear in the crates.io index before removing sibling path
-dependencies and verifying downstream extension packages. Publish only after
+Wait for 0.4.0 to appear in the crates.io index before verifying downstream
+extension packages against their final registry-only lockfiles. Publish only after
 explicit authorization; preparing or running this checklist is not permission
 to publish, tag, or push.

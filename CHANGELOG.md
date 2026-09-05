@@ -10,6 +10,19 @@ versions (`0.x.0`); patch versions (`0.x.y`) are non-breaking. The roadmap in
 [`docs/ROADMAP.md`](docs/ROADMAP.md) deliberately reshapes the API before the
 surface freezes at 1.0.
 
+## [Unreleased]
+
+## [0.4.0] - 2026-09-05
+
+### Changed
+
+- Promotes the current alpha cache and subscriber surface, including canonical
+  subscription log coverage, gap recovery, provider provenance, isolated
+  preconfirmation snapshots, bounded raw Flashblocks normalization, and
+  cooperative simulation cancellation. Uses `alloy-transport-balancer 0.3.0`.
+
+- Correct test-helper feature gates for isolated reactive and WebSocket builds.
+
 ## [0.4.0-alpha.5] - 2026-08-22
 
 ### Migration checklist
@@ -1356,7 +1369,7 @@ pre-release development phases (see [`docs/ROADMAP.md`](docs/ROADMAP.md)).
 - `EvmCache` requires a multi-thread tokio runtime for any RPC-touching path.
 - See [`docs/KNOWN_ISSUES.md`](docs/KNOWN_ISSUES.md) for current limitations.
 
-[Unreleased]: https://github.com/KaiCode2/evm-fork-cache/compare/v0.4.0-alpha.4...HEAD
+[Unreleased]: https://github.com/KaiCode2/evm-fork-cache/compare/v0.4.0...HEAD
 [0.4.0-alpha.4]: https://github.com/KaiCode2/evm-fork-cache/compare/v0.4.0-alpha.3...v0.4.0-alpha.4
 [0.4.0-alpha.3]: https://github.com/KaiCode2/evm-fork-cache/compare/v0.4.0-alpha.2...v0.4.0-alpha.3
 [0.4.0-alpha.2]: https://github.com/KaiCode2/evm-fork-cache/compare/v0.4.0-alpha.1...v0.4.0-alpha.2
@@ -1365,3 +1378,5 @@ pre-release development phases (see [`docs/ROADMAP.md`](docs/ROADMAP.md)).
 [0.2.1]: https://github.com/KaiCode2/evm-fork-cache/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/KaiCode2/evm-fork-cache/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/KaiCode2/evm-fork-cache/releases/tag/v0.1.0
+
+[0.4.0]: https://github.com/KaiCode2/evm-fork-cache/releases/tag/v0.4.0

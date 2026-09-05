@@ -106,8 +106,19 @@ The stable and MSRV jobs use the same reviewed toolchain-action commit and pass
 their requested toolchain explicitly. Updating any action requires verifying
 the new upstream ref and full commit before changing the pin.
 
-Sibling development dependencies are also immutable in CI. The alpha.4 cache
-workflow checks out `alloy-transport-balancer` at exact commit
-`7868bea593dec5748ad7475d1909fc3a2de0d4ad`, matching the first candidate in
-the documented publish order. Changing that revision requires rerunning the
-cache's complete locked release matrix.
+CI resolves the registry-only graph recorded in `Cargo.lock`. Changing a
+released dependency requires rerunning the applicable locked release matrix.
+
+## Alloy LRU advisory scope
+
+`RUSTSEC-2026-0253` concerns `lru::LruCache::pop` when a stored key's destructor
+panics and execution subsequently continues after catching that panic. The
+remaining `lru 0.16.4` copy comes only from `alloy-provider 1.6.3`. Its block
+stream uses `BlockNumber` (`u64`) keys and its cache layer uses `B256` keys;
+neither has a custom destructor. This dependency remains affected as a library,
+but the key-destructor trigger is absent from these selected Alloy uses.
+Reassess on an Alloy or key-type change. The fix is in lru 0.18.2, outside
+Alloy's 0.16 dependency range; no registry patch is hidden in this release.
+
+The TUI dependency set uses the patched `lru 0.18.2` where that version range
+is supported. Do not generalize the Alloy assessment to other lru consumers.

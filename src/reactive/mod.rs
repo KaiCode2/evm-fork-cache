@@ -22066,11 +22066,6 @@ mod subscriber_helper_tests {
         }
     }
 
-    #[cfg(any(
-        feature = "raw-flashblocks-json",
-        feature = "reactive-polling",
-        feature = "reactive-ws"
-    ))]
     fn rpc_block(number: u64, hash: B256) -> alloy_rpc_types_eth::Block {
         alloy_rpc_types_eth::Block::empty(alloy_rpc_types_eth::Header {
             hash,
@@ -24332,11 +24327,6 @@ mod subscriber_helper_tests {
     }
 
     // A log interest matching `rpc_log` (address 0x42, topic0 0x01).
-    #[cfg(any(
-        feature = "raw-flashblocks-json",
-        feature = "reactive-polling",
-        feature = "reactive-ws"
-    ))]
     fn log_interest_matching_rpc_log() -> ReactiveInterest<Ethereum> {
         ReactiveInterest::Logs(LogInterest {
             provider_filter: Filter::new()
