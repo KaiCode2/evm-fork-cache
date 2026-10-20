@@ -19551,16 +19551,15 @@ where
     let stream = stream::unfold(state, |mut state| async move {
         let gap = match state.raw.recv().await {
             Ok(value) => {
-                let dequeued = Instant::now();
+                let dequeued = state.receipts.as_ref().map(|_| Instant::now());
                 let receipt = state
                     .receipts
                     .as_ref()
                     .and_then(|lookup| lookup(value.get()));
                 match serde_json::from_str::<T>(value.get()) {
                     Ok(item) => {
-                        let decoded = Instant::now();
-                        let timing = receipt.and_then(|receipt| {
-                            CanonicalIngressTiming::new(receipt, dequeued, decoded)
+                        let timing = receipt.zip(dequeued).and_then(|(receipt, dequeued)| {
+                            CanonicalIngressTiming::new(receipt, dequeued, Instant::now())
                         });
                         let event = (state.to_event)(item, timing);
                         return Some((event, state));
@@ -25648,6 +25647,19 @@ mod stream_gap_tests {
                 timing,
             }
         })
+    }
+
+    #[tokio::test]
+    async fn receipt_lookup_disabled_preserves_delivery_without_timing() {
+        let counters = Arc::new(SubscriberStreamGapCounters::default());
+        let (tx, subscription) = wired_subscription(8);
+        tx.send(wire_log(100, 0)).expect("receiver alive");
+        let mut stream = gap_stream(subscription, log_source(0), counters);
+        let Some(SubscriberEvent::Log { log, timing, .. }) = stream.next().await else {
+            panic!("canonical log expected");
+        };
+        assert_eq!(log.block_number, Some(100));
+        assert!(timing.is_none());
     }
 
     #[tokio::test]
