@@ -12,6 +12,13 @@ surface freezes at 1.0.
 
 ## [Unreleased]
 
+### Added
+
+- Optional application-owned transport receipt lookup and canonical subscriber
+  dequeue/decode timing. Metadata stays observational, preserves existing queue
+  and canonical delivery semantics, and remains absent on missing or ambiguous
+  receipt evidence. See `docs/transport-receipt-timing.md`.
+
 ## [0.4.0] - 2026-09-05
 
 ### Changed

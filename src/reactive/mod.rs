@@ -64,6 +64,9 @@ use crate::{
     state_update::{AccountPatch, PurgeScope, StateDiff, StateUpdate},
 };
 
+mod ingress_timing;
+pub use ingress_timing::{CanonicalIngressTiming, TransportReceipt, TransportReceiptLookup};
+
 #[cfg(feature = "raw-flashblocks-json")]
 mod raw_json_flashblocks;
 #[cfg(feature = "raw-flashblocks-json")]
@@ -11236,6 +11239,7 @@ pub struct SubscriberInputRecord<N: Network = Ethereum> {
     record: ReactiveInputRecord<N>,
     scope: SubscriberInputScope,
     preconfirmation_timing: Option<FlashblockIngressTiming>,
+    canonical_timing: Option<CanonicalIngressTiming>,
 }
 
 impl<N: Network> SubscriberInputRecord<N> {
@@ -11252,6 +11256,11 @@ impl<N: Network> SubscriberInputRecord<N> {
     /// Original typed source ingress when this is a preconfirmed record.
     pub const fn preconfirmation_timing(&self) -> Option<FlashblockIngressTiming> {
         self.preconfirmation_timing
+    }
+
+    /// Actual transport and subscriber clocks, if an unambiguous receipt was supplied.
+    pub const fn canonical_timing(&self) -> Option<CanonicalIngressTiming> {
+        self.canonical_timing
     }
 
     /// Consume the scoped value into its reactive input record.
@@ -13158,6 +13167,7 @@ type FlashblockReconnectFuture<N> = Pin<
 /// `Ok(None)`.
 pub struct AlloySubscriber<P, N: Network = Ethereum> {
     provider: P,
+    transport_receipts: Option<TransportReceiptLookup>,
     /// Stable identity of an application-managed standardized Flashblock
     /// update source. The application owns its transport and lifecycle.
     #[cfg(feature = "raw-flashblocks-json")]
@@ -13370,6 +13380,7 @@ impl<P, N: Network> AlloySubscriber<P, N> {
             last_external_flashblock_snapshot: None,
             flashblocks_state_provider: None,
             provider_ref: None,
+            transport_receipts: None,
             log_verification_provider: None,
             chain_id: None,
             mode,
@@ -13425,6 +13436,13 @@ impl<P, N: Network> AlloySubscriber<P, N> {
     /// Borrow the provider.
     pub fn provider(&self) -> &P {
         &self.provider
+    }
+
+    /// Attach observational receipt lookup before subscriptions are connected.
+    /// Ambiguity or missing data affects telemetry only, never delivery/readiness.
+    pub fn with_transport_receipt_lookup(mut self, lookup: TransportReceiptLookup) -> Self {
+        self.transport_receipts = Some(lookup);
+        self
     }
 
     /// Bind this subscriber to the concrete provider lease that supplies
@@ -15290,13 +15308,14 @@ enum SubscriberEvent<N: Network> {
     Log {
         source_id: usize,
         log: Log,
+        timing: Option<CanonicalIngressTiming>,
     },
     BackfilledLogs {
         source_id: usize,
         logs: Vec<Log>,
     },
     Logs(Vec<Log>),
-    BlockHeader(N::HeaderResponse),
+    BlockHeader(N::HeaderResponse, Option<CanonicalIngressTiming>),
     PendingHash(B256),
     PendingHashes(Vec<B256>),
     BasePendingLog {
@@ -16967,7 +16986,12 @@ where
                 subscription,
                 source,
                 Arc::clone(&self.gap_counters),
-                move |log| SubscriberEvent::Log { source_id: id, log },
+                self.transport_receipts.clone(),
+                move |log, timing| SubscriberEvent::Log {
+                    source_id: id,
+                    log,
+                    timing,
+                },
             ))
         }
 
@@ -17006,7 +17030,8 @@ where
                 subscription,
                 source,
                 Arc::clone(&self.gap_counters),
-                move |log| SubscriberEvent::BasePendingLogTimed {
+                None,
+                move |log, _| SubscriberEvent::BasePendingLogTimed {
                     source_id: id,
                     log,
                     timing: FlashblockIngressTiming::new(Instant::now()),
@@ -17144,6 +17169,7 @@ where
                 subscription,
                 SubscriberStreamSource::PubSubBlockHeaders,
                 Arc::clone(&self.gap_counters),
+                self.transport_receipts.clone(),
                 SubscriberEvent::BlockHeader,
             ))
         }
@@ -17695,7 +17721,7 @@ where
                 return Ok(None);
             }
             self.last_certified_canonical_head = Some(certified);
-            return Ok(Some(SubscriberEvent::BlockHeader(header)));
+            return Ok(Some(SubscriberEvent::BlockHeader(header, None)));
         }
         self.record_rpc(
             SubscriberRpcCause::CanonicalHeadCertification,
@@ -17731,7 +17757,7 @@ where
             return Ok(None);
         }
         self.last_certified_canonical_head = Some(certified);
-        Ok(Some(SubscriberEvent::BlockHeader(header.clone())))
+        Ok(Some(SubscriberEvent::BlockHeader(header.clone(), None)))
     }
 
     fn accept_base_flashblock(
@@ -18558,7 +18584,7 @@ where
             }
             #[cfg(feature = "raw-flashblocks-json")]
             SubscriberEvent::ExternalFlashblockUpdate(_) => Ok(()),
-            SubscriberEvent::BlockHeader(_)
+            SubscriberEvent::BlockHeader(_, _)
             | SubscriberEvent::PendingHash(_)
             | SubscriberEvent::PendingHashes(_)
             | SubscriberEvent::BasePendingLog { .. }
@@ -18664,7 +18690,7 @@ where
             }
             #[cfg(feature = "raw-flashblocks-json")]
             SubscriberEvent::ExternalFlashblockUpdate(_) => {}
-            SubscriberEvent::BlockHeader(_)
+            SubscriberEvent::BlockHeader(_, _)
             | SubscriberEvent::PendingHash(_)
             | SubscriberEvent::PendingHashes(_)
             | SubscriberEvent::BasePendingLog { .. }
@@ -18758,11 +18784,15 @@ where
         excluded: Option<&HashSet<SubscriberOwnerEpoch>>,
     ) {
         match event {
-            SubscriberEvent::Log { source_id, log } => {
+            SubscriberEvent::Log {
+                source_id,
+                log,
+                timing,
+            } => {
                 if log_matches_any_interest(&log, &self.interests) {
                     let record = log_input_record(log, InputSource::Subscription);
                     self.note_log_block(source_id, &record);
-                    self.enqueue_record_with_excluded_owners(record, excluded);
+                    self.enqueue_timed_record_with_excluded_owners(record, excluded, timing);
                 }
             }
             SubscriberEvent::BackfilledLogs { source_id, logs } => {
@@ -18784,11 +18814,11 @@ where
                     }
                 }
             }
-            SubscriberEvent::BlockHeader(header) => {
+            SubscriberEvent::BlockHeader(header, timing) => {
                 if needs_header_block_stream(&self.interests) {
                     let record = block_header_input_record::<N>(header);
                     self.note_attestable_canonical_block(&record);
-                    self.enqueue_record_with_excluded_owners(record, excluded);
+                    self.enqueue_timed_record_with_excluded_owners(record, excluded, timing);
                 }
             }
             SubscriberEvent::PendingHash(hash) => {
@@ -18815,6 +18845,7 @@ where
                         record,
                         scope: SubscriberInputScope::Preconfirmed,
                         preconfirmation_timing: Some(timing),
+                        canonical_timing: None,
                     });
                 }
             }
@@ -19117,6 +19148,15 @@ where
         record: ReactiveInputRecord<N>,
         excluded: Option<&HashSet<SubscriberOwnerEpoch>>,
     ) {
+        self.enqueue_timed_record_with_excluded_owners(record, excluded, None);
+    }
+
+    fn enqueue_timed_record_with_excluded_owners(
+        &mut self,
+        record: ReactiveInputRecord<N>,
+        excluded: Option<&HashSet<SubscriberOwnerEpoch>>,
+        timing: Option<CanonicalIngressTiming>,
+    ) {
         let record = self.with_chain_id(record);
         let mut owners = self.staged_owners_for_record(&record);
         if let Some(excluded) = excluded {
@@ -19134,6 +19174,7 @@ where
                     record: record.clone(),
                     scope: SubscriberInputScope::OwnerOnly { owners },
                     preconfirmation_timing: None,
+                    canonical_timing: timing,
                 });
             }
             if !newly_served.is_empty() {
@@ -19146,6 +19187,7 @@ where
                         owners: newly_served,
                     },
                     preconfirmation_timing: None,
+                    canonical_timing: timing,
                 });
             }
             return;
@@ -19165,6 +19207,7 @@ where
                 }
             },
             preconfirmation_timing: None,
+            canonical_timing: timing,
         });
     }
 
@@ -19180,6 +19223,7 @@ where
                 owners: vec![owner],
             },
             preconfirmation_timing: None,
+            canonical_timing: None,
         });
     }
 
@@ -19304,6 +19348,7 @@ where
             record,
             scope: SubscriberInputScope::OwnerOnly { owners },
             preconfirmation_timing: None,
+            canonical_timing: None,
         });
     }
 
@@ -19475,12 +19520,13 @@ fn gap_observing_stream<N, T, F>(
     subscription: alloy_pubsub::Subscription<T>,
     source: SubscriberStreamSource,
     gap_counters: Arc<SubscriberStreamGapCounters>,
+    receipts: Option<TransportReceiptLookup>,
     to_event: F,
 ) -> BoxStream<'static, SubscriberEvent<N>>
 where
     N: Network + 'static,
     T: serde::de::DeserializeOwned + Send + 'static,
-    F: FnMut(T) -> SubscriberEvent<N> + Send + 'static,
+    F: FnMut(T, Option<CanonicalIngressTiming>) -> SubscriberEvent<N> + Send + 'static,
 {
     // The decode closure and the receiver both live in the unfold state, so no
     // borrow is held across an await point.
@@ -19489,6 +19535,7 @@ where
         to_event: F,
         source: SubscriberStreamSource,
         gap_counters: Arc<SubscriberStreamGapCounters>,
+        receipts: Option<TransportReceiptLookup>,
         _item: PhantomData<fn() -> T>,
     }
 
@@ -19497,25 +19544,37 @@ where
         to_event,
         source: source.clone(),
         gap_counters,
+        receipts,
         _item: PhantomData::<fn() -> T>,
     };
 
     let stream = stream::unfold(state, |mut state| async move {
         let gap = match state.raw.recv().await {
-            Ok(value) => match serde_json::from_str::<T>(value.get()) {
-                Ok(item) => {
-                    let event = (state.to_event)(item);
-                    return Some((event, state));
+            Ok(value) => {
+                let dequeued = Instant::now();
+                let receipt = state
+                    .receipts
+                    .as_ref()
+                    .and_then(|lookup| lookup(value.get()));
+                match serde_json::from_str::<T>(value.get()) {
+                    Ok(item) => {
+                        let decoded = Instant::now();
+                        let timing = receipt.and_then(|receipt| {
+                            CanonicalIngressTiming::new(receipt, dequeued, decoded)
+                        });
+                        let event = (state.to_event)(item, timing);
+                        return Some((event, state));
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            stream = state.source.label(),
+                            error = %error,
+                            "pubsub notification did not decode; treating it as lost data"
+                        );
+                        SubscriberStreamGap::Undecodable
+                    }
                 }
-                Err(error) => {
-                    tracing::warn!(
-                        stream = state.source.label(),
-                        error = %error,
-                        "pubsub notification did not decode; treating it as lost data"
-                    );
-                    SubscriberStreamGap::Undecodable
-                }
-            },
+            }
             Err(broadcast::error::RecvError::Lagged(skipped)) => {
                 tracing::warn!(
                     stream = state.source.label(),
@@ -20745,7 +20804,7 @@ mod subscriber_helper_tests {
                 .fetch_certified_canonical_head()
                 .await
                 .expect("first certified head"),
-            Some(SubscriberEvent::BlockHeader(_))
+            Some(SubscriberEvent::BlockHeader(_, _))
         ));
         assert!(
             subscriber
@@ -20810,7 +20869,7 @@ mod subscriber_helper_tests {
             .await
             .expect("OP pending parent can be certified")
             .expect("the first certified parent is emitted");
-        let SubscriberEvent::BlockHeader(header) = event else {
+        let SubscriberEvent::BlockHeader(header, _) = event else {
             panic!("expected a certified canonical block header")
         };
         assert_eq!(header.number(), 100);
@@ -22393,7 +22452,11 @@ mod subscriber_helper_tests {
             log_input_record(log.clone(), InputSource::Backfill),
             owner.clone(),
         );
-        subscriber.enqueue_event(SubscriberEvent::Log { source_id: 0, log });
+        subscriber.enqueue_event(SubscriberEvent::Log {
+            source_id: 0,
+            log,
+            timing: None,
+        });
 
         let batch = subscriber
             .drain_next_scoped_batch()
@@ -22537,6 +22600,7 @@ mod subscriber_helper_tests {
         subscriber.enqueue_event(SubscriberEvent::Log {
             source_id: 0,
             log: rpc_log(false),
+            timing: None,
         });
         let mut second = rpc_log(false);
         second.log_index = Some(6);
@@ -22544,6 +22608,7 @@ mod subscriber_helper_tests {
         subscriber.enqueue_event(SubscriberEvent::Log {
             source_id: 0,
             log: second,
+            timing: None,
         });
 
         assert_eq!(subscriber.pending_records.len(), 1);
@@ -22641,6 +22706,7 @@ mod subscriber_helper_tests {
             record: log_input_record(rpc_log(false), InputSource::Poll),
             scope: SubscriberInputScope::Canonical { owners: Vec::new() },
             preconfirmation_timing: None,
+            canonical_timing: None,
         });
 
         let error = subscriber
@@ -22734,6 +22800,7 @@ mod subscriber_helper_tests {
             record: log_input_record(rpc_log(false), InputSource::Poll),
             scope: SubscriberInputScope::Canonical { owners: Vec::new() },
             preconfirmation_timing: None,
+            canonical_timing: None,
         });
         let baseline = BlockRef {
             number: 100,
@@ -23014,6 +23081,7 @@ mod subscriber_helper_tests {
         subscriber.enqueue_event(SubscriberEvent::Log {
             source_id: 0,
             log: rpc_log(false),
+            timing: None,
         });
         assert!(subscriber.abort_interest_owner(&owner_a));
 
@@ -23058,7 +23126,11 @@ mod subscriber_helper_tests {
             log_input_record(log.clone(), InputSource::Backfill),
             epoch.clone(),
         );
-        subscriber.enqueue_event(SubscriberEvent::Log { source_id: 0, log });
+        subscriber.enqueue_event(SubscriberEvent::Log {
+            source_id: 0,
+            log,
+            timing: None,
+        });
 
         let batch = subscriber
             .next_scoped_batch()
@@ -23112,7 +23184,11 @@ mod subscriber_helper_tests {
             let mut log = rpc_log(false);
             log.transaction_hash = Some(B256::repeat_byte(index.saturating_add(1)));
             log.log_index = Some(index as u64);
-            SubscriberEvent::Log { source_id: 0, log }
+            SubscriberEvent::Log {
+                source_id: 0,
+                log,
+                timing: None,
+            }
         });
         let filter = log_filters(std::slice::from_ref(&interest)).pop().unwrap();
         let mut streams = SubscriberStreams::new();
@@ -23288,6 +23364,7 @@ mod subscriber_helper_tests {
         let event = SubscriberEvent::Log {
             source_id: 0,
             log: rpc_log(false),
+            timing: None,
         };
         let mut streams = SubscriberStreams::new();
         streams.push(
@@ -23744,6 +23821,7 @@ mod subscriber_helper_tests {
             },
             stream::once(async {
                 SubscriberEvent::<Ethereum>::Log {
+                    timing: None,
                     source_id: 0,
                     log: rpc_log(false),
                 }
@@ -23808,6 +23886,7 @@ mod subscriber_helper_tests {
             stream::once(async {
                 tokio::time::sleep(Duration::from_millis(1)).await;
                 SubscriberEvent::<Ethereum>::Log {
+                    timing: None,
                     source_id: 0,
                     log: rpc_log(false),
                 }
@@ -23860,6 +23939,7 @@ mod subscriber_helper_tests {
         subscriber.enqueue_event(SubscriberEvent::Log {
             source_id: 0,
             log: log.clone(),
+            timing: None,
         });
         subscriber.enqueue_event(SubscriberEvent::BackfilledLogs {
             source_id: 0,
@@ -23947,6 +24027,7 @@ mod subscriber_helper_tests {
         subscriber.enqueue_event(SubscriberEvent::Log {
             source_id: 0,
             log: rpc_log(false),
+            timing: None,
         });
         let mut streams = SubscriberStreams::new();
         streams.push(
@@ -25466,7 +25547,7 @@ mod canonical_head_rpc_stats_tests {
             .await
             .expect("first certification succeeds");
         assert!(
-            matches!(first, Some(SubscriberEvent::BlockHeader(_))),
+            matches!(first, Some(SubscriberEvent::BlockHeader(_, _))),
             "a newly certified head is delivered"
         );
 
@@ -25560,10 +25641,51 @@ mod stream_gap_tests {
         source: SubscriberStreamSource,
         counters: Arc<SubscriberStreamGapCounters>,
     ) -> BoxStream<'static, SubscriberEvent<Ethereum>> {
-        gap_observing_stream(subscription, source, counters, |log| SubscriberEvent::Log {
-            source_id: 0,
-            log,
+        gap_observing_stream(subscription, source, counters, None, |log, timing| {
+            SubscriberEvent::Log {
+                source_id: 0,
+                log,
+                timing,
+            }
         })
+    }
+
+    #[tokio::test]
+    async fn consumed_raw_subscription_preserves_transport_clock_without_rewriting_payload() {
+        let counters = Arc::new(SubscriberStreamGapCounters::default());
+        let (tx, subscription) = wired_subscription(8);
+        let raw = wire_log(100, 0);
+        let expected = raw.get().to_owned();
+        let received = Instant::now() - Duration::from_millis(30);
+        let receipt = TransportReceipt::new(B256::repeat_byte(7), received, received).unwrap();
+        let lookup: TransportReceiptLookup = Arc::new(move |raw| {
+            assert_eq!(raw, expected);
+            Some(receipt)
+        });
+        tx.send(raw).expect("receiver alive");
+        let mut stream = gap_observing_stream(
+            subscription,
+            log_source(0),
+            counters,
+            Some(lookup),
+            |log, timing| SubscriberEvent::<Ethereum>::Log {
+                source_id: 0,
+                log,
+                timing,
+            },
+        );
+        let Some(SubscriberEvent::Log {
+            timing: Some(timing),
+            log,
+            ..
+        }) = stream.next().await
+        else {
+            panic!("timed canonical log expected");
+        };
+        assert_eq!(log.block_number, Some(100));
+        assert_eq!(timing.receipt(), receipt);
+        assert!(timing.dequeued().duration_since(received) >= Duration::from_millis(30));
+        assert!(timing.decoded() >= timing.dequeued());
     }
 
     /// A channel that overflows reports the loss. Under
@@ -26014,7 +26136,10 @@ mod canonical_head_suppression_tests {
             .certify_canonical_head_on_sealed_block()
             .await
             .expect("certification succeeds");
-        assert!(matches!(certified, Some(SubscriberEvent::BlockHeader(_))));
+        assert!(matches!(
+            certified,
+            Some(SubscriberEvent::BlockHeader(_, _))
+        ));
 
         // A tick immediately afterwards is inside the poll window.
         assert!(subscriber.canonical_head_certification_is_current());
@@ -26066,7 +26191,7 @@ mod canonical_head_suppression_tests {
             .await
             .expect("second certification");
 
-        assert!(matches!(second, Some(SubscriberEvent::BlockHeader(_))));
+        assert!(matches!(second, Some(SubscriberEvent::BlockHeader(_, _))));
         assert_eq!(
             subscriber
                 .rpc_stats()
