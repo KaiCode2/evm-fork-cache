@@ -81,6 +81,30 @@ authentication behavior, retry policy, an application AMM integration, or
 permission to execute against speculative state. Those remain consumer-owned
 acceptance boundaries.
 
+## September release revalidation
+
+On 2026-09-05, the same optimized subscriber-output probe compared the official
+public Optimism raw feed with a paid QuickNode canonical WebSocket. It paired
+100 of 100 raw swaps with identical canonical content in 112.312 seconds, with
+no duplicate identities or unmatched mature raw records. Canonical delivery
+was first in 81 pairs; raw delivery was first in 19. Absolute pairing delay
+was 9,172.015 ms p95. Three canonical records remained unpaired at shutdown.
+
+**The live latency gate failed** (`raw delivery was not usually first`). This
+window does not qualify that source pair for a latency advantage or establish
+that the three unmatched canonical records were source omissions. The probe
+stops at its target pair count and does not drain a lagging source afterward.
+The historical August result remains a separate observation. The stable crate
+provides the opt-in JSON conversion and bounded handoff API; applications must
+qualify their own source, delivery policy, and continuity before using it.
+
+The optimized resource probes on the release candidate measured a 4,108,968-byte
+frame (4,500 transactions, 9,000 logs) at 8.8615–10.835 ms and 361.65–442.21
+MiB/s, and a 15,521,468-byte frame (17,000 transactions, 34,000 logs) at
+39.429–45.773 ms and 323.39–375.42 MiB/s. These are Criterion confidence
+intervals from 20 samples per large-frame case on the local M1 Pro; they measure
+conversion, not source delivery or trading readiness.
+
 ## Resource-limit policy
 
 The library defaults are deliberately broad compatibility ceilings: 16 MiB per

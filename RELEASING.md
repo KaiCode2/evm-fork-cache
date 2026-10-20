@@ -1,13 +1,21 @@
 # Releasing
 
-`evm-fork-cache` 0.4.0-alpha.4 adds bounded, caller-timed single-index reorder
-tolerance to the default-off raw JSON Flashblocks normalization layer, immutable
-snapshot lineage lookups, and provider-free cooperative cancellation scopes for
-related overlay calls. Publish `alloy-transport-balancer 0.3.0-alpha.2` first,
-then publish this crate before any extension crate that declares
-`evm-fork-cache = "0.4.0-alpha.4"`.
-No release step is automatic: use clean, reviewed commits and never publish
-from a credential-bearing working tree.
+`evm-fork-cache` 0.4.1 is an unpublished additive telemetry candidate based on
+published 0.4.0 (`ab08a5702982eba87d8d590120ef1076de8a3342`, confirmed by that
+registry archive's VCS metadata). It adds generic optional receipt/dequeue/decode
+provenance and preserves existing constructors and execution semantics. No
+exporter, bot label, provider operation or runtime task is added. See
+`docs/transport-receipt-timing.md` for the Alloy integration and disabled costs.
+The candidate also includes the reviewed Rust1.90 checkpoint CAS compatibility
+fix and release-lockfile TLS audit patches. It does not alter durable formats.
+
+The registry API confirmed 0.4.1 absent on 2026-10-20. Recheck availability before
+an explicitly authorized publication. No tag or package has been published by
+this preparation. Complete the unchanged checks below on the candidate and
+inspect the packaged source. Wait for the authorized cache publication before
+qualifying AMM's exact registry dependency; a local/Git patch is integration
+evidence only. No release step is automatic: use clean, reviewed commits and
+never publish from a credential-bearing working tree.
 
 ## Preflight
 
@@ -53,9 +61,8 @@ Confirm every third-party `uses:` entry remains pinned to the officially
 verified full commit recorded in `SECURITY.md`, not a mutable tag or branch.
 The stable and MSRV jobs must use the same pinned `dtolnay/rust-toolchain`
 action with explicit `toolchain: stable` and `toolchain: 1.90.0` inputs.
-Confirm the workflow's transport checkout still names the reviewed exact
-candidate commit recorded in `SECURITY.md`; a moving branch is not an acceptable
-substitute.
+Library CI resolves the checked-in registry-only dependency graph. It must not
+introduce sibling source overrides.
 
 Inspect `cargo package --list --locked` and confirm that secrets, local databases,
 planning/spec documents, and build output are excluded while consumer
@@ -88,11 +95,26 @@ the core's retained canonical history exactly.
 
 ```bash
 cargo publish --locked
-git tag -s v0.4.0-alpha.4 -m "Release evm-fork-cache v0.4.0-alpha.4"
-git push origin v0.4.0-alpha.4
+git tag -s v0.4.1 -m "Release evm-fork-cache v0.4.1"
+git push origin v0.4.1
 ```
 
-Wait for 0.4.0-alpha.4 to appear in the crates.io index before removing sibling path
-dependencies and verifying downstream extension packages. Publish only after
+Wait for 0.4.1 to appear in the crates.io index before verifying downstream
+extension packages against their final registry-only lockfiles. Publish only after
 explicit authorization; preparing or running this checklist is not permission
 to publish, tag, or push.
+
+## Optional ingress timing feature
+
+The `ingress-timing` Cargo feature is disabled by default. Without it, new
+receipt types, callback configuration, accessors, inline metadata fields and
+receipt clockwork are not compiled. Existing canonical and Flashblock timing
+APIs keep their prior behavior. Enabling the feature adds only generic data and
+hooks; consumers must still explicitly install a bounded receipt lookup. No
+exporter, tracing subscriber, global setup or runtime task is installed.
+
+Use `features = ["ingress-timing"]` alongside the existing transport features.
+Default/default-off and enabled builds, compile-fail API absence, record-layout
+regression and a real consumed-subscription timing fixture are covered in CI.
+This is a compatible extension at Alloy's pubsub boundary, not an Alloy-provided
+telemetry subsystem. Request Tower layers do not expose unsolicited receipt time.
