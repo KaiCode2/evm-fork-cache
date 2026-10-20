@@ -39,6 +39,8 @@ rustdoc-args = ["--cfg", "docsrs"]
 [features]
 default = ["reactive", "reactive-ws"]
 reactive = []
+# Optional process-local receipt provenance; no telemetry backend is selected.
+ingress-timing = ["reactive"]
 # `tokio/sync` exposes `broadcast::error::RecvError`, which the pubsub log and
 # header streams match on so a dropped notification is observable instead of
 # being silently skipped. alloy-pubsub already enables it, but relying on

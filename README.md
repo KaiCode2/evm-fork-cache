@@ -17,6 +17,12 @@ re-deriving state on every call.
 [`alloy`]: https://github.com/alloy-rs/alloy
 [`foundry-fork-db`]: https://github.com/foundry-rs/foundry-fork-db
 
+Canonical transport receipt provenance is separately opt-in with
+`features = ["ingress-timing"]`. This default-off feature adds generic receipt
+values and lookup hooks; installing a lookup is a second, runtime opt-in.
+Without the feature, the added APIs and record fields are absent. See the
+[receipt timing guide](docs/transport-receipt-timing.md).
+
 ## Why it exists
 
 A search loop evaluates many hypothetical transactions against the *same*

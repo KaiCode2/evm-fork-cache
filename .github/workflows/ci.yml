@@ -65,6 +65,13 @@ jobs:
       # feature-gated regression cannot slip through.
       - name: Feature matrix
         run: |
+          cargo test --locked --lib
+          cargo test --locked --doc
+          cargo check --locked --features ingress-timing
+          cargo check --locked --no-default-features --features ingress-timing
+          cargo test --locked --no-default-features --features reactive-ws,ingress-timing --lib stream_gap_tests
+          cargo metadata --locked --format-version 1 > /tmp/cache-default-features.json
+          python3 -c 'import json; d=json.load(open("/tmp/cache-default-features.json")); n=next(n for n in d["resolve"]["nodes"] if n["id"] == d["resolve"]["root"]); assert "ingress-timing" not in n["features"], n["features"]'
           cargo check --locked --no-default-features
           cargo check --locked --no-default-features --features reactive
           cargo check --locked --no-default-features --features reactive-polling
@@ -118,4 +125,5 @@ jobs:
       - name: Check library builds on MSRV
         run: |
           cargo check --lib --locked
+          cargo check --lib --locked --features ingress-timing
           cargo check --lib --locked --no-default-features --features raw-flashblocks-json

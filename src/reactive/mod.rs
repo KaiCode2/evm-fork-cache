@@ -64,7 +64,11 @@ use crate::{
     state_update::{AccountPatch, PurgeScope, StateDiff, StateUpdate},
 };
 
+#[cfg(all(test, not(feature = "ingress-timing")))]
+mod ingress_feature_tests;
+#[cfg(feature = "ingress-timing")]
 mod ingress_timing;
+#[cfg(feature = "ingress-timing")]
 pub use ingress_timing::{CanonicalIngressTiming, TransportReceipt, TransportReceiptLookup};
 
 #[cfg(feature = "raw-flashblocks-json")]
@@ -11235,10 +11239,25 @@ impl SubscriberInputScope {
 
 /// Reactive input together with its canonical/owner-scoped delivery audience.
 #[derive(Clone, Debug)]
+#[cfg_attr(
+    not(feature = "ingress-timing"),
+    doc = r#"
+The receipt API is absent unless `ingress-timing` is enabled:
+```compile_fail
+use evm_fork_cache::reactive::TransportReceipt;
+```
+```compile_fail
+fn receipt(record: &evm_fork_cache::reactive::SubscriberInputRecord) {
+    let _ = record.canonical_timing();
+}
+```
+"#
+)]
 pub struct SubscriberInputRecord<N: Network = Ethereum> {
     record: ReactiveInputRecord<N>,
     scope: SubscriberInputScope,
     preconfirmation_timing: Option<FlashblockIngressTiming>,
+    #[cfg(feature = "ingress-timing")]
     canonical_timing: Option<CanonicalIngressTiming>,
 }
 
@@ -11259,6 +11278,7 @@ impl<N: Network> SubscriberInputRecord<N> {
     }
 
     /// Actual transport and subscriber clocks, if an unambiguous receipt was supplied.
+    #[cfg(feature = "ingress-timing")]
     pub const fn canonical_timing(&self) -> Option<CanonicalIngressTiming> {
         self.canonical_timing
     }
@@ -13167,6 +13187,7 @@ type FlashblockReconnectFuture<N> = Pin<
 /// `Ok(None)`.
 pub struct AlloySubscriber<P, N: Network = Ethereum> {
     provider: P,
+    #[cfg(feature = "ingress-timing")]
     transport_receipts: Option<TransportReceiptLookup>,
     /// Stable identity of an application-managed standardized Flashblock
     /// update source. The application owns its transport and lifecycle.
@@ -13380,6 +13401,7 @@ impl<P, N: Network> AlloySubscriber<P, N> {
             last_external_flashblock_snapshot: None,
             flashblocks_state_provider: None,
             provider_ref: None,
+            #[cfg(feature = "ingress-timing")]
             transport_receipts: None,
             log_verification_provider: None,
             chain_id: None,
@@ -13440,6 +13462,7 @@ impl<P, N: Network> AlloySubscriber<P, N> {
 
     /// Attach observational receipt lookup before subscriptions are connected.
     /// Ambiguity or missing data affects telemetry only, never delivery/readiness.
+    #[cfg(feature = "ingress-timing")]
     pub fn with_transport_receipt_lookup(mut self, lookup: TransportReceiptLookup) -> Self {
         self.transport_receipts = Some(lookup);
         self
@@ -15308,6 +15331,7 @@ enum SubscriberEvent<N: Network> {
     Log {
         source_id: usize,
         log: Log,
+        #[cfg(feature = "ingress-timing")]
         timing: Option<CanonicalIngressTiming>,
     },
     BackfilledLogs {
@@ -15315,7 +15339,11 @@ enum SubscriberEvent<N: Network> {
         logs: Vec<Log>,
     },
     Logs(Vec<Log>),
-    BlockHeader(N::HeaderResponse, Option<CanonicalIngressTiming>),
+    BlockHeader {
+        header: N::HeaderResponse,
+        #[cfg(feature = "ingress-timing")]
+        timing: Option<CanonicalIngressTiming>,
+    },
     PendingHash(B256),
     PendingHashes(Vec<B256>),
     BasePendingLog {
@@ -16986,10 +17014,12 @@ where
                 subscription,
                 source,
                 Arc::clone(&self.gap_counters),
+                #[cfg(feature = "ingress-timing")]
                 self.transport_receipts.clone(),
-                move |log, timing| SubscriberEvent::Log {
+                move |log, #[cfg(feature = "ingress-timing")] timing| SubscriberEvent::Log {
                     source_id: id,
                     log,
+                    #[cfg(feature = "ingress-timing")]
                     timing,
                 },
             ))
@@ -17030,11 +17060,14 @@ where
                 subscription,
                 source,
                 Arc::clone(&self.gap_counters),
+                #[cfg(feature = "ingress-timing")]
                 None,
-                move |log, _| SubscriberEvent::BasePendingLogTimed {
-                    source_id: id,
-                    log,
-                    timing: FlashblockIngressTiming::new(Instant::now()),
+                move |log, #[cfg(feature = "ingress-timing")] _| {
+                    SubscriberEvent::BasePendingLogTimed {
+                        source_id: id,
+                        log,
+                        timing: FlashblockIngressTiming::new(Instant::now()),
+                    }
                 },
             ))
         }
@@ -17169,8 +17202,13 @@ where
                 subscription,
                 SubscriberStreamSource::PubSubBlockHeaders,
                 Arc::clone(&self.gap_counters),
+                #[cfg(feature = "ingress-timing")]
                 self.transport_receipts.clone(),
-                SubscriberEvent::BlockHeader,
+                |header, #[cfg(feature = "ingress-timing")] timing| SubscriberEvent::BlockHeader {
+                    header,
+                    #[cfg(feature = "ingress-timing")]
+                    timing,
+                },
             ))
         }
 
@@ -17721,7 +17759,11 @@ where
                 return Ok(None);
             }
             self.last_certified_canonical_head = Some(certified);
-            return Ok(Some(SubscriberEvent::BlockHeader(header, None)));
+            return Ok(Some(SubscriberEvent::BlockHeader {
+                header,
+                #[cfg(feature = "ingress-timing")]
+                timing: None,
+            }));
         }
         self.record_rpc(
             SubscriberRpcCause::CanonicalHeadCertification,
@@ -17757,7 +17799,11 @@ where
             return Ok(None);
         }
         self.last_certified_canonical_head = Some(certified);
-        Ok(Some(SubscriberEvent::BlockHeader(header.clone(), None)))
+        Ok(Some(SubscriberEvent::BlockHeader {
+            header: header.clone(),
+            #[cfg(feature = "ingress-timing")]
+            timing: None,
+        }))
     }
 
     fn accept_base_flashblock(
@@ -18584,7 +18630,7 @@ where
             }
             #[cfg(feature = "raw-flashblocks-json")]
             SubscriberEvent::ExternalFlashblockUpdate(_) => Ok(()),
-            SubscriberEvent::BlockHeader(_, _)
+            SubscriberEvent::BlockHeader { .. }
             | SubscriberEvent::PendingHash(_)
             | SubscriberEvent::PendingHashes(_)
             | SubscriberEvent::BasePendingLog { .. }
@@ -18690,7 +18736,7 @@ where
             }
             #[cfg(feature = "raw-flashblocks-json")]
             SubscriberEvent::ExternalFlashblockUpdate(_) => {}
-            SubscriberEvent::BlockHeader(_, _)
+            SubscriberEvent::BlockHeader { .. }
             | SubscriberEvent::PendingHash(_)
             | SubscriberEvent::PendingHashes(_)
             | SubscriberEvent::BasePendingLog { .. }
@@ -18787,12 +18833,18 @@ where
             SubscriberEvent::Log {
                 source_id,
                 log,
+                #[cfg(feature = "ingress-timing")]
                 timing,
             } => {
                 if log_matches_any_interest(&log, &self.interests) {
                     let record = log_input_record(log, InputSource::Subscription);
                     self.note_log_block(source_id, &record);
-                    self.enqueue_timed_record_with_excluded_owners(record, excluded, timing);
+                    self.enqueue_timed_record_with_excluded_owners(
+                        record,
+                        excluded,
+                        #[cfg(feature = "ingress-timing")]
+                        timing,
+                    );
                 }
             }
             SubscriberEvent::BackfilledLogs { source_id, logs } => {
@@ -18814,11 +18866,20 @@ where
                     }
                 }
             }
-            SubscriberEvent::BlockHeader(header, timing) => {
+            SubscriberEvent::BlockHeader {
+                header,
+                #[cfg(feature = "ingress-timing")]
+                timing,
+            } => {
                 if needs_header_block_stream(&self.interests) {
                     let record = block_header_input_record::<N>(header);
                     self.note_attestable_canonical_block(&record);
-                    self.enqueue_timed_record_with_excluded_owners(record, excluded, timing);
+                    self.enqueue_timed_record_with_excluded_owners(
+                        record,
+                        excluded,
+                        #[cfg(feature = "ingress-timing")]
+                        timing,
+                    );
                 }
             }
             SubscriberEvent::PendingHash(hash) => {
@@ -18845,6 +18906,7 @@ where
                         record,
                         scope: SubscriberInputScope::Preconfirmed,
                         preconfirmation_timing: Some(timing),
+                        #[cfg(feature = "ingress-timing")]
                         canonical_timing: None,
                     });
                 }
@@ -19148,14 +19210,19 @@ where
         record: ReactiveInputRecord<N>,
         excluded: Option<&HashSet<SubscriberOwnerEpoch>>,
     ) {
-        self.enqueue_timed_record_with_excluded_owners(record, excluded, None);
+        self.enqueue_timed_record_with_excluded_owners(
+            record,
+            excluded,
+            #[cfg(feature = "ingress-timing")]
+            None,
+        );
     }
 
     fn enqueue_timed_record_with_excluded_owners(
         &mut self,
         record: ReactiveInputRecord<N>,
         excluded: Option<&HashSet<SubscriberOwnerEpoch>>,
-        timing: Option<CanonicalIngressTiming>,
+        #[cfg(feature = "ingress-timing")] timing: Option<CanonicalIngressTiming>,
     ) {
         let record = self.with_chain_id(record);
         let mut owners = self.staged_owners_for_record(&record);
@@ -19174,6 +19241,7 @@ where
                     record: record.clone(),
                     scope: SubscriberInputScope::OwnerOnly { owners },
                     preconfirmation_timing: None,
+                    #[cfg(feature = "ingress-timing")]
                     canonical_timing: timing,
                 });
             }
@@ -19187,6 +19255,7 @@ where
                         owners: newly_served,
                     },
                     preconfirmation_timing: None,
+                    #[cfg(feature = "ingress-timing")]
                     canonical_timing: timing,
                 });
             }
@@ -19207,6 +19276,7 @@ where
                 }
             },
             preconfirmation_timing: None,
+            #[cfg(feature = "ingress-timing")]
             canonical_timing: timing,
         });
     }
@@ -19223,6 +19293,7 @@ where
                 owners: vec![owner],
             },
             preconfirmation_timing: None,
+            #[cfg(feature = "ingress-timing")]
             canonical_timing: None,
         });
     }
@@ -19348,6 +19419,7 @@ where
             record,
             scope: SubscriberInputScope::OwnerOnly { owners },
             preconfirmation_timing: None,
+            #[cfg(feature = "ingress-timing")]
             canonical_timing: None,
         });
     }
@@ -19516,17 +19588,21 @@ where
 ///
 /// [`Subscription::into_stream`]: alloy_pubsub::Subscription::into_stream
 #[cfg(feature = "reactive-ws")]
-fn gap_observing_stream<N, T, F>(
+fn gap_observing_stream<
+    N,
+    T,
+    #[cfg(feature = "ingress-timing")] F: FnMut(T, Option<CanonicalIngressTiming>) -> SubscriberEvent<N> + Send + 'static,
+    #[cfg(not(feature = "ingress-timing"))] F: FnMut(T) -> SubscriberEvent<N> + Send + 'static,
+>(
     subscription: alloy_pubsub::Subscription<T>,
     source: SubscriberStreamSource,
     gap_counters: Arc<SubscriberStreamGapCounters>,
-    receipts: Option<TransportReceiptLookup>,
+    #[cfg(feature = "ingress-timing")] receipts: Option<TransportReceiptLookup>,
     to_event: F,
 ) -> BoxStream<'static, SubscriberEvent<N>>
 where
     N: Network + 'static,
     T: serde::de::DeserializeOwned + Send + 'static,
-    F: FnMut(T, Option<CanonicalIngressTiming>) -> SubscriberEvent<N> + Send + 'static,
 {
     // The decode closure and the receiver both live in the unfold state, so no
     // borrow is held across an await point.
@@ -19535,6 +19611,7 @@ where
         to_event: F,
         source: SubscriberStreamSource,
         gap_counters: Arc<SubscriberStreamGapCounters>,
+        #[cfg(feature = "ingress-timing")]
         receipts: Option<TransportReceiptLookup>,
         _item: PhantomData<fn() -> T>,
     }
@@ -19544,6 +19621,7 @@ where
         to_event,
         source: source.clone(),
         gap_counters,
+        #[cfg(feature = "ingress-timing")]
         receipts,
         _item: PhantomData::<fn() -> T>,
     };
@@ -19551,17 +19629,24 @@ where
     let stream = stream::unfold(state, |mut state| async move {
         let gap = match state.raw.recv().await {
             Ok(value) => {
+                #[cfg(feature = "ingress-timing")]
                 let dequeued = state.receipts.as_ref().map(|_| Instant::now());
+                #[cfg(feature = "ingress-timing")]
                 let receipt = state
                     .receipts
                     .as_ref()
                     .and_then(|lookup| lookup(value.get()));
                 match serde_json::from_str::<T>(value.get()) {
                     Ok(item) => {
+                        #[cfg(feature = "ingress-timing")]
                         let timing = receipt.zip(dequeued).and_then(|(receipt, dequeued)| {
                             CanonicalIngressTiming::new(receipt, dequeued, Instant::now())
                         });
-                        let event = (state.to_event)(item, timing);
+                        let event = (state.to_event)(
+                            item,
+                            #[cfg(feature = "ingress-timing")]
+                            timing,
+                        );
                         return Some((event, state));
                     }
                     Err(error) => {
@@ -20803,7 +20888,7 @@ mod subscriber_helper_tests {
                 .fetch_certified_canonical_head()
                 .await
                 .expect("first certified head"),
-            Some(SubscriberEvent::BlockHeader(_, _))
+            Some(SubscriberEvent::BlockHeader { .. })
         ));
         assert!(
             subscriber
@@ -20868,7 +20953,7 @@ mod subscriber_helper_tests {
             .await
             .expect("OP pending parent can be certified")
             .expect("the first certified parent is emitted");
-        let SubscriberEvent::BlockHeader(header, _) = event else {
+        let SubscriberEvent::BlockHeader { header, .. } = event else {
             panic!("expected a certified canonical block header")
         };
         assert_eq!(header.number(), 100);
@@ -22454,6 +22539,7 @@ mod subscriber_helper_tests {
         subscriber.enqueue_event(SubscriberEvent::Log {
             source_id: 0,
             log,
+            #[cfg(feature = "ingress-timing")]
             timing: None,
         });
 
@@ -22599,6 +22685,7 @@ mod subscriber_helper_tests {
         subscriber.enqueue_event(SubscriberEvent::Log {
             source_id: 0,
             log: rpc_log(false),
+            #[cfg(feature = "ingress-timing")]
             timing: None,
         });
         let mut second = rpc_log(false);
@@ -22607,6 +22694,7 @@ mod subscriber_helper_tests {
         subscriber.enqueue_event(SubscriberEvent::Log {
             source_id: 0,
             log: second,
+            #[cfg(feature = "ingress-timing")]
             timing: None,
         });
 
@@ -22705,6 +22793,7 @@ mod subscriber_helper_tests {
             record: log_input_record(rpc_log(false), InputSource::Poll),
             scope: SubscriberInputScope::Canonical { owners: Vec::new() },
             preconfirmation_timing: None,
+            #[cfg(feature = "ingress-timing")]
             canonical_timing: None,
         });
 
@@ -22799,6 +22888,7 @@ mod subscriber_helper_tests {
             record: log_input_record(rpc_log(false), InputSource::Poll),
             scope: SubscriberInputScope::Canonical { owners: Vec::new() },
             preconfirmation_timing: None,
+            #[cfg(feature = "ingress-timing")]
             canonical_timing: None,
         });
         let baseline = BlockRef {
@@ -23080,6 +23170,7 @@ mod subscriber_helper_tests {
         subscriber.enqueue_event(SubscriberEvent::Log {
             source_id: 0,
             log: rpc_log(false),
+            #[cfg(feature = "ingress-timing")]
             timing: None,
         });
         assert!(subscriber.abort_interest_owner(&owner_a));
@@ -23128,6 +23219,7 @@ mod subscriber_helper_tests {
         subscriber.enqueue_event(SubscriberEvent::Log {
             source_id: 0,
             log,
+            #[cfg(feature = "ingress-timing")]
             timing: None,
         });
 
@@ -23186,6 +23278,7 @@ mod subscriber_helper_tests {
             SubscriberEvent::Log {
                 source_id: 0,
                 log,
+                #[cfg(feature = "ingress-timing")]
                 timing: None,
             }
         });
@@ -23363,6 +23456,7 @@ mod subscriber_helper_tests {
         let event = SubscriberEvent::Log {
             source_id: 0,
             log: rpc_log(false),
+            #[cfg(feature = "ingress-timing")]
             timing: None,
         };
         let mut streams = SubscriberStreams::new();
@@ -23820,6 +23914,7 @@ mod subscriber_helper_tests {
             },
             stream::once(async {
                 SubscriberEvent::<Ethereum>::Log {
+                    #[cfg(feature = "ingress-timing")]
                     timing: None,
                     source_id: 0,
                     log: rpc_log(false),
@@ -23885,6 +23980,7 @@ mod subscriber_helper_tests {
             stream::once(async {
                 tokio::time::sleep(Duration::from_millis(1)).await;
                 SubscriberEvent::<Ethereum>::Log {
+                    #[cfg(feature = "ingress-timing")]
                     timing: None,
                     source_id: 0,
                     log: rpc_log(false),
@@ -23938,6 +24034,7 @@ mod subscriber_helper_tests {
         subscriber.enqueue_event(SubscriberEvent::Log {
             source_id: 0,
             log: log.clone(),
+            #[cfg(feature = "ingress-timing")]
             timing: None,
         });
         subscriber.enqueue_event(SubscriberEvent::BackfilledLogs {
@@ -24026,6 +24123,7 @@ mod subscriber_helper_tests {
         subscriber.enqueue_event(SubscriberEvent::Log {
             source_id: 0,
             log: rpc_log(false),
+            #[cfg(feature = "ingress-timing")]
             timing: None,
         });
         let mut streams = SubscriberStreams::new();
@@ -25546,7 +25644,7 @@ mod canonical_head_rpc_stats_tests {
             .await
             .expect("first certification succeeds");
         assert!(
-            matches!(first, Some(SubscriberEvent::BlockHeader(_, _))),
+            matches!(first, Some(SubscriberEvent::BlockHeader { .. })),
             "a newly certified head is delivered"
         );
 
@@ -25640,15 +25738,22 @@ mod stream_gap_tests {
         source: SubscriberStreamSource,
         counters: Arc<SubscriberStreamGapCounters>,
     ) -> BoxStream<'static, SubscriberEvent<Ethereum>> {
-        gap_observing_stream(subscription, source, counters, None, |log, timing| {
-            SubscriberEvent::Log {
+        gap_observing_stream(
+            subscription,
+            source,
+            counters,
+            #[cfg(feature = "ingress-timing")]
+            None,
+            |log, #[cfg(feature = "ingress-timing")] timing| SubscriberEvent::Log {
                 source_id: 0,
                 log,
+                #[cfg(feature = "ingress-timing")]
                 timing,
-            }
-        })
+            },
+        )
     }
 
+    #[cfg(feature = "ingress-timing")]
     #[tokio::test]
     async fn receipt_lookup_disabled_preserves_delivery_without_timing() {
         let counters = Arc::new(SubscriberStreamGapCounters::default());
@@ -25662,6 +25767,7 @@ mod stream_gap_tests {
         assert!(timing.is_none());
     }
 
+    #[cfg(feature = "ingress-timing")]
     #[tokio::test]
     async fn consumed_raw_subscription_preserves_transport_clock_without_rewriting_payload() {
         let counters = Arc::new(SubscriberStreamGapCounters::default());
@@ -25687,7 +25793,8 @@ mod stream_gap_tests {
             },
         );
         let Some(SubscriberEvent::Log {
-            timing: Some(timing),
+            #[cfg(feature = "ingress-timing")]
+                timing: Some(timing),
             log,
             ..
         }) = stream.next().await
@@ -26150,7 +26257,7 @@ mod canonical_head_suppression_tests {
             .expect("certification succeeds");
         assert!(matches!(
             certified,
-            Some(SubscriberEvent::BlockHeader(_, _))
+            Some(SubscriberEvent::BlockHeader { .. })
         ));
 
         // A tick immediately afterwards is inside the poll window.
@@ -26203,7 +26310,7 @@ mod canonical_head_suppression_tests {
             .await
             .expect("second certification");
 
-        assert!(matches!(second, Some(SubscriberEvent::BlockHeader(_, _))));
+        assert!(matches!(second, Some(SubscriberEvent::BlockHeader { .. })));
         assert_eq!(
             subscriber
                 .rpc_stats()

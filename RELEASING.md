@@ -103,3 +103,18 @@ Wait for 0.4.1 to appear in the crates.io index before verifying downstream
 extension packages against their final registry-only lockfiles. Publish only after
 explicit authorization; preparing or running this checklist is not permission
 to publish, tag, or push.
+
+## Optional ingress timing feature
+
+The `ingress-timing` Cargo feature is disabled by default. Without it, new
+receipt types, callback configuration, accessors, inline metadata fields and
+receipt clockwork are not compiled. Existing canonical and Flashblock timing
+APIs keep their prior behavior. Enabling the feature adds only generic data and
+hooks; consumers must still explicitly install a bounded receipt lookup. No
+exporter, tracing subscriber, global setup or runtime task is installed.
+
+Use `features = ["ingress-timing"]` alongside the existing transport features.
+Default/default-off and enabled builds, compile-fail API absence, record-layout
+regression and a real consumed-subscription timing fixture are covered in CI.
+This is a compatible extension at Alloy's pubsub boundary, not an Alloy-provided
+telemetry subsystem. Request Tower layers do not expose unsolicited receipt time.

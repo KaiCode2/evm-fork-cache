@@ -14,6 +14,9 @@ surface freezes at 1.0.
 
 ## [0.4.1] - Unreleased candidate
 
+- Place all new ingress APIs, inline metadata and observer clockwork behind the
+  default-off `ingress-timing` Cargo feature; retain a separate runtime opt-in.
+
 ### Added
 
 - Optional application-owned transport receipt lookup and canonical subscriber
