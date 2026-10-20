@@ -341,13 +341,24 @@ impl DurableCheckpointStore {
     }
 
     fn reserve_generation(&self) -> Result<u64, DurableCheckpointError> {
-        self.coordinator
-            .latest_generation
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |generation| {
-                generation.checked_add(1)
-            })
-            .map(|previous| previous + 1)
-            .map_err(|_| DurableCheckpointError::GenerationExhausted)
+        // Explicit CAS preserves the 1.90 MSRV; newer toolchains deprecate
+        // fetch_update in favor of an API unavailable on that compiler.
+        let generation = &self.coordinator.latest_generation;
+        let mut observed = generation.load(Ordering::Acquire);
+        loop {
+            let next = observed
+                .checked_add(1)
+                .ok_or(DurableCheckpointError::GenerationExhausted)?;
+            match generation.compare_exchange_weak(
+                observed,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Ok(next),
+                Err(current) => observed = current,
+            }
+        }
     }
 
     /// Load a checkpoint without mutating a cache.
@@ -864,6 +875,32 @@ mod tests {
     use super::capture_backend_maps;
     #[cfg(unix)]
     use super::create_unique_temp_file;
+
+    #[test]
+    fn generation_reservation_never_wraps_at_exhaustion() {
+        let store = super::DurableCheckpointStore {
+            path: "unused-checkpoint-test".into(),
+            coordinator: Arc::new(super::CheckpointWriteCoordinator::default()),
+            max_checkpoint_bytes: 1,
+        };
+        assert_eq!(store.reserve_generation().unwrap(), 1);
+        store
+            .coordinator
+            .latest_generation
+            .store(u64::MAX - 1, std::sync::atomic::Ordering::Release);
+        assert_eq!(store.reserve_generation().unwrap(), u64::MAX);
+        assert!(matches!(
+            store.reserve_generation(),
+            Err(super::DurableCheckpointError::GenerationExhausted)
+        ));
+        assert_eq!(
+            store
+                .coordinator
+                .latest_generation
+                .load(std::sync::atomic::Ordering::Acquire),
+            u64::MAX
+        );
+    }
 
     #[test]
     fn backend_capture_retains_earlier_guards_while_waiting_for_later_maps() {

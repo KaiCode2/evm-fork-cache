@@ -23,3 +23,8 @@ normal gap-observing stream: a 30ms earlier transport timestamp survives the
 queue and typed decode, while the payload remains unchanged. Existing gap tests
 continue to require explicit loss notification. No extra provider operation is
 introduced. The complete release matrix remains required before publication.
+
+CI compatibility also replaces the checkpoint generation allocator's deprecated
+`fetch_update` call with an equivalent acquire/release compare-exchange loop.
+This keeps Rust 1.90 compatibility without adopting the newer replacement API;
+checked increment still rejects generation exhaustion without wrapping.
