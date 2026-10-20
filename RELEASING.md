@@ -1,13 +1,21 @@
 # Releasing
 
-`evm-fork-cache` 0.4.0 adds bounded, caller-timed single-index reorder
-tolerance to the default-off raw JSON Flashblocks normalization layer, immutable
-snapshot lineage lookups, and provider-free cooperative cancellation scopes for
-related overlay calls. Publish `alloy-transport-balancer 0.3.0` first,
-then publish this crate before any extension crate that declares
-`evm-fork-cache = "0.4.0"`.
-No release step is automatic: use clean, reviewed commits and never publish
-from a credential-bearing working tree.
+`evm-fork-cache` 0.4.1 is an unpublished additive telemetry candidate based on
+published 0.4.0 (`ab08a5702982eba87d8d590120ef1076de8a3342`, confirmed by that
+registry archive's VCS metadata). It adds generic optional receipt/dequeue/decode
+provenance and preserves existing constructors and execution semantics. No
+exporter, bot label, provider operation or runtime task is added. See
+`docs/transport-receipt-timing.md` for the Alloy integration and disabled costs.
+The candidate also includes the reviewed Rust1.90 checkpoint CAS compatibility
+fix and release-lockfile TLS audit patches. It does not alter durable formats.
+
+The registry API confirmed 0.4.1 absent on 2026-10-20. Recheck availability before
+an explicitly authorized publication. No tag or package has been published by
+this preparation. Complete the unchanged checks below on the candidate and
+inspect the packaged source. Wait for the authorized cache publication before
+qualifying AMM's exact registry dependency; a local/Git patch is integration
+evidence only. No release step is automatic: use clean, reviewed commits and
+never publish from a credential-bearing working tree.
 
 ## Preflight
 
@@ -87,11 +95,11 @@ the core's retained canonical history exactly.
 
 ```bash
 cargo publish --locked
-git tag -s v0.4.0 -m "Release evm-fork-cache v0.4.0"
-git push origin v0.4.0
+git tag -s v0.4.1 -m "Release evm-fork-cache v0.4.1"
+git push origin v0.4.1
 ```
 
-Wait for 0.4.0 to appear in the crates.io index before verifying downstream
+Wait for 0.4.1 to appear in the crates.io index before verifying downstream
 extension packages against their final registry-only lockfiles. Publish only after
 explicit authorization; preparing or running this checklist is not permission
 to publish, tag, or push.

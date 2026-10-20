@@ -2063,7 +2063,7 @@ dependencies = [
 
 [[package]]
 name = "evm-fork-cache"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "alloy-consensus",
  "alloy-contract",
