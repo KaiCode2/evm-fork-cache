@@ -19,6 +19,13 @@ surface freezes at 1.0.
   and canonical delivery semantics, and remains absent on missing or ambiguous
   receipt evidence. See `docs/transport-receipt-timing.md`.
 
+### Fixed
+
+- Refresh the development/release lockfile to rustls 0.23.46 and its required
+  rustls-webpki 0.103.16 patch, clearing RUSTSEC-2026-0285, RUSTSEC-2026-0346,
+  RUSTSEC-2026-0348 and RUSTSEC-2026-0349 without audit exceptions. This lockfile
+  update does not change the public dependency range or downstream lockfiles.
+
 ## [0.4.0] - 2026-09-05
 
 ### Changed
