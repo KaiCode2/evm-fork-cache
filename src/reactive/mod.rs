@@ -64,8 +64,10 @@ use crate::{
     state_update::{AccountPatch, PurgeScope, StateDiff, StateUpdate},
 };
 
+mod gap_policy;
 #[cfg(all(test, not(feature = "ingress-timing")))]
 mod ingress_feature_tests;
+pub use gap_policy::SubscriberGapPolicy;
 #[cfg(feature = "ingress-timing")]
 mod ingress_timing;
 #[cfg(feature = "ingress-timing")]
@@ -13222,6 +13224,8 @@ pub struct AlloySubscriber<P, N: Network = Ethereum> {
     chain_id: Option<u64>,
     mode: SubscriberMode,
     config: SubscriberConfig,
+    gap_policy: SubscriberGapPolicy,
+    terminal_gap: Option<(&'static str, SubscriberStreamGap)>,
     base_interests: Vec<ReactiveInterest<N>>,
     owned_interests: Vec<OwnedSubscriberInterests<N>>,
     next_owner_epoch: u64,
@@ -13407,6 +13411,8 @@ impl<P, N: Network> AlloySubscriber<P, N> {
             chain_id: None,
             mode,
             config,
+            gap_policy: SubscriberGapPolicy::default(),
+            terminal_gap: None,
             base_interests: Vec::new(),
             owned_interests: Vec::new(),
             next_owner_epoch: 0,
@@ -14927,6 +14933,7 @@ impl<P, N: Network> AlloySubscriber<P, N> {
         self.pending_chain_controls.clear();
         self.pending_reconcile_owner_records.clear();
         self.resource_error = None;
+        self.terminal_gap = None;
         self.last_seen_log_blocks.clear();
         self.verified_log_blocks.clear();
         self.verified_log_block_order.clear();
@@ -19119,6 +19126,7 @@ where
         match source {
             SubscriberStreamSource::PubSubLog { id, .. } => {
                 self.reset_log_attestation();
+                self.require_gap_recovery("canonical_logs", gap)?;
                 if !self.last_seen_log_blocks.contains_key(id) {
                     return Err(SubscriberError::Provider(format!(
                         "Alloy subscriber {} lost notifications ({gap}) before establishing a \
@@ -19134,6 +19142,7 @@ where
             }
             SubscriberStreamSource::PubSubBlockHeaders => {
                 self.gap_counters.record_header_gap();
+                self.require_gap_recovery("canonical_headers", gap)?;
                 Ok(None)
             }
             SubscriberStreamSource::BasePendingLog { .. } => {
@@ -19475,6 +19484,9 @@ where
     }
 
     fn check_resource_error(&self) -> Result<(), SubscriberError> {
+        if let Some((stream, gap)) = self.terminal_gap {
+            return Err(SubscriberError::CanonicalStreamGap { stream, gap });
+        }
         match &self.resource_error {
             Some(message) => Err(SubscriberError::ResourceExhausted(message.clone())),
             None => Ok(()),
@@ -25571,6 +25583,15 @@ fn provider_error(error: impl fmt::Display) -> SubscriberError {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum SubscriberError {
+    /// Strict delivery observed canonical notification loss and issued no
+    /// repair request. Only an explicit complete registration reset can resume.
+    #[error("canonical subscription {stream} lost notifications ({gap}); explicit repair required")]
+    CanonicalStreamGap {
+        /// Stable stream category, never a provider endpoint.
+        stream: &'static str,
+        /// Detected notification loss.
+        gap: SubscriberStreamGap,
+    },
     /// Invalid subscriber configuration.
     #[error("{0}")]
     InvalidConfig(&'static str),
@@ -25687,6 +25708,7 @@ mod canonical_head_rpc_stats_tests {
 /// and pin both the detection and the bounded recovery it triggers.
 #[cfg(all(test, feature = "reactive-ws"))]
 mod stream_gap_tests {
+    mod fail_closed;
     use super::*;
     use alloy_provider::ProviderBuilder;
     use alloy_transport::mock::Asserter;

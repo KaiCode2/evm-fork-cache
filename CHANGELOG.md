@@ -12,6 +12,20 @@ surface freezes at 1.0.
 
 ## [Unreleased]
 
+## [0.4.2-alpha.1] - Unreleased candidate
+
+- Refresh the release lockfile to patched `webpki-roots 1.0.10` for
+  RUSTSEC-2026-0381; no advisory exception is added. Downstream consumers must
+  use a patched version in their own lockfiles.
+
+- Add `EvmSnapshot::spec_id()` so local simulation preserves the captured EVM
+  hardfork rules instead of assuming a fork.
+- Add opt-in `SubscriberGapPolicy::FailClosed` to stop canonical log/header
+  delivery on detected notification loss before implicit repair requests.
+  Failure remains sticky until an explicit full registration reset; existing
+  reconciliation remains the default. Expose the pure planned provider-filter
+  view without changing subscriptions or source completeness guarantees.
+
 ## [0.4.1] - Unreleased candidate
 
 - Place all new ingress APIs, inline metadata and observer clockwork behind the

@@ -135,6 +135,12 @@ impl EvmSnapshot {
         self.chain_id
     }
 
+    /// Exact EVM hardfork rules captured by this immutable snapshot.
+    /// Local projections must preserve these rules rather than assume a fork.
+    pub const fn spec_id(&self) -> SpecId {
+        self.spec_id
+    }
+
     /// Block number installed in the snapshot's EVM context.
     pub const fn block_number(&self) -> Option<u64> {
         self.block_number
