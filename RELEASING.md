@@ -1,5 +1,21 @@
 # Releasing
 
+## Current alpha candidate
+
+`0.4.2-alpha.1` is an additive successor to registry `0.4.1`. It adds opt-in
+fail-closed subscriber gap handling, pure planned-filter inspection and the
+snapshot hardfork getter required by the Aero consumer. Default reconciliation
+and durable formats are unchanged. The release lockfile also patches
+`webpki-roots` to 1.0.10. This is package preparation, not publication authority.
+The crypto-bigint advisory remains visible and requires exact-artifact approval.
+
+Prepare from a clean reviewed source. Verify the archive's VCS commit, file list,
+checksum, packaged-source build and downstream compatibility. Publish this cache
+before AMM alpha.9, then verify the registry archive/checksum before proceeding.
+Any ambiguous upload must be resolved by inspecting registry state before retry.
+
+## Historical 0.4.1 preparation
+
 `evm-fork-cache` 0.4.1 is an unpublished additive telemetry candidate based on
 published 0.4.0 (`ab08a5702982eba87d8d590120ef1076de8a3342`, confirmed by that
 registry archive's VCS metadata). It adds generic optional receipt/dequeue/decode
@@ -95,11 +111,11 @@ the core's retained canonical history exactly.
 
 ```bash
 cargo publish --locked
-git tag -s v0.4.1 -m "Release evm-fork-cache v0.4.1"
-git push origin v0.4.1
+git tag -s v0.4.2-alpha.1 -m "Release evm-fork-cache v0.4.2-alpha.1"
+git push origin v0.4.2-alpha.1
 ```
 
-Wait for 0.4.1 to appear in the crates.io index before verifying downstream
+Wait for 0.4.2-alpha.1 to appear in the crates.io index before verifying downstream
 extension packages against their final registry-only lockfiles. Publish only after
 explicit authorization; preparing or running this checklist is not permission
 to publish, tag, or push.

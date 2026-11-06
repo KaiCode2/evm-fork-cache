@@ -122,3 +122,18 @@ Alloy's 0.16 dependency range; no registry patch is hidden in this release.
 
 The TUI dependency set uses the patched `lru 0.18.2` where that version range
 is supported. Do not generalize the Alloy assessment to other lru consumers.
+
+## November 2026 alpha candidate
+
+The candidate retains the exact previously reviewed bincode consumer topology;
+the scope check now names `evm-fork-cache 0.4.2-alpha.1`. No new bincode consumer
+is permitted. This version-only binding is not a vulnerability exception.
+
+The current dependency graph includes `crypto-bigint 0.5.5`, covered by
+[RUSTSEC-2026-0387](https://rustsec.org/advisories/RUSTSEC-2026-0387.html).
+The patched family starts at 0.7.6; the existing elliptic-curve 0.13 graph requires
+0.5. Package preparation and functional tests do not authorize publication with
+this finding. The previous qualification-only acceptance is expired and does
+not cover these releases. Publication requires either a repaired graph and new
+qualification or explicit acceptance of the exact final alpha artifacts. The
+unfiltered audit and all other advisory/reachability gates remain mandatory.

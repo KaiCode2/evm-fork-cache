@@ -98,7 +98,9 @@ jobs:
       - name: Security audit
         # The scope script requires the exact unreachable 0.2.25 lock entry and
         # proves every active tracing-subscriber is patched (>= 0.3.20).
-        run: cargo audit --ignore RUSTSEC-2025-0055
+        run: |
+          python3 -m unittest discover -s .github/security -p 'test_*.py'
+          python3 .github/security/aero_alpha_audit.py
 
   msrv:
     name: msrv (1.90)
